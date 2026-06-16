@@ -1,0 +1,127 @@
+"""
+conftest.py - shared pytest fixtures and respx mocking
+"""
+import pytest
+import respx
+from httpx import Response
+
+# Base URL used in tests
+BASE_URL = "https://api.test.nullrun.io"
+
+
+@pytest.fixture(autouse=True)
+def reset_runtime():
+    """Reset all singletons before each test (not after - avoids double-flush issues)."""
+    # Import here to avoid circular issues
+    import nullrun.actions as _act
+    import nullrun.decorators as _dec
+    import nullrun.runtime as _rt_mod
+    from nullrun.runtime import NullRunRuntime
+
+    # Disable polling for all tests via the runtime's internal `polling` flag
+    # (see make_runtime below — passes polling=False by default). The legacy
+    # NULLRUN_DISABLE_POLLING env var is gone as of Commit 5.
+
+    # Reset before test only - don't call shutdown in teardown
+    # because mock_api fixture already cleaned up its respx context
+    NullRunRuntime.reset_instance()
+    _dec._runtime = None
+    _act._action_handler = None
+    # Module-level cache used by `nullrun.track_llm` / `nullrun.track_tool` →
+    # `get_runtime()`. Without this, a stale singleton from a previous test
+    # leaks across the suite (e.g. a test that did `nullrun.init(...)` with
+    # the prod URL leaves that URL pinned for the next test).
+    _rt_mod._runtime = None
+
+    yield
+
+    # Just clear references, don't call shutdown which may try HTTP calls
+    # after respx mock context has already exited
+    NullRunRuntime._instance = None
+    _dec._runtime = None
+    _act._action_handler = None
+    _rt_mod._runtime = None
+
+
+@pytest.fixture
+def mock_api():
+    """Mock all HTTP calls to NullRun API."""
+    with respx.mock:
+        # Auth endpoint
+        respx.post(f"{BASE_URL}/api/v1/auth/verify").mock(
+            return_value=Response(200, json={
+                "organization_id": "ws-test",
+                "plan": "pro",
+                "features": [],
+                "limits": {"max_cost_cents": 10000},
+            })
+        )
+        # Gate (execute) endpoint
+        respx.post(f"{BASE_URL}/api/v1/gate").mock(
+            return_value=Response(200, json={
+                "decision": "allow",
+                "actions": [],
+                "local_cost_cents": 0,
+                "policy_id": "policy-test",
+                "decision_source": "gateway",
+            })
+        )
+        # Check endpoint
+        respx.post(f"{BASE_URL}/check").mock(
+            return_value=Response(200, json={
+                "allowed": True,
+                "actions": [],
+                "blocked_reason": None,
+            })
+        )
+        # Track batch endpoint
+        respx.post(f"{BASE_URL}/api/v1/track/batch").mock(
+            return_value=Response(200, json={"ok": True, "accepted": 1})
+        )
+        # Policies endpoint
+        respx.post(f"{BASE_URL}/api/v1/policies").mock(
+            return_value=Response(200, json=[{
+                "budget_cents": 1000,
+                "rate_limit": 100,
+                "loop_threshold": 6,
+                "retry_threshold": 5,
+            }])
+        )
+        # Health endpoint
+        respx.get(f"{BASE_URL}/health").mock(
+            return_value=Response(200, json={"status": "ok"})
+        )
+        yield
+
+
+@pytest.fixture
+def make_runtime(mock_api):
+    """Factory for creating isolated NullRunRuntime in tests.
+
+    Pins the created runtime into the @protect decorator's module-level
+    slot so `@protect` (which resolves a runtime lazily via
+    `decorators._get_or_create_runtime`) finds the test runtime, not a
+    fallback that would try to construct one with no api_key.
+    """
+    from nullrun.runtime import NullRunRuntime
+    import nullrun.decorators as _dec
+
+    def _make(**kwargs):
+        defaults = dict(
+            api_key="test-key-12345678",
+            api_url=BASE_URL,
+            # Internal flag — tests don't want a background WS/HTTP poller
+            # opening real sockets. The mocked respx context only covers
+            # auth/policy/track endpoints, not the long-lived control plane.
+            polling=False,
+        )
+        defaults.update(kwargs)
+        rt = NullRunRuntime(**defaults)
+        # Pin for @protect decorator's lazy resolution. Without this,
+        # @protect would call NullRunRuntime.get_instance() which reads
+        # env vars, finds no NULLRUN_API_KEY in the test environment,
+        # and raise NullRunAuthenticationError.
+        _dec._runtime = rt
+        return rt
+
+    return _make

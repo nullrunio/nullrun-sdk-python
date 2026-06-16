@@ -1,0 +1,37 @@
+syntax = "proto3";
+package nullrun.v1;
+
+service TrackService {
+  rpc BatchTrack(BatchTrackRequest) returns (BatchTrackResponse);
+  rpc Track(TrackRequest) returns (TrackResponse);
+}
+
+message TrackRequest {
+  string event_id = 1;
+  string workflow_id = 2;
+  string event_type = 3;
+  int64 tokens = 4;
+  int64 cost_cents = 5;
+  string tool_name = 6;
+  bool is_retry = 7;
+}
+
+message BatchTrackRequest {
+  repeated TrackRequest events = 1;
+}
+
+message TrackResponse {
+  bool accepted = 1;
+  string message = 2;
+}
+
+message BatchTrackResponse {
+  repeated string accepted_event_ids = 1;
+  repeated Action actions_taken = 2;
+}
+
+message Action {
+  string type = 1;
+  string workflow_id = 2;
+  string reason = 3;
+}

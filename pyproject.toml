@@ -1,0 +1,139 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nullrun"
+version = "0.3.0"
+description = "NullRun Python SDK — Enforcement gateway for AI agents."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+
+authors = [
+    { name = "nullrun.io", email = "support@nullrun.io" }
+]
+
+keywords = [
+    "circuit-breaker", "agent", "llm", "observability",
+    "ai-safety", "rate-limiting", "nullrun"
+]
+
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+
+dependencies = [
+    "httpx>=0.27.0,<1.0",
+    "grpcio>=1.60.0,<2.0",
+]
+
+[project.optional-dependencies]
+opentelemetry = [
+    "opentelemetry-api>=1.26.0,<2.0",
+    "opentelemetry-sdk>=1.26.0,<2.0",
+]
+langgraph = [
+    "langgraph>=0.2.0,<1.0",
+]
+# Phase E1: per-vendor auto-instrumentation dependencies.
+# Each patch in `nullrun.instrumentation.auto` wraps its vendor import in
+# `try/except ImportError` so a user who installs only one extras group
+# does not crash on SDK init. This matches the plan: zero glue code for
+# `nullrun.init(api_key=...)` to track all common LLM vendors.
+openai = ["openai>=1.0,<2.0"]
+anthropic = ["anthropic>=0.20,<1.0"]
+mistral = ["mistralai>=0.4,<1.0"]
+gemini = ["google-genai>=1.0,<2.0"]
+cohere = ["cohere>=5.0,<6.0"]
+bedrock = ["boto3>=1.34,<2.0"]
+agents = ["openai-agents>=0.1,<1.0"]
+langchain = ["langchain-core>=0.3,<1.0"]
+all = [
+    "openai>=1.0,<2.0",
+    "anthropic>=0.20,<1.0",
+    "mistralai>=0.4,<1.0",
+    "google-genai>=1.0,<2.0",
+    "cohere>=5.0,<6.0",
+    "boto3>=1.34,<2.0",
+    "openai-agents>=0.1,<1.0",
+    "langchain-core>=0.3,<1.0",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "respx>=0.21",
+    "mypy>=1.10",
+    "ruff>=0.5",
+    "coverage[toml]>=7.0",
+    "grpcio-tools>=1.60.0,<2.0",
+    "httpx>=0.27.0,<1.0",
+]
+
+[project.urls]
+Homepage = "https://nullrun.io"
+Documentation = "https://docs.nullrun.io"
+Repository = "https://github.com/nullrunio/nullrun-sdk-python"
+Changelog = "https://github.com/nullrunio/nullrun-sdk-python/blob/master/CHANGELOG.md"
+"Bug Tracker" = "https://github.com/nullrunio/nullrun-sdk-python/issues"
+"API-Compatibility" = "2024-01-15"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nullrun"]
+include = [
+    "src/nullrun/py.typed",
+]
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "tests/",
+    ".github/",
+    "*.pyc",
+    "__pycache__",
+]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_return_any = true
+warn_unused_ignores = true
+disallow_any_generics = true
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "S"]
+ignore = [
+    "S101",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S", "B"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "--tb=short -q"
+
+[tool.coverage.run]
+source = ["src/nullrun"]
+omit = ["tests/*"]
+
+[tool.coverage.report]
+fail_under = 70
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]

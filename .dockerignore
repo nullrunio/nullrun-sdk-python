@@ -1,0 +1,6 @@
+.git
+*.log
+*.lock
+.env
+**/node_modules
+dist

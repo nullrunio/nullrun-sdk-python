@@ -1,0 +1,17 @@
+# Development Dockerfile for Python SDK
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Copy source first (needed for editable install with src layout)
+COPY pyproject.toml README.md ./
+COPY src ./src
+
+# Install dependencies
+RUN pip install -e ".[dev,langgraph]"
+
+# Copy tests
+COPY tests ./tests
+
+# Stay alive for debugging - user can exec in to run tests manually
+CMD ["tail", "-f", "/dev/null"]
