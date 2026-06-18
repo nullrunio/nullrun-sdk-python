@@ -115,8 +115,8 @@ def init(
 
     # Imported lazily so we don't pull the runtime into the namespace
     # when the user only wants the static helpers.
-    from nullrun.runtime import NullRunRuntime
     import nullrun.runtime as _rt_mod
+    from nullrun.runtime import NullRunRuntime
 
     runtime = NullRunRuntime(
         api_key=api_key,

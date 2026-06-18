@@ -198,17 +198,25 @@ class ActionHandler:
         if self._webhooks:
             self._queue_webhook(action_type, workflow_id, reason or "Unknown", details)
 
+        # Catch only `Exception` here AND re-raise the control-signal
+        # exceptions that the SDK uses to halt agents. The previous
+        # `except BaseException` silently swallowed kills, which
+        # broke the kill contract per `docs/kill-contract.md` §1.
+        # (P0-0.5 fix.)
+        from nullrun.breaker.exceptions import (
+            WorkflowKilledInterrupt,
+            WorkflowPausedException,
+        )
+
         try:
             handler(workflow_id, reason or "Unknown", **details)  # type: ignore[no-untyped-call]
-        except BaseException as e:
-            # Don't let handler exceptions propagate. We catch
-            # `BaseException` (not just `Exception`) because
-            # `WorkflowKilledInterrupt` is intentionally a
-            # `BaseException` subclass — it's a non-recoverable
-            # control signal, but inside the ActionHandler dispatch
-            # loop we want the kill to be recorded in history
-            # (already done above) and swallowed, NOT re-raised into
-            # the caller's frame.
+        except (WorkflowKilledInterrupt, WorkflowPausedException):
+            # Control signals — MUST propagate to halt the agent.
+            raise
+        except Exception as e:
+            # Genuine handler errors (user bugs, network failures in
+            # webhook callbacks) are logged and swallowed so one
+            # broken handler does not break the dispatch loop.
             logger.error(f"Action handler error: {e}")
 
     def _default_kill(

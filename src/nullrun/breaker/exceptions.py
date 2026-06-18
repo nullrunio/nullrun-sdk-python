@@ -54,6 +54,51 @@ class NullRunTransportError(BreakerError):
         )
 
 
+class RateLimitError(NullRunTransportError):
+    """Raised when the gateway returns HTTP 429 with a ``Retry-After``
+    header (or JSON body field).
+
+    Phase 4 of the production-readiness plan: 429s were previously
+    raised as a generic ``NullRunTransportError`` which lost the
+    ``retry_after`` (seconds) and ``upgrade_url`` fields the
+    operator needs to schedule a retry or surface a billing
+    upgrade prompt. We subclass ``NullRunTransportError`` so
+    ``except NullRunTransportError`` keeps catching it (no
+    backwards-incompatible behaviour change).
+
+    Attributes:
+        retry_after: Seconds the server asks the client to wait
+            before retrying. ``None`` when the response did not
+            carry a ``Retry-After`` header.
+        upgrade_url: Plan-upgrade URL the server returns with the
+            429 body (per ``contracts/errors.ts:1-19``). ``None``
+            when the response did not include one.
+        body: The parsed JSON body the server returned with the
+            429. Useful for surfacing the original ``error`` /
+            ``message`` / ``details`` to the operator.
+    """
+    def __init__(
+        self,
+        message: str,
+        source: TransportErrorSource,
+        endpoint: str,
+        retry_after: float | None = None,
+        upgrade_url: str | None = None,
+        body: dict[str, Any] | None = None,
+        **details: Any,
+    ) -> None:
+        self.retry_after = retry_after
+        self.upgrade_url = upgrade_url
+        self.body = body or {}
+        # Surface the retry_after in the canonical detail dict
+        # too so callers inspecting ``exc.details`` see it.
+        if retry_after is not None:
+            details.setdefault("retry_after", retry_after)
+        if upgrade_url is not None:
+            details.setdefault("upgrade_url", upgrade_url)
+        super().__init__(message, source, endpoint, **details)
+
+
 class BreakerTransportError(BreakerError):
     """
     Raised when transport layer fails and events cannot be delivered.
@@ -258,7 +303,8 @@ class WorkflowKilledException(BaseException):
     non-recoverable signal and should not be caught by generic
     ``except Exception`` clauses. Only ``except BaseException`` or the
     explicit ``except WorkflowKilledInterrupt`` reliably stops the work.
-    See ``docs/kill-contract.md`` §6 for the full rationale.
+    See the kill-contract design note in the gateway repository
+    for the full rationale.
     """
 
     def __init__(self, workflow_id: str, reason: str) -> None:
@@ -295,8 +341,9 @@ class WorkflowKilledInterrupt(WorkflowKilledException):
         silently bypass the kill.
       * ``except BaseException`` catches it, like the stdlib interrupts.
 
-    See ``docs/kill-contract.md`` §6 for the full rationale, including
-    the four-level coverage model and the decision tree for users.
+    See the kill-contract design note in the gateway repository for
+    the full rationale, including the four-level coverage model and
+    the decision tree for users.
 
     Fields:
         workflow_id:  The workflow that was killed.

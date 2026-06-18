@@ -22,7 +22,7 @@ keywords = [
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -33,7 +33,6 @@ classifiers = [
 
 dependencies = [
     "httpx>=0.27.0,<1.0",
-    "grpcio>=1.60.0,<2.0",
 ]
 
 [project.optional-dependencies]
@@ -74,8 +73,13 @@ dev = [
     "mypy>=1.10",
     "ruff>=0.5",
     "coverage[toml]>=7.0",
-    "grpcio-tools>=1.60.0,<2.0",
     "httpx>=0.27.0,<1.0",
+    # `nullrun.instrumentation.langgraph` does a module-level
+    # `from langchain_core.callbacks import BaseCallbackHandler`,
+    # so any test that imports `nullrun` transitively pulls this in.
+    "langchain-core>=0.3,<1.0",
+    # test_ws_push.py exercises a real WebSocket client/server.
+    "websockets>=12.0",
 ]
 
 [project.urls]

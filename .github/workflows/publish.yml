@@ -3,67 +3,98 @@ name: Publish to PyPI
 on:
   push:
     tags:
-      - 'v*'   # триггер только по тегу: git tag v0.1.0 && git push --tags
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Publish target'
+        type: choice
+        required: true
+        default: testpypi
+        options:
+          - testpypi
+          - pypi
+
+# Trusted Publishing: no API tokens in repo or CI.
+# Configure once on the PyPI side, see SETUP.md for step-by-step.
 
 jobs:
   test:
     name: Run tests
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.10", "3.11", "3.12"]
-
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-
       - name: Install dependencies
-        run: |
-          pip install -e ".[dev]"
-
+        run: pip install -e ".[dev]"
       - name: Run tests
         run: pytest tests/ -v
+      - name: Lint (ruff)
+        run: |
+          ruff check src/ tests/
+          ruff format --check src/ tests/
+      - name: Type check (mypy strict)
+        run: mypy src/nullrun --strict
 
-  publish:
-    name: Build and publish
-    needs: test   # сначала все тесты зелёные — потом публикация
+  publish-testpypi:
+    name: Publish to TestPyPI
+    needs: test
+    if: github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi'
     runs-on: ubuntu-latest
-
     environment:
-      name: pypi
-      url: https://pypi.org/p/nullrun-sdk
-
+      name: testpypi
+      url: https://test.pypi.org/project/nullrun
     permissions:
-      id-token: write   # для trusted publishing (без токена, рекомендуется PyPI)
-
+      id-token: write
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Build package
         run: |
           pip install hatchling build
           python -m build
-
-      - name: Check dist contents
+      - name: Check dist
         run: |
           pip install twine
           twine check dist/*
+      - name: Publish to TestPyPI (Trusted Publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          attestations: false
 
-      # Вариант 1: Trusted Publishing (рекомендуется, не нужен токен)
-      # Настроить на pypi.org: Account → Publishing → Add publisher
-      # Publisher: GitHub, repo: maltsev-dev/nullrun-sdk, workflow: publish.yml
+  publish-pypi:
+    name: Publish to PyPI
+    needs: test
+    if: |
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi')
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/nullrun
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Build package
+        run: |
+          pip install hatchling build
+          python -m build
+      - name: Check dist
+        run: |
+          pip install twine
+          twine check dist/*
       - name: Publish to PyPI (Trusted Publishing)
         uses: pypa/gh-action-pypi-publish@release/v1
-
-      # Вариант 2: API токен (раскомментируй если не используешь Trusted Publishing)
-      # - name: Publish to PyPI (API token)
-      #   uses: pypa/gh-action-pypi-publish@release/v1
-      #   with:
-      #     password: ${{ secrets.PYPI_API_TOKEN }}

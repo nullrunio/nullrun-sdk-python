@@ -3,6 +3,7 @@ tests/test_runtime.py — покрытие NullRunRuntime и @protect
 Зависимости: pip install pytest pytest-asyncio respx httpx
 """
 import asyncio
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -29,9 +30,13 @@ class TestNullRunRuntimeInit:
         assert rt is not None
 
     def test_reads_api_key_from_env(self, monkeypatch, make_runtime):
+        """api_key can be supplied via NULLRUN_API_KEY env var; the
+        runtime picks it up on construction. (The previous version
+        of this test also set NULLRUN_WORKSPACE_ID, but that env var
+        is unused in 0.3.0 — the organization id is returned by
+        `/auth/verify` and stored on `self.organization_id`.)"""
         monkeypatch.setenv("NULLRUN_API_KEY", "env-key-12345678")
         monkeypatch.setenv("NULLRUN_API_URL", "https://api.test.nullrun.io")
-        monkeypatch.setenv("NULLRUN_WORKSPACE_ID", "ws-env")
         rt = make_runtime()
         assert rt is not None
 
@@ -382,3 +387,91 @@ class TestRuntimeDI:
         # rt2 might be the same as rt1 if environment is same
         # but at minimum reset_instance should have been called
         assert rt2 is not None
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Phase 0, Epic 0.4: track() must emit exactly once (no double-bill).
+# The pre-fix code had an `else` branch in `track()` that called
+# `self._transport.track(...)` twice in the HTTP path (after the
+# gRPC deletion already removed the gRPC-specific double-emit, this
+# was the remaining hazard). The contract is: every `track()` call
+# produces exactly one wire event.
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestTrackEmitsExactlyOnce:
+    """Regression for the P0-0.4 fix: `track()` must call
+    `self._transport.track(...)` exactly once per invocation. The
+    pre-fix code had a dead-code `wire_event` block in the
+    `else` branch that duplicated the event into the transport
+    buffer, causing customers to be double-billed."""
+
+    def test_track_emits_exactly_one_event(self, make_runtime):
+        """A single `track()` call must produce exactly one
+        `self._transport.track(...)` call. The pre-fix code had
+        an extra `wire_event = {...}` followed by a second
+        `self._transport.track(wire_event)` in the else branch
+        that double-billed customers."""
+        rt = make_runtime()
+        # Patch the underlying transport's track to count calls.
+        with patch.object(
+            rt._transport, "track", wraps=rt._transport.track
+        ) as mock_track:
+            rt.track({"event_id": "e1", "event_type": "llm_call", "tokens": 100})
+        assert mock_track.call_count == 1, (
+            f"track() should emit exactly one event, got {mock_track.call_count}"
+        )
+        # Verify the single emitted event has no `cost_cents` (the
+        # wire-format hygiene step).
+        call_args = mock_track.call_args
+        event = call_args[0][0] if call_args[0] else call_args[1].get("event")
+        if event is None and len(call_args) > 1:
+            event = list(call_args[1].values())[0] if isinstance(call_args[1], dict) else None
+        # The transport's track() may take a single dict positional.
+        # We check the FIRST positional argument.
+        if event and isinstance(event, dict):
+            assert "cost_cents" not in event, (
+                f"Wire event must NOT include cost_cents: {event}"
+            )
+
+    def test_track_emits_exactly_one_for_multiple_calls(self, make_runtime):
+        """Multiple `track()` calls must produce exactly N wire
+        events. This catches any future regression where a single
+        `track()` call starts emitting more than one event.
+
+        We bump the local loop threshold so the test isn't tripped
+        up by the in-memory loop detector (which is itself tested
+        in `test_runtime.py::TestTrackLocalLimits`)."""
+        rt = make_runtime()
+        rt._local_loop_threshold = 1000  # disable loop detection
+        rt._local_rate_limit = 100_000
+        with patch.object(
+            rt._transport, "track", wraps=rt._transport.track
+        ) as mock_track:
+            for i in range(10):
+                rt.track(
+                    {
+                        "event_id": f"e{i}",
+                        "event_type": "llm_call",
+                        "tool_name": f"tool_{i}",  # unique tool name
+                        "tokens": 100,
+                    }
+                )
+        assert mock_track.call_count == 10
+
+    def test_track_dedup_skips_duplicate_fingerprints(self, make_runtime):
+        """When `track()` is called twice with the same fingerprint
+        (via `_seen_track_fingerprints`), the second call must NOT
+        re-emit. The dedup LRU catches double-emit from the
+        auto-instrumentation paths (httpx + langchain callback)."""
+        rt = make_runtime()
+        with patch.object(
+            rt._transport, "track", wraps=rt._transport.track
+        ) as mock_track:
+            # First call: registers the fingerprint.
+            rt.track({"event_id": "e1", "event_type": "llm_call", "tokens": 100, "_fingerprint": "fp-1"})
+            # Second call with same fingerprint: should be deduped.
+            rt.track({"event_id": "e1", "event_type": "llm_call", "tokens": 100, "_fingerprint": "fp-1"})
+        assert mock_track.call_count == 1, (
+            f"track() with same fingerprint should dedup; got {mock_track.call_count}"
+        )

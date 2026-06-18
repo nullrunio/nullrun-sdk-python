@@ -23,9 +23,6 @@ These tests also exercise the per-call `on_transport_error` plumbing
 on `transport.execute` / `transport.check` and the new
 `NullRunTransportError` / `TransportErrorSource` exception pair.
 """
-import os
-import asyncio
-from typing import List
 
 import httpx
 import pytest
@@ -33,14 +30,11 @@ import respx
 
 import nullrun
 from nullrun.breaker.exceptions import (
-    BreakerTransportError,
     NullRunBlockedException,
     NullRunTransportError,
     TransportErrorSource,
     WorkflowKilledInterrupt,
 )
-from nullrun.decorators import reset as reset_decorator_runtime
-from nullrun.runtime import NullRunRuntime
 
 # Base URL used in tests
 BASE_URL = "https://api.test.nullrun.io"
@@ -64,12 +58,12 @@ class _RecordingRuntime:
     """
 
     def __init__(self) -> None:
-        self.events: List[dict] = []
+        self.events: list[dict] = []
         self._remote_states: dict = {}
         self._sensitive_tools: set = set()
         self._strict_mode_tools: set = set()
         # Order of gate calls recorded by `_record_gate` below
-        self.gate_calls: List[str] = []
+        self.gate_calls: list[str] = []
 
     def is_sensitive_tool(self, tool_name: str) -> bool:
         return tool_name in self._sensitive_tools
@@ -283,9 +277,6 @@ class TestEnforceSensitiveToolFailClosed:
         Simulated by injecting a runtime that returns the
         synthetic-allow result directly (bypassing transport)."""
         # Build a runtime that returns a FALLBACK_* decision
-        from nullrun.breaker.exceptions import (
-            NullRunBlockedException as _Blocked,
-        )
         rt = make_runtime()
         rt.add_sensitive_tool("charge_card")
         # Override execute to return a synthetic allow with
@@ -333,15 +324,31 @@ class TestEnforceSensitiveToolFailClosed:
         error) must STILL raise NullRunBlockedException. The
         fail-CLOSED rule applies to *both* transport failure and
         real policy blocks — the opt-out is scoped to transport
-        errors only."""
-        respx.post(f"{BASE_URL}/api/v1/gate").mock(
-            return_value=httpx.Response(200, json={
+        errors only.
+
+        The mock distinguishes the two gate calls: the budget
+        pre-check (`/check`) returns `allow` (so the request flows
+        through to the sensitive-tool gate), and the
+        sensitive-tool pre-check (`/execute`) returns `block`.
+        Both hit `/api/v1/gate` — we discriminate by the
+        `check_type` field in the request body.
+        """
+        import json
+
+        def _gate_router(request):
+            payload = json.loads(request.content.decode("utf-8"))
+            if payload.get("check_type") in ("llm", "tool"):
+                # budget pre-check — let the request through
+                return httpx.Response(200, json={"decision": "allow"})
+            # sensitive-tool pre-check — block
+            return httpx.Response(200, json={
                 "decision": "block",
                 "explanation": "blocked by policy",
                 "decision_source": "gateway",
                 "policy_version": 1,
             })
-        )
+
+        respx.post(f"{BASE_URL}/api/v1/gate").mock(side_effect=_gate_router)
         rt, charge_card, calls = self._build_protected_sensitive_tool(
             mock_api, make_runtime
         )

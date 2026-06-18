@@ -7,12 +7,13 @@ when workflow state changes (KILL/PAUSE).
 """
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import time
-import hmac
-import hashlib
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 try:
     import websockets
@@ -146,6 +147,12 @@ class WebSocketConnection:
         self._receive_task: asyncio.Task | None = None
         self._reconnect_task: asyncio.Task | None = None
         self._closed = False
+        # Per-workflow monotonic version dedup (ADR-007).
+        # Drop incoming state changes with `version <= last` to
+        # survive the at-least-once delivery semantics of the WS
+        # channel. Initialised to 0 (which means: always accept the
+        # first non-zero version seen).
+        self._last_version: dict[str, int] = {}
 
     async def _reconnect_loop(self) -> None:
         """
@@ -286,6 +293,30 @@ class WebSocketConnection:
                     except Exception as e:
                         logger.warning(f"Key rotation callback error: {e}")
 
+            elif msg_type == "resync_required":
+                # Server overflowed its broadcast channel. Per
+                # ADR-007 the SDK MUST close, reconnect, and replace
+                # its local state from the new ``initial_state`` —
+                # there is no "catch up" semantics. We clear the
+                # version-dedup cache and let ``_reconnect_loop``
+                # reopen the connection.
+                reason = data.get("reason", "overflow")
+                logger.warning(
+                    f"Server requested resync (reason={reason}); "
+                    "clearing local state and reconnecting"
+                )
+                self.clear_local_state()
+                # Mark the connection as closed so the receive loop
+                # unwinds; _reconnect_loop will pick up and reconnect.
+                self._running = False
+                self._closed = True
+                if self._conn is not None:
+                    try:
+                        await self._conn.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    self._conn = None
+
             elif msg_type == "pong":
                 # Pong response to ping - connection is alive
                 pass
@@ -332,34 +363,86 @@ class WebSocketConnection:
 
         Args:
             message_id: The message ID to acknowledge
+
+        Phase 1: when ``self.api_key`` AND ``self.secret_key`` are set,
+        the ACK is HMAC-signed before transmission. The signature
+        envelope mirrors the HTTP request scheme
+        (HMAC-SHA256(secret_key, "<ts>:<api_key>:<sha256_hex(payload)>"))
+        and the server's WS handler drops tampered ACKs at the edge.
+        No signature is added when ``secret_key`` is empty
+        (preserves dev/legacy behavior).
         """
         if not self._conn or not self._running:
             logger.warning("Cannot send ACK - WebSocket not connected")
             return
 
         try:
-            ack = {
+            ack: dict[str, Any] = {
                 "type": "ack",
                 "message_id": message_id,
                 "received_at": int(time.time() * 1000),  # milliseconds
             }
-            await self._conn.send(json.dumps(ack))
+            payload = json.dumps(ack)
+            if self.api_key and self.secret_key:
+                # Sign with the same scheme the server uses for
+                # incoming messages (see backend/src/proxy/http/ws_control.rs:69-82).
+                from nullrun.transport import compute_hmac_signature
+
+                timestamp = int(time.time())
+                signature = compute_hmac_signature(
+                    self.api_key,
+                    self.secret_key,
+                    timestamp,
+                    payload,
+                )
+                ack["signature"] = signature
+                ack["timestamp"] = timestamp
+                # Re-serialise with the new fields.
+                payload = json.dumps(ack)
+            await self._conn.send(payload)
             logger.debug(f"ACK sent for message {message_id}")
         except Exception as e:
             logger.warning(f"Failed to send ACK: {e}")
 
     def _dispatch_state(self, state: dict[str, Any]) -> None:
         """
-        Dispatch state to callback.
+        Dispatch state to callback after per-workflow version dedup
+        (ADR-007: at-least-once delivery, drop stale events).
 
         Args:
             state: State dict with workflow_id, state, version, etc.
         """
+        workflow_id = state.get("workflow_id", "")
+        incoming_version = state.get("version", 0)
+        if workflow_id:
+            last = self._last_version.get(workflow_id, 0)
+            if incoming_version <= last:
+                logger.debug(
+                    f"Dropping stale state event for {workflow_id}: "
+                    f"incoming version={incoming_version} <= last={last}"
+                )
+                return
+            # Only record after we've decided to dispatch — the
+            # check above does not persist the version.
+            self._last_version[workflow_id] = incoming_version
         if self.on_state_change:
             try:
                 self.on_state_change(state)
             except Exception as e:
                 logger.warning(f"State change callback error: {e}")
+
+    def clear_local_state(self) -> None:
+        """
+        Clear the in-memory per-workflow version cache.
+
+        Called after a ``ResyncRequired`` event so the next
+        ``initial_state`` from the server is accepted (the dedup
+        cache may otherwise drop the server's freshest state if
+        the version is unchanged from the pre-overflow value).
+        Per ADR-007 there is no "merge" — local state is fully
+        replaced by the next ``initial_state``.
+        """
+        self._last_version.clear()
 
     async def send(self, message: dict[str, Any]) -> None:
         """

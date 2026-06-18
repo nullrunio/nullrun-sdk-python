@@ -143,10 +143,9 @@ class DecisionHistoryRecorder:
         session = recorder.stop_recording()
         session.save("recording.json")
 
-        # Local re-emission (re-runs the cost line items through the
-        # local tracker; no network calls to the gateway)
+        # Offline inspection
         session = RecordingSession.load("recording.json")
-        results = recorder.replay_locally(session)
+        summary = recorder.estimate_cost(session)
     """
 
     def __init__(self, runtime: Optional["NullRunRuntime"] = None):
@@ -246,56 +245,6 @@ class DecisionHistoryRecorder:
         self._current_session = None
 
         return session
-
-    def replay_locally(
-        self,
-        session: RecordingSession,
-        on_event: Callable[[RecordedEvent], None] | None = None,
-    ) -> list[dict[str, Any]]:
-        """
-        Re-emit a recorded session's events through the local runtime tracker.
-
-        IMPORTANT: This is a local-only operation. It does NOT call any LLM
-        provider and does NOT contact the gateway. It re-runs each event
-        through `runtime.track()` so the local cost/usage tracker sees the
-        same line items. Useful for offline cost analysis and integration
-        tests.
-
-        For true server-side re-evaluation of a recorded decision, use the
-        backend's Decision History API: GET /api/v1/orgs/:org_id/decision-history.
-        """
-        results: list[dict[str, Any]] = []
-        for event in session.events:
-            result = self.runtime.track(event.raw_event)
-            results.append(result)
-            if on_event is not None:
-                on_event(event)
-        return results
-
-    def replay_event(self, event: RecordedEvent) -> dict[str, Any]:
-        """
-        Re-emit a single recorded event through the local runtime tracker.
-
-        Note: This only re-tracks the event locally through the runtime.
-        It does NOT communicate with the backend and does NOT re-execute
-        any LLM call.
-        """
-        return self.runtime.track(event.raw_event)
-
-    def replay_from_file(self, path: str) -> list[dict[str, Any]]:
-        """
-        Load a recorded session from disk and re-emit it locally.
-
-        Args:
-            path: Path to the JSON file produced by `RecordingSession.save()`
-
-        Returns:
-            List of results from each event
-
-        See `replay_locally()` for the honest scope of this method.
-        """
-        session = RecordingSession.load(path)
-        return self.replay_locally(session)
 
     def estimate_cost(self, session: RecordingSession) -> dict[str, Any]:
         """

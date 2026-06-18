@@ -7,10 +7,9 @@ prints the spend for the last 24 hours of one workflow so the user
 can see that the SDK and the dashboard agree.
 
 Run:
-    pip install -e ../sdk-python
+    pip install -e .
     export NULLRUN_API_KEY=nr_live_...
-    export NULLRUN_ORGANIZATION_ID=org-123
-    python cost_dashboard.py
+    python examples/cost_dashboard.py
 """
 
 import os
@@ -23,55 +22,60 @@ def fetch_last_24h_spend(api_url: str, org_id: str, api_key: str, workflow_id: s
     """
     Read the rolling 24h spend for one workflow from the backend.
 
-    The backend exposes this as `/api/v1/orgs/{org_id}/usage`. The
-    response shape is `{"workflows": [{...}], "totals": {...}}` —
-    filter to the workflow of interest on the client side because
-    the server-side filter is a Phase 4 follow-up.
+    The canonical endpoint is `/api/v1/orgs/{org_id}/quota` (per
+    `contracts/openapi.yaml:2306-2321`). The legacy `/usage` path
+    was removed when the dashboard migrated to the unified
+    `OrgStatusResponse` shape; this example uses the
+    dashboard-friendly status endpoint and projects a 24h window
+    from the `usage_today_cents` field.
+
+    Authentication: ``X-API-Key`` header (per
+    `contracts/openapi.yaml:59-74`). The SDK never sends a
+    ``Authorization: Bearer`` token on the user's behalf.
     """
-    headers = {"Authorization": f"Bearer {api_key}"}
+    headers = {"X-API-Key": api_key}
     with httpx.Client(timeout=10.0) as client:
         resp = client.get(
-            f"{api_url}/api/v1/orgs/{org_id}/usage",
-            params={"window": "24h"},
+            f"{api_url}/api/v1/orgs/{org_id}/quota",
             headers=headers,
         )
         resp.raise_for_status()
         body = resp.json()
 
-    for wf in body.get("workflows", []):
-        if wf.get("workflow_id") == workflow_id:
-            return wf
-
     return {
         "workflow_id": workflow_id,
-        "cost_cents": 0,
-        "tokens": 0,
-        "calls": 0,
-        "note": "no events in window",
+        "cost_cents": body.get("usage_today_cents", 0),
+        "tokens": body.get("tokens_today", 0),
+        "calls": body.get("calls_today", 0),
+        "budget_remaining_cents": body.get("budget_remaining_cents"),
     }
 
 
 def main() -> None:
-    api_url = os.environ.get("NULLRUN_API_URL", "http://localhost:8080")
-    org_id = os.environ.get("NULLRUN_ORGANIZATION_ID", "org-demo")
-    api_key = os.environ.get("NULLRUN_API_KEY", "demo-key")
+    api_url = os.environ.get("NULLRUN_API_URL", "https://api.nullrun.io")
+    api_key = os.environ.get("NULLRUN_API_KEY", "nr_live_demo_key")
     workflow_id = os.environ.get("NULLRUN_WORKFLOW_ID", "research-agent")
 
     nullrun.init(
-        organization_id=org_id,
         api_key=api_key,
         api_url=api_url,
     )
 
-    print(f"Reading last 24h for workflow {workflow_id!r} in org {org_id!r}...")
+    # Organization ID is returned by /auth/verify on init and is
+    # available on the runtime singleton — fetch it after init.
+    from nullrun import get_runtime
+    org_id = get_runtime().organization_id or "unknown"
+
+    print(f"Reading today for workflow {workflow_id!r} in org {org_id!r}...")
     wf = fetch_last_24h_spend(api_url, org_id, api_key, workflow_id)
 
     cost_dollars = wf.get("cost_cents", 0) / 100.0
     print(f"  cost:   ${cost_dollars:,.2f}")
     print(f"  tokens: {wf.get('tokens', 0):,}")
     print(f"  calls:  {wf.get('calls', 0):,}")
-    if "note" in wf:
-        print(f"  note:   {wf['note']}")
+    if wf.get("budget_remaining_cents") is not None:
+        remaining = wf["budget_remaining_cents"] / 100.0
+        print(f"  remaining budget: ${remaining:,.2f}")
 
     # The same number is the truth the dashboard shows — there is no
     # second source of truth in code. The policy in the Control

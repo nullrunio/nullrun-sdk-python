@@ -2,7 +2,22 @@
 src/nullrun/observability.py
 
 Structured logging + metrics for production readiness.
-This is a new module - add to src/nullrun/ and import in runtime.py and transport.py.
+
+Exposes:
+  * `get_logger(name)` — a `StructuredLogger` factory that tags every
+    log record with a `structured` extra dict for JSON ingest pipelines.
+  * `TenantFilter` / `configure_logging_with_tenant_context()` — a
+    `logging.Filter` that attaches `organization_id` / `api_key_id`
+    to every record so logs can be partitioned per tenant in the
+    downstream pipeline. Opt-in: call
+    `configure_logging_with_tenant_context()` once at startup.
+  * `metrics` — a global `MetricsRegistry` (thread-safe) for SDK
+    counters. See `MetricsRegistry.inc_transport` /
+    `MetricsRegistry.inc_runtime` / `MetricsRegistry.set_transport`
+    for the supported write paths. Direct `metrics.transport.x = N`
+    assignment is also supported but bypasses the lock.
+  * `timed(logger, event)` — context manager for measuring
+    operation time.
 """
 
 from __future__ import annotations
@@ -81,10 +96,13 @@ class TenantFilter(logging.Filter):
 
     def filter(self, record: logging.LogRecord) -> bool:
         # Import here to avoid circular imports
-        from nullrun.context import get_org_id, get_organization_id, get_api_key_id
+        from nullrun.context import get_api_key_id, get_organization_id
 
-        # Add tenant fields to the record for structured logging
-        record.org_id = get_org_id() or "none"
+        # Add tenant fields to the record for structured logging.
+        # Only the canonical `organization_id` is set; the legacy
+        # `org_id` field is gone (was tied to the deprecated
+        # `get_org_id()` helper, removed in 0.4.0 alongside the
+        # workspace_id → organization_id migration).
         record.organization_id = get_organization_id() or "none"
         record.api_key_id = get_api_key_id() or "none"
 
@@ -276,46 +294,3 @@ def timed(logger: StructuredLogger, event: str, **kwargs: Any) -> Generator[None
             **kwargs,
         )
         raise
-
-
-# ----------------------------------------------------------------
-# How to integrate in transport.py and runtime.py
-# ----------------------------------------------------------------
-#
-# In transport.py replace:
-#   import logging
-#   logger = logging.getLogger(__name__)
-#
-# With:
-#   from nullrun.observability import get_logger, metrics, timed
-#   logger = get_logger("transport")
-#
-# In _do_flush_locked():
-#   with timed(logger, "batch_flush", batch_size=len(batch)):
-#       result = self._circuit_breaker.call(self._send_batch, batch)
-#   metrics.transport.batches_sent += 1
-#   metrics.transport.events_sent += len(batch)
-#
-# On flush error:
-#   metrics.transport.batches_failed += 1
-#   metrics.transport.last_error = str(exc)[:200]
-#
-# On enqueue():
-#   metrics.transport.events_enqueued += 1
-#
-# On drop (buffer overflow):
-#   metrics.transport.events_dropped += 1
-#
-# In circuit_breaker.py _on_success / _on_failure:
-#   if newly_opened:
-#       metrics.transport.circuit_breaker_opens += 1
-#
-# In runtime.py track():
-#   metrics.runtime.track_calls += 1
-#
-# In runtime.py execute():
-#   metrics.runtime.execute_calls += 1
-#   if result.allowed:
-#       metrics.runtime.execute_allowed += 1
-#   else:
-#       metrics.runtime.execute_blocked += 1

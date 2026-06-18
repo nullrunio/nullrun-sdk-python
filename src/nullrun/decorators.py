@@ -38,13 +38,11 @@ import functools
 import inspect
 import logging
 import os
-import re
 from collections.abc import Callable
 from typing import Any, TypeVar
 
-from nullrun.instrumentation.openai import is_patched, patch_openai
-from nullrun.runtime import NullRunRuntime, get_runtime
 from nullrun.context import get_workflow_id
+from nullrun.runtime import NullRunRuntime, get_runtime
 from nullrun.tracing import (
     SpanContext,
     create_child_span,
@@ -58,7 +56,24 @@ logger = logging.getLogger(__name__)
 
 F = TypeVar("F", bound=Callable[..., Any])
 
-SENSITIVE_ARG_KEYS = {"password", "token", "secret", "api_key", "key", "auth", "authorization"}
+# Phase 3: expanded sensitive-arg keys. The original 7-key set
+# missed obvious PII tokens and credential names; ``@sensitive`` and
+# ``_safe_kwargs`` would have shipped them in the audit log.
+# Matching is case-insensitive (see ``_safe_kwargs`` which calls
+# ``.lower()`` on the key).
+SENSITIVE_ARG_KEYS = frozenset({
+    # Credentials / secrets
+    "password", "passwd", "pwd",
+    "token", "secret", "api_key", "apikey",
+    "key", "auth", "authorization", "bearer",
+    "session", "session_id", "cookie",
+    "access_token", "refresh_token", "id_token",
+    "private_key", "secret_key",
+    # PII
+    "email", "phone", "ssn",
+    "credit_card", "credit_card_number", "cvv", "cvc", "pin",
+    "otp", "mfa",
+})
 
 
 def _safe_repr(value: object, max_len: int = 50) -> str:
@@ -70,41 +85,120 @@ def _safe_repr(value: object, max_len: int = 50) -> str:
 
 
 def _safe_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
-    """Mask sensitive kwargs."""
+    """Mask sensitive kwargs (case-insensitive)."""
     return {
         k: "***" if k.lower() in SENSITIVE_ARG_KEYS else _safe_repr(v)
         for k, v in kwargs.items()
     }
 
 
-# SEC-29: regex used to strip the `details={...}` payload from an
-# exception's string form before it lands in the span_end audit event.
+# SEC-29: strip the `details={...}` payload from an exception's
+# string form before it lands in the span_end audit event.
 # `details` is caller-supplied structured data — it can contain raw
-# tool args, kwargs, or other user-controlled content that we do not
-# want to ship to the audit log. The two pattern variants match the
-# shape produced by NullRunBlockedException.__str__ / NullRunTransportError.__str__.
-_DETAILS_REDACTED = "details=<redacted>"
-_DETAILS_RE = re.compile(r"details=\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}")
+# tool args, kwargs, or other user-controlled content that we do
+# not want to ship to the audit log. The previous implementation
+# used a single-level regex which failed for nested dicts and for
+# dict values that contain `{` / `}` in their string content.
+# Phase 3 replaces it with a balanced-brace walker that handles
+# arbitrary nesting depth and balanced strings.
+_DETAILS_REDACTED = "<redacted>"  # the payload only — caller prepends "details="
+
+
+def _strip_details_balanced(text: str) -> str:
+    """Replace every top-level ``details={...}`` substring with
+    ``details=<redacted>``.
+
+    Walks the string with a small state machine that tracks
+    brace depth and string-literal state (``"…\\"…"'…`` and
+    ``'…\\'…'``). At depth 1 the opening ``{`` was just
+    consumed; when the depth returns to 0 the substring is
+    replaced. The walker tolerates ``{`` and ``}`` inside
+    string values so it does not under-report nesting.
+
+    Only ``details={…}`` constructs are redacted; a bare
+    ``details=foo`` (no opening brace) is left as-is so we
+    don't lose the user's free-form text.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    needle = "details="
+    while i < n:
+        idx = text.find(needle, i)
+        if idx < 0:
+            out.append(text[i:])
+            break
+
+        # Append everything before the "details=" token.
+        out.append(text[i:idx])
+
+        # Look ahead past optional whitespace for the opening
+        # brace. If absent, this isn't a `details={…}` construct —
+        # preserve the literal "details=…" up to the next ',', ')',
+        # or newline (so the user's free-form text is kept), and
+        # continue scanning.
+        j = idx + len(needle)
+        while j < n and text[j] in " \t":
+            j += 1
+        if j >= n or text[j] != "{":
+            end = j
+            while end < n and text[end] not in ",)\n":
+                end += 1
+            out.append(text[idx:end])
+            i = end
+            continue
+
+        # It IS a `details={…}` construct. Append the literal
+        # "details=" prefix, then walk to the matching '}' and
+        # replace the whole payload (including the braces) with
+        # ``<redacted>``.
+        out.append(text[idx:j])  # "details=" plus any leading whitespace
+        depth = 0
+        in_str: str | None = None
+        k = j
+        while k < n:
+            ch = text[k]
+            if in_str is not None:
+                if ch == "\\" and k + 1 < n:
+                    k += 2
+                    continue
+                if ch == in_str:
+                    in_str = None
+            elif ch in ('"', "'"):
+                in_str = ch
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    k += 1
+                    break
+            k += 1
+        out.append(_DETAILS_REDACTED)
+        i = k
+    return "".join(out)
 
 
 def _safe_error_str(error: BaseException | None) -> str | None:
-    """Return a log-safe string for `error`.
+    """Return a log-safe string for ``error``.
 
     SEC-29: ``str(error)`` for our blocked / transport exceptions
     embeds the caller's ``details`` payload (free-form structured
     data the SDK has no way to scrub). That payload can include raw
     tool args / kwargs. We strip the ``details={...}`` substring
-    before handing the string to ``track_event`` so the audit log
-    only sees the stable envelope (workflow_id, reason, action,
-    tool_name) and never the caller's arbitrary data.
+    via a balanced-brace walker (handles nested dicts and dict
+    values that themselves contain ``{`` / ``}``) before handing
+    the string to ``track_event`` so the audit log only sees the
+    stable envelope (workflow_id, reason, action, tool_name) and
+    never the caller's arbitrary data.
 
-    Non-None return; returns ``None`` only when `error` is None so
-    callers can pass the result straight to ``_emit_span_end``.
+    Non-None return; returns ``None`` only when ``error`` is None
+    so callers can pass the result straight to ``_emit_span_end``.
     """
     if error is None:
         return None
     raw = str(error)
-    return _DETAILS_RE.sub(_DETAILS_REDACTED, raw)
+    return _strip_details_balanced(raw)
 
 
 # Module-level cache for the runtime instance — the @protect decorator needs
@@ -139,8 +233,12 @@ def _get_or_create_runtime() -> NullRunRuntime:
     the SDK has no local mode: a missing API key must be a hard error,
     not a silent allow-all.
 
-    Tries to patch OpenAI on first creation so the auto-instrumentation
-    path picks up the runtime the user will eventually use.
+    The previous OpenAI v0.x auto-patch hook was removed in 0.4.0:
+    `openai>=1.0` does not expose `ChatCompletion.create` as an
+    attribute. All OpenAI v1.0+ traffic is now tracked
+    vendor-independently by the httpx transport hook in
+    `nullrun.instrumentation.auto`, which is wired by
+    `nullrun.init()` — not at the lazy-resolve path here.
     """
     global _runtime
 
@@ -148,13 +246,6 @@ def _get_or_create_runtime() -> NullRunRuntime:
         return _runtime
 
     _runtime = NullRunRuntime.get_instance()
-
-    if not is_patched():
-        try:
-            patch_openai()
-            logger.info("OpenAI auto-patch enabled")
-        except Exception as e:
-            logger.debug(f"OpenAI patching skipped: {e}")
 
     logger.info("NullRun runtime initialized: mode=cloud")
     return _runtime
@@ -466,14 +557,28 @@ def _enforce_sensitive_tool(
         ) from exc
 
     # Defense in depth (ADR-008 Rule 1 + Rule 2): if `runtime.execute`
-    # ever returns a dict with `decision_source` starting with
-    # `FALLBACK_` (i.e. transport failed but a synthetic allow slipped
-    # through — currently impossible when runtime passes
-    # `on_transport_error="raise"`, but easy to regress), honor the
-    # gate's fail-CLOSED policy here. The body still must not run.
+    # ever returns a dict with `decision_source` indicating a
+    # transport failure (i.e. `FALLBACK_*` from the historical
+    # `fallback_mode` path, or a `TransportErrorSource` enum value
+    # like `NETWORK_ERROR` / `GATEWAY_ERROR` / `BREAKER_OPEN` from
+    # the new `on_transport_error="open"` path), honor the gate's
+    # fail-CLOSED policy here. The body still must not run.
     if isinstance(result, dict):
         decision_source = result.get("decision_source", "")
-        if isinstance(decision_source, str) and decision_source.startswith("FALLBACK_"):
+        is_transport_fallback = (
+            isinstance(decision_source, str)
+            and (
+                decision_source.startswith("FALLBACK_")
+                or decision_source.startswith("FALLBACK")
+                or decision_source in {
+                    "NETWORK_ERROR",
+                    "GATEWAY_ERROR",
+                    "BREAKER_OPEN",
+                    "AUTH_ERROR",
+                }
+            )
+        )
+        if is_transport_fallback:
             if fail_open:
                 logger.warning(
                     f"sensitive tool pre-check for {fn.__name__!r} returned "

@@ -12,7 +12,6 @@ existing `_enrich_event` fallback generates fresh IDs from the
 loose contextvars (or synthesises new ones).
 """
 from types import SimpleNamespace
-from typing import List
 
 import pytest
 
@@ -22,7 +21,6 @@ from nullrun.tracing import (
     reset_span,
     set_span,
 )
-
 
 # ──────────────────────────────────────────────────────────────
 # Capture events from the runtime
@@ -39,7 +37,7 @@ def capturing_runtime(make_runtime, mock_api):
     captured and re-invoked so the runtime's own bookkeeping works.
     """
     rt = make_runtime()
-    events: List[dict] = []
+    events: list[dict] = []
 
     original_track = rt.track
 
@@ -228,9 +226,8 @@ def test_module_level_track_llm_output_tokens_optional(mock_api):
     stale singleton from a previous test (or a fresh one built from
     env defaults) targets the prod URL and respx raises
     AllMockedAssertionError."""
-    from tests.conftest import BASE_URL
-
     import nullrun
+    from tests.conftest import BASE_URL
 
     nullrun.init(api_key="test-key-12345678", api_url=BASE_URL)
     nullrun.track_llm(input_tokens=42)  # smoke test — no exception
@@ -244,10 +241,9 @@ def test_protect_then_track_llm_attaches_to_protect_span(capturing_runtime, monk
     """The integration story: @protect opens a span, a track_llm
     inside it inherits that span — no manual plumbing needed."""
     import nullrun
+    import nullrun.decorators as dec
     from nullrun import runtime as runtime_mod
     from nullrun.decorators import reset as reset_decorator_runtime
-
-    import nullrun.decorators as dec
     # Wire both: the @protect emit path (uses dec._runtime) AND the
     # module-level nullrun.track_llm path (uses runtime_mod.get_runtime).
     dec._runtime = capturing_runtime.runtime

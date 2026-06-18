@@ -31,7 +31,13 @@ RUN pip install /app/dist/*.whl --force-reinstall
 RUN useradd -m -u 1000 nullrun
 USER nullrun
 
-# Install optional dependencies
-RUN pip install "nullrun-breaker[langgraph]"
+# Install optional dependencies (langgraph integration is the only
+# one with a non-trivial extra deps tree at the moment). The
+# `nullrun[langgraph]` extra is defined in pyproject.toml.
+RUN pip install "nullrun[langgraph]"
 
-ENTRYPOINT ["python", "-m", "nullrun.breaker"]
+# The SDK ships as a library — there is no `python -m nullrun.breaker`
+# entry point. The default CMD is `python` so the user can wire
+# their own agent. Override at run time:
+#   docker run -it --rm nullrun-sdk python -c "from nullrun import protect; print('ok')"
+CMD ["python"]

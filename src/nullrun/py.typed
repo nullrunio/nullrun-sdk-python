@@ -1,0 +1,4 @@
+# Marker file for PEP 561 — see https://peps.python.org/pep-0561/.
+# The presence of this file tells type checkers (mypy, pyright, etc.)
+# that the `nullrun` package ships inline type annotations and can
+# be type-checked by downstream users. Do NOT delete this file.

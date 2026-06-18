@@ -13,8 +13,6 @@ envelope intact, and must accept ``None`` without raising.
 
 from __future__ import annotations
 
-import pytest
-
 from nullrun.breaker.exceptions import (
     LoopDetectedException,
     NullRunBlockedException,

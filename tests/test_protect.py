@@ -13,14 +13,11 @@ is a real `NullRunRuntime` with a bound workflow. The legacy
 "tolerate a noop runtime" behavior is no longer relevant.
 """
 import asyncio
-from typing import List
 
 import pytest
 
 import nullrun
-from nullrun.decorators import reset as reset_decorator_runtime
 from nullrun.tracing import get_current_span, reset_span, set_span
-
 
 # ──────────────────────────────────────────────────────────────
 # Fixtures
@@ -46,7 +43,7 @@ class _RecordingRuntime:
     """
 
     def __init__(self) -> None:
-        self.events: List[dict] = []
+        self.events: list[dict] = []
 
     def track_event(self, event_type: str, **kwargs) -> None:
         self.events.append({"type": event_type, **kwargs})

@@ -35,13 +35,23 @@ class TestActionHandlerInit:
 
 
 class TestKillAction:
-    """Test KILL action."""
+    """Test KILL action.
+
+    The default KILL handler intentionally raises
+    `WorkflowKilledInterrupt` to halt the agent. After the P0-0.5
+    fix, the kill contract is restored: the exception PROPAGATES,
+    not swallowed. The kill is still recorded in history.
+    """
 
     def test_kill_records_to_history(self):
-        """KILL action is recorded in history."""
+        """KILL action is recorded in history AND propagates
+        `WorkflowKilledInterrupt` (the kill contract)."""
+        from nullrun.breaker.exceptions import WorkflowKilledInterrupt
+
         handler = ActionHandler()
-        # handler catches exceptions internally, doesn't propagate
-        handler.handle(ActionType.KILL, "wf-123", "Test reason")
+        with pytest.raises(WorkflowKilledInterrupt):
+            handler.handle(ActionType.KILL, "wf-123", "Test reason")
+        # Action is still in history despite the exception.
         history = handler.get_action_history()
         assert len(history) == 1
         assert history[0].action_type == "kill"
@@ -49,27 +59,44 @@ class TestKillAction:
 
 
 class TestPauseAction:
-    """Test PAUSE action."""
+    """Test PAUSE action.
 
-    def test_pause_does_not_propagate_exception(self):
-        """PAUSE action is handled without propagating exception."""
+    Same contract as KILL: the default PAUSE handler raises
+    `WorkflowPausedException` to halt the agent. After the P0-0.5
+    fix, the pause propagates.
+    """
+
+    def test_pause_propagates_exception(self):
+        """PAUSE action raises `WorkflowPausedException` to halt
+        the agent (the pause contract). Action is still recorded."""
+        from nullrun.breaker.exceptions import WorkflowPausedException
+
         handler = ActionHandler()
-        # Should not raise - exceptions are caught internally
-        handler.handle(ActionType.PAUSE, "wf-456", "Rate limit hit")
-        # But action should be recorded
+        with pytest.raises(WorkflowPausedException):
+            handler.handle(ActionType.PAUSE, "wf-456", "Rate limit hit")
+        # Action is still in history despite the exception.
         history = handler.get_action_history()
         assert len(history) == 1
 
     def test_pause_tracks_workflow(self):
         """PAUSE action tracks workflow in paused_workflows."""
+        from nullrun.breaker.exceptions import WorkflowPausedException
+
         handler = ActionHandler()
-        handler.handle(ActionType.PAUSE, "wf-789", "Test pause")
+        with pytest.raises(WorkflowPausedException):
+            handler.handle(ActionType.PAUSE, "wf-789", "Test pause")
+        # Workflow is registered as paused even though the
+        # exception propagated.
         assert handler.is_paused("wf-789")
 
     def test_is_paused_respects_cooldown(self):
         """is_paused respects cooldown_seconds."""
+        from nullrun.breaker.exceptions import WorkflowPausedException
+
         handler = ActionHandler()
-        handler.handle(ActionType.PAUSE, "wf-cooldown", "Test")
+        # After P0-0.5, PAUSE propagates WorkflowPausedException.
+        with pytest.raises(WorkflowPausedException):
+            handler.handle(ActionType.PAUSE, "wf-cooldown", "Test")
         # Within cooldown
         assert handler.is_paused("wf-cooldown", cooldown_seconds=60.0)
         # After cooldown
@@ -256,3 +283,94 @@ class TestSnapshotAndBlock:
         # But action should be recorded
         history = handler.get_action_history()
         assert len(history) == 1
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Phase 0, Epic 0.5: kill/pause handlers must PROPAGATE their
+# BaseException subclasses (`WorkflowKilledInterrupt`,
+# `WorkflowPausedException`). The pre-fix code caught
+# `BaseException` and silently swallowed the kill/pause signal,
+# breaking the kill contract (see `docs/kill-contract.md` §1).
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestActionHandlerKillContract:
+    """The default KILL handler intentionally raises
+    `WorkflowKilledInterrupt` (a `BaseException` subclass) so that
+    the calling agent halts. The pre-fix `except BaseException` in
+    `ActionHandler.handle` silently swallowed it. The fix catches
+    only `Exception`."""
+
+    def test_kill_handler_propagates_workflowkilledinterrupt(self):
+        """`handle("kill", ...)` with the default KILL handler must
+        raise `WorkflowKilledInterrupt` so the agent halts."""
+        from nullrun.breaker.exceptions import WorkflowKilledInterrupt
+
+        handler = ActionHandler()
+        # The default `_default_kill` raises WorkflowKilledInterrupt.
+        with pytest.raises(WorkflowKilledInterrupt):
+            handler.handle(ActionType.KILL, "wf-kill", "test reason")
+
+    def test_pause_handler_propagates_workflowpausedexception(self):
+        """`handle("pause", ...)` with the default PAUSE handler must
+        raise `WorkflowPausedException` so the agent halts (a pause
+        is a non-resumable-by-the-agent signal)."""
+        from nullrun.breaker.exceptions import WorkflowPausedException
+
+        handler = ActionHandler()
+        with pytest.raises(WorkflowPausedException):
+            handler.handle(ActionType.PAUSE, "wf-pause", "test reason")
+
+    def test_kill_action_is_recorded_before_propagating(self):
+        """The KILL action must be in the history (so the operator
+        can see it was dispatched) BEFORE the exception propagates."""
+        from nullrun.breaker.exceptions import WorkflowKilledInterrupt
+
+        handler = ActionHandler()
+        with pytest.raises(WorkflowKilledInterrupt):
+            handler.handle(ActionType.KILL, "wf-kill-history", "test reason")
+        history = handler.get_action_history()
+        assert len(history) == 1
+        assert history[0].action_type == "kill"
+        assert history[0].workflow_id == "wf-kill-history"
+
+    def test_arbitrary_exception_in_handler_is_logged_not_propagated(self):
+        """A user-registered handler that raises an `Exception`
+        subclass (not a `BaseException` subclass) must NOT
+        propagate. The pre-fix code happened to swallow these too
+        (via the broad `except BaseException`), so the public
+        contract is preserved."""
+        handler = ActionHandler()
+
+        def broken_handler(workflow_id: str, reason: str, **_details) -> None:
+            raise ValueError("user bug")
+
+        handler.register_handler(ActionType.ALERT, broken_handler)
+        # Should NOT raise — ValueError is caught and logged.
+        handler.handle(ActionType.ALERT, "wf-broken", "test alert")
+
+    def test_keyboard_interrupt_propagates(self):
+        """`KeyboardInterrupt` is a `BaseException` subclass. It
+        MUST propagate (the previous `except BaseException` caught
+        it). This test pins the contract: user Ctrl-C is never
+        swallowed."""
+        handler = ActionHandler()
+
+        def ctrl_c_handler(workflow_id: str, reason: str, **_details) -> None:
+            raise KeyboardInterrupt()
+
+        handler.register_handler(ActionType.ALERT, ctrl_c_handler)
+        with pytest.raises(KeyboardInterrupt):
+            handler.handle(ActionType.ALERT, "wf-ctrlc", "test alert")
+
+    def test_system_exit_propagates(self):
+        """`SystemExit` is a `BaseException` subclass. It MUST
+        propagate (so the Python interpreter can shut down cleanly)."""
+        handler = ActionHandler()
+
+        def sys_exit_handler(workflow_id: str, reason: str, **_details) -> None:
+            raise SystemExit(1)
+
+        handler.register_handler(ActionType.ALERT, sys_exit_handler)
+        with pytest.raises(SystemExit):
+            handler.handle(ActionType.ALERT, "wf-sysexit", "test alert")

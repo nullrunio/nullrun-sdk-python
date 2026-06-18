@@ -1,7 +1,6 @@
 """
 tests/test_transport.py — transport, circuit breaker, flush, retry coverage
 """
-import asyncio
 import threading
 import time
 
@@ -11,7 +10,7 @@ import respx
 
 from nullrun.breaker.circuit_breaker import CBState, CircuitBreaker
 from nullrun.breaker.exceptions import BreakerTransportError
-from nullrun.transport import AsyncTransport, Transport
+from nullrun.transport import Transport
 
 
 @pytest.fixture
@@ -89,7 +88,12 @@ class TestTransport:
 
     @respx.mock
     def test_execute_fallback_strict_blocks_on_gateway_error(self, transport):
-        """STRICT fallback mode blocks when Gateway unavailable."""
+        """STRICT fallback mode blocks when Gateway unavailable.
+
+        Uses `on_transport_error="legacy"` so the historical
+        `fallback_mode` behavior takes over and a dict is returned
+        (the new ADR-008 default is "raise").
+        """
         respx.post("https://api.test.nullrun.io/api/v1/gate").mock(
             return_value=httpx.Response(500, text="Server Error")
         )
@@ -100,13 +104,17 @@ class TestTransport:
             tool="my.tool",
             input_data={},
             fallback_mode="strict",
+            on_transport_error="legacy",
         )
         assert result["decision"] == "block"
         assert result["decision_source"] == "fallback"
 
     @respx.mock
     def test_execute_fallback_permissive_allows_on_gateway_error(self, transport):
-        """PERMISSIVE fallback mode allows when Gateway unavailable."""
+        """PERMISSIVE fallback mode allows when Gateway unavailable.
+
+        Uses `on_transport_error="legacy"` for the historical shape.
+        """
         respx.post("https://api.test.nullrun.io/api/v1/gate").mock(
             return_value=httpx.Response(500, text="Server Error")
         )
@@ -117,13 +125,18 @@ class TestTransport:
             tool="my.tool",
             input_data={},
             fallback_mode="permissive",
+            on_transport_error="legacy",
         )
         assert result["decision"] == "allow"
         assert result["decision_source"] == "fallback"
 
     @respx.mock
     def test_execute_fallback_cached_uses_cache(self, transport):
-        """CACHED fallback mode uses cached decision when available."""
+        """CACHED fallback mode uses cached decision when available.
+
+        Uses `on_transport_error="legacy"` so the historical
+        `fallback_mode` behavior takes over.
+        """
         # Pre-populate the cache
         cache_key = transport._policy_cache.make_key("ws-123")
         transport._policy_cache.set(cache_key, "block", "policy-cached-123")
@@ -139,6 +152,7 @@ class TestTransport:
             tool="my.tool",
             input_data={},
             fallback_mode="cached",
+            on_transport_error="legacy",
         )
         assert result["decision"] == "block"
         assert result["decision_source"] == "cached"
@@ -146,7 +160,10 @@ class TestTransport:
 
     @respx.mock
     def test_execute_fallback_cached_no_cache_allows(self, transport):
-        """CACHED fallback allows when no cache available and Gateway unavailable."""
+        """CACHED fallback allows when no cache available and Gateway unavailable.
+
+        Uses `on_transport_error="legacy"`.
+        """
         respx.post("https://api.test.nullrun.io/api/v1/gate").mock(
             return_value=httpx.Response(500, text="Server Error")
         )
@@ -157,6 +174,7 @@ class TestTransport:
             tool="my.tool",
             input_data={},
             fallback_mode="cached",
+            on_transport_error="legacy",
         )
         assert result["decision"] == "allow"
         assert result["decision_source"] == "fallback"
@@ -190,18 +208,25 @@ class TestTransport:
 
     @respx.mock
     def test_check_endpoint_returns_block_on_error(self, transport):
-        """Check endpoint returns block decision on error."""
-        respx.post("https://api.test.nullrun.io/api/v1/check").mock(
+        """Check endpoint returns block decision on error.
+
+        Uses `on_transport_error="legacy"` for the historical
+        fail-CLOSED block return. The new ADR-008 default is "raise".
+        """
+        respx.post("https://api.test.nullrun.io/api/v1/gate").mock(
             return_value=httpx.Response(500, text="Server Error")
         )
-        result = transport.check({
-            "workspace_id": "ws-123",
-            "execution_id": "exec-456",
-            "operation_id": "op-789",
-            "check_type": "llm",
-            "model": "claude-3",
-            "estimated_tokens": 100,
-        })
+        result = transport.check(
+            {
+                "workspace_id": "ws-123",
+                "execution_id": "exec-456",
+                "operation_id": "op-789",
+                "check_type": "llm",
+                "model": "claude-3",
+                "estimated_tokens": 100,
+            },
+            on_transport_error="legacy",
+        )
         assert result["decision"] == "block"
 
     @respx.mock
@@ -362,37 +387,11 @@ class TestRetry:
         t.stop()
 
 
-class TestAsyncTransport:
-
-    @pytest.mark.asyncio
-    @respx.mock
-    async def test_async_send_batch_success(self):
-        respx.post("https://api.test.nullrun.io/api/v1/track/batch").mock(
-            return_value=httpx.Response(200, json={})
-        )
-        t = AsyncTransport(api_url="https://api.test.nullrun.io", api_key="test-key")
-        t._client = httpx.AsyncClient()
-        # Add events directly to buffer
-        async with t._lock:
-            t._buffer.append({"event": "async_test"})
-        await t._flush_locked()
-        await t.stop()
-
-    @pytest.mark.asyncio
-    @respx.mock
-    async def test_async_includes_api_version_header(self):
-        route = respx.post("https://api.test.nullrun.io/api/v1/track/batch").mock(
-            return_value=httpx.Response(200, json={})
-        )
-        t = AsyncTransport(api_url="https://api.test.nullrun.io", api_key="test-key")
-        t._client = httpx.AsyncClient()
-        # Add events directly to buffer
-        async with t._lock:
-            t._buffer.append({"event": "test"})
-        await t._flush_locked()
-        request = route.calls.last.request
-        assert "X-API-Version" in request.headers
-        await t.stop()
+# TestAsyncTransport and TestAsyncTransportFlush classes were removed
+# in 0.4.0 when AsyncTransport was deleted (Phase 0, Epic 0.2). The
+# sync Transport supports being driven from an async event loop via
+# `nullrun.track_llm` and `@nullrun.protect` (see
+# tests/test_async_from_event_loop.py for the new contract).
 
 
 class TestBoundedDict:
@@ -484,7 +483,7 @@ class TestTransportFlush:
             t.track({"event": f"e{i}"})
 
         # Flush with CB OPEN will re-queue and enforce max_buffer_size
-        initial_buffer_len = len(t._buffer)
+        len(t._buffer)
         t._do_flush()
 
         # After flush with CB OPEN, buffer should be capped at max_buffer_size
@@ -517,255 +516,10 @@ class TestTransportFlush:
         assert transport._stopped
 
 
-class TestAsyncTransportFlush:
-
-    @pytest.mark.asyncio
-    @respx.mock
-    async def test_async_flush_error_requeues(self):
-        """When async flush fails, batch is re-queued."""
-        t = AsyncTransport(api_url="https://api.test.nullrun.io", api_key="test-key")
-        t._client = httpx.AsyncClient()
-
-        # Mock a failing endpoint
-        respx.post("https://api.test.nullrun.io/api/v1/track/batch").mock(
-            return_value=httpx.Response(500, text="Server Error")
-        )
-
-        # Add events to buffer
-        async with t._lock:
-            t._buffer.append({"event": "test1"})
-            t._buffer.append({"event": "test2"})
-
-        initial_buffer_len = len(t._buffer)
-        await t._flush_locked()
-
-        # Buffer should have events re-queued after failure
-        # (may be empty if all re-queued or have some remaining)
-        # The key is it shouldn't silently drop without metric update
-        assert len(t._buffer) >= 0  # Re-queue happened
-        await t.stop()
-
-    @pytest.mark.asyncio
-    @respx.mock
-    async def test_async_flush_circuit_breaker_open(self):
-        """When CB opens in async transport, batch is re-queued."""
-        t = AsyncTransport(api_url="https://api.test.nullrun.io", api_key="test-key")
-        t._client = httpx.AsyncClient()
-
-        # Open the circuit breaker
-        cb = t._circuit_breaker
-        for _ in range(cb._failure_threshold):
-            try:
-                await cb.call(lambda: (_ for _ in ()).throw(RuntimeError("boom")))
-            except RuntimeError:
-                pass
-
-        # Add events
-        async with t._lock:
-            t._buffer.append({"event": "test1"})
-
-        await t._flush_locked()
-        # Buffer still has event since CB is open
-        assert len(t._buffer) >= 1
-        await t.stop()
-
-    @pytest.mark.asyncio
-    @respx.mock
-    async def test_async_track_increments_metrics(self):
-        """Async track increments events_enqueued metric."""
-        from nullrun.observability import metrics
-
-        metrics.reset()
-        t = AsyncTransport(api_url="https://api.test.nullrun.io", api_key="test-key")
-        await t.start()
-
-        # Mock successful batch
-        respx.post("https://api.test.nullrun.io/api/v1/track/batch").mock(
-            return_value=httpx.Response(200, json={})
-        )
-
-        await t.track({"event": "test1"})
-        await t.track({"event": "test2"})
-
-        # events_enqueued should be incremented
-        assert metrics.transport.events_enqueued >= 2
-        await t.stop()
-
-    @pytest.mark.asyncio
-    @respx.mock
-    async def test_async_flush_success_updates_metrics(self):
-        """Successful async flush updates batches_sent and events_sent metrics."""
-        from nullrun.observability import metrics
-
-        metrics.reset()
-        route = respx.post("https://api.test.nullrun.io/api/v1/track/batch").mock(
-            return_value=httpx.Response(200, json={"accepted_event_ids": ["e1", "e2"]})
-        )
-        t = AsyncTransport(api_url="https://api.test.nullrun.io", api_key="test-key")
-        t._client = httpx.AsyncClient()
-
-        async with t._lock:
-            t._buffer.append({"event_id": "e1", "event": "test1"})
-            t._buffer.append({"event_id": "e2", "event": "test2"})
-
-        await t._flush_locked()
-
-        assert metrics.transport.batches_sent >= 1
-        assert metrics.transport.events_sent >= 2
-        assert metrics.transport.last_flush_at is not None
-        await t.stop()
-
-    @pytest.mark.asyncio
-    @respx.mock
-    async def test_async_flush_circuit_breaker_open_increments_metrics(self):
-        """Circuit breaker opening increments circuit_breaker_opens metric in async."""
-        from nullrun.observability import metrics
-        from nullrun.breaker.circuit_breaker import CBState
-
-        metrics.reset()
-        t = AsyncTransport(api_url="https://api.test.nullrun.io", api_key="test-key")
-        await t.start()
-        t._client = httpx.AsyncClient()
-
-        # Open the circuit breaker via failures
-        cb = t._circuit_breaker
-        for _ in range(cb._failure_threshold):
-            try:
-                await cb.call(lambda: (_ for _ in ()).throw(RuntimeError("boom")))
-            except RuntimeError:
-                pass
-
-        assert cb.state == CBState.OPEN
-        assert metrics.transport.circuit_open_count >= 1
-        await t.stop()
-
-    @pytest.mark.asyncio
-    @respx.mock
-    async def test_async_buffer_overflow_drops_oldest(self):
-        """Async transport drops oldest events when buffer exceeds max_buffer_size."""
-        from nullrun.observability import metrics
-        from nullrun.transport import FlushConfig
-
-        metrics.reset()
-        config = FlushConfig(max_buffer_size=5, batch_size=100, max_failed_flush=3)
-        t = AsyncTransport(
-            api_url="https://api.test.nullrun.io",
-            api_key="test-key",
-            config=config,
-        )
-        t._client = httpx.AsyncClient()
-
-        # First, open the circuit breaker so re-queue path is triggered
-        cb = t._circuit_breaker
-        for _ in range(cb._failure_threshold):
-            try:
-                await cb.call(lambda: (_ for _ in ()).throw(RuntimeError("boom")))
-            except RuntimeError:
-                pass
-
-        # Add events beyond max_buffer_size
-        for i in range(10):
-            async with t._lock:
-                t._buffer.append({"event_id": f"e{i}", "event": f"test{i}"})
-
-        await t._flush_locked()
-
-        # After flush with CB OPEN, buffer should be capped at max_buffer_size
-        assert len(t._buffer) <= config.max_buffer_size
-        # Events should have been dropped due to overflow
-        assert metrics.transport.events_dropped >= 5
-        await t.stop()
-
-    @pytest.mark.asyncio
-    @respx.mock
-    async def test_async_flush_circuit_breaker_open_reequeue_full_batch(self):
-        """When CB opens, full batch is re-queued and preserved for retry."""
-        from nullrun.breaker.circuit_breaker import CBState
-
-        t = AsyncTransport(api_url="https://api.test.nullrun.io", api_key="test-key")
-        t._client = httpx.AsyncClient()
-
-        # Open the circuit breaker
-        cb = t._circuit_breaker
-        for _ in range(cb._failure_threshold):
-            try:
-                await cb.call(lambda: (_ for _ in ()).throw(RuntimeError("boom")))
-            except RuntimeError:
-                pass
-
-        assert cb.state == CBState.OPEN
-
-        # Add multiple events to buffer
-        async with t._lock:
-            t._buffer.append({"event_id": "e1", "event": "test1"})
-            t._buffer.append({"event_id": "e2", "event": "test2"})
-            t._buffer.append({"event_id": "e3", "event": "test3"})
-
-        batch_size = len(t._buffer)
-        await t._flush_locked()
-
-        # All events should be back in buffer since CB is OPEN
-        assert len(t._buffer) == batch_size
-        # Events should be in same order (appended to end)
-        event_ids = [e["event_id"] for e in t._buffer]
-        assert "e1" in event_ids
-        assert "e2" in event_ids
-        assert "e3" in event_ids
-        await t.stop()
-
-    @pytest.mark.asyncio
-    @respx.mock
-    async def test_async_flush_with_hmac_headers(self):
-        """Async flush includes HMAC signature headers when secret_key is set."""
-        route = respx.post("https://api.test.nullrun.io/api/v1/track/batch").mock(
-            return_value=httpx.Response(200, json={})
-        )
-        t = AsyncTransport(
-            api_url="https://api.test.nullrun.io",
-            api_key="test-key",
-            secret_key="secret-123",
-        )
-        t._client = httpx.AsyncClient()
-
-        async with t._lock:
-            t._buffer.append({"event": "test"})
-
-        await t._flush_locked()
-
-        request = route.calls.last.request
-        assert "X-Signature-Timestamp" in request.headers
-        assert "X-Signature" in request.headers
-        assert len(request.headers["X-Signature"]) == 64  # SHA256 hex
-        await t.stop()
-
-    @pytest.mark.asyncio
-    @respx.mock
-    async def test_async_track_batch_size_triggers_flush(self):
-        """Async track triggers flush when batch_size is reached."""
-        from nullrun.transport import FlushConfig
-
-        route = respx.post("https://api.test.nullrun.io/api/v1/track/batch").mock(
-            return_value=httpx.Response(200, json={})
-        )
-        config = FlushConfig(batch_size=3, flush_interval=60.0)
-        t = AsyncTransport(
-            api_url="https://api.test.nullrun.io",
-            api_key="test-key",
-            config=config,
-        )
-        await t.start()
-
-        await t.track({"event": "e1"})
-        await t.track({"event": "e2"})
-
-        # Not yet flushed (only 2 of 3)
-        assert not route.called
-
-        await t.track({"event": "e3"})
-
-        # Should have triggered flush
-        assert route.called
-        await t.stop()
+# TestAsyncTransportFlush class was removed in 0.4.0 (see comment above
+# TestAsyncTransport). The async-flush path is now exercised via
+# tests/test_async_from_event_loop.py which uses the sync Transport
+# from an async event loop.
 
 
 # ──────────────────────────────────────────────────────────────
@@ -793,8 +547,9 @@ class TestPolicyCache:
 
     def test_cache_expiry(self):
         """PolicyCache evicts expired entries."""
-        from nullrun.transport import PolicyCache
         import time
+
+        from nullrun.transport import PolicyCache
         cache = PolicyCache(maxsize=100, ttl_seconds=0.1)  # 100ms TTL
         cache.set("key1", "allow", "policy-123")
         # Not expired yet
@@ -896,6 +651,7 @@ class TestTransportHMAC:
     def test_generate_hmac_signature(self):
         """HMAC signature generation works."""
         import time
+
         from nullrun.transport import generate_hmac_signature
         sig = generate_hmac_signature(
             api_key="test-key",
@@ -909,6 +665,7 @@ class TestTransportHMAC:
     def test_verify_hmac_signature_valid(self):
         """HMAC verification succeeds with valid signature."""
         import time
+
         from nullrun.transport import generate_hmac_signature, verify_hmac_signature
         api_key = "test-key"
         secret_key = "secret-123"
@@ -921,6 +678,7 @@ class TestTransportHMAC:
     def test_verify_hmac_signature_invalid(self):
         """HMAC verification fails with invalid signature."""
         import time
+
         from nullrun.transport import verify_hmac_signature
         result = verify_hmac_signature(
             api_key="test-key",
@@ -933,8 +691,9 @@ class TestTransportHMAC:
 
     def test_verify_hmac_signature_expired(self):
         """HMAC verification fails with expired timestamp."""
-        from nullrun.transport import generate_hmac_signature, verify_hmac_signature
         import time
+
+        from nullrun.transport import generate_hmac_signature, verify_hmac_signature
         api_key = "test-key"
         secret_key = "secret-123"
         body = '{"event": "test"}'

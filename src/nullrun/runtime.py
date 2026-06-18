@@ -26,9 +26,10 @@ the authoritative table; deviations require an ADR amendment (Rule 5).
 The "Opt-out" column makes it explicit that `NULLRUN_SKIP_BUDGET_CHECK=1`
 is a **different category** of action than
 `NULLRUN_SENSITIVE_FAIL_OPEN=1` (bypass vs. change semantics), despite
-the similar naming. See `docs/adr/008-sdk-preflight-fail-policy.md`
-for the full rules, including transport error classification
-(`FALLBACK_NETWORK_ERROR` / `FALLBACK_GATEWAY_ERROR` / `FALLBACK_BREAKER_OPEN`).
+the similar naming. The full ADR (including transport error
+classification into `NETWORK_ERROR` / `GATEWAY_ERROR` /
+`BREAKER_OPEN` via `TransportErrorSource`) lives in the gateway
+repository; see the link in the README.
 """
 
 import asyncio
@@ -39,7 +40,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict, defaultdict, deque
-from collections.abc import MutableMapping
+from collections.abc import Callable, MutableMapping
 from dataclasses import dataclass, field
 from typing import Any, Optional, TypeVar
 
@@ -53,7 +54,6 @@ from nullrun.breaker.exceptions import (
     NullRunAuthenticationError,
     NullRunBlockedException,
     RetryStormException,
-    WorkflowKilledException,
     WorkflowKilledInterrupt,
     WorkflowPausedException,
 )
@@ -67,7 +67,6 @@ from nullrun.context import (
     get_workflow_id,
 )
 from nullrun.decision_history import DecisionHistoryRecorder
-from nullrun.grpc_transport import GrpcTransport, create_grpc_transport
 from nullrun.observability import metrics
 from nullrun.transport import DecisionSource, FallbackMode, FlushConfig, Transport
 
@@ -375,7 +374,6 @@ class NullRunRuntime:
         self._max_retries = 3
         self._debug = debug
         self._transport: Transport | None = None
-        self._grpc_transport: GrpcTransport | None = None
 
         # Local enforcement state
         # PER-WORKFLOW cost tracking - was a global counter before (BUG)
@@ -400,9 +398,66 @@ class NullRunRuntime:
         self._local_loop_threshold = 6
         self._local_rate_limit = 1000  # calls per minute
 
+        # Coverage counters (Phase 3 of the production-readiness plan).
+        # The instrumentation layer in `nullrun.instrumentation.auto`
+        # calls `_safe_bump_coverage(runtime, "_coverage_seen" /
+        # "_coverage_tracked" / "_coverage_streaming_skipped", host)`
+        # so the dashboard can show "which LLM hosts the SDK is
+        # seeing vs. successfully tracking". Previous versions
+        # relied on `_safe_bump_coverage` to no-op when these
+        # attributes were missing — the dashboard's coverage tab
+        # was always empty.
+        self._coverage_seen: dict[str, int] = {}
+        self._coverage_tracked: dict[str, int] = {}
+        self._coverage_streaming_skipped: dict[str, int] = {}
+
         # Remote control plane state (per-workflow, pushed from server via WS).
         # Unified model: effective_state = max(local_state, remote_state)
+        # P1-1.1: All reads/writes go through the `_remote_state_for` /
+        # `_set_remote_state` helpers under `_states_lock` to avoid the
+        # TOCTOU race that was previously possible between the
+        # "if workflow_id not in self._remote_states" check and the
+        # subsequent dict write. `dict` itself is GIL-atomic for
+        # individual ops, but the "check then insert" pattern in
+        # `track()` is not. Re-entrant lock is used because the WS
+        # callback and the synchronous `check_control_plane` can
+        # both be on the same call path in nested cases.
         self._remote_states: dict[str, dict[str, Any]] = {}
+        self._states_lock = threading.RLock()
+
+        # Phase B: control plane transport (WS push vs HTTP poll).
+        self._transport_mode: str = os.getenv("NULLRUN_TRANSPORT", "ws").lower()
+        self._ws_thread: threading.Thread | None = None
+        self._ws_stop_event = threading.Event()
+        self._ws_connection: Any = None
+        self._ws_loop: Any = None
+        # Legacy HTTP-poll state — only used when transport mode is `http`.
+        self._poll_thread: threading.Thread | None = None
+        self._poll_running = False
+
+        # Action handling + decision-history recorder.
+        self._action_handler: ActionHandler | None = None
+        self._recorder: DecisionHistoryRecorder | None = None
+        self._is_recording = False
+
+    def _remote_state_for(self, workflow_id: str) -> dict[str, Any]:
+        """Get-or-create the per-workflow state dict under lock.
+
+        Used by every read of `self._remote_states` to avoid the
+        TOCTOU race that was previously possible."""
+        with self._states_lock:
+            state = self._remote_states.get(workflow_id)
+            if state is None:
+                state = {}
+                self._remote_states[workflow_id] = state
+            return state
+
+    def _set_remote_state(
+        self, workflow_id: str, state: dict[str, Any]
+    ) -> None:
+        """Atomically set the per-workflow state under lock."""
+        with self._states_lock:
+            self._remote_states[workflow_id] = state
 
         # Phase B: control plane transport. The SDK connects to the server's
         # WS endpoint and receives state push events (killed/paused) within
@@ -437,22 +492,40 @@ class NullRunRuntime:
             ),
         )
 
-        # P2: Try to initialize gRPC transport for high-performance event ingestion
-        # gRPC uses binary protobuf + HTTP/2 for 30-50% overhead reduction vs REST/JSON
-        if os.getenv("NULLRUN_USE_GRPC"):
-            self._grpc_transport = create_grpc_transport(
-                api_key=self.api_key,
-            )
-            if self._grpc_transport:
-                logger.info("gRPC transport initialized for high-performance event ingestion")
-            else:
-                logger.warning("NULLRUN_USE_GRPC is set but gRPC transport could not be initialized (proto files may be missing)")
+        # P2 (removed in 0.4.0): gRPC transport was deleted. The backend
+        # proto is frozen and missing trace/span fields; HTTP is the
+        # only supported transport. The NULLRUN_USE_GRPC env var is
+        # now a no-op (logged once at WARNING if set).
+
+        # Action handler + decision-history recorder are initialised
+        # in BOTH the test-mode and the cloud-mode branches below,
+        # so the runtime always has the attribute available when
+        # ``track()`` consults ``_is_recording`` (Phase 5 cleanup
+        # had a regression where ``_test_mode=True`` skipped the
+        # recorder init and ``rt.track(...)`` raised AttributeError).
 
         # Initialize
+        if os.getenv("NULLRUN_USE_GRPC"):
+            logger.warning(
+                "NULLRUN_USE_GRPC is set but the gRPC transport has been "
+                "removed in SDK 0.4.0 — falling back to HTTP. The env var "
+                "is now a no-op. See CHANGELOG.md for the migration timeline."
+            )
+
         if self._test_mode:
             # Test mode: skip all network calls, use local policy
             self._policy = self._policy or Policy.default_local()
             self._transport.start()
+            # Initialise the action handler and the local
+            # decision-history recorder so ``track()`` and
+            # ``start_recording()`` work in test mode. The previous
+            # code only initialised them in the cloud branch
+            # (below) and skipped them for ``_test_mode=True``,
+            # which broke ``test_track_increments_counter`` and
+            # any test that called ``rt.track(...)`` without going
+            # through ``auth/verify``.
+            self._action_handler = ActionHandler()
+            self._recorder = DecisionHistoryRecorder(runtime=self)
         else:
             try:
                 self._authenticate()
@@ -478,7 +551,7 @@ class NullRunRuntime:
 
         # Phase 1.4: Sensitive tools that require strict mode (pre-execution enforcement)
         # These tools MUST go through /execute endpoint, NOT direct execution
-        self._sensitive_tools: set = {
+        self._sensitive_tools: set[str] = {
             # Financial operations
             "stripe.charge",
             "stripe.refund",
@@ -580,10 +653,14 @@ class NullRunRuntime:
 
         logger.debug(f"Authenticating with API at {self.api_url}/auth/verify")
         try:
-            # Use Transport's client for connection pooling, retry, and circuit breaker
-            response = self._transport._client.post(
-                f"{self.api_url}/api/v1/auth/verify",
-                json={"api_key": self.api_key},
+            # Route through _signed_post so HMAC + W3C trace context
+            # are applied automatically. Phase 1: HMAC always-on.
+            # /auth/verify accepts a signed body for symmetry with
+            # the rest of the API surface.
+            response = self._transport._signed_post(
+                "/api/v1/auth/verify",
+                {"api_key": self.api_key},
+                timeout=10.0,
             )
 
             if response.status_code == 200:
@@ -642,10 +719,10 @@ class NullRunRuntime:
             return
 
         try:
-            # Use Transport's client for connection pooling, retry, and circuit breaker
-            response = self._transport._client.post(
-                f"{self.api_url}/api/v1/policies",
-                json={"organization_id": self.organization_id},
+            # Route through _signed_post (Phase 1).
+            response = self._transport._signed_post(
+                "/api/v1/policies",
+                {"organization_id": self.organization_id},
             )
 
             if response.status_code == 200:
@@ -764,12 +841,12 @@ class NullRunRuntime:
                 if not workflow_id:
                     logger.debug("WS state message missing workflow_id: %s", state)
                     return
-                self._remote_states[workflow_id] = {
+                self._set_remote_state(workflow_id, {
                     "state": state.get("state", "Normal"),
                     "version": state.get("version", 0),
                     "reason": state.get("reason"),
                     "updated_at": state.get("updated_at", 0),
-                }
+                })
                 logger.debug(
                     "WS state push: workflow=%s state=%s reason=%s",
                     workflow_id,
@@ -811,8 +888,12 @@ class NullRunRuntime:
         """
         while self._poll_running:
             try:
-                # Get all workflows we're tracking
-                workflow_ids = list(self._remote_states.keys())
+                # Get all workflows we're tracking. Snapshot the keys
+                # under lock to avoid `RuntimeError: dictionary
+                # changed size during iteration` if a concurrent
+                # `_set_remote_state` adds a workflow mid-poll.
+                with self._states_lock:
+                    workflow_ids = list(self._remote_states.keys())
                 if not workflow_ids:
                     # If no workflows yet, try to get organization workflows
                     pass
@@ -849,31 +930,44 @@ class NullRunRuntime:
         return self.workflow_id
 
     def _fetch_remote_state(self, workflow_id: str) -> None:
-        """Fetch remote state for a specific workflow from /status endpoint."""
+        """Fetch remote state for a specific workflow from /status endpoint.
+
+        Phase 1: routed through ``_transport._signed_request`` so the
+        canonical header set (X-API-Key, X-API-Version, optional HMAC)
+        is applied in one place. A GET has no body, so no signature
+        is computed — the server authenticates via the X-API-Key
+        header.
+        """
         try:
-            response = httpx.get(
-                f"{self.api_url}/api/v1/status/{workflow_id}",
-                headers=self._auth_headers(),
+            response = self._transport._signed_request(
+                "GET",
+                f"/api/v1/status/{workflow_id}",
                 timeout=5.0,
             )
             if response.status_code == 200:
                 data = response.json()
-                self._remote_states[workflow_id] = {
+                self._set_remote_state(workflow_id, {
                     "state": data.get("state", "Normal"),
                     "version": data.get("version", 0),
                     "reason": data.get("reason"),
                     "updated_at": data.get("updated_at", 0),
-                }
-                logger.debug(f"Remote state for {workflow_id}: {self._remote_states[workflow_id]}")
+                })
+                logger.debug(f"Remote state for {workflow_id}: {data}")
         except Exception as e:
             logger.debug(f"Failed to fetch remote state for {workflow_id}: {e}")
 
-    def check_control_plane(self, workflow_id: str) -> None:
+    def check_control_plane(self, workflow_id: str | None) -> None:
         """
         Check remote control plane state and raise if workflow is paused/killed.
 
         This is called in the execution path after local enforcement.
         The unified state model: effective_state = max(local_state, remote_state)
+
+        Args:
+            workflow_id: Optional workflow id. Resolved through
+                `_resolve_workflow_id` (contextvar → API-key-bound
+                workflow → no-op). `None` is the canonical "no
+                workflow scoped" value — the gate then no-ops.
 
         Raises:
             WorkflowPausedException: If workflow is paused on server
@@ -884,17 +978,23 @@ class NullRunRuntime:
         # in that case there's no workflow to check, so we no-op
         # (preserves pre-139 behavior for keys that have never been
         # workflow-bound).
-        resolved = self._resolve_workflow_id(workflow_id or None)
+        resolved = self._resolve_workflow_id(workflow_id)
         if not resolved:
             return
         workflow_id = resolved
 
-        # Ensure we have the latest remote state
-        if workflow_id not in self._remote_states:
+        # Ensure we have the latest remote state. The "is in cache"
+        # check is done under the lock to avoid the TOCTOU race
+        # where a concurrent `_set_remote_state` could change the
+        # answer between the check and the read.
+        with self._states_lock:
+            in_cache = workflow_id in self._remote_states
+        if not in_cache:
             # Fetch synchronously if not in cache yet
             self._fetch_remote_state(workflow_id)
 
-        remote_state = self._remote_states.get(workflow_id, {})
+        with self._states_lock:
+            remote_state = self._remote_states.get(workflow_id, {})
         state = remote_state.get("state", "Normal")
 
         if state == "Paused":
@@ -993,25 +1093,36 @@ class NullRunRuntime:
         return headers
 
     def shutdown(self) -> None:
-        """Shutdown runtime gracefully."""
+        """Shutdown runtime gracefully.
+
+        Defensive against missing attributes: the test-mode
+        constructor does not initialize `_poll_thread`, `_ws_thread`,
+        `_ws_stop_event`, etc. — `getattr` is used everywhere a
+        missing attribute is possible. Without this, a test-mode
+        runtime that calls `shutdown()` raises `AttributeError`."""
         # Stop the HTTP poller (legacy path) if it was started.
         self._poll_running = False
-        if self._poll_thread and self._poll_thread.is_alive():
-            self._poll_thread.join(timeout=2.0)
+        poll_thread = getattr(self, "_poll_thread", None)
+        if poll_thread is not None and poll_thread.is_alive():
+            poll_thread.join(timeout=2.0)
 
         # Stop the WS control plane listener (Phase B). Closing the
         # connection causes the receive task to unblock, the loop to
         # exit, and the thread to terminate.
-        self._ws_stop_event.set()
-        conn = self._ws_connection
-        if conn is not None and self._ws_loop is not None:
+        ws_stop_event = getattr(self, "_ws_stop_event", None)
+        if ws_stop_event is not None:
+            ws_stop_event.set()
+        conn = getattr(self, "_ws_connection", None)
+        ws_loop = getattr(self, "_ws_loop", None)
+        if conn is not None and ws_loop is not None:
             try:
-                future = asyncio.run_coroutine_threadsafe(conn.close(), self._ws_loop)
+                future = asyncio.run_coroutine_threadsafe(conn.close(), ws_loop)
                 future.result(timeout=2.0)
             except Exception as e:
                 logger.debug(f"WS close on shutdown failed (best-effort): {e}")
-        if self._ws_thread and self._ws_thread.is_alive():
-            self._ws_thread.join(timeout=2.0)
+        ws_thread = getattr(self, "_ws_thread", None)
+        if ws_thread is not None and ws_thread.is_alive():
+            ws_thread.join(timeout=2.0)
 
         if self._transport:
             self._transport.stop()
@@ -1118,8 +1229,10 @@ class NullRunRuntime:
         # may be None on legacy keys — that's fine, the no-op
         # branch in check_control_plane will skip polling.
         workflow_id = enriched.get("workflow_id")
-        if workflow_id and workflow_id not in self._remote_states:
-            self._remote_states[workflow_id] = {}
+        if workflow_id:
+            # Use the helper to avoid the TOCTOU race between the
+            # "not in dict" check and the write.
+            self._remote_state_for(workflow_id)
 
         # Local policy enforcement (BEFORE sending)
         if self._policy:
@@ -1130,29 +1243,13 @@ class NullRunRuntime:
         # contextvar → self.workflow_id → no-op (legacy keys).
         self.check_control_plane(workflow_id)
 
-        # Buffer for transport - use gRPC if available for better performance
-        if self._grpc_transport:
-            # gRPC path: direct send for lowest latency
-            try:
-                self._grpc_transport.track(
-                    event_id=enriched.get("event_id", ""),
-                    workflow_id=enriched.get("workflow_id", ""),
-                    tokens=enriched.get("tokens", 0),
-                    tool_name=enriched.get("tool_name"),
-                    is_retry=enriched.get("is_retry", False),
-                    event_type=enriched.get("event_type", ""),
-                )
-            except Exception as e:
-                logger.warning(f"gRPC track failed, falling back to HTTP: {e}")
-                wire_event = {k: v for k, v in enriched.items() if k != "cost_cents"}
-                self._transport.track(wire_event)
-        else:
-            # The wire payload must NOT include cost_cents — the SDK
-            # does not estimate cost. The backend recomputes it from
-            # tokens + the org's policy. Local budget enforcement
-            # already ran on the original event dict above.
-            wire_event = {k: v for k, v in enriched.items() if k != "cost_cents"}
-            self._transport.track(wire_event)
+        # Buffer for transport. (gRPC path was removed in 0.4.0 —
+        # the backend proto is frozen and missing trace/span fields.)
+        # The wire payload must NOT include `cost_cents` — the SDK
+        # does not estimate cost; the backend recomputes it from
+        # `tokens` + the org's pricing policy.
+        if self._transport is not None:
+            self._transport.track(self._strip_wire_only_fields(enriched))
 
         # Update metrics (thread-safe)
         metrics.inc_runtime("track_calls")
@@ -1337,7 +1434,7 @@ class NullRunRuntime:
         metrics.inc_runtime("execute_allowed")
         return result
 
-    def wrap_tool(self, tool_name: str, tool_fn: callable) -> callable:
+    def wrap_tool(self, tool_name: str, tool_fn: Callable[..., Any]) -> Callable[..., Any]:
         """
         Wrap a tool function with pre-execution enforcement.
 
@@ -1354,7 +1451,7 @@ class NullRunRuntime:
             Wrapped function
         """
         @functools.wraps(tool_fn)
-        def wrapper(*args, **kwargs):
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
             # Pre-execution check (raises if blocked)
             input_data = {"args": args, "kwargs": kwargs}
             self.execute(tool_name, input_data)
@@ -1368,7 +1465,7 @@ class NullRunRuntime:
             return output
         return wrapper
 
-    def wrap(self, tool_fn: callable) -> callable:
+    def wrap(self, tool_fn: Callable[..., Any]) -> Callable[..., Any]:
         """
         Wrap a tool function with NullRun protection.
 
@@ -1385,18 +1482,26 @@ class NullRunRuntime:
         Returns:
             Wrapped function that auto-calls execute() before running
         """
+        from nullrun.context import get_workflow_id
+
         tool_name = tool_fn.__name__
 
         @functools.wraps(tool_fn)
-        def wrapper(*args, **kwargs):
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
             # Pre-execution check
             input_data = {"args": args, "kwargs": kwargs}
             result = self.execute(tool_name, input_data)
 
-            # Raise if blocked
+            # Raise if blocked. Resolve workflow_id from the active
+            # contextvar — `execute()` already raises NullRunBlockedException
+            # for a real gateway block, so this branch only fires if a
+            # future caller returns a dict with decision=block without
+            # raising. Use the same fallback the rest of the runtime
+            # uses ("<unknown>") when no contextvar is set.
             if result.get("decision") == "block":
+                resolved_wf = get_workflow_id() or "<unknown>"
                 raise NullRunBlockedException(
-                    workflow_id=workflow_id or "<unknown>",
+                    workflow_id=resolved_wf,
                     reason=result.get("explanation", "policy violation"),
                     tool_name=tool_name,
                 )
@@ -1560,39 +1665,44 @@ class NullRunRuntime:
         workflow_id = get_workflow_id()
         trace_id = get_trace_id() or str(uuid.uuid4())
 
-        # Call /evaluate endpoint if available, otherwise fallback to /execute
-        # Use transport._client for connection pooling, retry, and circuit breaker
+        # Route through `transport.evaluate()` (the public API) so the
+        # call benefits from the same connection pool, HMAC signing,
+        # circuit breaker, and retry policy as `execute()`. The
+        # previous implementation reached into `transport._client`
+        # directly, which silently bypassed the circuit breaker — a
+        # production hazard on a long-lived runtime.
+        #
+        # `transport.evaluate()` is fail-CLOSED on transport error by
+        # default (raises NullRunTransportError) per ADR-008. We
+        # swallow that here because the public `runtime.evaluate()`
+        # contract is "always return a dict" (used for pre-validation
+        # / dry-run), not "halt the agent on a backend outage".
+        from nullrun.breaker.exceptions import NullRunTransportError
+
         try:
-            response = self._transport._client.post(
-                f"{self.api_url}/api/v1/evaluate",
-                json={
-                    "organization_id": organization_id,
-                    "execution_id": workflow_id,
-                    "trace_id": trace_id,
-                    "tool": tool_name,
-                    "context": context or {},
-                },
-                headers=self._auth_headers(),
-                timeout=5.0,
+            return self._transport.evaluate(
+                organization_id=organization_id,
+                execution_id=workflow_id,
+                trace_id=trace_id,
+                tool=tool_name,
+                context=context or {},
+                on_transport_error="closed",
             )
-
-            if response.status_code == 200:
-                return response.json()  # type: ignore[no-any-return]
-
-        except httpx.RequestError:
-            pass
-
-        # Fallback: simulate evaluate response based on local policy
-        is_sensitive = self.is_sensitive_tool(tool_name)
-        return {
-            "decision": "allow" if not is_sensitive else "block",
-            "decision_source": DecisionSource.FALLBACK,
-            "explanation": "Evaluation endpoint unavailable",
-            "policy_version": 0,
-            "matched_rules": [],
-            "scores": {},
-            "allow_execution": not is_sensitive,
-        }
+        except NullRunTransportError as exc:
+            # Transport unavailable — return a local-fallback decision
+            # so pre-validation never halts the user's agent.
+            is_sensitive = self.is_sensitive_tool(tool_name)
+            return {
+                "decision": "allow" if not is_sensitive else "block",
+                "decision_source": DecisionSource.FALLBACK,
+                "explanation": (
+                    f"Evaluation endpoint unavailable ({exc.source.value}): {exc}"
+                ),
+                "policy_version": 0,
+                "matched_rules": [],
+                "scores": {},
+                "allow_execution": not is_sensitive,
+            }
 
     def start_recording(self, workflow_id: str, metadata: dict[str, Any] = None) -> str:
         """
@@ -1668,6 +1778,29 @@ class NullRunRuntime:
             enriched["operation_name"] = None
 
         return enriched
+
+    @staticmethod
+    def _strip_wire_only_fields(event: dict[str, Any]) -> dict[str, Any]:
+        """Remove fields the SDK adds for local enforcement but that
+        do not belong on the wire (the backend recomputes them from
+        `tokens` + the org's pricing policy).
+
+        Two fields are stripped:
+
+          - ``cost_cents``: backend recomputes from tokens + pricing.
+          - ``_fingerprint``: sink-only dedup key for the
+            ``_seen_track_fingerprints`` LRU; never reaches the
+            gateway.
+
+        Centralized so the wire-format contract is in one place; if
+        a future SDK revision adds more local-only fields they land
+        here too.
+        """
+        return {
+            k: v
+            for k, v in event.items()
+            if k not in ("cost_cents", "_fingerprint")
+        }
 
     def _check_local_limits(self, event: dict[str, Any]) -> None:
         """
@@ -1891,6 +2024,17 @@ class NullRunRuntime:
         # to 0 so the deserializer accepts the event; the cost
         # computation in the handler treats 0 tokens as no-op.
         event.setdefault("tokens", 0)
+        # Phase 3: emit a stable fingerprint so the dedup LRU at
+        # the track() sink can collapse repeat emissions of the
+        # same event (e.g. when the user calls track_event manually
+        # AND the httpx transport hook fires for the same LLM
+        # call). Field is stripped before wire send (see
+        # `_strip_wire_only_fields`).
+        if "_fingerprint" not in event:
+            from nullrun.instrumentation.auto import (
+                _fingerprint_for_event_dict,
+            )
+            event["_fingerprint"] = _fingerprint_for_event_dict(event)
         return self.track(event)
 
 

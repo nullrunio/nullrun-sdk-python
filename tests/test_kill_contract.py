@@ -1,6 +1,12 @@
 """Smoke test for the kill contract exception classes.
 
-Run from sdk-python/ root: python tests/test_kill_contract.py
+Run from the repository root (e.g. `nullrun-sdk-python/`):
+    python tests/test_kill_contract.py
+
+Note: this file is a manual smoke test (it has an `if __name__ ==
+"__main__"` driver and is NOT a pytest test). The real contract is
+also covered by `test_blocked_exception.py` and the
+`test_kill_contract_*` tests in this directory.
 """
 import sys
 import warnings

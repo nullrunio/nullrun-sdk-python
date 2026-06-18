@@ -29,10 +29,11 @@ What this module owns:
 - Double-emission guard: `request._nullrun_tracked = True` is set on
   the PreparedRequest after a successful track, so a future
   `urllib3` patch (which `requests` uses under the hood) can skip
-  already-tracked requests. See plan section P2 / "requests ↔ urllib3".
+  already-tracked requests.
 
-`aiohttp` is deliberately out of scope for this phase — see
-`docs/known-limitations.md` and the plan's open questions.
+`aiohttp` is deliberately out of scope for this phase — see the
+known-limitations section in the gateway repository for the up-to-date
+list of unsupported HTTP clients.
 """
 
 from __future__ import annotations
@@ -144,7 +145,7 @@ def patch_requests(runtime: Any) -> bool:
         if _requests_patched:
             return True
         try:
-            import requests  # type: ignore[import-not-found]
+            import requests  # noqa: F401  # type: ignore[import-not-found]
         except ImportError:
             logger.debug("requests not installed; auto-instrumentation skipped")
             return False

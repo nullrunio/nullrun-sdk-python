@@ -45,12 +45,21 @@ def reset_runtime():
 
 @pytest.fixture
 def mock_api():
-    """Mock all HTTP calls to NullRun API."""
+    """Mock all HTTP calls to NullRun API.
+
+    The mocked auth response includes `workflow_id` so the runtime
+    is bound to a workflow out of the box — this matches the
+    Phase 139+ contract where `/auth/verify` returns the workflow
+    the key is bound to. Tests that need to exercise the
+    "no workflow" path can still set `rt.workflow_id = None`
+    after `make_runtime()`.
+    """
     with respx.mock:
         # Auth endpoint
         respx.post(f"{BASE_URL}/api/v1/auth/verify").mock(
             return_value=Response(200, json={
                 "organization_id": "ws-test",
+                "workflow_id": "wf-test",
                 "plan": "pro",
                 "features": [],
                 "limits": {"max_cost_cents": 10000},
@@ -103,8 +112,8 @@ def make_runtime(mock_api):
     `decorators._get_or_create_runtime`) finds the test runtime, not a
     fallback that would try to construct one with no api_key.
     """
-    from nullrun.runtime import NullRunRuntime
     import nullrun.decorators as _dec
+    from nullrun.runtime import NullRunRuntime
 
     def _make(**kwargs):
         defaults = dict(
