@@ -76,6 +76,16 @@ dev = [
     "coverage[toml]>=7.0",
     "grpcio-tools>=1.60.0,<2.0",
     "httpx>=0.27.0,<1.0",
+    # The SDK eagerly imports `nullrun.instrumentation.langgraph`
+    # (from `nullrun.decorators`, imported by `nullrun.__init__` at
+    # collection time), which itself does `from langchain_core.callbacks
+    # import BaseCallbackHandler`. Without this dep, *every* test in
+    # the suite errors at pytest collection, not at a specific test.
+    # CI installs `[dev]` only, so the test extras need to cover the
+    # import chain. `langchain-core` is the smallest dep that makes
+    # the import succeed; the `langgraph` and `langchain` extras pull
+    # in heavier stacks that the unit tests don't need.
+    "langchain-core>=0.3,<1.0",
 ]
 
 [project.urls]
