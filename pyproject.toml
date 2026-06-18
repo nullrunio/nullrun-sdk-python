@@ -106,6 +106,8 @@ Documentation = "https://docs.nullrun.io"
 Repository = "https://github.com/nullrunio/nullrun-sdk-python"
 Changelog = "https://github.com/nullrunio/nullrun-sdk-python/blob/master/CHANGELOG.md"
 "Bug Tracker" = "https://github.com/nullrunio/nullrun-sdk-python/issues"
+Organization = "https://github.com/nullrunio"
+Examples = "https://github.com/nullrunio/nullrun-examples"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/nullrun"]

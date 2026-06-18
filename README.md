@@ -1,10 +1,14 @@
-# nullrun (Python SDK)
+# nullrun
 
-Enforcement gateway for AI agents.
+**Enforcement gateway for AI agents.**
 
-> **Status: experimental.** This SDK is shipping in alpha and the public API
-> may shift between minor versions. Pin your dependency and read the
-> [CHANGELOG](./CHANGELOG.md) on every upgrade.
+Stop runaway agents before they burn the budget. NullRun sits between your
+code and your LLM calls, tracking cost and tool usage so a single agent can't
+take down your account.
+
+> ⚠️ **Status: alpha.** The public API may shift between minor versions.
+> Pin your dependency and read the [CHANGELOG](./CHANGELOG.md) on every
+> upgrade.
 
 ---
 
@@ -16,74 +20,66 @@ pip install nullrun
 
 ## Quick start
 
+Wrap any function that calls an LLM with `@protect` and you're done — cost
+and tool calls are tracked automatically.
+
 ```python
 from nullrun import protect
 
 @protect
 def my_agent(prompt: str) -> str:
-    return call_my_llm(prompt)  # cost + tool calls are tracked
+    return call_my_llm(prompt)
 ```
 
-See [`examples/`](./examples) for LangGraph, OpenAI Agents, and raw OpenAI
-integrations.
+Or drop in zero-code auto-instrumentation for the LLM libraries you already
+use. Pass your API key once at startup; supported vendors are detected
+automatically.
+
+```python
+import nullrun
+import openai
+
+nullrun.init(api_key="nr_...")
+
+client = openai.OpenAI()
+client.chat.completions.create(...)   # tracked, no other changes needed
+```
 
 ## Configuration
 
-Sprint 3.4 (B6): the previous version had two env-var tables that
-contradicted each other (`NULLRUN_BATCH_SIZE` was listed as `50`
-and `100` in different tables) and listed several env vars that
-the SDK does not actually read (`NULLRUN_HMAC_REQUIRED`,
-`NULLRUN_LOG_LEVEL`, `NULLRUN_TIMEOUT`). The table below lists
-only the env vars that the SDK reads in 0.4.0. If you find a
-documented env var that has no effect, please open an issue.
+Two environment variables cover almost every setup:
 
-| Env var | Default | Description |
+| Variable | Default | Purpose |
 |---|---|---|
-| `NULLRUN_API_KEY` | — | API key from the NullRun dashboard. **Required** (0.3.0+). |
-| `NULLRUN_API_URL` | `https://api.nullrun.io` | Backend base URL. |
-| `NULLRUN_SKIP_BUDGET_CHECK` | unset | Opt-out of pre-flight `/check` (test only). |
-| `NULLRUN_BATCH_SIZE` | `50` | Override `FlushConfig.batch_size`. |
-| `NULLRUN_FLUSH_INTERVAL_MS` | `5000` | Override `FlushConfig.flush_interval`. |
-| `NULLRUN_FALLBACK_MODE` | `permissive` | One of `permissive` / `strict` / `cached`. Deprecated in favour of the typed `on_transport_error` parameter on `Transport.execute()` (Sprint 3.2). |
-| `NULLRUN_TRANSPORT` | `ws` | Control plane transport: `ws` (WebSocket, default) or `http` (HTTP polling). |
-| `NULLRUN_TLS_CLIENT_CERT` | unset | mTLS client certificate path. See [mTLS](#mtls--client-certificate-authentication) below. |
-| `NULLRUN_TLS_CLIENT_KEY` | unset | mTLS client key path. |
-| `NULLRUN_TLS_CA_CERT` | unset | Override the default CA bundle (self-signed enterprise gateways). |
-| `NULLRUN_SENSITIVE_FAIL_OPEN` | unset | Opt-out of fail-CLOSED for sensitive tools (test only). |
+| `NULLRUN_API_KEY` | — | Your NullRun API key. **Required.** |
+| `NULLRUN_API_URL` | `https://api.nullrun.io` | Backend base URL (override for self-hosted). |
 
-## mTLS / client certificate authentication
+Everything else — batching, transport tuning, mTLS, vendor-specific options
+— lives in the docs:
 
-Set `NULLRUN_TLS_CLIENT_CERT` and `NULLRUN_TLS_CLIENT_KEY` to enable
-mutual TLS. `NULLRUN_TLS_CA_CERT` overrides the default CA bundle
-(useful for self-signed enterprise gateways). The wiring lives in
-`src/nullrun/transport.py:482-548`.
+- 📘 **Full configuration reference**: <https://docs.nullrun.io>
 
-```bash
-export NULLRUN_TLS_CLIENT_CERT=/etc/nullrun/client.crt
-export NULLRUN_TLS_CLIENT_KEY=/etc/nullrun/client.key
-export NULLRUN_TLS_CA_CERT=/etc/nullrun/ca-bundle.crt
-```
+## Examples
 
-### gRPC transport (EXPERIMENTAL — FROZEN, do not enable in production)
+A growing set of runnable examples (LangGraph, OpenAI Agents, raw OpenAI,
+Anthropic, multi-agent) is maintained in a separate repo so you can copy
+and adapt without cloning the SDK source:
 
-| Env var | Default | Description |
-|---|---|---|
-| `NULLRUN_USE_GRPC` | unset | **Do not enable in production.** See warning below. |
-| `NULLRUN_GRPC_URL` | `localhost:50051` | gRPC server address (server-side: `GRPC_PORT`). |
-| `NULLRUN_GRPC_REFLECTION` | unset | Server-side: `1` enables proto schema reflection on `:50051`. |
-| `NULLRUN_GRPC_UNSAFE_ALLOW` | unset | Server-side: required alongside `NULLRUN_USE_GRPC=1` to acknowledge the gRPC server is unsafe. The backend refuses to start if `NULLRUN_USE_GRPC=1` is set without this. Never set in shared environments. |
+- 🧪 **Examples repo**: <https://github.com/nullrunio/nullrun-examples>
 
-> ⚠️ **The gRPC server is intentionally frozen.** It does not validate
-> `x-api-key` in metadata (the auth helper exists in the
-> [gateway repository](https://github.com/nullrunio/nullrun) but is not
-> wired into the RPC handlers), runs over plaintext HTTP/2, and exposes
-> the full proto schema via reflection (when enabled). The backend's
-> startup script (in the [gateway repository](https://github.com/nullrunio/nullrun))
-> refuses to start if `NULLRUN_USE_GRPC=1` is set without the explicit
-> opt-in `NULLRUN_GRPC_UNSAFE_ALLOW=1`. The opt-in is for local/dev use
-> only and is logged at WARN. See the activation checklist (TLS → auth →
-> proto extensions → cost pipeline parity → tests) in the gateway repo
-> that must be completed before this transport is production-safe.
+## Documentation
+
+Concept guides, integration recipes, and the full Python API reference:
+
+- 📖 <https://docs.nullrun.io>
+
+## Project & organisation
+
+This SDK is one part of the NullRun platform.
+
+- 🏢 **Organisation**: <https://github.com/nullrunio>
+- 🐛 **Issues**: <https://github.com/nullrunio/nullrun-sdk-python/issues>
+- 📝 **Changelog**: <https://github.com/nullrunio/nullrun-sdk-python/blob/master/CHANGELOG.md>
 
 ## License
 
