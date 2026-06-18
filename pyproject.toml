@@ -146,6 +146,12 @@ ignore = [
 asyncio_mode = "auto"
 testpaths = ["tests"]
 addopts = "--tb=short -q"
+# Make the tests/ directory importable as a top-level package so
+# tests can use `from tests.conftest import BASE_URL`. Without this,
+# `from tests.conftest` raises ModuleNotFoundError on Python 3.10/3.11
+# because pytest's rootdir discovery lands on the repo root rather
+# than the tests/ directory.
+pythonpath = ["."]
 
 [tool.coverage.run]
 source = ["src/nullrun"]
