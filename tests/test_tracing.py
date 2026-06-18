@@ -135,3 +135,48 @@ def test_span_context_is_immutable():
         # the broader `Exception` is fine because exact subclass is
         # not part of the public surface.
         root.span_id = "tampered"  # type: ignore[misc]
+
+
+# ===========================================================================
+# Sprint 2.6 (B5): create_child_span must reject None parent clearly
+# ===========================================================================
+# Pre-fix: ``create_child_span(None)`` raised
+# ``TypeError: unsupported operand for None + 1`` on the
+# ``parent.depth + 1`` line. That crashed the whole
+# ``@protect`` / track_* pipeline when a caller passed ``None``
+# instead of a SpanContext (e.g. ``get_current_span()`` returns
+# ``None`` when no trace is in progress). Post-fix the function
+# raises ``ValueError`` with a clear message.
+
+
+def test_create_child_span_rejects_none_parent():
+    """``create_child_span(None)`` raises ``ValueError`` (not ``TypeError``).
+
+    Regression for B5: pre-fix this raised a confusing
+    ``TypeError`` deep inside the dataclass constructor
+    (``unsupported operand for None + 1``) which crashed the
+    whole tracking pipeline. Now it raises ``ValueError`` with
+    a message that points the caller at the right alternative
+    (``create_root_span()``).
+    """
+    from nullrun.tracing import create_child_span
+
+    with pytest.raises(ValueError) as exc_info:
+        create_child_span(None)  # type: ignore[arg-type]
+
+    # The message must guide the caller to the right alternative.
+    assert "create_root_span" in str(exc_info.value), (
+        f"ValueError message should mention create_root_span() "
+        f"as the alternative; got: {exc_info.value}"
+    )
+
+
+def test_create_child_span_with_valid_parent_works():
+    """Sanity: the defensive check does not break the happy path."""
+    from nullrun.tracing import create_child_span, create_root_span
+
+    root = create_root_span()
+    child = create_child_span(root)
+    assert child.parent_span_id == root.span_id
+    assert child.trace_id == root.trace_id
+    assert child.depth == root.depth + 1

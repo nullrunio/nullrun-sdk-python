@@ -10,7 +10,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
@@ -151,7 +151,7 @@ class ActionHandler:
         """Record action to history."""
         with self._lock:
             event = ActionEvent(
-                timestamp=datetime.utcnow().isoformat(),
+                timestamp=datetime.now(timezone.utc).isoformat(),
                 action_type=action_type.value,
                 workflow_id=workflow_id,
                 reason=reason,
@@ -186,8 +186,35 @@ class ActionHandler:
         try:
             action_type = ActionType(action.lower())
         except ValueError:
-            logger.warning(f"Unknown action type: {action}")
-            action_type = ActionType.BLOCK
+            # Sprint 1.5 (B14): pre-fix this degraded silently to
+            # ``ActionType.BLOCK`` and triggered ``_default_block``,
+            # which raises ``NullRunBlockedException``. That made
+            # the SDK into a DoS amplifier: a single malformed
+            # ``action`` from the server (or a MITM, or a server
+            # schema regression) would block every subsequent tool
+            # call in the workflow with no actionable error.
+            #
+            # Post-fix: log at ERROR, record the event for forensic
+            # visibility, and DO NOT invoke any handler. The
+            # workflow keeps running under fail-open. The operator
+            # gets a clear signal that the control plane sent an
+            # action type the SDK doesn't understand — likely a
+            # version mismatch (server upgraded, SDK not yet) or a
+            # schema regression worth investigating.
+            logger.error(
+                f"Unknown action type received from control plane: {action!r} "
+                f"for workflow {workflow_id!r} (reason={reason!r}). "
+                "This is a server/SDK version mismatch or a control plane "
+                "schema regression. Failing open — the workflow will continue "
+                "running. Investigate ASAP."
+            )
+            self._record_action(
+                ActionType.BLOCK,  # record what would have happened pre-fix
+                workflow_id,
+                f"unknown_action_type:{action}",
+                details,
+            )
+            return
 
         handler = self._handlers.get(action_type, self._default_block)
 
@@ -296,7 +323,7 @@ class ActionHandler:
             "workflow_id": workflow_id,
             "reason": reason,
             "details": details,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         with self._lock:
             # Enforce max queue size to prevent memory leak
@@ -391,11 +418,6 @@ class ActionHandler:
                 return False
 
             return True
-
-    def clear_pause(self, workflow_id: str) -> None:
-        """Manually clear paused state for a workflow."""
-        with self._lock:
-            self._paused_workflows.pop(workflow_id, None)
 
 
 # Global action handler instance

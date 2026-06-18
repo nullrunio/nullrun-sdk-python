@@ -51,6 +51,7 @@ def mock_api():
         respx.post(f"{BASE_URL}/api/v1/auth/verify").mock(
             return_value=Response(200, json={
                 "organization_id": "ws-test",
+                "workflow_id": "00000000-0000-0000-0000-000000000001",
                 "plan": "pro",
                 "features": [],
                 "limits": {"max_cost_cents": 10000},
@@ -103,8 +104,8 @@ def make_runtime(mock_api):
     `decorators._get_or_create_runtime`) finds the test runtime, not a
     fallback that would try to construct one with no api_key.
     """
-    from nullrun.runtime import NullRunRuntime
     import nullrun.decorators as _dec
+    from nullrun.runtime import NullRunRuntime
 
     def _make(**kwargs):
         defaults = dict(

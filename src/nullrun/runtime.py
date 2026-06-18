@@ -12,16 +12,16 @@ This is the main entry point for the SDK. It handles:
 
 The SDK enforces workflow safety through a set of *pre-execution gates*
 that run before a protected function body executes and may raise to halt
-the work. Each gate declares its own fail-OPEN/CLOSED policy — this is
+the work. Each gate declares its own fail-OPEN/CLOSED policy -- this is
 the authoritative table; deviations require an ADR amendment (Rule 5).
 
 | Gate | Transport-error behavior | Recovery behavior | Opt-out |
 |---|---|---|---|
-| `check_workflow_budget` | OPEN (skip check, log warning) | silent post-hoc correction in `/track` events via `cost_correction_applied=true` | `NULLRUN_SKIP_BUDGET_CHECK=1` — **full billing bypass**, not just check bypass (see docstring WARNING) |
-| `check_control_plane` | OPEN (treat state as `Normal`) | deferred enforcement — next WS-push or `/status` poll sees the true state | none |
-| `_enforce_sensitive_tool` (default `_fallback_mode=permissive`) | CLOSED — body MUST NOT run when `decision_source` is any `FALLBACK_*` | n/a (body did not run) | `NULLRUN_SENSITIVE_FAIL_OPEN=1` — explicitly documented as "OPEN-when-engine-unavailable" |
-| `_enforce_sensitive_tool` (`_fallback_mode=strict`) | CLOSED — transport returns `decision=block, decision_source=FALLBACK_*` | n/a | none |
-| `_emit_span_start` / `_emit_span_end` | n/a — never blocks | n/a | n/a |
+| `check_workflow_budget` | OPEN (skip check, log warning) | silent post-hoc correction in `/track` events via `cost_correction_applied=true` | `NULLRUN_SKIP_BUDGET_CHECK=1` -- **full billing bypass**, not just check bypass (see docstring WARNING) |
+| `check_control_plane` | OPEN (treat state as `Normal`) | deferred enforcement -- next WS-push or `/status` poll sees the true state | none |
+| `_enforce_sensitive_tool` (default `_fallback_mode=permissive`) | CLOSED -- body MUST NOT run when `decision_source` is any `FALLBACK_*` | n/a (body did not run) | `NULLRUN_SENSITIVE_FAIL_OPEN=1` -- explicitly documented as "OPEN-when-engine-unavailable" |
+| `_enforce_sensitive_tool` (`_fallback_mode=strict`) | CLOSED -- transport returns `decision=block, decision_source=FALLBACK_*` | n/a | none |
+| `_emit_span_start` / `_emit_span_end` | n/a -- never blocks | n/a | n/a |
 
 The "Opt-out" column makes it explicit that `NULLRUN_SKIP_BUDGET_CHECK=1`
 is a **different category** of action than
@@ -32,28 +32,23 @@ for the full rules, including transport error classification
 """
 
 import asyncio
-import functools
 import logging
 import os
 import threading
 import time
 import uuid
-from collections import OrderedDict, defaultdict, deque
-from collections.abc import MutableMapping
-from dataclasses import dataclass, field
-from typing import Any, Optional, TypeVar
+from collections import defaultdict, deque
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any, Optional
 
 import httpx
 
 from nullrun.actions import ActionHandler, ActionType
 from nullrun.breaker.exceptions import (
     BreakerError,
-    CostLimitExceeded,
-    LoopDetectedException,
     NullRunAuthenticationError,
     NullRunBlockedException,
-    RetryStormException,
-    WorkflowKilledException,
     WorkflowKilledInterrupt,
     WorkflowPausedException,
 )
@@ -66,42 +61,14 @@ from nullrun.context import (
     get_trace_id,
     get_workflow_id,
 )
-from nullrun.decision_history import DecisionHistoryRecorder
-from nullrun.grpc_transport import GrpcTransport, create_grpc_transport
 from nullrun.observability import metrics
-from nullrun.transport import DecisionSource, FallbackMode, FlushConfig, Transport
-
-KT = TypeVar("KT")
-VT = TypeVar("VT")
-
-
-class BoundedDict(OrderedDict, MutableMapping[KT, VT]):
-    """
-    Thread-safe dict with size limit. Evicts oldest entry on overflow (FIFO).
-
-    Used for _workflow_costs, _loop_counts, _retry_counts to prevent unbounded
-    memory growth during long-running SDK sessions.
-    """
-
-    def __init__(self, maxsize: int = 10_000) -> None:
-        self._maxsize = maxsize
-        super().__init__()
-
-    def __setitem__(self, key: KT, value: VT) -> None:  # type: ignore[override]
-        if key not in self and len(self) >= self._maxsize:
-            self.popitem(last=False)
-        super().__setitem__(key, value)
-
-    def __repr__(self) -> str:
-        return f"BoundedDict(maxsize={self._maxsize}, len={len(self)})"
-
-
-@dataclass
-class LocalDecision:
-    """Decision from local check (no network round-trip)."""
-    allowed: bool
-    reason: str = None
-    suggestion: str = None
+from nullrun.transport import (
+    DecisionSource,
+    FallbackMode,
+    FlushConfig,
+    Transport,
+    TransportErrorSource,
+)
 
 
 class LoopTracker:
@@ -195,43 +162,21 @@ class RateTracker:
 
 
 @dataclass
-class CheckDecision:
-    """
-    Decision returned from check_before_llm/check_before_tool.
-
-    This is the non-exception-based API for pre-execution checks.
-    """
-    decision: str  # "allow", "block", "throttle"
-    reservation_id: str | None
-    remaining_budget_cents: int
-    projected_cost_cents: int
-    explanations: list[str]
-    suggestions: list[str]
-
-    def is_allowed(self) -> bool:
-        return self.decision == "allow"
-
-    def is_blocked(self) -> bool:
-        return self.decision == "block"
-
-    def is_throttled(self) -> bool:
-        return self.decision == "throttle"
-
-
-@dataclass(frozen=True)
-class TrackResult:
-    """Result of a track() call."""
+class LocalDecision:
+    """Decision from local check (no network round-trip)."""
     allowed: bool
-    actions: list[str] = field(default_factory=list)
-    local_cost_cents: int = 0
-    blocked_reason: str | None = None
-    policy_id: str | None = None
-
-    def __bool__(self) -> bool:
-        return self.allowed
+    reason: str = None
+    suggestion: str = None
 
 
 logger = logging.getLogger(__name__)
+
+# Phase 0.3.1: sentinel used when a gate fires outside a
+# ``with workflow(...)`` context. The double-underscore prefix
+# namespacing avoids collision with a user workflow that happens
+# to be named ``<unknown>`` (the previous literal was a
+# collision hazard). Wire compat: still a string.
+UNKNOWN_WORKFLOW_ID: str = "__nullrun_unknown__"
 
 
 @dataclass
@@ -302,6 +247,7 @@ class NullRunRuntime:
         secret_key: str | None = None,
         api_url: str = "https://api.nullrun.io",
         policy: Policy | None = None,
+        fallback_mode: str | None = None,
         debug: bool = False,
         _test_mode: bool = False,
         polling: bool = True,
@@ -355,7 +301,7 @@ class NullRunRuntime:
             raise NullRunAuthenticationError(
                 "NullRunRuntime() requires an api_key. Pass api_key='nr_live_...' "
                 "or set NULLRUN_API_KEY. (Silent no-op fallback was removed "
-                "in 0.3.0 — see CHANGELOG.)"
+                "in 0.3.0 -- see CHANGELOG.)"
             )
         # organization_id is set by _authenticate(); stays None until then.
         self.organization_id: str | None = None
@@ -363,25 +309,53 @@ class NullRunRuntime:
         # key's binding (organization_api_keys.workflow_id). Used as a
         # fallback for /check, /status, and span events when the user
         # hasn't entered a `with workflow(...)` context. None on legacy
-        # keys (pre-139 or never used) — call sites must NOT invent one.
+        # keys (pre-139 or never used) -- call sites must NOT invent one.
         self.workflow_id: str | None = None
 
         self._test_mode = _test_mode
         self.polling = polling
 
         self._policy: Policy | None = policy
-        self._fallback_mode = "PERMISSIVE"
+        # Sprint 3.2: prefer the typed ``on_transport_error`` parameter
+        # over the legacy string ``fallback_mode`` parameter. The
+        # legacy string (and its NULLRUN_FALLBACK_MODE env var) is
+        # still honoured for one minor version, with a one-time
+        # ``DeprecationWarning`` so operators see the migration path.
+        fb_raw = fallback_mode
+        if fb_raw is None and os.environ.get("NULLRUN_FALLBACK_MODE"):
+            # Legacy env var: emit a one-time deprecation warning
+            # at construction. After Sprint 3.2 the env var
+            # continues to work (so existing deployments don't
+            # break) but the user is told to migrate to
+            # ``on_transport_error`` on ``Transport.execute()``.
+            import warnings as _w
+            _w.warn(
+                "NULLRUN_FALLBACK_MODE is deprecated. Pass "
+                "``on_transport_error=`` to ``Transport.execute()`` "
+                "instead (one of 'raise' | 'open' | 'closed'). "
+                "The env var will be removed in 0.5.0.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            fb_raw = os.environ.get("NULLRUN_FALLBACK_MODE", "permissive")
+        fb_upper = str(fb_raw).upper() if fb_raw is not None else "PERMISSIVE"
+        if fb_upper == "STRICT":
+            self._fallback_mode = FallbackMode.STRICT
+        elif fb_upper == "CACHED":
+            self._fallback_mode = FallbackMode.CACHED
+        else:
+            self._fallback_mode = FallbackMode.PERMISSIVE
         self._timeout = 30
         self._max_retries = 3
         self._debug = debug
         self._transport: Transport | None = None
-        self._grpc_transport: GrpcTransport | None = None
 
         # Local enforcement state
-        # PER-WORKFLOW cost tracking - was a global counter before (BUG)
-        self._workflow_costs: BoundedDict = BoundedDict(maxsize=10_000)
-        self._loop_counts: BoundedDict = BoundedDict(maxsize=10_000)
-        self._retry_counts: BoundedDict = BoundedDict(maxsize=10_000)
+        # Phase 0.3.1: the BoundedDict-based per-workflow cost /
+        # loop / retry counters have been removed alongside
+        # ``_check_local_limits``. The local loop / rate checks
+        # (``_loop_tracker`` / ``_rate_tracker`` below) are
+        # independent and stay -- they do not depend on cost.
         self._workflow_start_time: float = time.time()
 
         # Local loop and rate tracking (for _local_check in track())
@@ -396,17 +370,44 @@ class NullRunRuntime:
         from nullrun.instrumentation.auto import make_dedup_state
         self._seen_track_fingerprints = make_dedup_state()
 
+        # Per ADR-008 the SDK does not track local cost. The two response
+        # fields below are kept in the return shape for backwards
+        # compatibility with 0.3.x callers but always read 0. The previous
+        # implementation read from `self._workflow_costs` (a BoundedDict
+        # removed in 0.3.1) which left `track()` raising AttributeError on
+        # first call.
+        self._local_cost_cents_estimate: int = 0
+
         # Default thresholds for local check (Phase 1 - hardcoded, not from backend)
         self._local_loop_threshold = 6
         self._local_rate_limit = 1000  # calls per minute
 
+        # Coverage counters (Phase 3 of the production-readiness plan).
+        # The instrumentation layer in `nullrun.instrumentation.auto`
+        # calls ``_safe_bump_coverage(runtime, "_coverage_seen" /
+        # "_coverage_tracked" / "_coverage_streaming_skipped", host)``
+        # so the dashboard can show "which LLM hosts the SDK is
+        # seeing vs. successfully tracking". Previous versions
+        # relied on ``_safe_bump_coverage`` to no-op when these
+        # attributes were missing -- the dashboard's coverage tab
+        # was always empty.
+        self._coverage_seen: dict[str, int] = {}
+        self._coverage_tracked: dict[str, int] = {}
+        self._coverage_streaming_skipped: dict[str, int] = {}
+
         # Remote control plane state (per-workflow, pushed from server via WS).
-        # Unified model: effective_state = max(local_state, remote_state)
+        # Unified model: effective_state = max(local_state, remote_state).
+        # All writes and reads go through the `_remote_state_for` /
+        # `_set_remote_state` helpers (Phase 5 #5.1) so the WS callback,
+        # the HTTP poll, and the gate check can run concurrently
+        # without a TOCTOU race. RLock because the same thread can
+        # re-enter via the gate's get-then-set sequence.
         self._remote_states: dict[str, dict[str, Any]] = {}
+        self._states_lock = threading.RLock()
 
         # Phase B: control plane transport. The SDK connects to the server's
         # WS endpoint and receives state push events (killed/paused) within
-        # ~100ms of the operator action — vs the previous 1s HTTP poll.
+        # ~100ms of the operator action -- vs the previous 1s HTTP poll.
         # The HTTP poll path is preserved as a fallback when
         # `NULLRUN_TRANSPORT=http` is set (env var defaults to `ws`).
         self._transport_mode: str = os.getenv("NULLRUN_TRANSPORT", "ws").lower()
@@ -414,16 +415,12 @@ class NullRunRuntime:
         self._ws_stop_event = threading.Event()
         self._ws_connection: Any = None  # WebSocketConnection; typed loosely to avoid import cycle
         self._ws_loop: Any = None  # asyncio loop running in the WS thread
-        # Legacy HTTP-poll state — only used when transport mode is `http`.
+        # Legacy HTTP-poll state -- only used when transport mode is `http`.
         self._poll_thread: threading.Thread | None = None
         self._poll_running = False
 
         # Action handling
         self._action_handler: ActionHandler | None = None
-
-        # Local decision-history recorder
-        self._recorder: DecisionHistoryRecorder | None = None
-        self._is_recording = False
 
         # Initialize transport FIRST (before auth/policy) so we can reuse its client
         # Transport will be started later after auth/policy succeed
@@ -437,16 +434,16 @@ class NullRunRuntime:
             ),
         )
 
-        # P2: Try to initialize gRPC transport for high-performance event ingestion
-        # gRPC uses binary protobuf + HTTP/2 for 30-50% overhead reduction vs REST/JSON
+        # Note: a gRPC transport was prototyped in earlier SDK versions but the
+        # gRPC server at the platform is intentionally frozen until the
+        # activation checklist (TLS, auth, proto extensions, cost pipeline
+        # parity, tests) is complete. The SDK no longer attempts to construct
+        # a gRPC client. NULLRUN_USE_GRPC is a silent no-op.
         if os.getenv("NULLRUN_USE_GRPC"):
-            self._grpc_transport = create_grpc_transport(
-                api_key=self.api_key,
+            logger.info(
+                "NULLRUN_USE_GRPC is set but the gRPC transport is not "
+                "implemented in this SDK version; falling back to HTTP."
             )
-            if self._grpc_transport:
-                logger.info("gRPC transport initialized for high-performance event ingestion")
-            else:
-                logger.warning("NULLRUN_USE_GRPC is set but gRPC transport could not be initialized (proto files may be missing)")
 
         # Initialize
         if self._test_mode:
@@ -472,9 +469,6 @@ class NullRunRuntime:
 
         # Initialize action handler
         self._action_handler = ActionHandler()
-
-        # Initialize local decision-history recorder
-        self._recorder = DecisionHistoryRecorder(runtime=self)
 
         # Phase 1.4: Sensitive tools that require strict mode (pre-execution enforcement)
         # These tools MUST go through /execute endpoint, NOT direct execution
@@ -509,14 +503,7 @@ class NullRunRuntime:
         }
         self._strict_mode_tools: set[str] = set()
 
-        # Convert fallback_mode string to FallbackMode enum
-        fallback_mode_upper = self._fallback_mode.upper()
-        if fallback_mode_upper == "STRICT":
-            self._fallback_mode = FallbackMode.STRICT
-        elif fallback_mode_upper == "CACHED":
-            self._fallback_mode = FallbackMode.CACHED
-        else:
-            self._fallback_mode = FallbackMode.PERMISSIVE
+
 
         logger.info(
             f"NullRun Runtime initialized: "
@@ -526,27 +513,27 @@ class NullRunRuntime:
 
     @classmethod
     def get_instance(cls) -> "NullRunRuntime":
-        """Get the singleton runtime instance."""
-        if cls._instance is None:
-            with cls._lock:
-                if cls._instance is None:
-                    # Re-read env vars at creation time to ensure we have latest values
-                    api_key = os.getenv("NULLRUN_API_KEY")
-                    api_url = os.getenv("NULLRUN_API_URL", "https://api.nullrun.io")
-                    cls._instance = cls(
-                        api_key=api_key,
-                        api_url=api_url,
-                    )
-        else:
-            # P6: Check if credentials have changed since last initialization
-            # If so, reset and re-authenticate to prevent stale session issues
-            current_api_key = os.getenv("NULLRUN_API_KEY")
-            current_api_url = os.getenv("NULLRUN_API_URL", "https://api.nullrun.io")
-            existing = cls._instance
+        """Get the singleton runtime instance.
 
-            # Check if key or URL changed
-            key_changed = current_api_key != existing.api_key
-            url_changed = current_api_url != existing.api_url
+        Thread-safe: the singleton lock is held for the full read-compare-
+        rebuild sequence (Phase 5 #5.3). The previous version dropped the
+        lock between shutdown and the recursive get_instance(), creating a
+        window where a concurrent caller could observe a half-shutdown
+        runtime.
+        """
+        with cls._lock:
+            # Re-read env vars at every call site so credential rotation
+            # is observed on the next get_instance() invocation.
+            api_key = os.getenv("NULLRUN_API_KEY")
+            api_url = os.getenv("NULLRUN_API_URL", "https://api.nullrun.io")
+
+            if cls._instance is None:
+                cls._instance = cls(api_key=api_key, api_url=api_url)
+                return cls._instance
+
+            existing = cls._instance
+            key_changed = api_key != existing.api_key
+            url_changed = api_url != existing.api_url
 
             if key_changed or url_changed:
                 logger.info(
@@ -554,11 +541,10 @@ class NullRunRuntime:
                     f"api_url={'changed' if url_changed else 'unchanged'} - reinitializing"
                 )
                 existing.shutdown()
-                cls._instance = None
-                # Recurse to create fresh instance with new credentials
-                return cls.get_instance()
+                cls._instance = cls(api_key=api_key, api_url=api_url)
+                return cls._instance
 
-        return cls._instance
+            return cls._instance
 
     @classmethod
     def reset_instance(cls) -> None:
@@ -598,12 +584,31 @@ class NullRunRuntime:
                 self.organization_id = org_id
 
                 # Phase 139+: pick up the workflow this key is bound to.
-                # `None` on legacy keys (pre-139 or never-used) — call
+                # `None` on legacy keys (pre-139 or never-used) -- call
                 # sites that NEED a workflow (check_workflow_budget,
                 # check_control_plane, span events) will fall through to
                 # the contextvar when self.workflow_id is None, exactly
                 # like before. New keys always have this set.
                 self.workflow_id = data.get("workflow_id")
+
+                # Phase 0.3.1: pre-Phase-139 API keys do not return
+                # workflow_id, so the SDK cannot honour the
+                # dashboard's KILL/PAUSE for that workflow. Emit a
+                # one-time WARNING so the operator knows to rotate
+                # the key. Without this, the kill switch silently
+                # no-ops (a real safety hole for legacy users).
+                if self.workflow_id is None:
+                    masked_key = (
+                        (self.api_key[:8] + "***")
+                        if self.api_key and len(self.api_key) >= 8
+                        else "***"
+                    )
+                    logger.warning(
+                        f"API key {masked_key!s} is a legacy key with no "
+                        f"workflow binding; remote kill/pause will not be "
+                        f"honoured. Rotate to a Phase 139+ key in the "
+                        f"dashboard to enable control plane enforcement."
+                    )
 
                 # Handle key rotation: server may return new key_version and secret_key
                 # This allows seamless secret key rotation without downtime
@@ -737,7 +742,7 @@ class NullRunRuntime:
             finally:
                 self._ws_loop.close()
                 self._ws_loop = None
-        except Exception as e:  # noqa: BLE001 — background thread, must never die silently
+        except Exception as e:  # noqa: BLE001 -- background thread, must never die silently
             logger.warning(f"WS control plane thread exited: {e}")
         finally:
             self._ws_connection = None
@@ -764,12 +769,12 @@ class NullRunRuntime:
                 if not workflow_id:
                     logger.debug("WS state message missing workflow_id: %s", state)
                     return
-                self._remote_states[workflow_id] = {
+                self._set_remote_state(workflow_id, {
                     "state": state.get("state", "Normal"),
                     "version": state.get("version", 0),
                     "reason": state.get("reason"),
                     "updated_at": state.get("updated_at", 0),
-                }
+                })
                 logger.debug(
                     "WS state push: workflow=%s state=%s reason=%s",
                     workflow_id,
@@ -830,41 +835,70 @@ class NullRunRuntime:
         Resolve the effective workflow_id for /check, /status, and span
         events. Order of precedence:
 
-          1. `explicit` — passed by the call site (e.g. contextvar in
+          1. `explicit` -- passed by the call site (e.g. contextvar in
              track_event or the user-supplied arg in check_control_plane)
-          2. `self.workflow_id` — bound to the API key by the server
+          2. `self.workflow_id` -- bound to the API key by the server
              (Phase 139+). Set during _authenticate(). None on legacy
              keys.
-          3. None — caller is in cloud mode but has no workflow scope.
+          3. None -- caller is in cloud mode but has no workflow scope.
              /check falls through to org-level policy; /status is
              skipped; span events are emitted without workflow_id
              (orphan, as before).
 
         The SDK does NOT auto-generate a workflow_id. The Phase 139
-        invariant — workflow is derived server-side from the key, never
-        invented by the SDK — is preserved.
+        invariant -- workflow is derived server-side from the key, never
+        invented by the SDK -- is preserved.
         """
         if explicit:
             return explicit
         return self.workflow_id
 
+    def _remote_state_for(self, workflow_id: str) -> dict[str, Any]:
+        """Return the cached remote state for `workflow_id` (Phase 5 #5.1).
+
+        Thread-safe via `_states_lock`. If no state has been pushed
+        yet, returns an empty dict (so callers can do
+        ``state.get("state", "Normal")`` without an extra check).
+        """
+        with self._states_lock:
+            st = self._remote_states.get(workflow_id)
+            if st is None:
+                st = {}
+                self._remote_states[workflow_id] = st
+            return st
+
+    def _set_remote_state(self, workflow_id: str, state: dict[str, Any]) -> None:
+        """Atomically replace the cached remote state for `workflow_id`."""
+        with self._states_lock:
+            self._remote_states[workflow_id] = dict(state)
+
     def _fetch_remote_state(self, workflow_id: str) -> None:
-        """Fetch remote state for a specific workflow from /status endpoint."""
+        """Fetch remote state for a specific workflow from /status endpoint.
+
+        Phase 5 #5.5: route through ``self._transport._client`` so the
+        shared connection pool, retry policy, and circuit breaker
+        apply. The previous raw ``httpx.get`` call created a fresh
+        connection every time and bypassed the CB.
+        """
         try:
-            response = httpx.get(
+            response = self._transport._client.get(
                 f"{self.api_url}/api/v1/status/{workflow_id}",
                 headers=self._auth_headers(),
                 timeout=5.0,
             )
             if response.status_code == 200:
                 data = response.json()
-                self._remote_states[workflow_id] = {
+                self._set_remote_state(workflow_id, {
                     "state": data.get("state", "Normal"),
                     "version": data.get("version", 0),
                     "reason": data.get("reason"),
                     "updated_at": data.get("updated_at", 0),
-                }
-                logger.debug(f"Remote state for {workflow_id}: {self._remote_states[workflow_id]}")
+                })
+                logger.debug(
+                    "Remote state for %s: %s",
+                    workflow_id,
+                    self._remote_state_for(workflow_id),
+                )
         except Exception as e:
             logger.debug(f"Failed to fetch remote state for {workflow_id}: {e}")
 
@@ -880,7 +914,7 @@ class NullRunRuntime:
             WorkflowKilledInterrupt: If workflow is killed on server
         """
         # Phase 139+: prefer the explicit arg (contextvar-supplied), fall
-        # back to the API key's bound workflow. None on legacy keys —
+        # back to the API key's bound workflow. None on legacy keys --
         # in that case there's no workflow to check, so we no-op
         # (preserves pre-139 behavior for keys that have never been
         # workflow-bound).
@@ -890,11 +924,14 @@ class NullRunRuntime:
         workflow_id = resolved
 
         # Ensure we have the latest remote state
-        if workflow_id not in self._remote_states:
+        # Phase 5 #5.1: use the lock-protected getter so a concurrent
+        # WS push can't drop the state between the membership check
+        # and the read.
+        remote_state = self._remote_state_for(workflow_id)
+        if not remote_state:
             # Fetch synchronously if not in cache yet
             self._fetch_remote_state(workflow_id)
-
-        remote_state = self._remote_states.get(workflow_id, {})
+            remote_state = self._remote_state_for(workflow_id)
         state = remote_state.get("state", "Normal")
 
         if state == "Paused":
@@ -916,6 +953,9 @@ class NullRunRuntime:
         before the wrapped function runs, so a workflow with no remaining
         budget never gets to spend tokens.
 
+        Sprint 3.1: bumps the ``check_calls`` metric so the dashboard
+        can show the rate of pre-flight budget checks.
+
         Decision → exception mapping:
             "block"   → WorkflowKilledInterrupt   (hard policy / reservation error)
             "throttle"→ WorkflowPausedException   (insufficient budget, can resume)
@@ -923,7 +963,7 @@ class NullRunRuntime:
 
         Fail-OPEN: any transport error (network, timeout, 5xx) is logged
         at warning level and the caller proceeds. This mirrors the
-        pattern in `check_control_plane` — a transient backend outage
+        pattern in `check_control_plane` -- a transient backend outage
         must never freeze the user's agent. The /track fast path also
         does not gate on budget, so the worst case under /gate failure
         is that we revert to the pre-C behaviour: budget enforcement is
@@ -931,7 +971,7 @@ class NullRunRuntime:
 
         Uses `estimated_tokens=1` (the minimum the API accepts). Goal
         is the binary question "is there any budget left?", not cost
-        prediction — the backend recomputes the authoritative cost on
+        prediction -- the backend recomputes the authoritative cost on
         /track from the real token count.
 
         Opt-out: set `NULLRUN_SKIP_BUDGET_CHECK=1` to disable the
@@ -943,12 +983,18 @@ class NullRunRuntime:
             logger.debug("check_workflow_budget: skipped via NULLRUN_SKIP_BUDGET_CHECK=1")
             return
 
+        # Sprint 3.1 (B23): bump the ``check_calls`` counter so the
+        # dashboard can show the rate of pre-flight budget checks
+        # and the operator can verify the pre-flight is actually
+        # running (not silently always-skipped).
+        metrics.inc_runtime("check_calls")
+
         from nullrun.context import get_workflow_id
 
         # Phase 139+: prefer the user-set contextvar (explicit `with
         # workflow(...)` block), fall back to the API key's bound
         # workflow. Returns None only on legacy keys that have never
-        # been workflow-bound — in that case the check is silently
+        # been workflow-bound -- in that case the check is silently
         # skipped, exactly as before this change.
         workflow_id = self._resolve_workflow_id(get_workflow_id())
         if not workflow_id:
@@ -972,8 +1018,31 @@ class NullRunRuntime:
             return
 
         decision = response.get("decision", "allow")
+        decision_source = response.get("decision_source", DecisionSource.GATEWAY)
+        # Round 3 (Phase 0.4.0): only fail-OPEN on EXPLICIT synthetic
+        # responses (decision_source starts with "fallback" or is one
+        # of the classified TransportErrorSource values). Real
+        # backend decisions (decision_source="gateway", or missing,
+        # for backward compat) are honoured.
+        if decision_source.startswith("fallback") or decision_source in {
+            TransportErrorSource.NETWORK_ERROR,
+            TransportErrorSource.GATEWAY_ERROR,
+            TransportErrorSource.BREAKER_OPEN,
+            TransportErrorSource.AUTH_ERROR,
+        }:
+            logger.debug(
+                f"check_workflow_budget: synthetic decision_source="
+                f"{decision_source!r}, treating as transport error"
+            )
+            return
         if decision == "block":
             reasons = response.get("explanations") or ["block"]
+            # Sprint 3 follow-up (B23): bump ``cost_limit_exceeded``
+            # when the pre-flight blocks the workflow. The counter
+            # is the operator's primary signal for "the budget
+            # cap is biting" — distinct from loop / retry / rate
+            # which have their own counters.
+            metrics.inc_runtime("cost_limit_exceeded")
             raise WorkflowKilledInterrupt(
                 workflow_id=workflow_id,
                 reason="; ".join(reasons),
@@ -997,7 +1066,10 @@ class NullRunRuntime:
         # Stop the HTTP poller (legacy path) if it was started.
         self._poll_running = False
         if self._poll_thread and self._poll_thread.is_alive():
-            self._poll_thread.join(timeout=2.0)
+            # Phase 6 #6.3: cap to 0.5s (was 2.0s) so a SIGTERM
+            # handler returns quickly. The HTTP-poll is best-effort
+            # and the WS push channel is the authoritative source.
+            self._poll_thread.join(timeout=0.5)
 
         # Stop the WS control plane listener (Phase B). Closing the
         # connection causes the receive task to unblock, the loop to
@@ -1011,7 +1083,7 @@ class NullRunRuntime:
             except Exception as e:
                 logger.debug(f"WS close on shutdown failed (best-effort): {e}")
         if self._ws_thread and self._ws_thread.is_alive():
-            self._ws_thread.join(timeout=2.0)
+            self._ws_thread.join(timeout=0.5)
 
         if self._transport:
             self._transport.stop()
@@ -1046,7 +1118,7 @@ class NullRunRuntime:
                    - metadata: dict (optional)
 
         Note:
-            `cost_cents` is NOT a valid event key — the SDK does not
+            `cost_cents` is NOT a valid event key -- the SDK does not
             estimate cost. The backend computes it from tokens + the
             organization's policy.
 
@@ -1058,10 +1130,14 @@ class NullRunRuntime:
             - blocked_reason: str (if blocked locally)
             - blocked_suggestion: str (if blocked locally)
 
-        Raises:
-            CostLimitExceeded: If local policy limit exceeded
-            LoopDetectedException: If loop detected
-            RetryStormException: If retry storm detected
+        Note:
+            Local block reasons (loop detected, retry storm, rate
+            limit, cost limit) are reported via the returned dict's
+            ``blocked`` / ``blocked_reason`` / ``blocked_suggestion``
+            fields rather than by raising an exception. The
+            exception-raising variants of these conditions were
+            removed in 0.4.0 because they had no in-tree callers;
+            see ``nullrun.breaker.exceptions`` for the list.
         """
         logger.debug(f"Tracking event: {event.get('event_type', 'unknown')}")
 
@@ -1077,9 +1153,7 @@ class NullRunRuntime:
                 return {
                     "allowed": True,
                     "actions": [],
-                    "local_cost_cents": self._workflow_costs.get(
-                        event.get("workflow_id") or "", 0
-                    ),
+                    "local_cost_cents": self._local_cost_cents_estimate,
                     "deduped": True,
                 }
 
@@ -1110,49 +1184,44 @@ class NullRunRuntime:
             enriched.get("tokens"),
         )
 
-        # Record to local session if active
-        if self._is_recording and self._recorder:
-            self._recorder.record_event(enriched)
-
         # Register workflow for remote state polling. workflow_id
-        # may be None on legacy keys — that's fine, the no-op
+        # may be None on legacy keys -- that's fine, the no-op
         # branch in check_control_plane will skip polling.
         workflow_id = enriched.get("workflow_id")
-        if workflow_id and workflow_id not in self._remote_states:
-            self._remote_states[workflow_id] = {}
+        if workflow_id:
+            with self._states_lock:
+                self._remote_states.setdefault(workflow_id, {})
 
-        # Local policy enforcement (BEFORE sending)
-        if self._policy:
-            self._check_local_limits(enriched)
+        # Phase 0.3.1: the local cost / loop / retry-storm check
+        # (``_check_local_limits``) has been removed. It read
+        # ``event.get("cost_cents", 0)`` and accumulated into a
+        # per-workflow counter, but ``track_llm`` /
+        # ``track_tool`` / ``track_event`` never set ``cost_cents``
+        # (the SDK does not estimate cost -- the backend does). The
+        # local check therefore never fired for the public API
+        # and silently drifted from the backend's authoritative
+        # cost. The local loop / rate checks (``_local_check``)
+        # are independent and stay -- they do not depend on cost.
+        # Budget enforcement is now exclusively the backend's
+        # job: ``check_workflow_budget`` (pre-flight) + the
+        # server-side /track cost ledger reconciliation.
 
         # Check remote control plane (after local enforcement)
         # This catches server-initiated pause/kill. Resolves
         # contextvar → self.workflow_id → no-op (legacy keys).
         self.check_control_plane(workflow_id)
 
-        # Buffer for transport - use gRPC if available for better performance
-        if self._grpc_transport:
-            # gRPC path: direct send for lowest latency
-            try:
-                self._grpc_transport.track(
-                    event_id=enriched.get("event_id", ""),
-                    workflow_id=enriched.get("workflow_id", ""),
-                    tokens=enriched.get("tokens", 0),
-                    tool_name=enriched.get("tool_name"),
-                    is_retry=enriched.get("is_retry", False),
-                    event_type=enriched.get("event_type", ""),
-                )
-            except Exception as e:
-                logger.warning(f"gRPC track failed, falling back to HTTP: {e}")
-                wire_event = {k: v for k, v in enriched.items() if k != "cost_cents"}
-                self._transport.track(wire_event)
-        else:
-            # The wire payload must NOT include cost_cents — the SDK
-            # does not estimate cost. The backend recomputes it from
-            # tokens + the org's policy. Local budget enforcement
-            # already ran on the original event dict above.
-            wire_event = {k: v for k, v in enriched.items() if k != "cost_cents"}
-            self._transport.track(wire_event)
+        # Buffer for transport. The wire payload must NOT include
+        # cost_cents -- the SDK does not estimate cost; the backend
+        # recomputes it from tokens + the org's policy. The
+        # sink-only ``_fingerprint`` field is also stripped before
+        # the wire send so the dedup key shape is not leaked to
+        # anyone with audit-log access.
+        wire_event = {
+            k: v for k, v in enriched.items()
+            if k not in ("cost_cents", "_fingerprint")
+        }
+        self._transport.track(wire_event)
 
         # Update metrics (thread-safe)
         metrics.inc_runtime("track_calls")
@@ -1160,7 +1229,7 @@ class NullRunRuntime:
         return {
             "allowed": True,
             "actions": [],
-            "local_cost_cents": self._workflow_costs.get(workflow_id, 0),
+            "local_cost_cents": self._local_cost_cents_estimate,
         }
 
     def _trigger_action(
@@ -1199,6 +1268,69 @@ class NullRunRuntime:
             True if tool requires strict mode
         """
         return tool_name in self._sensitive_tools or tool_name in self._strict_mode_tools
+
+    def coverage_report(self) -> dict[str, dict[str, int]]:
+        """
+        Snapshot of the LLM-host coverage counters that the auto-
+        instrumentation layer maintains. The SDK tracks three
+        counters per host:
+
+          - ``seen`` -- every LLM host the SDK observed a request to.
+          - ``tracked`` -- hosts whose response was successfully
+            extracted and emitted as an ``llm_call`` event.
+          - ``streaming_skipped`` -- hosts whose response was a
+            streaming SSE / ``stream=True`` and was deliberately
+            NOT buffered (so the user keeps their chunked read).
+
+        The same payload is sent over the WebSocket heartbeat every
+        60s and via the HTTP-fallback path when the WS connection
+        is down. The dashboard's coverage tab uses these counters
+        to surface "we know about this host but cannot track it" --
+        the leading indicator that an SDK upgrade is needed.
+
+        Returns:
+            ``{"seen": {...}, "tracked": {...},
+            "streaming_skipped": {...}}``. Each value is a fresh
+            ``dict`` so callers can mutate the result without
+            affecting the runtime's internal state.
+        """
+        return {
+            "seen": dict(self._coverage_seen),
+            "tracked": dict(self._coverage_tracked),
+            "streaming_skipped": dict(self._coverage_streaming_skipped),
+        }
+
+    def get_org_status(self, org_id: str | None = None) -> dict[str, Any]:
+        """Public helper for reading ``/api/v1/orgs/{org_id}/status``.
+
+        Phase 8 #8.1: routes through ``self._transport._client`` so
+        the shared connection pool, retry policy, and circuit breaker
+        apply. Used by ``examples/cost_dashboard.py``.
+
+        Args:
+            org_id: Optional organisation ID. Defaults to the runtime's
+                ``self.organization_id`` (set during ``_authenticate``).
+
+        Returns:
+            Parsed JSON dict of the org-status payload.
+
+        Raises:
+            NullRunAuthenticationError: if neither ``org_id`` nor
+                ``self.organization_id`` is available.
+            httpx.HTTPError: on transport failure.
+        """
+        resolved = org_id or self.organization_id
+        if not resolved:
+            raise NullRunAuthenticationError(
+                "get_org_status requires org_id (or a runtime bound to one)"
+            )
+        response = self._transport._client.get(
+            f"{self.api_url}/api/v1/orgs/{resolved}/status",
+            headers=self._auth_headers(),
+            timeout=10.0,
+        )
+        response.raise_for_status()
+        return response.json()  # type: ignore[no-any-return]
 
     def add_sensitive_tool(self, tool_name: str) -> None:
         """
@@ -1261,6 +1393,7 @@ class NullRunRuntime:
         tool_name: str,
         input_data: dict[str, Any],
         mode: str = "auto",
+        on_transport_error: Callable[[Exception], dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """
         Pre-execution policy evaluation via /execute endpoint.
@@ -1311,7 +1444,7 @@ class NullRunRuntime:
             }
 
         # Strict mode or sensitive tool: call /execute endpoint
-        # (no local_mode branch — api_key is now required, see T3-S2)
+        # (no local_mode branch -- api_key is now required, see T3-S2)
         result = self._transport.execute(
             organization_id=organization_id,
             execution_id=workflow_id,
@@ -1320,6 +1453,7 @@ class NullRunRuntime:
             input_data=input_data,
             mode=mode,
             fallback_mode=self._fallback_mode,
+            on_transport_error=on_transport_error,
         )
 
         # Update metrics (thread-safe)
@@ -1329,270 +1463,13 @@ class NullRunRuntime:
         if result.get("decision") == "block":
             metrics.inc_runtime("execute_blocked")
             raise NullRunBlockedException(
-                workflow_id=workflow_id or "<unknown>",
+                workflow_id=workflow_id or UNKNOWN_WORKFLOW_ID,
                 reason=result.get("explanation", "policy violation"),
                 tool_name=tool_name,
             )
 
         metrics.inc_runtime("execute_allowed")
         return result
-
-    def wrap_tool(self, tool_name: str, tool_fn: callable) -> callable:
-        """
-        Wrap a tool function with pre-execution enforcement.
-
-        The wrapped function will:
-        1. Call /execute before the tool runs
-        2. Raise NullRunBlockedException if blocked
-        3. Track the event after execution
-
-        Args:
-            tool_name: Name of the tool (for policy lookup)
-            tool_fn: The original tool function
-
-        Returns:
-            Wrapped function
-        """
-        @functools.wraps(tool_fn)
-        def wrapper(*args, **kwargs):
-            # Pre-execution check (raises if blocked)
-            input_data = {"args": args, "kwargs": kwargs}
-            self.execute(tool_name, input_data)
-
-            # Execute if allowed
-            output = tool_fn(*args, **kwargs)
-
-            # Post-execution tracking
-            self.track_tool(tool_name=tool_name)
-
-            return output
-        return wrapper
-
-    def wrap(self, tool_fn: callable) -> callable:
-        """
-        Wrap a tool function with NullRun protection.
-
-        Unlike wrap_tool, this uses the function name as the tool name.
-        Useful for wrapping any function without explicitly naming it.
-
-        Example:
-            db_query = runtime.wrap(original_db_query)
-            result = db_query("SELECT * FROM users")  # Auto-protected
-
-        Args:
-            tool_fn: The original tool function
-
-        Returns:
-            Wrapped function that auto-calls execute() before running
-        """
-        tool_name = tool_fn.__name__
-
-        @functools.wraps(tool_fn)
-        def wrapper(*args, **kwargs):
-            # Pre-execution check
-            input_data = {"args": args, "kwargs": kwargs}
-            result = self.execute(tool_name, input_data)
-
-            # Raise if blocked
-            if result.get("decision") == "block":
-                raise NullRunBlockedException(
-                    workflow_id=workflow_id or "<unknown>",
-                    reason=result.get("explanation", "policy violation"),
-                    tool_name=tool_name,
-                )
-
-            # Execute if allowed
-            output = tool_fn(*args, **kwargs)
-
-            # Post-execution tracking
-            self.track_tool(tool_name=tool_name)
-
-            return output
-        return wrapper
-
-    def check_before_llm(
-        self,
-        model: str,
-        estimated_tokens: int | None = None,
-        operation_name: str | None = None,
-    ) -> CheckDecision:
-        """
-        Pre-execution check for LLM calls.
-        Returns decision object - does NOT raise exception.
-
-        Args:
-            model: Model name (e.g., "gpt-4", "claude-3-opus")
-            estimated_tokens: Estimated token count (optional)
-            operation_name: Optional name for this operation
-
-        Returns:
-            CheckDecision with allow/block/throttle decision
-        """
-        event = {
-            "type": "llm_call",
-            "model": model,
-            "tokens": estimated_tokens or 0,
-            "check_type": "llm",
-        }
-        return self._check(event, operation_name)
-
-    def check_before_tool(
-        self,
-        tool_name: str,
-        operation_name: str | None = None,
-    ) -> CheckDecision:
-        """
-        Pre-execution check for tool calls.
-        Returns decision object - does NOT raise exception.
-
-        Args:
-            tool_name: Name of the tool to check
-            operation_name: Optional name for this operation
-
-        Returns:
-            CheckDecision with allow/block/throttle decision
-        """
-        event = {
-            "type": "tool_call",
-            "tool_name": tool_name,
-            "check_type": "tool",
-        }
-        return self._check(event, operation_name)
-
-    def enforce_check_before_llm(
-        self,
-        model: str,
-        estimated_tokens: int | None = None,
-        operation_name: str | None = None,
-    ) -> CheckDecision:
-        """
-        Strict mode: raises NullRunBlockedException if blocked.
-
-        Args:
-            model: Model name
-            estimated_tokens: Estimated token count (optional)
-            operation_name: Optional name for this operation
-
-        Returns:
-            CheckDecision if allowed
-
-        Raises:
-            NullRunBlockedException: If decision is "block"
-        """
-        decision = self.check_before_llm(model, estimated_tokens, operation_name)
-        if decision.is_blocked():
-            raise NullRunBlockedException(
-                workflow_id=get_workflow_id() or "<unknown>",
-                reason="; ".join(decision.explanations) or "policy violation",
-                tool_name=model,
-                reservation_id=decision.reservation_id,
-                suggestions=decision.suggestions,
-            )
-        return decision
-
-    def _check(self, event: dict[str, Any], operation_name: str | None) -> CheckDecision:
-        """
-        Internal check implementation for pre-execution checks.
-
-        Args:
-            event: Event dict with check_type, model, tool_name, tokens
-            operation_name: Optional operation name
-
-        Returns:
-            CheckDecision from the backend
-        """
-        from nullrun.context import get_workflow_id
-
-        organization_id = self.organization_id or "local"
-        execution_id = get_workflow_id()
-        operation_id = operation_name or str(uuid.uuid4())
-
-        # Build check request
-        check_req = {
-            "organization_id": organization_id,
-            "execution_id": execution_id,
-            "operation_id": operation_id,
-            "check_type": event.get("check_type", "llm"),
-            "model": event.get("model"),
-            "tool_name": event.get("tool_name"),
-            "estimated_tokens": event.get("tokens"),
-        }
-
-        # Call /api/v1/check endpoint via transport
-        response = self._transport.check(check_req)
-
-        return CheckDecision(
-            decision=response.get("decision", "block"),
-            reservation_id=response.get("reservation_id"),
-            remaining_budget_cents=response.get("remaining_budget_cents", 0),
-            projected_cost_cents=response.get("projected_cost_cents", 0),
-            explanations=response.get("explanations", []),
-            suggestions=response.get("suggestions", []),
-        )
-
-    def evaluate(
-        self,
-        tool_name: str,
-        context: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        """
-        Evaluate policies without executing a tool.
-
-        Useful for checking "what if" scenarios before running
-        an agent or to pre-validate tool permissions.
-
-        Args:
-            tool_name: Name of the tool to evaluate
-            context: Optional context dict with tool-specific parameters
-
-        Returns:
-            Dict with:
-                - decision: "allow" | "block" | "flag" | "pause" | "require_approval"
-                - decision_source: "gateway" | "cached" | "fallback" | "local"
-                - explanation: Human-readable explanation
-                - policy_version: Policy version used
-                - matched_rules: List of matching policy rules
-                - scores: Dict of rule_id -> score
-        """
-        from nullrun.context import get_trace_id, get_workflow_id
-
-        organization_id = self.organization_id or "local"
-        workflow_id = get_workflow_id()
-        trace_id = get_trace_id() or str(uuid.uuid4())
-
-        # Call /evaluate endpoint if available, otherwise fallback to /execute
-        # Use transport._client for connection pooling, retry, and circuit breaker
-        try:
-            response = self._transport._client.post(
-                f"{self.api_url}/api/v1/evaluate",
-                json={
-                    "organization_id": organization_id,
-                    "execution_id": workflow_id,
-                    "trace_id": trace_id,
-                    "tool": tool_name,
-                    "context": context or {},
-                },
-                headers=self._auth_headers(),
-                timeout=5.0,
-            )
-
-            if response.status_code == 200:
-                return response.json()  # type: ignore[no-any-return]
-
-        except httpx.RequestError:
-            pass
-
-        # Fallback: simulate evaluate response based on local policy
-        is_sensitive = self.is_sensitive_tool(tool_name)
-        return {
-            "decision": "allow" if not is_sensitive else "block",
-            "decision_source": DecisionSource.FALLBACK,
-            "explanation": "Evaluation endpoint unavailable",
-            "policy_version": 0,
-            "matched_rules": [],
-            "scores": {},
-            "allow_execution": not is_sensitive,
-        }
 
     def start_recording(self, workflow_id: str, metadata: dict[str, Any] = None) -> str:
         """
@@ -1605,9 +1482,14 @@ class NullRunRuntime:
         Returns:
             session_id for this recording
         """
-        self._is_recording = True
-        if self._recorder:
-            return self._recorder.start_recording(workflow_id, metadata)
+        # Sprint 2.1: local decision-history recorder was removed.
+        # This method is kept as a no-op stub for one minor
+        # version to avoid breaking callers that imported it. It
+        # will be deleted in the next release.
+        logger.debug(
+            "runtime.start_recording() is a no-op; "
+            "decision history moved to the backend dashboard."
+        )
         return ""
 
     def stop_recording(self):
@@ -1617,9 +1499,7 @@ class NullRunRuntime:
         Returns:
             The recorded session, or None if not recording
         """
-        self._is_recording = False
-        if self._recorder:
-            return self._recorder.stop_recording()
+        # Sprint 2.1: paired no-op stub for start_recording().
         return None
 
     def _enrich_event(self, event: dict[str, Any]) -> dict[str, Any]:
@@ -1628,7 +1508,7 @@ class NullRunRuntime:
 
         # Phase 139+: workflow_id from context, else from the API
         # key's binding (set in _authenticate). Stays unset on legacy
-        # keys — emitted events then carry no workflow_id (orphan, as
+        # keys -- emitted events then carry no workflow_id (orphan, as
         # before this change).
         if "workflow_id" not in enriched:
             wf_id = self._resolve_workflow_id(get_workflow_id())
@@ -1669,60 +1549,6 @@ class NullRunRuntime:
 
         return enriched
 
-    def _check_local_limits(self, event: dict[str, Any]) -> None:
-        """
-        Check local policy limits without network call.
-
-        This provides INSTANT enforcement with zero latency.
-        Raises specific exceptions and triggers actions.
-        """
-        cost_cents = event.get("cost_cents", 0)
-        tool_name = event.get("tool_name")
-        is_retry = event.get("is_retry", False)
-        workflow_id = event.get("workflow_id", "unknown")
-
-        # Update local cost (PER-WORKFLOW, not global)
-        current_cost = self._workflow_costs.get(workflow_id, 0)
-        new_cost = current_cost + cost_cents
-        self._workflow_costs[workflow_id] = new_cost
-
-        # Budget exceeded (per-workflow)
-        if new_cost > self.policy.budget_cents:
-            exc = CostLimitExceeded(
-                workflow_id=workflow_id,
-                cost=new_cost / 100.0,
-                limit=self.policy.budget_cents / 100.0,
-            )
-            self._trigger_action(ActionType.KILL, workflow_id, str(exc))
-            raise exc
-
-        # Loop detection (per-workflow, per-tool)
-        if self.policy.loop_detection_enabled and tool_name:
-            key = f"{workflow_id}:{tool_name}"
-            count = self._loop_counts.get(key, 0) + 1
-            self._loop_counts[key] = count
-            if count >= self.policy.loop_threshold:
-                exc = LoopDetectedException(
-                    workflow_id=workflow_id,
-                    tool_name=tool_name,
-                    count=count,
-                )
-                self._trigger_action(ActionType.KILL, workflow_id, str(exc))
-                raise exc
-
-        # Retry detection (per-workflow)
-        if self.policy.retry_detection_enabled and is_retry:
-            key = f"{workflow_id}:retries"
-            count = self._retry_counts.get(key, 0) + 1
-            self._retry_counts[key] = count
-            if count >= self.policy.retry_threshold:
-                exc = RetryStormException(
-                    workflow_id=workflow_id,
-                    count=count,
-                )
-                self._trigger_action(ActionType.KILL, workflow_id, str(exc))
-                raise exc
-
     def _local_check(self, event: dict[str, Any]) -> LocalDecision:
         """
         Local check BEFORE sending to backend.
@@ -1741,6 +1567,10 @@ class NullRunRuntime:
         # Check loop count (6 same tool calls in 60s window)
         loop_count = self._loop_tracker.count(tool_name, window=60)
         if loop_count >= self._local_loop_threshold:
+            # Sprint 3.1 (B23): bump the ``loop_detections`` counter
+            # so an SRE can alert on a sudden spike (often a sign
+            # of an agent stuck in a retry loop).
+            metrics.inc_runtime("loop_detections")
             return LocalDecision(
                 allowed=False,
                 reason="loop_detected",
@@ -1774,7 +1604,7 @@ class NullRunRuntime:
         Args:
             input_tokens:  Number of input / prompt tokens.
             output_tokens: Number of output / completion tokens. Defaults
-                to 0 — embeddings and reasoning-only calls have no
+                to 0 -- embeddings and reasoning-only calls have no
                 completion token count.
             model:         Model name, e.g. "gpt-4o-mini".
             latency_ms:    Request latency in milliseconds.
@@ -1789,7 +1619,7 @@ class NullRunRuntime:
             policy. Splitting prompt vs completion matters because most
             models price them differently.
         """
-        # Lazy import to keep the runtime import graph acyclic —
+        # Lazy import to keep the runtime import graph acyclic --
         # `nullrun.tracing` deliberately has no SDK-side dependencies.
         from nullrun.tracing import get_current_span
 
@@ -1809,7 +1639,7 @@ class NullRunRuntime:
         # Auto-tag the event with the active span so the backend can
         # render this call under the right node in the trace timeline.
         # If no @protect / manual set_span is active, span is None and
-        # the field is omitted — _enrich_event will fall back to the
+        # the field is omitted -- _enrich_event will fall back to the
         # loose contextvars or generate fresh IDs.
         span = get_current_span()
         if span is not None:
@@ -1830,7 +1660,7 @@ class NullRunRuntime:
     ) -> dict[str, Any]:
         """
         Track a tool call. Pulls the active SpanContext from contextvars
-        automatically — see `track_llm` for the rationale.
+        automatically -- see `track_llm` for the rationale.
 
         Args:
             tool_name:   Name of the tool called.
@@ -1887,10 +1717,21 @@ class NullRunRuntime:
         event = {"type": event_type, **kwargs}
         # Backend's SdkTrackRequest requires `tokens: u64` (non-Optional).
         # Span-lifecycle events (span_start / span_end) don't have a
-        # token count — they're bookkeeping, not consumption. Default
+        # token count -- they're bookkeeping, not consumption. Default
         # to 0 so the deserializer accepts the event; the cost
         # computation in the handler treats 0 tokens as no-op.
         event.setdefault("tokens", 0)
+        # Phase 3: emit a stable fingerprint so the dedup LRU at
+        # the track() sink can collapse repeat emissions of the
+        # same event (e.g. when the user calls track_event manually
+        # AND the httpx transport hook fires for the same LLM
+        # call). Field is stripped before wire send (see
+        # ``_strip_wire_only_fields``).
+        if "_fingerprint" not in event:
+            from nullrun.instrumentation.auto import (
+                _fingerprint_for_event_dict,
+            )
+            event["_fingerprint"] = _fingerprint_for_event_dict(event)
         return self.track(event)
 
 
@@ -1918,7 +1759,7 @@ def track(event: dict[str, Any]) -> dict[str, Any]:
     return get_runtime().track(event)
 
 
-# Phase 3.4: explicit alias for `track()` — same call signature, friendlier
+# Phase 3.4: explicit alias for `track()` -- same call signature, friendlier
 # name for users who reach for `track_event` first. Both names share the
 # same callable object, so `nullrun.track is nullrun.track_event` is True.
 track_event = track
@@ -1938,7 +1779,7 @@ def track_llm(
     Args:
         input_tokens:  Number of input / prompt tokens.
         output_tokens: Number of output / completion tokens. Defaults
-            to 0 — embeddings and reasoning-only calls have no
+            to 0 -- embeddings and reasoning-only calls have no
             completion token count.
         **kwargs: Forwarded to `NullRunRuntime.track_llm` (model,
             latency_ms, metadata).

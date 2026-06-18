@@ -32,6 +32,9 @@ RUN useradd -m -u 1000 nullrun
 USER nullrun
 
 # Install optional dependencies
-RUN pip install "nullrun-breaker[langgraph]"
+# Sprint 1.3 (B9): the previous `nullrun-breaker[langgraph]` package
+# does not exist in `pyproject.toml` (only `nullrun[langgraph]`).
+# Installing the non-existent package would make `docker build` fail.
+RUN pip install "nullrun[langgraph]"
 
 ENTRYPOINT ["python", "-m", "nullrun.breaker"]

@@ -9,7 +9,23 @@ we just need a duck-typed object with `.invoke` and `.stream`.
 import pytest
 
 from nullrun.instrumentation.langgraph import NullRunCallback
+from nullrun.runtime import NullRunRuntime
 from nullrun.toolbox.langgraph import wrapper
+
+
+@pytest.fixture(autouse=True)
+def _test_runtime(monkeypatch):
+    """Provide a runtime in test mode so get_runtime() returns without
+    authenticating against a real server."""
+    monkeypatch.setenv("NULLRUN_API_KEY", "test-key-12345678")
+    NullRunRuntime.reset_instance()
+    # Pre-build a test-mode singleton so get_runtime() returns it without
+    # hitting the network. Construct directly and store on the singleton
+    # slot so subsequent get_instance() calls return it.
+    rt = NullRunRuntime(api_key="test-key-12345678", _test_mode=True)
+    NullRunRuntime._instance = rt
+    yield
+    NullRunRuntime.reset_instance()
 
 
 class _FakeApp:

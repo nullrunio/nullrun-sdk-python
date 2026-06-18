@@ -1,44 +1,34 @@
 """
 NullRun Platform SDK.
 
-A unified SDK for NullRun AI Agent Safety Layer platform products.
-
-Phase 3.4: the curated public surface is six symbols — see `__all__` below.
-Everything else is reachable on demand via `from nullrun import X` for
-backward compatibility, but does NOT appear in `dir(nullrun)`. This keeps
-the SDK discoverable for the "track AI cost in 5 minutes" use case.
-
-T9 (0.3.0): the legacy Breaker exports (`BreakerError`, `CostLimitExceeded`,
-`ApprovalRequired`, `BreakerTimeout`, `Policy`, `FallbackMode`,
-`PoolConfig`) were removed from `_LAZY_EXPORTS`. They are still reachable
-via the canonical exception names (`NullRunBlockedException`,
-`WorkflowPausedException`, etc.) and the canonical policy/transport
-modules (`from nullrun.runtime import Policy`,
-`from nullrun.transport import FallbackMode, PoolConfig`). The
-`NullRunNoop` fallback and the `local_mode` field were also removed
-(T3-S2) — see CHANGELOG.
+Enforcement gateway client for AI agents. Curated 6-symbol surface:
+`init`, `protect`, `track_llm`, `track_tool`, `track_event`. Everything
+else is reachable on demand via `from nullrun import X` but does NOT
+appear in `dir(nullrun)`.
 
 Usage:
-    # Initialize at app startup
     import nullrun
-    nullrun.init(organization_id="org-123", api_key="your-key")
+    nullrun.init(api_key="nr_live_...")
 
-    # Wrap any function as a gate
     @nullrun.protect
-    def my_agent_step():
-        return call_llm(...)
+    def my_agent(query):
+        return call_llm(query)
 
-    # Manual cost tracking
-    nullrun.track_llm(input_tokens=80, output_tokens=20, model="gpt-4o")
-    nullrun.track_tool(tool_name="search", duration_ms=150)
-    nullrun.track_event({"type": "llm_call", "input_tokens": 80, "output_tokens": 20})
+See README.md for LangGraph, OpenAI Agents, llama-index, crewai, autogen
+auto-instrumentation; CHANGELOG.md for breaking changes between versions.
 """
 
 from __future__ import annotations
 
+import threading as _threading
+
 # Use lazy import inside __getattr__ instead of `import importlib` at
 # module top-level — keeps `dir(nullrun)` focused on the curated surface.
-from nullrun import __version__
+from nullrun.__version__ import __version__
+
+# Module-level lock that serialises the three singleton-slot writes
+# inside `init()`. See plan item B3.
+_init_lock = _threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Curated public surface (Phase 3.4)
@@ -115,30 +105,41 @@ def init(
 
     # Imported lazily so we don't pull the runtime into the namespace
     # when the user only wants the static helpers.
-    from nullrun.runtime import NullRunRuntime
-    import nullrun.runtime as _rt_mod
+    import threading as _threading
 
-    runtime = NullRunRuntime(
-        api_key=api_key,
-        api_url=api_url,
-        debug=debug,
-    )
-
-    # Register as the module-level singleton so `nullrun.track_llm` /
-    # `nullrun.track_tool` (which resolve via `get_runtime()`) and any
-    # other consumers reading the cached instance find *this* runtime —
-    # not whatever a previous test or stale env would otherwise produce.
-    _rt_mod._runtime = runtime
-    NullRunRuntime._instance = runtime
-
-    # Wire the @protect decorator's own module-level cache to this
-    # runtime too. The decorator short-circuits on its local `_runtime`
-    # slot and never re-resolves via `get_instance()`, so without this
-    # assignment a re-init cycle (init → shutdown → init) leaves the
-    # decorator pointing at the dead previous runtime and silently
-    # drops span_start/span_end events.
     import nullrun.decorators as _dec_mod
-    _dec_mod._runtime = runtime
+    import nullrun.runtime as _rt_mod
+    from nullrun.runtime import NullRunRuntime
+
+    # Phase 0.3.1: the three singleton slots (NullRunRuntime._instance,
+    # _rt_mod._runtime, _dec_mod._runtime) must all be assigned
+    # atomically. Without a lock, concurrent init() calls from
+    # multiple threads can leave the three slots pointing at two
+    # different runtimes. The failure mode is silent — the
+    # decorator's @protect wrapper reads _dec._runtime once and
+    # never re-resolves, so a missed assignment drops every
+    # span_start/span_end event for that runtime.
+    with _init_lock:
+        runtime = NullRunRuntime(
+            api_key=api_key,
+            api_url=api_url,
+            debug=debug,
+        )
+
+        # Register as the module-level singleton so `nullrun.track_llm` /
+        # `nullrun.track_tool` (which resolve via `get_runtime()`) and any
+        # other consumers reading the cached instance find *this* runtime —
+        # not whatever a previous test or stale env would otherwise produce.
+        _rt_mod._runtime = runtime
+        NullRunRuntime._instance = runtime
+
+        # Wire the @protect decorator's own module-level cache to this
+        # runtime too. The decorator short-circuits on its local `_runtime`
+        # slot and never re-resolves via `get_instance()`, so without this
+        # assignment a re-init cycle (init → shutdown → init) leaves the
+        # decorator pointing at the dead previous runtime and silently
+        # drops span_start/span_end events.
+        _dec_mod._runtime = runtime
 
     # Phase D6: wire auto-instrumentation AFTER the runtime is fully
     # constructed. In 0.3.0 api_key is required, so this branch is
@@ -175,8 +176,15 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
 
     # Instrumentation
     "NullRunCallback": ("nullrun.instrumentation", "NullRunCallback"),
-    "patch_openai": ("nullrun.instrumentation", "patch_openai"),
-    "unpatch_openai": ("nullrun.instrumentation", "unpatch_openai"),
+    # NOTE (Sprint 1.2 / B11-B12): `patch_openai` and `unpatch_openai`
+    # were removed from `_LAZY_EXPORTS` because they pointed at
+    # non-existent attributes on `nullrun.instrumentation` (the actual
+    # function is `patch_openai_agents`, with different semantics —
+    # it patches `agents.Runner`, not the `openai` SDK). The pre-fix
+    # lazy entries caused `AttributeError` on first access, which is
+    # a worse failure mode than a clean `ImportError` from
+    # `from nullrun import patch_openai` failing because the symbol
+    # is no longer in the lazy table.
 
     # Toolbox — framework-specific wrappers (Phase 1 Commit 6).
     # The previous `instrument()` helper lived at
@@ -213,9 +221,8 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     # Exceptions (Phase 3)
     "NullRunBlockedException": ("nullrun.breaker.exceptions", "NullRunBlockedException"),
     "NullRunAuthenticationError": ("nullrun.breaker.exceptions", "NullRunAuthenticationError"),
-    "LoopDetectedException": ("nullrun.breaker.exceptions", "LoopDetectedException"),
-    "RetryStormException": ("nullrun.breaker.exceptions", "RetryStormException"),
-    "RateLimitExceededException": ("nullrun.breaker.exceptions", "RateLimitExceededException"),
+    # Sprint 2.2: zombie exception classes removed. See the
+    # NOTE block in breaker/exceptions.py for the list.
     "WorkflowPausedException": ("nullrun.breaker.exceptions", "WorkflowPausedException"),
     "WorkflowKilledException": ("nullrun.breaker.exceptions", "WorkflowKilledException"),
     "WorkflowKilledInterrupt": ("nullrun.breaker.exceptions", "WorkflowKilledInterrupt"),
@@ -264,13 +271,12 @@ __all__ = [
     "track_event",
 ]
 
-# Decision History is a backend + dashboard surface only.
-# The SDK does not (and cannot) replay LLM calls because NULLRUN does
-# not store request/response payloads or hold client LLM keys.
-
-# Phase 0.6: The `nullrun.replay` module was a stub that never matched the real
-# backend capability (NULLRUN does not store request bodies, so there is no
-# agentic replay to expose from the SDK). The user-facing surface has been
-# renamed to Decision History, which lives on the backend and is accessed via
-# the dashboard, not from the SDK. The replay module has been removed; do not
-# re-export ReplayManager / ReplaySession / ReplayEvent / EventRecorder.
+# Sprint 2.1: the SDK-side ``decision_history`` module was deleted.
+# Decision history is a backend + dashboard surface only — the SDK
+# does not (and cannot) replay LLM calls because NULLRUN does not
+# store request/response payloads or hold client LLM keys. The
+# orphan ``start_recording`` / ``stop_recording`` methods on
+# ``NullRunRuntime`` are kept as no-op stubs for one minor version
+# for backward compatibility; they will be removed in 0.5.0.
+# Do NOT re-export ReplayManager / ReplaySession / ReplayEvent /
+# EventRecorder.

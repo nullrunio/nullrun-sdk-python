@@ -12,7 +12,7 @@ import threading
 import time
 from collections.abc import Callable
 from enum import Enum
-from typing import Any, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +59,7 @@ class CircuitBreaker:
         failure_threshold: int = 5,
         recovery_timeout: float = 30.0,
         half_open_max_calls: int = 1,
-        redis_client: Optional[Any] = None,
+        redis_client: Any | None = None,
         name: str = "default",
     ):
         self._failure_threshold = failure_threshold
@@ -96,7 +96,7 @@ class CircuitBreaker:
     # Redis-based distributed state sharing
     # =============================================================================
 
-    def _check_global_state(self) -> Optional[str]:
+    def _check_global_state(self) -> str | None:
         """
         Check if any instance has the circuit open in Redis.
 
@@ -194,6 +194,12 @@ class CircuitBreaker:
         """Record state transition metrics."""
         if new_state == CBState.OPEN:
             metrics.inc_transport("circuit_open_count")
+            # Sprint 3 follow-up (B24): also bump the
+            # ``circuit_breaker_opens`` global counter on
+            # ``TransportMetrics`` (was 0-call). This is the
+            # cross-CB-instance counter — the operator alerts
+            # on its rate, not on the per-CB ``circuit_open_count``.
+            metrics.inc_transport("circuit_breaker_opens")
             self._metrics.circuit_open_count += 1
         elif new_state == CBState.HALF_OPEN:
             metrics.inc_transport("circuit_half_open_count")
@@ -214,13 +220,17 @@ class CircuitBreaker:
             self._metrics.half_open_duration_count += 1
             self._half_open_start = None
 
-    def record_fallback(self) -> None:
-        """Record a fallback activation."""
-        metrics.inc_transport("fallback_mode_activations")
-        self._metrics.fallback_activations += 1
-
     @property
     def state(self) -> CBState:
+        # Phase 0.3.1: hold the lock for the whole transition so
+        # concurrent threads do not race into HALF_OPEN. The
+        # previous version only held the lock for the dict read,
+        # which let two workers independently decide they should
+        # both probe in HALF_OPEN at the same wall-clock moment.
+        # The fix also publishes HALF_OPEN to Redis (was defined
+        # but never called) so other workers see the state via
+        # ``_check_global_state`` instead of falling back to
+        # PERMISSIVE.
         with self._lock:
             if self._state == CBState.OPEN:
                 if (
@@ -232,6 +242,12 @@ class CircuitBreaker:
                     self._half_open_calls = 0
                     self._on_state_change(old_state, self._state)
                     self._on_half_open()
+                    # Publish the new state so other workers see
+                    # HALF_OPEN in Redis and respect
+                    # _half_open_max_calls (instead of treating
+                    # the local probe as fresh and sending
+                    # uncapped traffic).
+                    self._publish_half_open_state()
             return self._state
 
     def call(self, func: Callable[..., Any], *args, **kwargs) -> Any:
@@ -249,7 +265,11 @@ class CircuitBreaker:
             time_in_open = time.monotonic() - self._opened_at
             if time_in_open >= self._recovery_timeout:
                 # Add random jitter (0-30 seconds) to prevent thundering herd
-                jitter = random.uniform(0, 30.0)
+                # Phase 8: cap at 5s (was 30s). The previous value
+                # blocked the caller's thread for up to 30s on
+                # every OPEN->HALF_OPEN transition. 5s is plenty
+                # to spread reconnects across workers.
+                jitter = random.uniform(0, 5.0)
                 time.sleep(jitter)
 
         state = self.state

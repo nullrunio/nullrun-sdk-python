@@ -36,7 +36,6 @@ from __future__ import annotations
 import uuid
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Optional
 
 
 def _new_id() -> str:
@@ -66,19 +65,19 @@ class SpanContext:
 
     trace_id: str
     span_id: str
-    parent_span_id: Optional[str] = None
+    parent_span_id: str | None = None
     depth: int = 0
 
 
 # The currently-active span. `None` means "no trace in progress" — track_*
 # will fall back to creating a synthetic root on each call so events are
 # still attributed to *something*.
-_current_span: ContextVar[Optional[SpanContext]] = ContextVar(
+_current_span: ContextVar[SpanContext | None] = ContextVar(
     "nullrun_span", default=None
 )
 
 
-def get_current_span() -> Optional[SpanContext]:
+def get_current_span() -> SpanContext | None:
     """
     Return the active span, or None if no `@protect` / manual `set_span`
     has put us inside a trace.
@@ -93,7 +92,22 @@ def create_child_span(parent: SpanContext) -> SpanContext:
     The child inherits `parent.trace_id` and increments `parent.depth`.
     `parent_span_id` is set to `parent.span_id` so the tree is fully
     reconstructable from the event stream.
+
+    Raises:
+        ValueError: if `parent` is ``None``. The function does NOT
+            silently degrade to creating a root span — that would
+            hide bugs in the caller where a parent was expected.
+            Sprint 2.6 (B5): pre-fix this raised
+            ``TypeError: unsupported operand for None + 1`` on
+            ``parent.depth + 1`` which crashed the entire
+            ``@protect`` / track_* pipeline. Raise a clear
+            ``ValueError`` instead so the caller can fix the bug.
     """
+    if parent is None:
+        raise ValueError(
+            "create_child_span requires a non-None parent SpanContext. "
+            "If you want a root span, use create_root_span() instead."
+        )
     return SpanContext(
         trace_id=parent.trace_id,
         span_id=_new_id(),
