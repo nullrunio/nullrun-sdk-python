@@ -5,7 +5,6 @@ Handles HTTP communication with batching and background flush.
 Includes fallback modes for Gateway unavailability.
 """
 
-import asyncio
 import hashlib
 import hmac
 import json
@@ -607,7 +606,7 @@ class Transport:
         if not os.path.exists(wal_path):
             return
         events = []
-        with open(wal_path, "r") as f:
+        with open(wal_path) as f:
             for line in f:
                 try:
                     events.append(json.loads(line.strip()))
@@ -1324,11 +1323,11 @@ class Transport:
         Raises:
             ConnectionError: If WebSocket connection fails
         """
-        from nullrun.transport_websocket import WebSocketConnection
-
         # Phase 6 #6.6: build the WS URL via urllib.parse instead of
         # string replace. Reject unknown schemes with a clear error.
         from urllib.parse import urlparse, urlunparse
+
+        from nullrun.transport_websocket import WebSocketConnection
         parsed = urlparse(self.api_url)
         if parsed.scheme not in ("http", "https"):
             raise ValueError(
@@ -1470,8 +1469,8 @@ def _parse_error_envelope(
                 retry_after = float(ra_header)
             except ValueError:
                 try:
-                    from email.utils import parsedate_to_datetime
                     from datetime import datetime, timezone
+                    from email.utils import parsedate_to_datetime
                     dt = parsedate_to_datetime(ra_header)
                     retry_after = (
                         dt - datetime.now(timezone.utc)

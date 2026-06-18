@@ -79,9 +79,8 @@ def test_auto_instrument_patches_requests():
     """`auto_instrument` now includes `patch_requests` in its install list."""
     # Indirect: when `requests` is not installed, patch_requests returns False.
     # The important contract is that auto_instrument calls it without error.
-    from nullrun.instrumentation.auto import auto_instrument
+    from nullrun.instrumentation.auto import auto_instrument, reset_for_tests
     from nullrun.runtime import NullRunRuntime
-    from nullrun.instrumentation.auto import reset_for_tests
 
     reset_for_tests()
     runtime = NullRunRuntime(api_key="test", _test_mode=True)

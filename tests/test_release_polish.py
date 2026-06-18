@@ -9,11 +9,7 @@ Phase 8:
 """
 from __future__ import annotations
 
-import io
-import json
-
 import pytest
-
 
 # ===========================================================================
 # 8.1: get_org_status
@@ -21,9 +17,10 @@ import pytest
 
 def test_get_org_status_requires_org_id():
     """get_org_status raises NullRunAuthenticationError when no org_id and runtime has none."""
-    from nullrun.runtime import NullRunRuntime
-    from nullrun.breaker.exceptions import NullRunAuthenticationError
     import pytest
+
+    from nullrun.breaker.exceptions import NullRunAuthenticationError
+    from nullrun.runtime import NullRunRuntime
 
     runtime = NullRunRuntime(api_key="test", _test_mode=True)
     # organization_id is None until _authenticate runs; get_org_status
@@ -149,8 +146,9 @@ def test_open_to_halfopen_sleep_capped_at_5s():
     simpler and faster than monkeypatching time.sleep through
     `nullrun.breaker.circuit_breaker` (which `import time` locally).
     """
-    from nullrun.breaker import circuit_breaker
     import inspect
+
+    from nullrun.breaker import circuit_breaker
 
     src = inspect.getsource(circuit_breaker.CircuitBreaker.call)
     assert "random.uniform(0, 5.0)" in src

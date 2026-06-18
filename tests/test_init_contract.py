@@ -15,7 +15,6 @@ unknown-kwarg rejection (the 7-symbol surface of the SDK is
 from __future__ import annotations
 
 import threading
-from unittest.mock import patch
 
 import pytest
 

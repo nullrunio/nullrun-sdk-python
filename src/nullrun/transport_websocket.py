@@ -7,12 +7,13 @@ when workflow state changes (KILL/PAUSE).
 """
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import time
-import hmac
-import hashlib
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 try:
     import websockets

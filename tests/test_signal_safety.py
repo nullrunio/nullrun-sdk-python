@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import gc
 import signal
-import threading
 import weakref
 from unittest.mock import patch
 
