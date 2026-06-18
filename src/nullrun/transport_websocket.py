@@ -107,8 +107,13 @@ class WebSocketConnection:
         await conn.close()
     """
 
-    # States that require acknowledgment (KILL/PAUSE)
-    ACKNOWLEDGED_STATES = {"killed", "paused"}
+    # States that require acknowledgment (KILL/PAUSE).
+    # The server's WsWorkflowState enum (NULLRUN/backend/src/proxy/http/
+    # ws_control.rs) emits PascalCase ("Killed", "Paused"); the SDK
+    # must compare against the same casing, otherwise the ACK
+    # path stays dead and the server's pending-ack queue grows
+    # without ever being drained.
+    ACKNOWLEDGED_STATES = {"Killed", "Paused"}
 
     def __init__(
         self,
