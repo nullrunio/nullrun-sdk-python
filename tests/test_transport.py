@@ -514,8 +514,9 @@ class TestPolicyCache:
 
     def test_cache_expiry(self):
         """PolicyCache evicts expired entries."""
-        from nullrun.transport import PolicyCache
         import time
+
+        from nullrun.transport import PolicyCache
         cache = PolicyCache(maxsize=100, ttl_seconds=0.1)  # 100ms TTL
         cache.set("key1", "allow", "policy-123")
         # Not expired yet
@@ -617,6 +618,7 @@ class TestTransportHMAC:
     def test_generate_hmac_signature(self):
         """HMAC signature generation works."""
         import time
+
         from nullrun.transport import generate_hmac_signature
         sig = generate_hmac_signature(
             api_key="test-key",
@@ -630,6 +632,7 @@ class TestTransportHMAC:
     def test_verify_hmac_signature_valid(self):
         """HMAC verification succeeds with valid signature."""
         import time
+
         from nullrun.transport import generate_hmac_signature, verify_hmac_signature
         api_key = "test-key"
         secret_key = "secret-123"
@@ -642,6 +645,7 @@ class TestTransportHMAC:
     def test_verify_hmac_signature_invalid(self):
         """HMAC verification fails with invalid signature."""
         import time
+
         from nullrun.transport import verify_hmac_signature
         result = verify_hmac_signature(
             api_key="test-key",
@@ -654,8 +658,9 @@ class TestTransportHMAC:
 
     def test_verify_hmac_signature_expired(self):
         """HMAC verification fails with expired timestamp."""
-        from nullrun.transport import generate_hmac_signature, verify_hmac_signature
         import time
+
+        from nullrun.transport import generate_hmac_signature, verify_hmac_signature
         api_key = "test-key"
         secret_key = "secret-123"
         body = '{"event": "test"}'
@@ -696,6 +701,7 @@ class TestRefetchCredentialsUsesSharedClient:
         see the call (and the patch would have no effect).
         """
         import json as _json
+
         from nullrun.transport import Transport
 
         t = Transport(
@@ -749,8 +755,9 @@ class TestRefetchCredentialsUsesSharedClient:
         ``import requests; requests.post(...)`` shortcut breaks
         this test.
         """
-        from nullrun.transport import Transport
         import sys
+
+        from nullrun.transport import Transport
 
         t = Transport(
             api_url="https://api.test.nullrun.io",

@@ -238,8 +238,8 @@ class TestAllMetricsWired:
 
     def test_timeouts_incremented_on_httpx_timeout(self):
         """``httpx.TimeoutException`` must bump ``timeouts``."""
-        from nullrun.observability import metrics
         from nullrun.breaker.exceptions import BreakerTransportError
+        from nullrun.observability import metrics
         from nullrun.transport import _retry_with_backoff
 
         self._reset_metrics()
@@ -263,8 +263,8 @@ class TestAllMetricsWired:
 
     def test_last_error_set_on_failure(self):
         """``last_error`` must be set when a request fails."""
-        from nullrun.observability import metrics
         from nullrun.breaker.exceptions import BreakerTransportError
+        from nullrun.observability import metrics
         from nullrun.transport import _retry_with_backoff
 
         self._reset_metrics()
@@ -284,8 +284,8 @@ class TestAllMetricsWired:
 
     def test_circuit_breaker_opens_incremented_on_open_transition(self):
         """Transitioning to OPEN must bump ``circuit_breaker_opens``."""
-        from nullrun.observability import metrics
         from nullrun.breaker.circuit_breaker import CBState, CircuitBreaker
+        from nullrun.observability import metrics
 
         self._reset_metrics()
         cb = CircuitBreaker(
@@ -308,10 +308,9 @@ class TestAllMetricsWired:
 
     def test_cost_limit_exceeded_incremented_on_block(self):
         """A pre-flight decision=block must bump ``cost_limit_exceeded``."""
-        from nullrun.observability import metrics
         from nullrun.breaker.exceptions import WorkflowKilledInterrupt
+        from nullrun.observability import metrics
         from nullrun.runtime import NullRunRuntime
-        from nullrun.context import _workflow_id_var, workflow
 
         self._reset_metrics()
         # Use _test_mode=True so NullRunRuntime skips the auth

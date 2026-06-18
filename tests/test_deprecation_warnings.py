@@ -19,7 +19,6 @@ These tests pin the warning contract:
 """
 from __future__ import annotations
 
-import os
 import warnings
 
 

@@ -105,10 +105,11 @@ def init(
 
     # Imported lazily so we don't pull the runtime into the namespace
     # when the user only wants the static helpers.
-    from nullrun.runtime import NullRunRuntime
-    import nullrun.runtime as _rt_mod
-    import nullrun.decorators as _dec_mod
     import threading as _threading
+
+    import nullrun.decorators as _dec_mod
+    import nullrun.runtime as _rt_mod
+    from nullrun.runtime import NullRunRuntime
 
     # Phase 0.3.1: the three singleton slots (NullRunRuntime._instance,
     # _rt_mod._runtime, _dec_mod._runtime) must all be assigned
