@@ -36,7 +36,6 @@ import nullrun
 from nullrun.instrumentation import auto as _auto
 from nullrun.instrumentation.auto import PROVIDER_EXTRACTORS, _openai_extractor
 
-
 # ---------------------------------------------------------------------------
 # Mock LLM + NULLRUN backend (one server, two routes)
 # ---------------------------------------------------------------------------

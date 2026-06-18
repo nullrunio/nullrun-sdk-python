@@ -296,7 +296,6 @@ class TestTrackEventFingerprint:
         from unittest.mock import MagicMock
 
         from nullrun.instrumentation.auto import make_dedup_state
-        from nullrun.runtime import NullRunRuntime
 
         # Build a stand-in runtime that uses the real dedup LRU.
         # We can't easily construct a full NullRunRuntime here

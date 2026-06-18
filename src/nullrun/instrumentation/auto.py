@@ -956,9 +956,9 @@ def auto_instrument(runtime: Any) -> bool:
         # packages aren't installed.
         from nullrun.instrumentation._safe_patch import safe_patch
         from nullrun.instrumentation.auto_requests import patch_requests
-        from nullrun.instrumentation.llama_index import patch_llama_index
-        from nullrun.instrumentation.crewai import patch_crewai
         from nullrun.instrumentation.autogen import patch_autogen
+        from nullrun.instrumentation.crewai import patch_crewai
+        from nullrun.instrumentation.llama_index import patch_llama_index
 
         paths = [
             safe_patch("httpx", lambda: patch_httpx(runtime)),

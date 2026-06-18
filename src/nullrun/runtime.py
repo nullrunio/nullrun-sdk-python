@@ -32,15 +32,15 @@ for the full rules, including transport error classification
 """
 
 import asyncio
-import functools
 import logging
 import os
 import threading
 import time
 import uuid
 from collections import defaultdict, deque
-from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any, Optional
 
 import httpx
 
@@ -49,7 +49,6 @@ from nullrun.breaker.exceptions import (
     BreakerError,
     NullRunAuthenticationError,
     NullRunBlockedException,
-    WorkflowKilledException,
     WorkflowKilledInterrupt,
     WorkflowPausedException,
 )
@@ -63,7 +62,13 @@ from nullrun.context import (
     get_workflow_id,
 )
 from nullrun.observability import metrics
-from nullrun.transport import DecisionSource, FallbackMode, FlushConfig, Transport, TransportErrorSource
+from nullrun.transport import (
+    DecisionSource,
+    FallbackMode,
+    FlushConfig,
+    Transport,
+    TransportErrorSource,
+)
 
 
 class LoopTracker:
@@ -316,7 +321,6 @@ class NullRunRuntime:
         # legacy string (and its NULLRUN_FALLBACK_MODE env var) is
         # still honoured for one minor version, with a one-time
         # ``DeprecationWarning`` so operators see the migration path.
-        from nullrun.transport import FallbackMode
         fb_raw = fallback_mode
         if fb_raw is None and os.environ.get("NULLRUN_FALLBACK_MODE"):
             # Legacy env var: emit a one-time deprecation warning

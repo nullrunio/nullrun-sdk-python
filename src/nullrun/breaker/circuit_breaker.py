@@ -12,7 +12,7 @@ import threading
 import time
 from collections.abc import Callable
 from enum import Enum
-from typing import Any, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +59,7 @@ class CircuitBreaker:
         failure_threshold: int = 5,
         recovery_timeout: float = 30.0,
         half_open_max_calls: int = 1,
-        redis_client: Optional[Any] = None,
+        redis_client: Any | None = None,
         name: str = "default",
     ):
         self._failure_threshold = failure_threshold
@@ -96,7 +96,7 @@ class CircuitBreaker:
     # Redis-based distributed state sharing
     # =============================================================================
 
-    def _check_global_state(self) -> Optional[str]:
+    def _check_global_state(self) -> str | None:
         """
         Check if any instance has the circuit open in Redis.
 

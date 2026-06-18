@@ -36,7 +36,6 @@ from __future__ import annotations
 import uuid
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Optional
 
 
 def _new_id() -> str:
@@ -66,19 +65,19 @@ class SpanContext:
 
     trace_id: str
     span_id: str
-    parent_span_id: Optional[str] = None
+    parent_span_id: str | None = None
     depth: int = 0
 
 
 # The currently-active span. `None` means "no trace in progress" — track_*
 # will fall back to creating a synthetic root on each call so events are
 # still attributed to *something*.
-_current_span: ContextVar[Optional[SpanContext]] = ContextVar(
+_current_span: ContextVar[SpanContext | None] = ContextVar(
     "nullrun_span", default=None
 )
 
 
-def get_current_span() -> Optional[SpanContext]:
+def get_current_span() -> SpanContext | None:
     """
     Return the active span, or None if no `@protect` / manual `set_span`
     has put us inside a trace.

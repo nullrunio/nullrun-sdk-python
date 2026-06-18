@@ -13,15 +13,15 @@ Phase 5 of the production-readiness plan:
 """
 from __future__ import annotations
 
-
 # ===========================================================================
 # 5.1: Remote state helpers
 # ===========================================================================
 
 def test_remote_states_lock_is_rlock():
     """`_states_lock` is an RLock so gate-check re-entry doesn't deadlock."""
-    from nullrun.runtime import NullRunRuntime
     import threading
+
+    from nullrun.runtime import NullRunRuntime
 
     runtime = NullRunRuntime(api_key="test", _test_mode=True)
     assert hasattr(runtime, "_states_lock")
@@ -61,7 +61,7 @@ def test_set_remote_state_replaces_atomically():
 
 def test_policy_cache_preserves_ttl():
     """`policy_version` must NOT be written into `ttl_seconds`."""
-    from nullrun.transport import CachedDecision, PolicyCache
+    from nullrun.transport import PolicyCache
 
     cache = PolicyCache(maxsize=10, ttl_seconds=300.0)
     cache.set("k1", "allow", policy_id="p1", policy_version=42)
@@ -115,6 +115,7 @@ def test_fetch_remote_state_uses_transport_client(monkeypatch):
 def test_workflow_emits_uuid4_when_no_name():
     """Auto-generated workflow IDs are UUID4 (not wf-{hex32})."""
     import uuid as _uuid
+
     from nullrun.context import workflow
 
     with workflow() as wid:
@@ -135,7 +136,6 @@ def test_workflow_uses_explicit_name():
 
 def test_sensitive_raises_on_missing_api_key(monkeypatch):
     """`@sensitive` now propagates NullRunAuthenticationError when no api_key."""
-    import os
     monkeypatch.delenv("NULLRUN_API_KEY", raising=False)
     # Reset singleton so the env change is picked up.
     from nullrun.runtime import NullRunRuntime
@@ -143,8 +143,9 @@ def test_sensitive_raises_on_missing_api_key(monkeypatch):
 
     try:
         import pytest
-        from nullrun.breaker.exceptions import NullRunAuthenticationError
+
         import nullrun.decorators as dec
+        from nullrun.breaker.exceptions import NullRunAuthenticationError
 
         @dec.sensitive
         def my_func(x):
@@ -174,6 +175,7 @@ def test_kill_switch_honoured_for_custom_host():
 
     import httpx
     import pytest
+
     from nullrun.breaker.exceptions import WorkflowKilledInterrupt
 
     req = httpx.Request("POST", "https://my-custom-llm.example.com/v1/chat")
@@ -214,8 +216,8 @@ def test_execute_on_transport_error_callback_receives_breaker_error(monkeypatch)
     test exercises the callback contract without depending on the
     internal circuit breaker / retry helper.
     """
-    from nullrun.runtime import NullRunRuntime
     from nullrun.breaker.exceptions import BreakerTransportError
+    from nullrun.runtime import NullRunRuntime
 
     runtime = NullRunRuntime(api_key="test", _test_mode=True)
 
@@ -242,6 +244,7 @@ def test_execute_on_transport_error_callback_receives_breaker_error(monkeypatch)
     # when the result has decision="block". The callback was already invoked
     # by Transport.execute before the result propagated up.
     import pytest
+
     from nullrun.breaker.exceptions import NullRunBlockedException
     with pytest.raises(NullRunBlockedException):
         runtime.execute(

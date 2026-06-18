@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import pytest
 
-
 # ===========================================================================
 # llama-index
 # ===========================================================================
@@ -124,7 +123,7 @@ def test_patch_autogen_returns_false_when_missing(monkeypatch):
 
 def test_new_framework_modules_importable():
     """The three new patch modules are importable from `nullrun.instrumentation`."""
-    from nullrun.instrumentation import llama_index, crewai, autogen
+    from nullrun.instrumentation import autogen, crewai, llama_index
 
     assert hasattr(llama_index, "patch_llama_index")
     assert hasattr(llama_index, "unpatch_llama_index")
@@ -179,6 +178,7 @@ class TestSafePatchWrapper:
     def test_import_error_is_debug_not_warning(self, caplog):
         """Optional dep missing is debug-level, not warning."""
         import logging
+
         from nullrun.instrumentation._safe_patch import safe_patch
 
         def _missing_dep():
@@ -196,6 +196,7 @@ class TestSafePatchWrapper:
     def test_other_exception_logs_at_warning(self, caplog):
         """Real patch failure must be visible at WARNING level (B47)."""
         import logging
+
         from nullrun.instrumentation._safe_patch import safe_patch
 
         def _broken():

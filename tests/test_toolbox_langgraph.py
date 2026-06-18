@@ -6,12 +6,11 @@ the runtime sees LLM usage. These tests verify the wiring
 without requiring an actual LangChain/LangGraph runtime —
 we just need a duck-typed object with `.invoke` and `.stream`.
 """
-import os
 import pytest
 
 from nullrun.instrumentation.langgraph import NullRunCallback
-from nullrun.toolbox.langgraph import wrapper
 from nullrun.runtime import NullRunRuntime
+from nullrun.toolbox.langgraph import wrapper
 
 
 @pytest.fixture(autouse=True)

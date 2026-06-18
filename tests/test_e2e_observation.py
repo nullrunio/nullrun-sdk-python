@@ -29,7 +29,6 @@ import pytest
 
 import nullrun
 
-
 E2E_BASE_URL = os.environ.get("NULLRUN_E2E_BASE_URL")
 E2E_API_KEY = os.environ.get("NULLRUN_E2E_API_KEY")
 E2E_ORG_ID = os.environ.get("NULLRUN_E2E_ORG_ID", "org-e2e")
@@ -153,6 +152,6 @@ def test_e2e_openai_call_lands_in_backend(e2e_workflow_id: str) -> None:
             break
         time.sleep(0.5)
 
-    assert wf is not None, f"openai call did not land in /usage within 10s"
+    assert wf is not None, "openai call did not land in /usage within 10s"
     assert wf.get("calls", 0) >= 1
     assert wf.get("tokens", 0) > 0, f"expected non-zero tokens, got {wf!r}"

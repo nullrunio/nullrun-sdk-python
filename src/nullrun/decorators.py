@@ -41,13 +41,13 @@ import os
 from collections.abc import Callable
 from typing import Any, TypeVar
 
-from nullrun.runtime import NullRunRuntime, get_runtime
-from nullrun.context import get_workflow_id
 from nullrun.breaker.exceptions import (
     NullRunBlockedException,
     WorkflowKilledInterrupt,
     WorkflowPausedException,
 )
+from nullrun.context import get_workflow_id
+from nullrun.runtime import NullRunRuntime, get_runtime
 
 # Sentinel used when a gate fires outside a workflow context.
 # Matches the constant in nullrun.runtime so we don't introduce

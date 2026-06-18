@@ -26,7 +26,6 @@ from nullrun.transport import (
     verify_hmac_signature,
 )
 
-
 # ──────────────────────────────────────────────────────────────────────
 # Test fixture
 # ──────────────────────────────────────────────────────────────────────
@@ -63,7 +62,7 @@ class TestGenerateHmacSignature:
         timestamp = 1700000000
         body = '{"event":"test"}'
         expected_body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
-        expected_message = f"{timestamp}:{api_key}:{expected_body_hash}".encode("utf-8")
+        expected_message = f"{timestamp}:{api_key}:{expected_body_hash}".encode()
         expected = hmac.new(
             secret.encode("utf-8"),
             expected_message,

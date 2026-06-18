@@ -103,6 +103,7 @@ class TestHalfOpenConcurrencyLimit:
         ``len(passed) > 2``.
         """
         import threading
+
         from nullrun.breaker.circuit_breaker import CBState
         from nullrun.breaker.exceptions import BreakerTransportError
 

@@ -17,7 +17,8 @@ detailed comments). Two integration points:
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +79,9 @@ def patch_autogen(runtime: Any) -> bool:
     # Belt-and-suspenders: capture streaming-safe usage off the
     # OpenAI client's CreateResult.usage.
     try:
-        from autogen_ext.models.openai import OpenAIChatCompletionClient  # type: ignore[import-not-found]
+        from autogen_ext.models.openai import (
+            OpenAIChatCompletionClient,  # type: ignore[import-not-found]
+        )
 
         if not getattr(OpenAIChatCompletionClient, "_nullrun_patched", False):
             global _orig_openai_create
@@ -147,7 +150,9 @@ def unpatch_autogen() -> None:
     BaseChatAgent._nullrun_patched = False  # type: ignore[attr-defined]
 
     try:
-        from autogen_ext.models.openai import OpenAIChatCompletionClient  # type: ignore[import-not-found]
+        from autogen_ext.models.openai import (
+            OpenAIChatCompletionClient,  # type: ignore[import-not-found]
+        )
 
         if _orig_openai_create is not None:
             OpenAIChatCompletionClient.create = _orig_openai_create  # type: ignore[method-assign]

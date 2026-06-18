@@ -104,8 +104,8 @@ def make_runtime(mock_api):
     `decorators._get_or_create_runtime`) finds the test runtime, not a
     fallback that would try to construct one with no api_key.
     """
-    from nullrun.runtime import NullRunRuntime
     import nullrun.decorators as _dec
+    from nullrun.runtime import NullRunRuntime
 
     def _make(**kwargs):
         defaults = dict(

@@ -23,9 +23,6 @@ These tests also exercise the per-call `on_transport_error` plumbing
 on `transport.execute` / `transport.check` and the new
 `NullRunTransportError` / `TransportErrorSource` exception pair.
 """
-import os
-import asyncio
-from typing import List
 
 import httpx
 import pytest
@@ -33,14 +30,11 @@ import respx
 
 import nullrun
 from nullrun.breaker.exceptions import (
-    BreakerTransportError,
     NullRunBlockedException,
     NullRunTransportError,
     TransportErrorSource,
     WorkflowKilledInterrupt,
 )
-from nullrun.decorators import reset as reset_decorator_runtime
-from nullrun.runtime import NullRunRuntime
 
 # Base URL used in tests
 BASE_URL = "https://api.test.nullrun.io"
@@ -64,12 +58,12 @@ class _RecordingRuntime:
     """
 
     def __init__(self) -> None:
-        self.events: List[dict] = []
+        self.events: list[dict] = []
         self._remote_states: dict = {}
         self._sensitive_tools: set = set()
         self._strict_mode_tools: set = set()
         # Order of gate calls recorded by `_record_gate` below
-        self.gate_calls: List[str] = []
+        self.gate_calls: list[str] = []
 
     def is_sensitive_tool(self, tool_name: str) -> bool:
         return tool_name in self._sensitive_tools
@@ -283,9 +277,6 @@ class TestEnforceSensitiveToolFailClosed:
         Simulated by injecting a runtime that returns the
         synthetic-allow result directly (bypassing transport)."""
         # Build a runtime that returns a FALLBACK_* decision
-        from nullrun.breaker.exceptions import (
-            NullRunBlockedException as _Blocked,
-        )
         rt = make_runtime()
         rt.add_sensitive_tool("charge_card")
         # Override execute to return a synthetic allow with

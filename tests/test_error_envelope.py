@@ -21,7 +21,6 @@ from nullrun.breaker.exceptions import (
 )
 from nullrun.transport import _parse_error_envelope
 
-
 # ──────────────────────────────────────────────────────────────────────
 # 429 — Rate Limit (typed RateLimitError with retry_after + upgrade_url)
 # ──────────────────────────────────────────────────────────────────────
@@ -73,8 +72,8 @@ class TestRateLimitMapping:
         from datetime import datetime, timezone
         future = datetime.now(timezone.utc).timestamp() + 60
         # Format as HTTP date (RFC 7231)
-        from email.utils import format_datetime
         from datetime import timezone as tz
+        from email.utils import format_datetime
         future_dt = datetime.fromtimestamp(future, tz=tz.utc)
         http_date = format_datetime(future_dt, usegmt=True)
         r = httpx.Response(

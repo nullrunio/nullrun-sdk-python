@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import pytest
 
-
 # ===========================================================================
 # Runtime-level removals
 # ===========================================================================
@@ -99,6 +98,7 @@ def test_workflow_context_class_removed():
 def test_workflow_contextmanager_still_works():
     """The `with workflow(...)` contextmanager (replacement for WorkflowContext) still works."""
     import uuid as _uuid
+
     from nullrun.context import workflow
 
     with workflow("explicit-id") as wid:
