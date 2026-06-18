@@ -54,6 +54,42 @@ class NullRunTransportError(BreakerError):
         )
 
 
+class RateLimitError(NullRunTransportError):
+    """Raised when the gateway returns HTTP 429 with a ``Retry-After``
+    header (or JSON body field).
+
+    Phase 4: subclass of ``NullRunTransportError`` so
+    ``except NullRunTransportError`` keeps catching it. Surfaces
+    ``retry_after`` (seconds) and ``upgrade_url`` so callers can
+    schedule a retry or surface a billing upgrade prompt.
+
+    Attributes:
+        retry_after: Seconds the server asks the client to wait
+            before retrying. ``None`` when no ``Retry-After`` header.
+        upgrade_url: Plan-upgrade URL from the 429 body. ``None``
+            when the response did not include one.
+        body: Parsed JSON body (gateway's ``error`` / ``message``).
+    """
+    def __init__(
+        self,
+        message: str,
+        source: TransportErrorSource,
+        endpoint: str,
+        retry_after: float | None = None,
+        upgrade_url: str | None = None,
+        body: dict[str, Any] | None = None,
+        **details: Any,
+    ) -> None:
+        self.retry_after = retry_after
+        self.upgrade_url = upgrade_url
+        self.body = body or {}
+        if retry_after is not None:
+            details.setdefault("retry_after", retry_after)
+        if upgrade_url is not None:
+            details.setdefault("upgrade_url", upgrade_url)
+        super().__init__(message, source, endpoint, **details)
+
+
 class BreakerTransportError(BreakerError):
     """
     Raised when transport layer fails and events cannot be delivered.
@@ -102,34 +138,6 @@ class NullRunAuthenticationError(BreakerError):
     def __init__(self, message: str):
         self.message = message
         super().__init__(message)
-
-
-class CostLimitExceeded(BreakerError):
-    """Raised when workflow cost exceeds limit."""
-
-    def __init__(self, workflow_id: str, cost: float, limit: float):
-        self.workflow_id = workflow_id
-        self.cost = cost
-        self.limit = limit
-        super().__init__(f"Workflow {workflow_id} cost ${cost:.2f} exceeds limit ${limit:.2f}")
-
-
-class ApprovalRequired(BreakerError):
-    """Raised when destructive action requires human approval."""
-
-    def __init__(self, workflow_id: str, action: str, request_id: str):
-        self.workflow_id = workflow_id
-        self.action = action
-        self.request_id = request_id
-        super().__init__(
-            f"Workflow {workflow_id} requires approval for {action}. "
-            f"Request ID: {request_id}"
-        )
-
-
-class BreakerTimeout(BreakerError):
-    """Raised when request times out."""
-    pass
 
 
 class NullRunBlockedException(BreakerError):
@@ -181,42 +189,18 @@ class NullRunBlockedException(BreakerError):
         )
 
 
-class LoopDetectedException(NullRunBlockedException):
-    """Raised when infinite loop is detected."""
-
-    def __init__(self, workflow_id: str, tool_name: str, count: int):
-        super().__init__(
-            workflow_id=workflow_id,
-            reason=f"Loop detected: {tool_name} called {count}x",
-            action="kill",
-            tool_name=tool_name,
-            count=count,
-        )
-
-
-class RetryStormException(NullRunBlockedException):
-    """Raised when excessive retries are detected."""
-
-    def __init__(self, workflow_id: str, count: int):
-        super().__init__(
-            workflow_id=workflow_id,
-            reason=f"Retry storm detected: {count} retries",
-            action="kill",
-            count=count,
-        )
-
-
-class RateLimitExceededException(NullRunBlockedException):
-    """Raised when rate limit is exceeded."""
-
-    def __init__(self, workflow_id: str, rate: float, limit: float):
-        super().__init__(
-            workflow_id=workflow_id,
-            reason=f"Rate limit exceeded: {rate}/min > {limit}/min",
-            action="pause",
-            rate=rate,
-            limit=limit,
-        )
+# NOTE (Sprint 2.2): the following six exception classes were removed
+# in 0.4.0 because they had no callers in the SDK or in any
+# test. They were zombie public surface — defined but never raised.
+# If a real use case emerges in the future, they should be re-added
+# with at least one in-tree caller and a regression test that
+# exercises the raise path:
+#   - CostLimitExceeded
+#   - ApprovalRequired
+#   - BreakerTimeout
+#   - LoopDetectedException
+#   - RetryStormException
+#   - RateLimitExceededException
 
 
 class WorkflowPausedException(BreakerError):
@@ -302,6 +286,27 @@ class WorkflowKilledInterrupt(WorkflowKilledException):
         workflow_id:  The workflow that was killed.
         reason:       Server-supplied reason (e.g. "killed via API",
                       "budget exhausted", "circuit-breaker tripped").
+
+    Catching in production
+    ----------------------
+    ``WorkflowKilledInterrupt`` is a ``BaseException`` subclass
+    (NOT ``Exception``), so a user-agent ``try / except Exception``
+    will not catch it. This is intentional — the kill signal
+    must reach the top of the loop. It does mean, however, that
+    Sentry / OpenTelemetry default error handlers (which filter
+    on ``Exception``) will not record the kill event unless the
+    user's code re-raises it under an ``except BaseException``:
+
+        from sentry_sdk import capture_exception
+        try:
+            agent.run()
+        except BaseException:
+            capture_exception()  # records kill, ctrl-c, system-exit
+            raise
+
+    ``except Exception`` will swallow non-kill errors but let the
+    kill through. ``except BaseException`` captures everything
+    including the kill — recommended for the top of an agent loop.
     """
 
     def __init__(self, workflow_id: str, reason: str) -> None:

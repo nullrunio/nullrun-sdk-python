@@ -2,17 +2,29 @@
 Context management for NullRun SDK.
 
 Provides workflow and trace context for automatic event correlation.
+
+Sprint 2.7 (B27): the previously-defined ``_organization_id_var`` /
+``_api_key_id_var`` contextvars and the ``get_organization_id`` /
+``get_api_key_id`` getters were removed because:
+  1. No code path ever wrote to them — both getters always
+     returned ``None``.
+  2. ``observability.TenantFilter`` (the only consumer) was
+     removed in 0.3.1.
+  3. The structured-logging tenant-isolation feature moved to
+     the backend in the same release.
+
+If a future use case appears (e.g. per-API-key rate isolation),
+re-introduce the contextvars AND a setter API (token-based like
+``set_attempt_index``) AND wire them in ``NullRunRuntime.__init__``
+from the ``_authenticate`` response.
 """
 
 import uuid
-import warnings
 from collections.abc import Generator
 from contextlib import contextmanager
 from contextvars import ContextVar
 
-# Context variables for tenant isolation and workflow/trace propagation
-_organization_id_var: ContextVar[str | None] = ContextVar("organization_id", default=None)
-_api_key_id_var: ContextVar[str | None] = ContextVar("api_key_id", default=None)
+# Context variables for workflow/trace propagation.
 _workflow_id_var: ContextVar[str | None] = ContextVar("workflow_id", default=None)
 _trace_id_var: ContextVar[str | None] = ContextVar("trace_id", default=None)
 _span_id_var: ContextVar[str | None] = ContextVar("span_id", default=None)
@@ -21,74 +33,8 @@ _attempt_index_var: ContextVar[int] = ContextVar("attempt_index", default=0)
 
 
 # =============================================================================
-# Tenant Context Getters/Setters (for structured logging isolation)
+# Workflow / trace getters
 # =============================================================================
-
-
-def get_org_id() -> str | None:
-    """Get current organization ID from context."""
-    warnings.warn(
-        "get_org_id() is deprecated, use get_organization_id() instead",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    return _organization_id_var.get()
-
-
-def get_organization_id() -> str | None:
-    """Get current organization ID from context."""
-    return _organization_id_var.get()
-
-
-def get_api_key_id() -> str | None:
-    """Get current API key ID from context."""
-    return _api_key_id_var.get()
-
-
-def set_tenant_context(organization_id: str | None = None, api_key_id: str | None = None) -> None:
-    """Set tenant context for logging isolation.
-
-    Args:
-        organization_id: Organization ID (replaces workspace_id)
-        api_key_id: API key ID
-    """
-    if organization_id is not None:
-        _organization_id_var.set(organization_id)
-    if api_key_id is not None:
-        _api_key_id_var.set(api_key_id)
-
-
-@contextmanager
-def tenant_context(organization_id: str, api_key_id: str | None = None) -> Generator[str, None, None]:
-    """
-    Context manager for tenant scope (for structured logging isolation).
-
-    All SDK log records within this context automatically include tenant fields.
-
-    Usage:
-        from nullrun.context import tenant_context
-
-        with tenant_context("org-123", "key-789"):
-            # All logs here include organization_id, api_key_id
-            logger.info("Processing event")
-            track({"type": "llm_call", ...})
-
-    Args:
-        organization_id: Organization ID
-        api_key_id: Optional API key ID
-
-    Yields:
-        The organization ID
-    """
-    token_org_id = _organization_id_var.set(organization_id)
-    token_key = _api_key_id_var.set(api_key_id) if api_key_id else None
-
-    try:
-        yield organization_id
-    finally:
-        _organization_id_var.reset(token_org_id)
-        if token_key is not None:
-            _api_key_id_var.reset(token_key)
 
 
 def get_workflow_id() -> str | None:
@@ -160,7 +106,10 @@ def workflow(name: str | None = None) -> Generator[str, None, None]:
     Yields:
         The workflow_id string
     """
-    workflow_id = name or f"wf-{uuid.uuid4().hex}"
+    # Phase 5 #5.6: emit a real UUID4 with dashes (matching
+    # ``generate_trace_id``). The previous ``wf-{hex32}`` format
+    # was inconsistent with the rest of the SDK's id generation.
+    workflow_id = name or str(uuid.uuid4())
     trace_id = generate_trace_id()
 
     # Save current values
@@ -257,24 +206,3 @@ def attempt(attempt_index: int) -> Generator[int, None, None]:
         yield attempt_index
     finally:
         _attempt_index_var.reset(token)
-
-
-class WorkflowContext:
-    """
-    Manual workflow context manager (alternative to `with workflow()`).
-
-    Useful when you need to manage lifecycle explicitly.
-    """
-
-    def __init__(self, name: str | None = None):
-        self.workflow_id = name or f"wf-{uuid.uuid4().hex}"
-        self._token = None
-
-    def __enter__(self) -> "WorkflowContext":
-        self._token = _workflow_id_var.set(self.workflow_id)
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if self._token is not None:
-            _workflow_id_var.reset(self._token)
-        return False

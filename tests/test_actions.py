@@ -256,3 +256,87 @@ class TestSnapshotAndBlock:
         # But action should be recorded
         history = handler.get_action_history()
         assert len(history) == 1
+
+
+# ===========================================================================
+# Sprint 1.5 (B14): unknown action type must NOT silently BLOCK
+# ===========================================================================
+# Pre-fix: an unknown action type (e.g. server schema regression,
+# version mismatch, or attacker-controlled input) silently degraded
+# to ``ActionType.BLOCK`` and triggered ``_default_block``, which
+# raises ``NullRunBlockedException``. That made the SDK into a DoS
+# amplifier: one malformed message stopped the whole workflow.
+# Post-fix: log at ERROR, record a forensic event with the unknown
+# action type, and DO NOT invoke any handler. Workflow continues.
+
+
+class TestUnknownActionTypeFailOpen:
+    """Unknown action types must fail open, not silently BLOCK."""
+
+    def test_unknown_action_does_not_raise_blocked_exception(self):
+        """Unknown action type must not raise NullRunBlockedException.
+
+        Pre-fix this raised ``NullRunBlockedException`` because
+        ``ActionType(action.lower())`` raised ``ValueError`` which
+        was caught and silently fell through to ``ActionType.BLOCK``
+        → ``_default_block`` → raise. Post-fix the method returns
+        cleanly and the workflow continues.
+        """
+        handler = ActionHandler()
+        # Must not raise.
+        handler.handle("totally_made_up_action", "wf-mystery", "test reason")
+
+    def test_unknown_action_records_forensic_event(self):
+        """Unknown action type is still recorded in action history.
+
+        The action is recorded with the unknown action type
+        encoded into the reason (``"unknown_action_type:..."``) so
+        an operator investigating the ERROR log can correlate the
+        event in history.
+        """
+        handler = ActionHandler()
+        handler.handle("not_a_real_action", "wf-mystery", "real reason")
+
+        history = handler.get_action_history()
+        assert len(history) == 1
+        # The reason field carries the forensic marker.
+        assert "unknown_action_type:not_a_real_action" in history[0].reason
+
+    def test_unknown_action_logs_at_error_level(self, caplog):
+        """Unknown action type must log at ERROR, not WARNING.
+
+        Promoted from WARNING (pre-fix) to ERROR because for a
+        safety-layer product, an unrecognised control plane action
+        is a first-class incident — not a routine diagnostic.
+        """
+        import logging
+        handler = ActionHandler()
+
+        with caplog.at_level(logging.ERROR, logger="nullrun.actions"):
+            handler.handle("bogus", "wf-x", "r")
+
+        error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert any("bogus" in r.getMessage() for r in error_records), (
+            "Unknown action type was not logged at ERROR level. "
+            "Pre-fix logged at WARNING which was too quiet for a "
+            "control-plane integrity event."
+        )
+
+    def test_known_actions_still_work_after_unknown_action(self):
+        """A prior unknown action must not corrupt handler state.
+
+        Regression guard: a malformed action in the stream must not
+        prevent subsequent KILL/PAUSE/etc. from being delivered.
+        Pre-fix the silent-BLOCK raised an exception that the
+        ``except BaseException`` swallowed, but a future change to
+        that catch could break this — pin it.
+        """
+        handler = ActionHandler()
+        handler.handle("malformed_first", "wf-mix", "first")
+        # Now a real KILL — must still be recorded and still raise.
+        handler.handle(ActionType.KILL, "wf-mix", "second")
+
+        history = handler.get_action_history()
+        assert len(history) == 2
+        assert history[0].reason == "unknown_action_type:malformed_first"
+        assert history[1].reason == "second"
