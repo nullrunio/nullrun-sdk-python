@@ -146,30 +146,68 @@ class WebSocketConnection:
         self._receive_task: asyncio.Task | None = None
         self._reconnect_task: asyncio.Task | None = None
         self._closed = False
+        # Per-workflow monotonic version dedup (ADR-007).
+        # Drop incoming state changes with ``version <= last`` to
+        # survive the at-least-once delivery semantics of the WS
+        # channel.
+        #
+        # Sprint 1.4 (B2): the previous sentinel of 0 dropped incoming
+        # ``version == 0`` on first receive because ``0 <= 0`` is
+        # True. The server uses ``version: 0`` for the very first
+        # ``initial_state`` frame after a (re)connect, so the SDK was
+        # silently discarding the server's initial view — meaning a
+        # ``Killed``/``Paused`` state delivered in that first frame
+        # was lost. Sentinel is now -1 so any non-negative version
+        # passes the guard on the first message; subsequent stale
+        # ``version == 0`` re-deliveries are still dropped because
+        # ``last_seen`` will be ``>= 1`` for that workflow.
+        self._last_version: dict[str, int] = {}
 
     async def _reconnect_loop(self) -> None:
         """
         Background reconnect loop with exponential backoff.
 
-        Attempts to reconnect on connection loss with increasing delays up to max_delay.
-        Resets delay on successful connection.
+        The receive loop sets ``self._running = False`` in its
+        ``finally`` block when the connection drops. This loop waits
+        while the receive loop is healthy and reconnects on demand.
+
+        Without the ``continue`` branch, the pre-fix code exited after
+        the very first successful ``_connect()`` because the
+        ``if not self._running`` guard became False the moment
+        ``_connect()`` set ``_running = True``. That broke the control
+        plane: after any network blip, kill/pause commands from the
+        dashboard would never reach the client until the process was
+        restarted. For a product whose core promise is a centralised
+        kill-switch, this was a safety gap — see plan item B1.
         """
         delay = 1.0
         max_delay = 60.0
 
         while not self._closed:
-            if not self._running and not self._closed:
-                try:
-                    await self._connect()
-                    delay = 1.0  # reset on success
-                    logger.info(f"WebSocket reconnected successfully: {self.url}")
-                except Exception as e:
-                    logger.warning(f"WebSocket reconnect failed, retrying in {delay}s: {e}")
-                    await asyncio.sleep(delay)
-                    delay = min(delay * 2, max_delay)
-            else:
-                # Connection is running or closed, exit reconnect loop
-                break
+            if self._running:
+                # Receive loop is healthy. Sleep briefly and re-check;
+                # if the connection drops the receive loop's
+                # ``finally`` block will set ``_running = False`` and
+                # we will reconnect on the next iteration.
+                await asyncio.sleep(0.5)
+                continue
+
+            # Connection is down. Try to reconnect with backoff.
+            try:
+                await self._connect()
+                delay = 1.0  # reset on success
+                logger.info(f"WebSocket reconnected successfully: {self.url}")
+                # A fresh server connection may re-deliver events the
+                # client has already seen (or has never seen) — clear
+                # the version-dedup cache so the server's current view
+                # is accepted, not deduplicated against the
+                # pre-disconnect state. Same semantic as
+                # ``resync_required``.
+                self.clear_local_state()
+            except Exception as e:
+                logger.warning(f"WebSocket reconnect failed, retrying in {delay}s: {e}")
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, max_delay)
 
     async def _connect(self) -> None:
         """
@@ -238,29 +276,132 @@ class WebSocketConnection:
             if signature and timestamp and self.api_key and self.secret_key:
                 # This is a signed message - verify the signature
                 msg_timestamp = int(timestamp) if isinstance(timestamp, (int, str)) else 0
-                # Use the raw message bytes (same as backend used for signing)
+
+                # FIX-C (counterpart of backend fix(ws-control) in
+                # NULLRUN): the server embeds the exact bytes that were
+                # HMAC-signed in `signed_payload` (hex-encoded). The
+                # receiver MUST verify against those exact bytes —
+                # never against the full wire JSON (which includes
+                # signature/timestamp/api_key_id themselves and would
+                # never match). The pre-FIX-C server builds kept the
+                # signing scheme but did not publish the canonical
+                # payload, so we fall back to the legacy behaviour
+                # (verify against the full wire bytes) only when
+                # `signed_payload` is absent.
+                #
+                # See memory/ws-signed-message-byte-mismatch for the
+                # original failure this design rule encodes.
+                signed_payload_hex = data.get("signed_payload")
+                if isinstance(signed_payload_hex, str) and signed_payload_hex:
+                    try:
+                        verify_payload = bytes.fromhex(signed_payload_hex)
+                    except ValueError:
+                        # Malformed hex from a non-conforming server.
+                        # Fall through to the legacy wire-bytes path
+                        # so we still have a chance to accept it; the
+                        # signature check will fail in either case
+                        # and we'll reject with the standard error.
+                        verify_payload = message.encode('utf-8')
+                else:
+                    # Pre-FIX-C server: verify against full wire
+                    # bytes. Will pass only on round-trip tests where
+                    # the server happens to hash the same bytes we
+                    # do; in real life this is the byte-mismatch path
+                    # and the message should be rejected. Kept as
+                    # best-effort backwards compatibility.
+                    verify_payload = message.encode('utf-8')
+
                 if not verify_hmac_signature(
                     self.api_key,
                     self.secret_key,
                     msg_timestamp,
-                    message.encode('utf-8'),
+                    verify_payload,
                     signature,
                     max_age_seconds=300,
                 ):
-                    logger.warning(f"Invalid HMAC signature for {msg_type} message - rejecting")
+                    # Sprint 1.5 (B13): pre-fix this logged at
+                    # WARNING and dropped the message silently. For a
+                    # safety layer whose core contract is "the
+                    # server can always KILL a workflow", a failed
+                    # signature verification on a control plane
+                    # message is a first-class incident — promote to
+                    # ERROR and bump the counter so an SRE can
+                    # alert on ``hmac_verify_failures_total > 0``.
+                    # A signed-but-invalid message means either
+                    # (a) the secret_key is out of sync (server
+                    # rotated, client missed the rotation event), or
+                    # (b) something is forging traffic. Both are
+                    # actionable and the operator needs to know.
+                    logger.error(
+                        f"Invalid HMAC signature for {msg_type} message - "
+                        "rejecting. This usually means the secret_key is out "
+                        "of sync with the server (check for a key_rotated "
+                        "event you may have missed) or the control plane is "
+                        "being tampered with."
+                    )
+                    # Local import to avoid a module-level cycle:
+                    # observability imports nothing from us, so this
+                    # is safe and lazy.
+                    from nullrun.observability import metrics
+                    metrics.inc_transport("hmac_verify_failures_total")
                     return
+
+            # FIX-C (counterpart of backend fix(ws-control) in
+            # NULLRUN): when the message is signed and carries a
+            # `signed_payload` field, dispatching from the outer
+            # body fields would let an attacker splice forged values
+            # into the outer body while reusing a captured
+            # (signed_payload, signature) pair. The signature is
+            # computed over the bytes inside signed_payload, not the
+            # outer body, so the *only* trusted source is signed_payload
+            # itself. We parse it once and use the parsed dict for all
+            # state-dispatch decisions.
+            #
+            # For non-signed messages (legacy servers, or policy
+            # events that don't need per-payload signing) we fall back
+            # to the outer body — there is no signing, no attacker
+            # model.
+            trusted: dict[str, Any] | None = None
+            if signature and timestamp and self.api_key and self.secret_key:
+                if isinstance(signed_payload_hex, str) and signed_payload_hex:
+                    try:
+                        trusted = json.loads(
+                            bytes.fromhex(signed_payload_hex).decode("utf-8")
+                        )
+                    except (ValueError, json.JSONDecodeError):
+                        # Malformed signed_payload — the signature
+                        # check above will already have rejected this
+                        # message, so this branch should be unreachable
+                        # in practice. We keep the fall-through to
+                        # outer body to avoid a hard crash if the
+                        # two checks ever drift.
+                        trusted = None
 
             if msg_type == "initial_state":
                 # Initial state with all workflow states
                 workflows = data.get("workflows", [])
                 logger.debug(f"Received initial state: {len(workflows)} workflows")
                 for wf in workflows:
+                    # Trust the inner workflows[] entries the same
+                    # way we trust state_change: when the parent
+                    # envelope is signed, parse each entry from its
+                    # embedded signed_payload if present, else fall
+                    # back to the outer dict.
+                    if isinstance(wf, dict) and wf.get("signed_payload") and self.api_key and self.secret_key:
+                        try:
+                            inner = json.loads(
+                                bytes.fromhex(wf["signed_payload"]).decode("utf-8")
+                            )
+                            self._dispatch_state(inner)
+                            continue
+                        except (ValueError, json.JSONDecodeError, KeyError):
+                            pass
                     self._dispatch_state(wf)
 
             elif msg_type == "state_change":
                 # Workflow state change notification
                 # Check if this message requires acknowledgment
-                await self._handle_state_change_with_ack(data)
+                await self._handle_state_change_with_ack(data, trusted)
 
             elif msg_type == "policy_invalidated":
                 # Policy was updated via dashboard - SDK should clear its cache
@@ -286,6 +427,28 @@ class WebSocketConnection:
                     except Exception as e:
                         logger.warning(f"Key rotation callback error: {e}")
 
+            elif msg_type == "resync_required":
+                # Server overflowed its broadcast channel. Per
+                # ADR-007 the SDK MUST close, reconnect, and
+                # replace its local state from the new
+                # ``initial_state`` — there is no "catch up"
+                # semantics. We clear the version-dedup cache and
+                # let ``_reconnect_loop`` reopen the connection.
+                reason = data.get("reason", "overflow")
+                logger.warning(
+                    f"Server requested resync (reason={reason}); "
+                    "clearing local state and reconnecting"
+                )
+                self.clear_local_state()
+                self._running = False
+                self._closed = True
+                if self._conn is not None:
+                    try:
+                        await self._conn.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    self._conn = None
+
             elif msg_type == "pong":
                 # Pong response to ping - connection is alive
                 pass
@@ -304,18 +467,36 @@ class WebSocketConnection:
         except json.JSONDecodeError:
             logger.warning(f"Invalid JSON message: {message[:100]}")
 
-    async def _handle_state_change_with_ack(self, data: dict[str, Any]) -> None:
+    async def _handle_state_change_with_ack(
+        self,
+        data: dict[str, Any],
+        trusted: dict[str, Any] | None = None,
+    ) -> None:
         """
         Handle state change message that may require acknowledgment.
 
         For killed/paused states, sends ACK immediately before dispatching.
 
         Args:
-            data: The state change message data
+            data: The outer (envelope) message data — used for
+                routing metadata only.
+            trusted: The parsed bytes of `signed_payload` (when the
+                message was signed). When present, dispatch reads
+                state / workflow_id / version / message_id from this
+                dict, NOT from `data`. The signature is computed over
+                the bytes inside signed_payload, so any divergence
+                between `data` and `trusted` is a forgery attempt and
+                must not be honoured.
         """
-        state = data.get("state", "")
-        workflow_id = data.get("workflow_id", "")
-        message_id = data.get("message_id")
+        # FIX-C: when the message is signed, the signature covers the
+        # bytes inside `signed_payload`, not the outer body. We must
+        # use `trusted` (the parsed signed_payload) for any
+        # security-sensitive decision. The outer `data` is only used
+        # for routing.
+        source = trusted if trusted is not None else data
+        state = source.get("state", "")
+        workflow_id = source.get("workflow_id", "")
+        message_id = source.get("message_id")
 
         # Check if this state requires acknowledgment
         if state in self.ACKNOWLEDGED_STATES and message_id:
@@ -323,8 +504,10 @@ class WebSocketConnection:
             await self._send_ack(message_id)
             logger.debug(f"Sent ACK for message {message_id} ({state} for workflow {workflow_id})")
 
-        # Dispatch state to callback
-        self._dispatch_state(data)
+        # Dispatch state to callback. Use the trusted source so
+        # callbacks (and the per-workflow version dedup in
+        # _dispatch_state) see the same values that were ACK'd.
+        self._dispatch_state(source)
 
     async def _send_ack(self, message_id: str) -> None:
         """
@@ -350,16 +533,43 @@ class WebSocketConnection:
 
     def _dispatch_state(self, state: dict[str, Any]) -> None:
         """
-        Dispatch state to callback.
+        Dispatch state to callback after per-workflow version dedup
+        (ADR-007: at-least-once delivery, drop stale events).
 
         Args:
             state: State dict with workflow_id, state, version, etc.
         """
+        workflow_id = state.get("workflow_id", "")
+        incoming_version = state.get("version", 0)
+        if workflow_id:
+            # Sprint 1.4 (B2): default -1 (not 0) so version=0 is
+            # accepted on first receive. See __init__ for rationale.
+            last = self._last_version.get(workflow_id, -1)
+            if incoming_version <= last:
+                logger.debug(
+                    f"Dropping stale state event for {workflow_id}: "
+                    f"incoming version={incoming_version} <= last={last}"
+                )
+                return
+            self._last_version[workflow_id] = incoming_version
         if self.on_state_change:
             try:
                 self.on_state_change(state)
             except Exception as e:
                 logger.warning(f"State change callback error: {e}")
+
+    def clear_local_state(self) -> None:
+        """
+        Clear the in-memory per-workflow version cache.
+
+        Called after a ``ResyncRequired`` event so the next
+        ``initial_state`` from the server is accepted (the dedup
+        cache may otherwise drop the server's freshest state if
+        the version is unchanged from the pre-overflow value).
+        Per ADR-007 there is no "merge" — local state is fully
+        replaced by the next ``initial_state``.
+        """
+        self._last_version.clear()
 
     async def send(self, message: dict[str, Any]) -> None:
         """
@@ -409,80 +619,3 @@ class WebSocketConnection:
         """Check if connection is active."""
         return self._running and self._conn is not None and not self._closed
 
-
-class WebSocketManager:
-    """
-    Manager for WebSocket connections per organization.
-
-    Maintains a single connection per organization to avoid
-    duplicate connections.
-    """
-
-    def __init__(self):
-        self._connections: dict[str, WebSocketConnection] = {}
-
-    async def connect(
-        self,
-        organization_id: str,
-        url: str,
-        headers: dict[str, str] | None = None,
-        api_key: str | None = None,
-        secret_key: str | None = None,
-        on_state_change: Callable[[dict[str, Any]], None] | None = None,
-        on_policy_invalidated: Callable[[str, str, int], None] | None = None,
-        on_key_rotated: Callable[[str, str, int], None] | None = None,
-    ) -> WebSocketConnection:
-        """
-        Get or create WebSocket connection for an organization.
-
-        Args:
-            organization_id: Organization identifier
-            url: WebSocket URL
-            headers: HTTP headers
-            api_key: API key for HMAC verification
-            secret_key: Secret key for HMAC verification
-            on_state_change: State change callback
-            on_policy_invalidated: Callback when policy cache should be cleared
-            on_key_rotated: Callback when secret key should be re-fetched
-
-        Returns:
-            WebSocketConnection for the organization
-        """
-        # Return existing connection if available
-        if organization_id in self._connections:
-            conn = self._connections[organization_id]
-            if conn.is_connected:
-                return conn
-            # Connection was closed, remove it
-            del self._connections[organization_id]
-
-        # Create new connection
-        conn = WebSocketConnection(
-            url=url,
-            headers=headers,
-            api_key=api_key,
-            secret_key=secret_key,
-            on_state_change=on_state_change,
-            on_policy_invalidated=on_policy_invalidated,
-            on_key_rotated=on_key_rotated,
-        )
-        await conn.connect()
-        self._connections[organization_id] = conn
-        return conn
-
-    async def disconnect(self, organization_id: str) -> None:
-        """
-        Disconnect and remove connection for an organization.
-
-        Args:
-            organization_id: Organization identifier
-        """
-        if organization_id in self._connections:
-            conn = self._connections[organization_id]
-            await conn.close()
-            del self._connections[organization_id]
-
-    async def disconnect_all(self) -> None:
-        """Disconnect all active connections."""
-        for organization_id in list(self._connections.keys()):
-            await self.disconnect(organization_id)
