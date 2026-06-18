@@ -267,3 +267,269 @@ def test_ws_connection_class_dispatches_state_change():
     assert received, "WebSocketConnection never invoked on_state_change"
     assert received[0]["state"] == "Killed"
     assert received[0]["workflow_id"] == "wf-wire"
+
+
+# ---------------------------------------------------------------------------
+# 3. Reconnect test: server-side drop must trigger reconnection
+# ---------------------------------------------------------------------------
+# Pins the B1 fix: pre-fix, the reconnect loop exited after the first
+# successful connect (because ``_running=True`` made the
+# ``if not self._running`` guard False and hit ``else: break``), so
+# any subsequent server-side disconnect left the control plane dead
+# until process restart. Post-fix, the loop waits while ``_running``
+# is True and reconnects on demand.
+
+
+async def _reconnect_handler(
+    ws,
+    ready: threading.Event,
+    connection_count: list[int],
+):
+    """Server handler that closes the FIRST connection (simulating a
+    network blip) and pushes a ``state_change`` on the SECOND
+    connection (the client's automatic reconnection)."""
+    ready.set()
+    connection_count[0] += 1
+
+    if connection_count[0] == 1:
+        # First connection: close immediately. The client's receive
+        # loop will see ``ConnectionClosed``, set ``_running = False``
+        # in its ``finally`` block, and the reconnect loop will
+        # attempt to reconnect with backoff (initial delay=1.0s).
+        await ws.close()
+        return
+
+    # Second connection (the reconnect): push a state_change.
+    # Tiny delay so the client's _receive_task is scheduled first.
+    await asyncio.sleep(0.05)
+    push = {
+        "type": "state_change",
+        "workflow_id": "wf-reconnect",
+        "state": "Killed",
+        "version": 1,
+        "reason": "reconnect_test",
+        "updated_at": int(time.time()),
+    }
+    await ws.send(json.dumps(push))
+    # Keep the connection alive briefly so the client processes the
+    # message before we tear down.
+    await asyncio.sleep(0.2)
+
+
+def test_ws_reconnects_after_server_disconnect():
+    """End-to-end: server closes connection 1, client must
+    automatically reconnect, and server pushes a state_change on
+    connection 2 that the client must receive.
+
+    This test is the regression guard for plan item B1. Pre-fix, the
+    test would hang on ``received_event`` until its 5s deadline and
+    fail with ``received == []``.
+    """
+    connection_count: list[int] = [0]
+    ready = threading.Event()
+    port, _server, _thread = _start_ws_server(
+        lambda ws, r=ready, c=connection_count: _reconnect_handler(ws, r, c)
+    )
+
+    received: list[dict[str, Any]] = []
+    received_event = threading.Event()
+
+    async def _main():
+        conn = WebSocketConnection(
+            url=f"ws://127.0.0.1:{port}/ws/control/org-1",
+            api_key="k",
+            on_state_change=lambda s: (
+                received.append(s),
+                received_event.set(),
+            ),
+        )
+        await conn.connect()
+
+        # Wait up to 5s for the reconnect + push. The first attempt
+        # has backoff delay=1.0s, so budget is generous.
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            if received_event.is_set():
+                break
+            await asyncio.sleep(0.05)
+        await conn.close()
+
+    asyncio.run(_main())
+
+    assert received, (
+        "WebSocketConnection did not reconnect and receive the "
+        "state_change after the server closed the first connection. "
+        "This is the B1 regression: the reconnect loop exited after "
+        "the first successful connect and never reconnected."
+    )
+    assert received[0]["state"] == "Killed"
+    assert received[0]["workflow_id"] == "wf-reconnect"
+    # Sanity: server saw exactly 2 connections (initial + reconnect).
+    assert connection_count[0] == 2, (
+        f"Expected server to see 2 connections (initial + reconnect), "
+        f"got {connection_count[0]}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 4. Version-dedup unit tests: version=0 must be accepted on first receive
+# ---------------------------------------------------------------------------
+# Pins the B2 fix: pre-fix, ``_dispatch_state`` defaulted
+# ``_last_version[wf]`` to 0, so ``incoming_version=0`` failed the
+# ``incoming_version <= last`` guard (``0 <= 0``) and was dropped.
+# For a server that emits ``initial_state`` with ``version: 0`` for
+# each workflow on connect, this meant the very first state event
+# for every workflow was silently discarded.
+
+
+def test_dispatch_state_accepts_version_zero_on_first_receive():
+    """First state event with version=0 must reach the callback.
+
+    Pre-fix this was a silent safety gap: the first ``initial_state``
+    frame (which the server emits with version=0) was dropped because
+    the dedup default was 0, so ``0 <= 0`` was True.
+    """
+    conn = WebSocketConnection(
+        url="ws://127.0.0.1:1/ws/control/org-x",
+        api_key="k",
+    )
+    received: list[dict[str, Any]] = []
+    conn.on_state_change = lambda s: received.append(s)
+
+    conn._dispatch_state(
+        {
+            "workflow_id": "wf-zero",
+            "state": "Killed",
+            "version": 0,
+            "reason": "test",
+        }
+    )
+
+    assert len(received) == 1, (
+        f"version=0 was dropped on first receive (got {len(received)} events). "
+        "This is the B2 regression: the version-dedup sentinel was 0, so "
+        "``0 <= 0`` was True and the very first state event was lost."
+    )
+    assert received[0]["state"] == "Killed"
+    # And the cache must now reflect version=0, so a *re-delivery* of
+    # version=0 from the server's at-least-once channel is still
+    # dropped.
+    conn._dispatch_state(
+        {
+            "workflow_id": "wf-zero",
+            "state": "Killed",
+            "version": 0,
+            "reason": "test",
+        }
+    )
+    assert len(received) == 1, "Stale re-delivery of version=0 was not dropped"
+
+
+def test_dispatch_state_drops_older_versions_after_seen_higher():
+    """After accepting version=5, an incoming version=2 must be dropped.
+
+    Pins the stale-event rejection path: ``incoming_version <= last``
+    must remain True for any version <= the last-seen one.
+    """
+    conn = WebSocketConnection(
+        url="ws://127.0.0.1:1/ws/control/org-x",
+        api_key="k",
+    )
+    received: list[dict[str, Any]] = []
+    conn.on_state_change = lambda s: received.append(s)
+
+    # First: high version — must be accepted.
+    conn._dispatch_state(
+        {
+            "workflow_id": "wf-mono",
+            "state": "Normal",
+            "version": 5,
+        }
+    )
+    # Then: stale lower version — must be dropped.
+    conn._dispatch_state(
+        {
+            "workflow_id": "wf-mono",
+            "state": "Killed",
+            "version": 2,
+        }
+    )
+
+    assert len(received) == 1
+    assert received[0]["version"] == 5
+    assert received[0]["state"] == "Normal"
+
+
+# ---------------------------------------------------------------------------
+# 5. Sprint 1.5 (B13): HMAC verify failure on signed messages
+# ---------------------------------------------------------------------------
+# Pre-fix: a signed WS message with a bad signature was logged at
+# WARNING and dropped silently. For a safety-layer product, a
+# signature mismatch is a first-class incident (either the server
+# rotated the secret_key and the client missed the rotation, or
+# the control plane is being tampered with) and must be visible.
+# Post-fix: log at ERROR and bump ``hmac_verify_failures_total``.
+
+
+def test_hmac_verify_failure_logs_error_and_bumps_metric(caplog):
+    """A signed message with an invalid signature must log at ERROR
+    and increment the ``hmac_verify_failures_total`` metric.
+
+    We use a real ``WebSocketConnection`` instance but invoke
+    ``_handle_message`` directly so we don't need a live WS server
+    for this test. The branch under test is the signature-mismatch
+    path inside ``_handle_message``.
+    """
+    import logging
+
+    from nullrun.observability import metrics
+
+    conn = WebSocketConnection(
+        url="ws://127.0.0.1:1/ws/control/org-x",
+        api_key="nr_live_test",
+        secret_key="correct-secret",
+    )
+    # Snapshot the metric so we can assert the delta.
+    before = metrics.transport.hmac_verify_failures_total
+
+    # Build a signed message with a deliberately wrong signature.
+    # The shape matches what the server emits: a ``state_change``
+    # with a ``signature`` and ``timestamp`` field. We sign with
+    # the wrong secret so ``verify_hmac_signature`` returns False.
+    payload = {
+        "type": "state_change",
+        "workflow_id": "wf-hmac-fail",
+        "state": "Killed",
+        "version": 1,
+        "reason": "forged",
+        "updated_at": int(time.time()),
+    }
+    bad_msg = dict(payload)
+    bad_msg["timestamp"] = int(time.time())
+    bad_msg["signature"] = "deadbeef" * 8  # 64 hex chars but wrong
+
+    received: list[dict[str, Any]] = []
+    conn.on_state_change = lambda s: received.append(s)
+
+    with caplog.at_level(logging.ERROR, logger="nullrun.transport_websocket"):
+        # The handler is async; drive it synchronously via asyncio.run
+        # so the test stays simple.
+        asyncio.run(conn._handle_message(json.dumps(bad_msg)))
+
+    after = metrics.transport.hmac_verify_failures_total
+    assert after == before + 1, (
+        f"hmac_verify_failures_total did not increment: "
+        f"before={before}, after={after}"
+    )
+    # The bad message MUST NOT have reached the callback — signature
+    # verification is the gate that prevents forged kill commands.
+    assert received == [], (
+        f"Forged message was dispatched to on_state_change: {received}"
+    )
+    # And the failure must be visible at ERROR level.
+    error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert any("HMAC" in r.getMessage() for r in error_records), (
+        "HMAC verify failure was not logged at ERROR level. "
+        "Pre-fix logged at WARNING which was too quiet for a "
+        "control-plane integrity event."
+    )

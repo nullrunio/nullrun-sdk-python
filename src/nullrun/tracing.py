@@ -93,7 +93,22 @@ def create_child_span(parent: SpanContext) -> SpanContext:
     The child inherits `parent.trace_id` and increments `parent.depth`.
     `parent_span_id` is set to `parent.span_id` so the tree is fully
     reconstructable from the event stream.
+
+    Raises:
+        ValueError: if `parent` is ``None``. The function does NOT
+            silently degrade to creating a root span — that would
+            hide bugs in the caller where a parent was expected.
+            Sprint 2.6 (B5): pre-fix this raised
+            ``TypeError: unsupported operand for None + 1`` on
+            ``parent.depth + 1`` which crashed the entire
+            ``@protect`` / track_* pipeline. Raise a clear
+            ``ValueError`` instead so the caller can fix the bug.
     """
+    if parent is None:
+        raise ValueError(
+            "create_child_span requires a non-None parent SpanContext. "
+            "If you want a root span, use create_root_span() instead."
+        )
     return SpanContext(
         trace_id=parent.trace_id,
         span_id=_new_id(),
