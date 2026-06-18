@@ -5,19 +5,18 @@ inaccessible as a first-class attribute, so cookbook examples that read
 `exc.tool_name` raised `AttributeError`.
 
 The fix exposed `tool_name` as a kwarg on `NullRunBlockedException.__init__`
-and stored it on `self.tool_name`. Subclasses (`LoopDetectedException`,
-`RetryStormException`, `RateLimitExceededException`) flow through the
-new parameter because they call `super().__init__(...)` with it.
+and stored it on `self.tool_name`.
 
 Backwards compat: `tool_name` is optional and defaults to `None`, so
 all existing raise sites that do not pass it still work.
+
+Sprint 2.2: the previously-tested subclasses ``LoopDetectedException``,
+``RetryStormException``, and ``RateLimitExceededException`` were
+removed because they had no in-tree callers. The base-class
+attribute surface tests below still pin the contract for any future
+subclass.
 """
-from nullrun.breaker.exceptions import (
-    LoopDetectedException,
-    NullRunBlockedException,
-    RateLimitExceededException,
-    RetryStormException,
-)
+from nullrun.breaker.exceptions import NullRunBlockedException
 
 
 def test_tool_name_kwarg_exposed_as_attribute():
@@ -51,35 +50,6 @@ def test_tool_name_does_not_leak_into_details():
     assert exc.tool_name == "refund_payment"
     assert "tool_name" not in exc.details
     assert exc.details == {"extra_field": "kept-in-details"}
-
-
-def test_loop_detected_subclass_inherits_tool_name():
-    """LoopDetectedException passes tool_name via super().__init__."""
-    exc = LoopDetectedException(
-        workflow_id="wf-loop",
-        tool_name="search_web",
-        count=7,
-    )
-    assert exc.tool_name == "search_web"
-    assert exc.action == "kill"
-    assert exc.details == {"count": 7}
-
-
-def test_retry_storm_subclass_without_tool_name():
-    """Subclasses that do not pass tool_name get tool_name=None."""
-    exc = RetryStormException(workflow_id="wf-retry", count=99)
-    assert exc.tool_name is None
-    assert exc.action == "kill"
-    assert exc.details == {"count": 99}
-
-
-def test_rate_limit_subclass_without_tool_name():
-    exc = RateLimitExceededException(
-        workflow_id="wf-rl", rate=120.0, limit=60.0
-    )
-    assert exc.tool_name is None
-    assert exc.action == "pause"
-    assert exc.details == {"rate": 120.0, "limit": 60.0}
 
 
 def test_message_includes_tool_suffix_when_present():

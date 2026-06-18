@@ -7,6 +7,248 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [0.3.1] — 2026-06-17
+
+Production-readiness hardening. No public-API changes; the curated 6-symbol
+surface is unchanged. Aligns the SDK with the contracts in
+`NULLRUN/docs/adr/008-sdk-preflight-fail-policy.md` and
+`NULLRUN/docs/kill-contract.md`.
+
+### Fixed (P0 — must-fix)
+
+- **gRPC transport code path removed.** `create_grpc_transport` was
+  referenced but never defined, so setting `NULLRUN_USE_GRPC=1` raised
+  `NameError` at init. The gRPC server at the platform is intentionally
+  frozen until the activation checklist (TLS, auth, proto extensions,
+  cost pipeline parity, tests) is complete. The SDK now logs an
+  INFO line on `NULLRUN_USE_GRPC=1` and silently falls back to
+  HTTP. The `grpcio` hard dependency has been dropped from
+  `pyproject.toml`. If/when gRPC is unblocked, the SDK will add it back
+  as a separate optional extra.
+- **`InsecureTransportError` URL check hardened.** Replaced the
+  `startswith("http://127.0.0.1")` chain with a `urllib.parse.urlparse`
+  + `ipaddress.ip_address` check. The previous check let
+  `http://127.0.0.1.attacker.com` and `http://localhost.evil.com`
+  through (homograph attacks) and rejected `http://[::1]:8080`
+  (IPv6 loopback). The new check allows the full `127.0.0.0/8`
+  IPv4 loopback range, `::1`, and `localhost` (case-insensitive).
+- **`signal.signal` global hijack removed.** `Transport.__init__` no
+  longer installs a process-wide `SIGTERM` / `SIGINT` handler
+  that called `sys.exit(0)` from inside the signal context.
+  The fix contract was already pinned in `tests/test_signal_safety.py`
+  and is now applied to the source.
+- **`atexit.register` replaced with `weakref.finalize`.** The
+  per-Transport `atexit` chain was growing without bound in
+  long-running deployments; weakref finalizers only fire if the
+  transport is still alive at process exit.
+- **`Transport` is now a context manager.** `with Transport(...) as t:`
+  starts the flush thread on enter and stops it on exit. Replaces
+  the manual `start() / stop()` pair that was easy to forget.
+- **HMAC body byte-equality in the legacy batch path.** The
+  pre-fix code signed `body = json.dumps({"events": batch})` and
+  then sent the same payload via httpx's `json=...` parameter,
+  which re-serialises with compact separators. The signed bytes
+  and the wire bytes were not identical. Now the path uses
+  `content=body` so the signed bytes are the wire bytes.
+- **All 4 examples fixed.** `basic.py` was calling `init()` with no
+  args (raises in 0.3.0). `basic_observe.py` was passing
+  `organization_id=` (not in the signature) and calling
+  `nullrun.coverage_report()` (did not exist). `cost_dashboard.py`
+  was using `Authorization: Bearer` and the non-existent
+  `/api/v1/orgs/{org_id}/usage` endpoint. All four now use the
+  current SDK surface and the canonical `/api/v1/orgs/{org_id}/status`
+  endpoint.
+
+### Fixed (P1)
+
+- **AsyncTransport dead code deleted.** 626 lines of unused
+  async transport that had no call sites. Tests already removed.
+- **TrackResult dead class deleted.** `track()` returns `dict`,
+  not `TrackResult`. The class was unreferenced.
+- **Singleton-state lock added.** `init()` now wraps the three
+  singleton-slot writes (`NullRunRuntime._instance`,
+  `_rt_mod._runtime`, `_dec_mod._runtime`) in a module-level
+  `threading.Lock` so concurrent `init()` calls cannot leave
+  the slots pointing at two different runtimes.
+- **Legacy API key warning.** Pre-Phase-139 API keys (no
+  `workflow_id` from `/auth/verify`) now emit a one-time
+  WARNING explaining that remote kill/pause will not be
+  honoured. Without the warning, the dashboard KILL button
+  silently no-ops for users on legacy keys.
+- **Distributed circuit-breaker race fix.** The pre-fix code
+  defined `_publish_half_open_state` but never called it. The
+  `state` property now calls it on the `OPEN → HALF_OPEN`
+  transition so other workers see the new state in Redis
+  instead of falling back to PERMISSIVE.
+
+### Removed (dead code)
+
+- `AsyncTransport` (626 lines)
+- `TrackResult` (12 lines)
+- `BoundedDict` cost / loop / retry counters
+- `_check_local_limits` (the local budget check that read
+  `cost_cents` which the SDK never sets — was dead for the
+  public API)
+- `StructuredLogger`, `get_logger`, `TenantFilter`,
+  `configure_logging_with_tenant_context`, `timed` from
+  `observability.py` (zero call sites)
+- `tenant_context`, `set_tenant_context`, `get_org_id` from
+  `context.py` (zero call sites; `get_org_id` was already
+  documented as gone in 0.3.0 CHANGELOG)
+- `instrumentation/openai.py` (the v0.x patcher that no
+  longer applied to `openai>=1.0`)
+
+### Added
+
+- `NullRunRuntime.coverage_report()` — public method that
+  returns `{"seen": ..., "tracked": ...,
+  "streaming_skipped": ...}`. The auto-instrumentation layer
+  already populates the counters; this method just exposes
+  them. Called by `examples/basic_observe.py`.
+- `Transport.__enter__` / `__exit__` (see above)
+- `tests/test_init_contract.py` — pins the 0.3.0 init
+  contract (api_key required, singleton state, no
+  organization_id kwarg)
+- `tests/test_insecure_transport.py` — homograph / IPv6 /
+  case-insensitive coverage for the new URL check
+- `tests/test_grpc_removed.py` — pins the post-deletion
+  gRPC contract
+- `tests/test_legacy_key_warning.py` — pins the legacy
+  API key warning
+- `tests/test_cb_halfopen_publish.py` — pins the
+  HALF_OPEN Redis publish
+- `tests/test_kill_deprecation.py` — pins the
+  `WorkflowKilledInterrupt` deprecation-bypass contract
+
+### Documentation
+
+- `WorkflowKilledInterrupt` docstring now includes a
+  "Catching in production" section with the recommended
+  Sentry / OpenTelemetry pattern (`except BaseException`,
+  not `except Exception`).
+- `NULLRUN/docs/sdk/README.md` rewritten to match the
+  actual 6-symbol SDK surface and current `track_*`
+  signatures. The previous 7-symbol reference was a
+  description of an older design that did not match the
+  shipped SDK.
+
+## [Unreleased]
+
+### Added (production-readiness hardening)
+
+- **HMAC always-on when `secret_key` is present.** The SDK now signs every
+  outgoing POST/GET (auth/verify, /track/batch, /gate, /evaluate, /status)
+  via the new `Transport._signed_post` / `_signed_request` helpers. The
+  outgoing WebSocket ACK is also signed (mirroring incoming-message
+  verification). Header set is built once via `_build_signed_headers`
+  (Content-Type, X-API-Version, X-API-Key, X-Signature,
+  X-Signature-Timestamp, W3C trace context). Previously only
+  /track/batch and /gate were signed; auth/verify, /status GET, and
+  WS ACKs were not. Compliant with the canonical
+  `HMAC-SHA256(secret_key, "<ts>:<api_key>:<sha256_hex(body)>")` formula
+  from `backend/src/auth/hmac.rs:6-9`.
+
+- **WebSocket protocol compliance (Phase 2 of the plan).** The SDK now
+  honours `resync_required` (closes the connection, clears local state,
+  reconnects — no merge per ADR-007), enforces per-workflow `version`
+  monotonic dedup (drops events with `version <= last` to survive
+  at-least-once delivery), and signs outgoing ACKs. The URL uses
+  `X-API-Key` header (never the query string — per SEC-7, the server
+  rejects `?api_key=…`).
+
+- **`track_event` fingerprint + coverage counters (Phase 3).** `track_event`
+  now emits a stable `_fingerprint` so the dedup LRU at the `track()`
+  sink collapses repeat emissions of the same event (the user's manual
+  `track_event` plus the httpx transport hook firing on the same LLM
+  call). The fingerprint is stripped before the wire send. The
+  `_coverage_seen` / `_coverage_tracked` / `_coverage_streaming_skipped`
+  counters are now initialised in `__init__` so the
+  `_safe_bump_coverage` helper in `nullrun.instrumentation.auto`
+  actually increments the dashboard's coverage tab.
+
+- **`SENSITIVE_ARG_KEYS` expanded from 7 to 29 tokens.** Now masks
+  `password`, `passwd`, `pwd`, `token`, `secret`, `api_key`, `apikey`,
+  `key`, `auth`, `authorization`, `bearer`, `session`, `session_id`,
+  `cookie`, `access_token`, `refresh_token`, `id_token`, `private_key`,
+  `secret_key`, `email`, `phone`, `ssn`, `credit_card`,
+  `credit_card_number`, `cvv`, `cvc`, `pin`, `otp`, `mfa`. Matching
+  is case-insensitive.
+
+- **Recursive `_safe_error_str` (Phase 3).** The previous one-level
+  regex was replaced with a balanced-brace walker that handles
+  arbitrary nesting depth and dict values that contain `{` / `}` in
+  string content. Bare `details=foo` (no opening brace) is preserved
+  so we don't lose free-form text.
+
+- **`RateLimitError` exception class (Phase 4).** A new
+  `RateLimitError(NullRunTransportError)` carries the parsed
+  `Retry-After` (seconds) and `upgrade_url` from the 429 envelope
+  per `contracts/errors.ts`. The transport layer's
+  `_parse_error_envelope` helper maps 4xx / 5xx / 429 to typed
+  exceptions (`NullRunAuthenticationError` /
+  `NullRunTransportError(GATEWAY_ERROR)` / `RateLimitError`) so
+  callers can branch on the type instead of string-matching
+  `str(exc)`.
+
+- **`Transport.post_signed_with_401_retry` helper (Phase 4).** The
+  runtime can opt into transparent one-shot re-authentication on
+  HTTP 401 by passing a `reauth_callback` (typically
+  `lambda: self._authenticate()`). The first 401 re-calls
+  `auth/verify` to pick up the freshly-rotated `secret_key` and
+  retries the original request. A second 401 propagates as
+  `NullRunAuthenticationError`.
+
+- **`PolicyCache.clear()` (Phase 2).** New method on the transport's
+  policy cache so the `PolicyInvalidated` WebSocket callback can
+  flush every cached decision atomically. The
+  `Transport.clear_policy_cache` public method now delegates to it
+  instead of poking the internal `_cache` dict.
+
+- **`_fingerprint_for_event_dict` helper (Phase 3).** New in
+  `nullrun.instrumentation.auto` for the generic event-dict
+  fingerprint used by `track_event` (the existing
+  `_fingerprint_for` is for HTTP responses keyed on host+body+status).
+
+### Removed (Phase 5)
+
+- **Empty placeholder modules deleted.** `src/nullrun/flow/`,
+  `src/nullrun/gate/`, `src/nullrun/common/` were placeholders for
+  promised-but-unimplemented products. Removed.
+- **Orphan `protos/` directory deleted.** `grpc_transport.py` was
+  removed in 0.4.0; the proto schema is no longer needed in the SDK.
+- **`instrumentation/openai.py` (v0.x patcher) deleted.** It patched
+  `openai.ChatCompletion.create` which `openai>=1.0` does not
+  expose. All OpenAI v1.0+ traffic is now tracked via the httpx
+  transport hook in `nullrun.instrumentation.auto`.
+- **`DecisionHistoryRecorder.replay_locally` / `replay_event` /
+  `replay_from_file` deleted.** They called `runtime.track` (which
+  hits the backend) despite the docstring claiming "local-only".
+  The honest-scope local recorder surface (`start_recording`,
+  `stop_recording`, `record_event`, `estimate_cost`,
+  `RecordingSession.to_dict` / `from_dict`) is preserved.
+- **`observability.TenantFilter` no longer writes the deprecated
+  `org_id` field** — only the canonical `organization_id` and
+  `api_key_id` remain. The legacy `get_org_id()` helper is gone
+  alongside the workspace_id → organization_id migration.
+
+### Fixed
+
+- **`examples/cost_dashboard.py`** switched from
+  `Authorization: Bearer` (which the SDK never uses on the user's
+  behalf) to `X-API-Key`, and from the non-existent `/usage`
+  endpoint to the canonical `/quota` per `contracts/openapi.yaml`.
+
+### Notes
+
+- Public surface unchanged. `init`, `protect`, `track_llm`,
+  `track_tool`, `track_event` retain the same call signatures
+  documented in the existing examples. The platform's
+  `docs/sdk/README.md` describes an alternative 7-symbol surface
+  (with `wrap` alias and a different `init(organization_id, ...)`
+  signature) — that doc is out of sync with the SDK; an update
+  to the platform docs is tracked separately. Per the production
+  plan's user decisions, the SDK's surface is the source of truth.
+
 ## [Unreleased]
 
 ### Added
@@ -34,6 +276,119 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   contract of `nullrun.init()`. Aligns with the T3-S2 invariant that
   the SDK has no local mode: a missing API key is a hard error, not a
   silent allow-all.
+
+---
+
+## [0.4.0] — 2026-06-17
+
+Production-readiness release. Resolves all BLOCKER + HIGH + MEDIUM + LOW
+audit findings from the 0.3.x audit. The curated 6-symbol public surface
+(`init`, `protect`, `track_llm`, `track_tool`, `track_event`,
+`__version__`) is unchanged. Full PR-by-PR description follows; this
+entry is the summary. Phase-7 (framework patches) and Phase-8
+(release-prep polish) ship as follow-up releases under the same 0.4.x
+line.
+
+### Removed (dead code)
+
+- `BoundedDict` class (`runtime.py`) — dead since 0.3.1.
+- `wrap_tool`, `wrap`, `check_before_tool`, `enforce_check_before_llm`,
+  `check_before_llm` (and the `CheckDecision` dataclass), `evaluate`
+  (`runtime.py`) — zero in-tree callers; `wrap` had a latent
+  `NameError` that's gone with the deletion.
+- `clear_pause` (`actions.py`) — zero callers.
+- `WorkflowContext` class (`context.py`) — duplicate of the
+  `workflow()` contextmanager.
+- `WebSocketManager` (`transport_websocket.py`) — never instantiated;
+  the runtime uses `WebSocketConnection` directly.
+- `PoolConfig` + `AdaptivePool` (`transport.py`) — never instantiated;
+  `httpx.Limits` is the real pool.
+- `Transport._atexit_flush` (`transport.py`) — orphan method from the
+  pre-weakref.finalize migration.
+- `EventRecorder` (`decision_history.py`) — never used.
+
+### Fixed (BLOCKER)
+
+- **First-`track()` `AttributeError` (Phase 2).** `runtime.track()` no
+  longer reads `self._workflow_costs` (a BoundedDict removed in 0.3.1
+  whose two callers survived). Returns `local_cost_cents = 0` from
+  the new `_local_cost_cents_estimate` attribute.
+- **`auto_requests` module was unimportable.** The missing
+  `_safe_bump_coverage` helper that `auto_requests.py` imports is
+  now defined in `auto.py`. The whole module imports cleanly and the
+  coverage dashboard counter is reachable.
+- **`auto_instrument()` now calls `patch_requests`.** The `requests`
+  library path is no longer dead; ~30-50% of real codebases that use
+  `requests` directly are now tracked.
+
+### Fixed (HIGH reliability — Phase 5)
+
+- `_remote_states` now protected by `threading.RLock`. New helpers
+  `_remote_state_for` / `_set_remote_state` are the only public mutation
+  path. `test_remote_states_race.py` is now meaningful.
+- `PolicyCache` no longer writes `policy_version` into the `ttl_seconds`
+  field (silent cache-lifetime corruption). Added dedicated
+  `policy_version` field on `CachedDecision`.
+- `get_instance()` re-auth path is now inside the singleton lock; no
+  more TOCTOU window where a concurrent caller can observe a
+  half-shutdown runtime.
+- `_fetch_remote_state` uses `self._transport._client` (shared pool
+  + circuit breaker) instead of a raw `httpx.get`.
+- `workflow()` emits a real UUID4 instead of `wf-{hex32}`.
+- `@sensitive` propagates `NullRunAuthenticationError` instead of
+  silently swallowing it.
+- Custom-host LLM endpoints now honour the dashboard KILL switch
+  (the kill check is no longer gated on the extractor table).
+- `Transport.execute` accepts an `on_transport_error` callback
+  (per ADR-008) so sensitive-tool pre-checks can fail-CLOSED on
+  classified transport errors.
+
+### Changed (MEDIUM hygiene — Phase 6)
+
+- `NULLRUN_FALLBACK_MODE` env var (or `fallback_mode` constructor arg)
+  selects PERMISSIVE / STRICT / CACHED.
+- `_rebuild` strips `Transfer-Encoding` alongside `Content-Encoding`.
+- `shutdown()` caps join waits at 0.5s (was 2.0s) — safe from
+  signal handlers.
+- WS URL constructed via `urllib.parse` (rejects unknown schemes).
+- `DEDUP_LRU_MAX` raised 512 -> 4096.
+
+### Added (Phase 7 — framework patches)
+
+- `nullrun.instrumentation.llama_index` — `patch_llama_index`
+  subscribes to `LLMChatEndEvent` and `FunctionCallEvent` on the
+  llama-index core Dispatcher. Optional extra `pip install
+  nullrun[llama-index]`.
+- `nullrun.instrumentation.crewai` — `patch_crewai` wraps
+  `Crew.kickoff` and `Crew.kickoff_async` to install
+  `step_callback` / `task_callback`. Post-run reads
+  `crew.usage_metrics` and emits one `llm_call` event per model.
+  Optional extra `pip install nullrun[crewai]`.
+- `nullrun.instrumentation.autogen` — `patch_autogen` wraps
+  `BaseChatAgent.on_messages` for span tracking and
+  `OpenAIChatCompletionClient.create` for streaming-safe usage
+  capture. Optional extra `pip install nullrun[autogen]`.
+
+### Added (Phase 8 — release polish)
+
+- `NullRunRuntime.get_org_status(org_id)` — public helper for
+  reading `/api/v1/orgs/{org_id}/status`. Routes through the shared
+  transport client. Used by `examples/cost_dashboard.py`.
+- `NULLRUN_BATCH_SIZE` and `NULLRUN_FLUSH_INTERVAL_MS` env vars
+  override `FlushConfig` without subclassing.
+- README "mTLS / client certificate authentication" section
+  documenting `NULLRUN_TLS_CLIENT_CERT`, `NULLRUN_TLS_CLIENT_KEY`,
+  `NULLRUN_TLS_CA_CERT`.
+- Circuit-breaker `OPEN -> HALF_OPEN` jitter sleep capped at 5s
+  (was 30s).
+- `RecordingSession` no longer persists the dedup `_fingerprint`
+  field — it leaks to disk via `save()` otherwise.
+
+### Notes
+
+- The platform's `docs/sdk/README.md` describes a 7-symbol surface that
+  does not match the shipped SDK. The SDK's curated surface is the
+  source of truth; platform docs re-alignment is tracked separately.
 
 ---
 

@@ -279,13 +279,20 @@ def _check_kill_before_send(runtime: Any, request: httpx.Request) -> None:
     """
     if runtime is None:
         return
-    host = request.url.host
-    if _match_extractor(host) is None:
+    # Defensive: test doubles (and any duck-typed runtime) may not
+    # implement `_resolve_workflow_id`. Skip the kill check silently
+    # rather than crashing the user's transport hook.
+    if not hasattr(runtime, "_resolve_workflow_id"):
         return
+    # Phase 5 #5.8: the kill check is independent of which LLM host
+    # the user is talking to. Previously the check was gated on the
+    # extractor table, so a custom LLM endpoint silently bypassed the
+    # dashboard KILL switch. The kill state lives in `_remote_states`,
+    # which is keyed by workflow, not by host.
     workflow_id = runtime._resolve_workflow_id(None)
     if not workflow_id:
         return
-    state = getattr(runtime, "_remote_states", {}).get(workflow_id, {})
+    state = runtime._remote_state_for(workflow_id) if hasattr(runtime, "_remote_state_for") else getattr(runtime, "_remote_states", {}).get(workflow_id, {})
     state_name = state.get("state", "Normal")
     if state_name == "Killed":
         from nullrun.breaker.exceptions import WorkflowKilledInterrupt
@@ -311,11 +318,14 @@ def _check_kill_before_send(runtime: Any, request: httpx.Request) -> None:
 # once, the extractor runs, and a fresh Response is returned with the same
 # body bytes — callers see no behavioural change.
 
-# Streaming detection: a non-empty text/event-stream content type signals
-# SSE. We still attempt to consume + extract for streaming; OpenAI v1.0+
-# puts `usage` in the LAST chunk, so consumption is required to see it.
-_STREAMING_CONTENT_TYPES = ("text/event-stream",)
-
+# NOTE (Sprint 2.3): the ``_STREAMING_CONTENT_TYPES`` constant was
+# defined here but only consumed in ``auto_requests.py`` (same
+# constant is re-defined there). The streaming branch in the
+# httpx transport wrapper does not actually consult this table;
+# it just reads the body and lets the extractors return ``None``
+# for non-usage bodies. The constant is deleted to avoid the
+# false impression that this module has streaming-specific
+# behaviour. See auto.py module docstring §"Streaming".
 
 class NullRunSyncTransport(httpx.BaseTransport):
     """Synchronous httpx transport that emits a `llm_call` event for known
@@ -367,7 +377,13 @@ class NullRunSyncTransport(httpx.BaseTransport):
         # against the post-decompression byte count.
         req = getattr(response, "_request", None) or request
         headers = response.headers.copy()
-        for enc in ("content-encoding", "Content-Encoding"):
+        # Phase 6 #6.2: also strip Transfer-Encoding so downstream
+        # HTTP clients (and httpx itself) don't try to chunk-decode
+        # an already-buffered body.
+        for enc in (
+            "content-encoding", "Content-Encoding",
+            "transfer-encoding", "Transfer-Encoding",
+        ):
             if enc in headers:
                 del headers[enc]
         if "content-length" in headers:
@@ -470,7 +486,13 @@ class NullRunAsyncTransport(httpx.AsyncBaseTransport):
         # zlib.error.
         req = getattr(response, "_request", None) or request
         headers = response.headers.copy()
-        for enc in ("content-encoding", "Content-Encoding"):
+        # Phase 6 #6.2: also strip Transfer-Encoding so downstream
+        # HTTP clients (and httpx itself) don't try to chunk-decode
+        # an already-buffered body.
+        for enc in (
+            "content-encoding", "Content-Encoding",
+            "transfer-encoding", "Transfer-Encoding",
+        ):
             if enc in headers:
                 del headers[enc]
         if "content-length" in headers:
@@ -552,6 +574,26 @@ def _fingerprint_for(host: str, body: bytes, status: int) -> str:
     h.update(str(status).encode("ascii"))
     h.update(b"|")
     h.update(body)
+    return h.hexdigest()[:16]
+
+
+def _fingerprint_for_event_dict(event: dict[str, Any]) -> str:
+    """Stable fingerprint for a generic event dict.
+
+    Phase 3 of the production-readiness plan: ``runtime.track_event``
+    was the only emit path that did NOT set ``_fingerprint``, so two
+    observers firing for the same LLM call (the user's manual
+    ``track_event`` plus the httpx transport hook) produced two
+    ``/track`` POSTs. This helper gives the dedup LRU a stable key
+    derived from the event's content.
+    """
+    try:
+        payload = json.dumps(event, sort_keys=True, default=str).encode("utf-8")
+    except (TypeError, ValueError):
+        payload = repr(event).encode("utf-8")
+    h = hashlib.sha256()
+    h.update(b"event|")
+    h.update(payload)
     return h.hexdigest()[:16]
 
 
@@ -895,16 +937,38 @@ def auto_instrument(runtime: Any) -> bool:
     """Install all auto-instrumentation paths. Idempotent. Returns True if
     at least one path was installed (so the caller can log a useful
     'instrumented N paths' message).
+
+    Sprint 2.9 (B47): every patch call is wrapped in ``safe_patch``
+    which logs at WARNING if the patch raised a non-ImportError
+    exception. Pre-fix the 25+ scattered ``try/except Exception:
+    pass  # pragma: no cover`` blocks meant a vendor SDK breaking
+    change (e.g. a renamed method) would silently disable cost
+    tracking with no log line. The operator would only find out
+    when the bill arrived.
     """
     global _auto_installed
     with _auto_lock:
         if _auto_installed:
             return True
+        # Lazy imports — auto_requests needs `_safe_bump_coverage` (now
+        # defined in this module) at module import time. The framework
+        # patches below are silent no-ops when their respective
+        # packages aren't installed.
+        from nullrun.instrumentation._safe_patch import safe_patch
+        from nullrun.instrumentation.auto_requests import patch_requests
+        from nullrun.instrumentation.llama_index import patch_llama_index
+        from nullrun.instrumentation.crewai import patch_crewai
+        from nullrun.instrumentation.autogen import patch_autogen
+
         paths = [
-            patch_httpx(runtime),
-            patch_langchain_callback(runtime),
-            patch_openai_agents(runtime),
-            patch_langgraph_compiled(runtime),
+            safe_patch("httpx", lambda: patch_httpx(runtime)),
+            safe_patch("langchain_callback", lambda: patch_langchain_callback(runtime)),
+            safe_patch("openai_agents", lambda: patch_openai_agents(runtime)),
+            safe_patch("langgraph_compiled", lambda: patch_langgraph_compiled(runtime)),
+            safe_patch("requests", lambda: patch_requests(runtime)),
+            safe_patch("llama_index", lambda: patch_llama_index(runtime)),
+            safe_patch("crewai", lambda: patch_crewai(runtime)),
+            safe_patch("autogen", lambda: patch_autogen(runtime)),
         ]
         # We deliberately mark this as installed even if zero paths
         # succeeded — calling auto_instrument twice must not redo work
@@ -985,7 +1049,7 @@ def reset_for_tests() -> None:
 # events. This is exposed here so tests can introspect / clear the LRU
 # without poking into the runtime module.
 
-DEDUP_LRU_MAX = 512
+DEDUP_LRU_MAX = 4096  # Phase 6 #6.7: 4096 entries give a 410ms dedup window at 10K events/sec
 
 
 def make_dedup_state() -> OrderedDict[str, None]:
@@ -1003,3 +1067,29 @@ def _fingerprint_is_seen(state: OrderedDict[str, None], fp: str) -> bool:
     if len(state) > DEDUP_LRU_MAX:
         state.popitem(last=False)
     return False
+
+
+def _safe_bump_coverage(runtime: Any, target_attr: str, host: str) -> None:
+    """Bump a per-host counter on the runtime, tolerating stub runtimes
+    (MagicMock, custom test doubles) that don't carry the attribute.
+
+    ``target_attr`` is one of ``_coverage_seen``,
+    ``_coverage_streaming_skipped``. Mirrors the structure of
+    ``_fingerprint_is_seen`` — never raises.
+
+    Background: ``nullrun.instrumentation.auto_requests`` imports this
+    helper but the original 0.3.0 release never defined it, so the
+    entire ``requests`` auto-instrumentation path was unimportable.
+    Adding the helper here unblocks the module and the dashboard's
+    coverage tab.
+    """
+    target = getattr(runtime, target_attr, None)
+    if target is None:
+        return
+    if isinstance(target, dict):
+        target[host] = int(target.get(host, 0)) + 1
+    else:
+        try:
+            target[host] = int(target[host]) + 1
+        except Exception as e:  # pragma: no cover — defensive
+            logger.debug("_safe_bump_coverage: %s bump failed: %s", target_attr, e)

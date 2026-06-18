@@ -51,6 +51,7 @@ def mock_api():
         respx.post(f"{BASE_URL}/api/v1/auth/verify").mock(
             return_value=Response(200, json={
                 "organization_id": "ws-test",
+                "workflow_id": "00000000-0000-0000-0000-000000000001",
                 "plan": "pro",
                 "features": [],
                 "limits": {"max_cost_cents": 10000},

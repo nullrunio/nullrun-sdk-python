@@ -29,19 +29,40 @@ integrations.
 
 ## Configuration
 
+Sprint 3.4 (B6): the previous version had two env-var tables that
+contradicted each other (`NULLRUN_BATCH_SIZE` was listed as `50`
+and `100` in different tables) and listed several env vars that
+the SDK does not actually read (`NULLRUN_HMAC_REQUIRED`,
+`NULLRUN_LOG_LEVEL`, `NULLRUN_TIMEOUT`). The table below lists
+only the env vars that the SDK reads in 0.4.0. If you find a
+documented env var that has no effect, please open an issue.
+
 | Env var | Default | Description |
 |---|---|---|
-| `NULLRUN_API_KEY` | — | API key from the NullRun dashboard. **Required.** |
+| `NULLRUN_API_KEY` | — | API key from the NullRun dashboard. **Required** (0.3.0+). |
 | `NULLRUN_API_URL` | `https://api.nullrun.io` | Backend base URL. |
-| `NULLRUN_HMAC_REQUIRED` | `false` | Server-side: require HMAC body signature. |
 | `NULLRUN_SKIP_BUDGET_CHECK` | unset | Opt-out of pre-flight `/check` (test only). |
+| `NULLRUN_BATCH_SIZE` | `50` | Override `FlushConfig.batch_size`. |
+| `NULLRUN_FLUSH_INTERVAL_MS` | `5000` | Override `FlushConfig.flush_interval`. |
+| `NULLRUN_FALLBACK_MODE` | `permissive` | One of `permissive` / `strict` / `cached`. Deprecated in favour of the typed `on_transport_error` parameter on `Transport.execute()` (Sprint 3.2). |
+| `NULLRUN_TRANSPORT` | `ws` | Control plane transport: `ws` (WebSocket, default) or `http` (HTTP polling). |
+| `NULLRUN_TLS_CLIENT_CERT` | unset | mTLS client certificate path. See [mTLS](#mtls--client-certificate-authentication) below. |
+| `NULLRUN_TLS_CLIENT_KEY` | unset | mTLS client key path. |
+| `NULLRUN_TLS_CA_CERT` | unset | Override the default CA bundle (self-signed enterprise gateways). |
 | `NULLRUN_SENSITIVE_FAIL_OPEN` | unset | Opt-out of fail-CLOSED for sensitive tools (test only). |
-| `NULLRUN_TLS_CLIENT_CERT` | unset | mTLS client cert path (server-side). |
-| `NULLRUN_TLS_CLIENT_KEY` | unset | mTLS client key path (server-side). |
-| `NULLRUN_LOG_LEVEL` | `INFO` | One of `DEBUG` / `INFO` / `WARNING` / `ERROR`. |
-| `NULLRUN_BATCH_SIZE` | `100` | Track event batch size. |
-| `NULLRUN_FLUSH_INTERVAL_MS` | `5000` | Track event flush interval. |
-| `NULLRUN_TIMEOUT` | `30` | HTTP request timeout, seconds. |
+
+## mTLS / client certificate authentication
+
+Set `NULLRUN_TLS_CLIENT_CERT` and `NULLRUN_TLS_CLIENT_KEY` to enable
+mutual TLS. `NULLRUN_TLS_CA_CERT` overrides the default CA bundle
+(useful for self-signed enterprise gateways). The wiring lives in
+`src/nullrun/transport.py:482-548`.
+
+```bash
+export NULLRUN_TLS_CLIENT_CERT=/etc/nullrun/client.crt
+export NULLRUN_TLS_CLIENT_KEY=/etc/nullrun/client.key
+export NULLRUN_TLS_CA_CERT=/etc/nullrun/ca-bundle.crt
+```
 
 ### gRPC transport (EXPERIMENTAL — FROZEN, do not enable in production)
 
@@ -63,19 +84,6 @@ integrations.
 > only and is logged at WARN. See the activation checklist (TLS → auth →
 > proto extensions → cost pipeline parity → tests) in the gateway repo
 > that must be completed before this transport is production-safe.
-
-If you copy `.env.example` to `.env`, copy this block as well:
-
-```bash
-# ===========================================
-# gRPC Transport (EXPERIMENTAL — FROZEN)
-# ===========================================
-# NULLRUN_USE_GRPC=0             # EXPERIMENTAL: do not enable in production
-# NULLRUN_GRPC_URL=localhost:50051
-# GRPC_PORT=50051
-# NULLRUN_GRPC_REFLECTION=0      # 0=disabled (default), 1=expose proto schema on :50051
-# NULLRUN_GRPC_UNSAFE_ALLOW=0    # server-side: required with NULLRUN_USE_GRPC=1 to acknowledge risk
-```
 
 ## License
 

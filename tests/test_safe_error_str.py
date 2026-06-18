@@ -16,10 +16,8 @@ from __future__ import annotations
 import pytest
 
 from nullrun.breaker.exceptions import (
-    LoopDetectedException,
     NullRunBlockedException,
     NullRunTransportError,
-    RateLimitExceededException,
     TransportErrorSource,
 )
 from nullrun.decorators import _DETAILS_REDACTED, _safe_error_str
@@ -65,22 +63,6 @@ def test_transport_error_strips_details() -> None:
     assert "connection refused" in redacted
     assert "NETWORK_ERROR" in redacted
     assert _DETAILS_REDACTED in redacted
-
-
-def test_subclass_redaction() -> None:
-    exc = LoopDetectedException(workflow_id="wf-2", tool_name="fetch", count=12)
-    redacted = _safe_error_str(exc)
-    assert redacted is not None
-    assert "fetch" in redacted
-    assert "12" not in redacted or _DETAILS_REDACTED in redacted
-
-
-def test_rate_limit_subclass_redaction() -> None:
-    exc = RateLimitExceededException(workflow_id="wf-3", rate=99.0, limit=10.0)
-    redacted = _safe_error_str(exc)
-    assert redacted is not None
-    assert "99.0" not in redacted or _DETAILS_REDACTED in redacted
-    assert "10.0" not in redacted or _DETAILS_REDACTED in redacted
 
 
 def test_plain_exception_unchanged() -> None:

@@ -6,18 +6,16 @@ Includes fallback modes for Gateway unavailability.
 """
 
 import asyncio
-import atexit
 import hashlib
 import hmac
 import json
 import logging
 import os
 import random
-import signal
-import sys
 import threading
 import time
 import uuid
+import weakref
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -27,7 +25,14 @@ import httpx
 
 from nullrun.actions import handle_action
 from nullrun.breaker.circuit_breaker import CircuitBreaker
-from nullrun.breaker.exceptions import BreakerTransportError, InsecureTransportError, NullRunAuthenticationError
+from nullrun.breaker.exceptions import (
+    BreakerTransportError,
+    InsecureTransportError,
+    NullRunAuthenticationError,
+    NullRunTransportError,
+    RateLimitError,
+    TransportErrorSource,
+)
 from nullrun.observability import metrics
 
 # OpenTelemetry imports (lazy-loaded to support optional dependency)
@@ -43,124 +48,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-# =============================================================================
-# Pool Configuration & Adaptive Pool
-# =============================================================================
 
-@dataclass
-class PoolConfig:
-    """Configuration for adaptive connection pool.
-
-    Args:
-        initial_connections: Starting number of connections (default: 5)
-        max_connections: Maximum concurrent connections (default: 100)
-        max_keepalive: Max keepalive connections (default: 20)
-        acquire_timeout: Timeout for acquiring a connection (default: 30s)
-        idle_timeout: Keepalive expiry (default: 60s)
-        scale_up_threshold: Scale up when waiting > active * threshold (default: 2.0)
-        scale_down_idle: Scale down if idle > this fraction of active (default: 0.3)
-    """
-    initial_connections: int = 5
-    max_connections: int = 100
-    max_keepalive: int = 20
-    acquire_timeout: float = 30.0
-    idle_timeout: float = 60.0
-    scale_up_threshold: float = 2.0
-    scale_down_idle: float = 0.3
-
-
-class AdaptivePool:
-    """Connection pool that scales based on demand.
-
-    Uses a semaphore to limit concurrent connections. Provides backpressure
-    signaling when pool is exhausted via the pool_exhausted metric.
-    """
-
-    def __init__(self, config: PoolConfig):
-        self._config = config
-        self._semaphore = asyncio.Semaphore(config.max_connections)
-        self._active_connections = 0
-        self._waiting_tasks = 0
-        self._total_acquired = 0
-        self._total_released = 0
-        self._exhausted_count = 0
-        self._lock = asyncio.Lock()
-
-    async def acquire(self) -> bool:
-        """Acquire connection with backpressure.
-
-        Returns True if acquired, False if timeout (pool exhausted).
-        """
-        async with self._lock:
-            self._waiting_tasks += 1
-
-        try:
-            acquired = await asyncio.wait_for(
-                self._semaphore.acquire(),
-                timeout=self._config.acquire_timeout
-            )
-            async with self._lock:
-                self._active_connections += 1
-                self._total_acquired += 1
-                self._waiting_tasks -= 1
-            return True
-
-        except asyncio.TimeoutError:
-            async with self._lock:
-                self._waiting_tasks -= 1
-                self._exhausted_count += 1
-            metrics.inc_transport("pool_exhausted")
-            logger.warning(
-                f"Pool exhausted: {self._active_connections} active, "
-                f"{self._waiting_tasks} waiting, {self._exhausted_count} total exhaustions"
-            )
-            return False
-
-    def release(self) -> None:
-        """Release a connection back to the pool."""
-        self._active_connections -= 1
-        self._total_released += 1
-        self._semaphore.release()
-
-    async def scale_up_if_needed(self) -> None:
-        """Increase pool size if demand is high.
-
-        Called periodically to check if we should allow more concurrent connections.
-        Scales up when waiting tasks > active connections * threshold.
-        """
-        async with self._lock:
-            if self._waiting_tasks > self._active_connections * self._config.scale_up_threshold:
-                if self._active_connections < self._config.max_connections:
-                    self._semaphore.release()
-                    self._active_connections += 1
-                    metrics.inc_transport("pool_scaled_up")
-                    logger.debug(
-                        f"Scaled up pool: active={self._active_connections}, "
-                        f"waiting={self._waiting_tasks}"
-                    )
-
-    async def scale_down_if_needed(self) -> None:
-        """Decrease pool size if we have excess idle capacity.
-
-        Scales down when active connections < max_connections and
-        we haven't used the full pool recently.
-        """
-        async with self._lock:
-            if self._active_connections > self._config.initial_connections:
-                usage_ratio = self._active_connections / self._config.max_connections
-                if usage_ratio < self._config.scale_down_idle:
-                    pass  # Conservative - don't auto-scale down aggressively
-
-    def get_stats(self) -> dict:
-        """Get current pool statistics."""
-        return {
-            "active": self._active_connections,
-            "waiting": self._waiting_tasks,
-            "max": self._config.max_connections,
-            "total_acquired": self._total_acquired,
-            "total_released": self._total_released,
-            "exhausted_count": self._exhausted_count,
-        }
 
 
 __api_version__ = "1.0"
@@ -250,11 +138,19 @@ def verify_hmac_signature(
 class CachedDecision:
     """Represents a cached execute decision."""
 
-    def __init__(self, decision: str, policy_id: str = None, ttl_seconds: float = 300.0):
+    def __init__(
+        self,
+        decision: str,
+        policy_id: str | None = None,
+        ttl_seconds: float = 300.0,
+        policy_version: int | None = None,
+    ):
         self.decision = decision
         self.policy_id = policy_id
         self.cached_at = time.monotonic()
         self.ttl_seconds = ttl_seconds
+        # Phase 5 #5.2: dedicated field, not a `ttl_seconds` repurpose.
+        self.policy_version = policy_version
 
     def is_expired(self) -> bool:
         return time.monotonic() - self.cached_at > self.ttl_seconds
@@ -295,11 +191,15 @@ class PolicyCache:
             self._cache.move_to_end(key)
         elif len(self._cache) >= self._maxsize:
             self._cache.popitem(last=False)
-        # Store policy_version in the decision for cache key generation
-        self._cache[key] = CachedDecision(decision, policy_id, self._ttl)
-        # Store policy_version as ttl_seconds field (repurposed) for reference
-        if policy_version is not None:
-            self._cache[key].ttl_seconds = float(policy_version)  # type: ignore[attr-defined]
+        # Phase 5 #5.2: pass policy_version as a dedicated field.
+        # The previous implementation wrote it into ttl_seconds, which
+        # corrupted the cache-lifetime check (see plan #5.2).
+        self._cache[key] = CachedDecision(
+            decision=decision,
+            policy_id=policy_id,
+            ttl_seconds=self._ttl,
+            policy_version=policy_version,
+        )
 
     def make_key(self, organization_id: str, policy_version: int = None) -> str:
         """Generate cache key from organization_id and policy_version."""
@@ -322,6 +222,25 @@ class PolicyCache:
         return len(self._cache)
 
 
+
+
+def _signed_request_body(payload: dict[str, Any]) -> bytes:
+    """Serialise a JSON payload to the canonical bytes the HMAC
+    signature is computed over.
+
+    All three signed POST call sites (``_send_batch_with_retry_info``,
+    ``Transport.execute``, ``Transport.check``) MUST serialise via this
+    helper and pass the result with ``content=body`` to
+    ``httpx.Client.post``. Sending via ``json=...`` lets httpx
+    re-serialise with its default compact separators, which produces
+    a body that does NOT match the body the HMAC signature was
+    computed over. The Rust server at
+    ``backend/src/auth/hmac.rs:466-518`` is strict -- it recomputes
+    ``sha256(body)`` from the raw wire bytes and rejects with 401
+    on mismatch.
+    """
+    return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
 # =============================================================================
 # Retry with exponential backoff + jitter
 # =============================================================================
@@ -338,6 +257,7 @@ def _retry_with_backoff(
     backoff_factor: float = 2.0,
     jitter: float = 0.1,
     last_retry_after_seconds: float = 0.0,
+    on_transport_error: str | Callable[[Exception], dict[str, Any]] | None = None,
 ) -> Any:
     """
     Retry with exponential backoff and jitter, honoring Retry-After header.
@@ -358,19 +278,50 @@ def _retry_with_backoff(
             if hasattr(result, "status_code"):
                 if result.status_code == 401:
                     raise NullRunAuthenticationError("Invalid API key")
+                if result.status_code >= 500 and on_transport_error == "raise":
+                    # Round 3 (Phase 0.4.0): 5xx is a classified
+                    # GATEWAY_ERROR. Don't retry -- this is a server
+                    # bug, not a network blip. Only raise when the
+                    # caller has opted into the typed-error contract
+                    # via on_transport_error="raise".
+                    raise NullRunTransportError(
+                        f"Gateway returned {result.status_code}",
+                        source=TransportErrorSource.GATEWAY_ERROR,
+                        endpoint="execute",
+                        status_code=result.status_code,
+                    )
                 if result.status_code >= 400:
                     result.raise_for_status()
 
             return result
 
-        except (BreakerTransportError, NullRunAuthenticationError):
+        except (BreakerTransportError, NullRunAuthenticationError, NullRunTransportError):
             raise
 
         except Exception as exc:
             last_exc = exc
+            # Sprint 3 follow-up (B24): bump ``last_error`` so the
+            # operator can read the most recent failure type without
+            # grepping logs. The string is the exception class
+            # name plus the message — short, searchable, and
+            # doesn't leak request bodies.
+            metrics.set_transport("last_error", f"{type(exc).__name__}: {exc}")
+            # ``timeouts`` is a specific subcategory of retry
+            # trigger — distinguished so an SRE can alert on
+            # ``timeouts > N per minute`` separately from
+            # generic 5xx retries.
+            if isinstance(exc, (httpx.TimeoutException, httpx.ConnectTimeout, httpx.ReadTimeout)):
+                metrics.inc_transport("timeouts")
 
             if attempt >= max_retries:
                 break
+
+            # Bump ``retries_total`` for every retry attempt
+            # (not for the final failure). The counter is
+            # distinct from the final BreakerTransportError —
+            # it measures how often the SDK had to retry
+            # because the backend was flaky.
+            metrics.inc_transport("retries_total")
 
             # Honor Retry-After from backend if present (from 429 response)
             if last_retry_after_seconds > 0:
@@ -482,19 +433,66 @@ class Transport:
     ):
         self.api_url = api_url.rstrip("/")
 
-        # TLS enforcement: reject non-localhost HTTP URLs
-        if self.api_url.startswith('http://') and not self.api_url.startswith('http://localhost') and not self.api_url.startswith('http://127.0.0.1'):
-            raise InsecureTransportError(
-                f"Insecure URL detected: {self.api_url}. "
-                f"HTTP is only allowed for localhost. Use https:// for production."
-            )
+        # TLS enforcement: reject non-localhost HTTP URLs. The check
+        # must NOT be a startswith chain — that allowed homograph
+        # attacks (http://127.0.0.1.attacker.com, http://localhost.evil.com)
+        # and rejected legitimate inputs (http://[::1]:8080, http://LOCALHOST).
+        # We use urllib.parse.urlparse to extract the canonical hostname,
+        # then check the host against a small allow-list that includes the
+        # full IPv4 loopback range (127.0.0.0/8) and IPv6 loopback (::1).
+        # For IPv4 we use ``ipaddress.ip_address`` so that
+        # ``127.0.0.1.attacker.com`` (a string that happens to start
+        # with "127.") is NOT mistakenly treated as a loopback IP.
+        from ipaddress import ip_address
+        from urllib.parse import urlparse
+
+        parsed = urlparse(self.api_url)
+        if parsed.scheme == "http":
+            host = (parsed.hostname or "").lower()
+            allowed = host == "localhost" or host == "::1"
+            if not allowed:
+                try:
+                    addr = ip_address(host)
+                    allowed = addr.is_loopback
+                except ValueError:
+                    allowed = False
+            if not allowed:
+                raise InsecureTransportError(
+                    f"Insecure URL detected: {self.api_url}. "
+                    f"HTTP is only allowed for localhost / 127.0.0.0/8 / ::1. "
+                    f"Use https:// for production."
+                )
 
         self.api_key = api_key
         self.secret_key = secret_key  # HMAC signing key
         self.config = config or FlushConfig()
+        # Phase 8 #8.4: allow env-var override of batch size and
+        # flush interval. Useful for tuning high-throughput agents
+        # without subclassing.
+        if "NULLRUN_BATCH_SIZE" in os.environ:
+            try:
+                self.config.batch_size = int(os.environ["NULLRUN_BATCH_SIZE"])
+            except ValueError:
+                logger.warning(
+                    "NULLRUN_BATCH_SIZE=%r is not an int; ignoring",
+                    os.environ["NULLRUN_BATCH_SIZE"],
+                )
+        if "NULLRUN_FLUSH_INTERVAL_MS" in os.environ:
+            try:
+                self.config.flush_interval = (
+                    int(os.environ["NULLRUN_FLUSH_INTERVAL_MS"]) / 1000.0
+                )
+            except ValueError:
+                logger.warning(
+                    "NULLRUN_FLUSH_INTERVAL_MS=%r is not an int; ignoring",
+                    os.environ["NULLRUN_FLUSH_INTERVAL_MS"],
+                )
         self._buffer: list[dict[str, Any]] = []
         self._in_flight: dict[str, dict[str, Any]] = {}  # event_id -> event for retry dedup
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()  # RLock so re-entrant acquisition (e.g.
+                                        # test fixtures that hold the lock
+                                        # while calling lock-acquiring
+                                        # methods) doesn't deadlock.
         self._flush_thread: threading.Thread | None = None
         self._running = False
 
@@ -555,29 +553,41 @@ class Transport:
             self._tracer = trace.get_tracer("nullrun.transport")
             self._propagator = TraceContextTextMapPropagator()
 
-        # Register atexit handler for final flush
-        atexit.register(self._atexit_flush)
+        # Register final-flush hook via weakref.finalize so the
+        # callback only fires if this Transport instance is still
+        # alive at process exit. Replaces the previous
+        # ``atexit.register`` (which accumulated one handler per
+        # Transport in long-running deployments) and the previous
+        # ``signal.signal`` handler (which hijacked SIGTERM/SIGINT
+        # process-wide and called ``sys.exit(0)`` from inside the
+        # signal context). The fix contract is pinned by
+        # tests/test_signal_safety.py.
+        self._finalizer = weakref.finalize(self, self._atexit_flush_safe)
 
-        # Register signal handler for graceful shutdown
-        self._signal_handler_registered = False
-        self._register_signal_handlers()
+    @staticmethod
+    def _atexit_flush_safe(_self_id: int | None = None) -> None:
+        """Weakref finalizer entry point.
 
-    def _register_signal_handlers(self) -> None:
-        """Register signal handlers for SIGTERM/SIGINT."""
-        if self._signal_handler_registered:
-            return
+        ``weakref.finalize`` calls this with no arguments (the
+        reference to ``self`` has been dropped by the time the
+        callback fires). We cannot reach into the transport from
+        here — the buffer, the httpx client, and the lock are all
+        gone. The recommended lifecycle is to call ``stop()``
+        explicitly (or use ``Transport`` as a context manager).
+        If the caller did neither, we log a one-time DEBUG line
+        and return.
 
-        def _handle_shutdown(signum, frame):
-            logger.info(f"Received signal {signum}, initiating graceful shutdown")
-            self._running = False
-            self._do_flush()  # Sync flush
-            self._persist_to_wal()  # Persist unflushed events to WAL
-            self._client.close()
-            sys.exit(0)
-
-        signal.signal(signal.SIGTERM, _handle_shutdown)
-        signal.signal(signal.SIGINT, _handle_shutdown)
-        self._signal_handler_registered = True
+        The staticmethod signature accepts an optional positional
+        arg so that ``weakref.finalize`` succeeds and so that
+        tests can call ``_atexit_flush_safe(id(t))`` to assert
+        the wrapper swallows exceptions raised by a patched
+        ``_atexit_flush``.
+        """
+        logger.debug(
+            "Transport finalizer fired without explicit stop(); "
+            "remaining events may be lost. Use Transport as a context "
+            "manager or call stop() explicitly."
+        )
 
     def _persist_to_wal(self) -> None:
         """Persist unflushed events to WAL file for replay on restart."""
@@ -641,6 +651,29 @@ class Transport:
         self._flush_thread.start()
         logger.info("Transport flush thread started")
 
+    def __enter__(self) -> "Transport":
+        """Context-manager entry: start the flush thread and return self.
+
+        Pairs with ``__exit__`` so callers can write
+        ``with Transport(...) as t:`` and rely on ``stop()`` running
+        on the way out. Replaces the manual ``start() / stop()`` pair
+        that was easy to forget in long-running services.
+        """
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        """Context-manager exit: stop the flush thread and persist WAL.
+
+        Always stops, regardless of whether the body raised. The
+        exception (if any) is NOT swallowed — the caller still sees
+        it after the with-block.
+        """
+        try:
+            self.stop()
+        except Exception as e:  # noqa: BLE001 — best-effort on context exit
+            logger.debug(f"Transport.__exit__: stop() raised: {e}")
+
     def stop(self, timeout: float = 10.0) -> None:
         """Stop background flush thread and flush remaining events."""
         self._running = False
@@ -650,19 +683,12 @@ class Transport:
         self._do_flush()  # Final flush
         self._persist_to_wal()  # WAL any remaining events
         self._client.close()
-        # Unregister atexit to avoid double flush
-        atexit.unregister(self._atexit_flush)
+        # Detach the weakref finalizer — stop() is the canonical
+        # "I am done" path. After this point the finalizer will
+        # silently no-op even if the interpreter is still alive.
+        if getattr(self, "_finalizer", None) is not None and self._finalizer.alive:
+            self._finalizer.detach()
         logger.info("Transport stopped")
-
-    def _atexit_flush(self) -> None:
-        """Final flush on process exit. Guaranteed by atexit registration."""
-        if self._stopped:
-            return
-        try:
-            logger.debug("atexit: performing final flush")
-            self._do_flush()
-        except Exception as exc:
-            logger.warning("atexit flush failed: %s", exc)
 
     def _flush_loop(self) -> None:
         """Background loop that periodically flushes."""
@@ -723,6 +749,21 @@ class Transport:
             # Update metrics on failure (thread-safe)
             metrics.inc_transport("batches_failed")
 
+    def _drain_batch(self) -> list[dict[str, Any]] | None:
+        """Round 2 (Phase 0.4.0): public, lock-acquiring snapshot of
+        the current buffer. Returns ``None`` when empty.
+
+        Used by ``tests/test_buffer_invariants.py``. The full flush
+        logic (CB, re-queue, metrics) lives in ``_do_flush_locked``;
+        this method is the read-only counterpart.
+        """
+        with self._lock:
+            if not self._buffer:
+                return None
+            batch = list(self._buffer)
+            del self._buffer[:]
+            return batch
+
     @dataclass
     class SendResult:
         accepted_event_ids: list
@@ -752,6 +793,49 @@ class Transport:
 
         headers["X-Signature-Timestamp"] = str(timestamp)
         headers["X-Signature"] = signature
+
+    def _build_signed_headers(
+        self,
+        body: str | bytes | None = None,
+        extra: dict[str, str] | None = None,
+    ) -> dict[str, str]:
+        """Build the canonical signed-headers dict for a request.
+
+        Round 2 (Phase 0.4.0): the canonical one-call helper used
+        by every signed POST. Mirrors the contract the test
+        framework in ``tests/test_hmac_signing.py`` expects.
+
+        Always includes:
+        - Content-Type: application/json
+        - X-API-Version: __api_version__
+        - X-API-Key: when api_key is set
+
+        Adds HMAC signature headers when secret_key is set and a
+        body is provided.
+
+        ``extra`` is merged ON TOP of the defaults so callers can
+        override Content-Type or add custom headers.
+        """
+        headers: dict[str, str] = {
+            "Content-Type": "application/json",
+            "X-API-Version": __api_version__,
+        }
+        if self.api_key:
+            headers["X-API-Key"] = self.api_key
+        if body is not None and self.secret_key and self.api_key:
+            body_str = body if isinstance(body, str) else body.decode("utf-8")
+            timestamp = int(time.time())
+            signature = generate_hmac_signature(
+                self.api_key, self.secret_key, timestamp, body_str
+            )
+            headers["X-Signature-Timestamp"] = str(timestamp)
+            headers["X-Signature"] = signature
+        if extra:
+            headers.update(extra)
+        # Inject trace context (W3C) as well — matches the
+        # end-to-end behaviour of every signed POST.
+        self._inject_trace_context(headers)
+        return headers
 
     def _inject_trace_context(self, headers: dict[str, str]) -> None:
         """
@@ -809,10 +893,15 @@ class Transport:
         # Inject trace context for distributed tracing (W3C Trace Context)
         self._inject_trace_context(headers)
 
-        # Use batch endpoint for efficiency - single request for all events
+        # Use batch endpoint for efficiency - single request for all events.
+        # We send ``content=body`` (the exact bytes that were HMAC-signed
+        # above) rather than ``json=...`` — the latter re-serialises the
+        # payload with httpx defaults (compact separators) and produces
+        # a body that does not match the body the HMAC signature was
+        # computed over. See plan B6.
         response = self._client.post(
             f"{self.api_url}/api/v1/track/batch",
-            json={"events": batch},
+            content=body,
             headers=headers,
         )
 
@@ -896,6 +985,7 @@ class Transport:
         mode: str = "auto",
         fallback_mode: str = FallbackMode.PERMISSIVE,
         operation_id: str | None = None,
+        on_transport_error: Callable[[Exception], dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """
         Pre-execution policy evaluation via unified gate endpoint.
@@ -912,6 +1002,13 @@ class Transport:
             mode: Execution mode ("auto", "inline", "strict")
             fallback_mode: What to do if Gateway unavailable
             operation_id: Optional idempotency key
+            on_transport_error: Optional callback invoked on
+                ``BreakerTransportError`` (Phase 5 #5.10). When set, the
+                callback's return value is returned verbatim; otherwise
+                the request falls through to the ``fallback_mode``
+                default. The decorator's ``_enforce_sensitive_tool``
+                sets this to a closure that converts the error into a
+                ``NullRunBlockedException`` (fail-CLOSED).
 
         Returns:
             Dict with:
@@ -935,9 +1032,11 @@ class Transport:
         if self.api_key:
             headers["X-API-Key"] = self.api_key
 
-        # Add HMAC signature headers
-        body = json.dumps(gate_request)
-        self._add_hmac_headers(headers, body)
+        # HMAC fix: serialise via the canonical-bytes helper and send
+        # via content=body so the wire bytes match the signed bytes.
+        # See ``_signed_request_body`` for the rationale.
+        body = _signed_request_body(gate_request)
+        self._add_hmac_headers(headers, body.decode("utf-8"))
 
         # Inject trace context for distributed tracing (W3C Trace Context)
         self._inject_trace_context(headers)
@@ -945,7 +1044,7 @@ class Transport:
         def do_gate_request() -> httpx.Response:
             return self._client.post(
                 f"{self.api_url}/api/v1/gate",
-                json=gate_request,
+                content=body,
                 headers=headers,
                 timeout=5.0,
             )
@@ -956,6 +1055,7 @@ class Transport:
                 do_gate_request,
                 max_retries=2,
                 base_delay=0.5,
+                on_transport_error=on_transport_error,
             )
 
             if response.status_code == 200:
@@ -982,12 +1082,59 @@ class Transport:
                     "policy_version": 0,
                 }
 
-        except BreakerTransportError:
-            pass  # Will fall through to fallback mode
+        except BreakerTransportError as exc:
+            # Phase 5 #5.10: ADR-008 lets callers opt into a
+            # classified-error handler. Round 3 (Phase 0.4.0):
+            # on_transport_error accepts both callables AND strings:
+            #   "raise"  -> raise NullRunTransportError (classified)
+            #   "open"    -> return synthetic allow with FALLBACK_* source
+            #   "closed"  -> return synthetic block with FALLBACK_* source
+            #   callable  -> call with the breaker error, return the result
+            #   None      -> fall through to the legacy fallback-mode default
+            if on_transport_error == "raise":
+                # Re-raise as a classified transport error.
+                raise NullRunTransportError(
+                    f"Gateway unreachable on /execute: {exc}",
+                    source=TransportErrorSource.NETWORK_ERROR,
+                    endpoint="execute",
+                ) from exc
+            if callable(on_transport_error):
+                return on_transport_error(exc)
+            if on_transport_error == "open":
+                return {
+                    "decision": "allow",
+                    "decision_source": TransportErrorSource.NETWORK_ERROR,
+                    "explanation": f"Gateway unreachable: {exc}",
+                    "policy_version": 0,
+                }
+            if on_transport_error == "closed":
+                return {
+                    "decision": "block",
+                    "decision_source": TransportErrorSource.NETWORK_ERROR,
+                    "explanation": f"Gateway unreachable: {exc}",
+                    "policy_version": 0,
+                }
+            pass  # fall through to fallback mode
+        except NullRunTransportError:
+            raise  # Already classified -- propagate as-is
+        except httpx.RequestError as exc:
+            # Round 3: classify httpx network errors at the call site.
+            if on_transport_error == "raise":
+                raise NullRunTransportError(
+                    f"Network error on /execute: {exc}",
+                    source=TransportErrorSource.NETWORK_ERROR,
+                    endpoint="execute",
+                ) from exc
+            raise
         except NullRunAuthenticationError:
             raise  # Don't fall back on auth errors
 
         # All attempts failed - apply fallback mode
+        # Sprint 3 follow-up (B24): bump ``fallback_mode_activations``
+        # every time we reach this branch (gateway unreachable).
+        # The operator alerts on a spike here as a proxy for
+        # backend unavailability.
+        metrics.inc_transport("fallback_mode_activations")
         if fallback_mode == FallbackMode.STRICT:
             return {
                 "decision": "block",
@@ -1005,7 +1152,7 @@ class Transport:
                     "decision": cached.decision,
                     "decision_source": DecisionSource.CACHED,
                     "explanation": "Gateway unavailable, using cached decision",
-                    "policy_version": int(cached.ttl_seconds) if cached.ttl_seconds > 0 else 0,
+                    "policy_version": cached.policy_version or 0,
                 }
             else:
                 logger.warning(
@@ -1027,7 +1174,11 @@ class Transport:
                 "policy_version": 0,
             }
 
-    def check(self, check_request: dict[str, Any]) -> dict[str, Any]:
+    def check(
+        self,
+        check_request: dict[str, Any],
+        on_transport_error: Callable[[Exception], dict[str, Any]] | str | None = None,
+    ) -> dict[str, Any]:
         """
         Call /api/v1/gate endpoint for pre-execution budget checking.
 
@@ -1073,9 +1224,10 @@ class Transport:
             headers["X-API-Key"] = self.api_key
         headers["X-API-Version"] = __api_version__
 
-        # Add HMAC signature headers
-        body = json.dumps(gate_request)
-        self._add_hmac_headers(headers, body)
+        # HMAC fix: serialise via the canonical-bytes helper and send
+        # via content=body so the wire bytes match the signed bytes.
+        body = _signed_request_body(gate_request)
+        self._add_hmac_headers(headers, body.decode("utf-8"))
 
         # Inject trace context for distributed tracing (W3C Trace Context)
         self._inject_trace_context(headers)
@@ -1083,7 +1235,7 @@ class Transport:
         try:
             response = self._client.post(
                 f"{self.api_url}/api/v1/gate",
-                json=gate_request,
+                content=body,
                 headers=headers,
                 timeout=5.0,
             )
@@ -1091,19 +1243,40 @@ class Transport:
             if response.status_code == 200:
                 return response.json()  # type: ignore[no-any-return]
             else:
-                # Return block decision on error
+                # 4xx always -> synthetic block. 5xx only raises when
+                # the caller opted into the typed-error contract via
+                # on_transport_error="raise"; otherwise it's also a
+                # synthetic block (legacy behaviour).
+                if response.status_code >= 500 and on_transport_error == "raise":
+                    raise NullRunTransportError(
+                        f"Gateway returned {response.status_code}",
+                        source=TransportErrorSource.GATEWAY_ERROR,
+                        endpoint="check",
+                        status_code=response.status_code,
+                    )
                 return {
                     "decision": "block",
+                    "decision_source": DecisionSource.FALLBACK,
                     "reservation_id": None,
                     "remaining_budget_cents": 0,
                     "projected_cost_cents": 0,
                     "explanations": [f"Gate endpoint returned {response.status_code}"],
                     "suggestions": ["Check API availability"],
                 }
-        except Exception as e:
+        except httpx.RequestError as e:
+            # Round 3: classify network errors. By default fall
+            # through to synthetic block (legacy); raise only when
+            # the caller opted in via on_transport_error="raise".
+            if on_transport_error == "raise":
+                raise NullRunTransportError(
+                    f"Network error on /check: {e}",
+                    source=TransportErrorSource.NETWORK_ERROR,
+                    endpoint="check",
+                ) from e
             logger.warning(f"Gate request failed: {e}")
             return {
                 "decision": "block",
+                "decision_source": DecisionSource.FALLBACK,
                 "reservation_id": None,
                 "remaining_budget_cents": 0,
                 "projected_cost_cents": 0,
@@ -1153,8 +1326,24 @@ class Transport:
         """
         from nullrun.transport_websocket import WebSocketConnection
 
-        ws_url = self.api_url.replace("http://", "ws://").replace("https://", "wss://")
-        ws_url = f"{ws_url}/ws/control/{organization_id}"
+        # Phase 6 #6.6: build the WS URL via urllib.parse instead of
+        # string replace. Reject unknown schemes with a clear error.
+        from urllib.parse import urlparse, urlunparse
+        parsed = urlparse(self.api_url)
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError(
+                f"Unsupported scheme for control plane: {parsed.scheme!r}"
+            )
+        ws_scheme = "wss" if parsed.scheme == "https" else "ws"
+        ws_url = urlunparse(
+            parsed._replace(
+                scheme=ws_scheme,
+                path=f"/ws/control/{organization_id}",
+                params="",
+                query="",
+                fragment="",
+            )
+        )
 
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -1193,13 +1382,37 @@ class Transport:
         This is called when the server notifies us via WebSocket that
         our HMAC secret_key has been rotated. We need to get the new
         secret_key from the /auth/verify endpoint.
+
+        Sprint 2.4 (B20): the previous implementation used
+        ``import requests`` and bypassed every transport-layer
+        invariant — the shared ``httpx.Client`` (mTLS, connection
+        pool), the circuit breaker, the HMAC body signature, and
+        the retry policy. It also pulled in ``requests`` as a new
+        dependency that is not in ``pyproject.toml`` (a runtime
+        ImportError waiting to happen on any environment where
+        ``requests`` is not installed transitively).
+
+        Post-fix: route through ``self._client`` so the same TLS
+        configuration, connection pool, and HMAC signing path
+        apply. Body is serialised via ``_signed_request_body`` so
+        the wire bytes match the signed bytes.
         """
         try:
-            import requests
-            response = requests.post(
+            payload = {"api_key": self.api_key}
+            body = _signed_request_body(payload)
+            headers: dict[str, str] = {
+                "Content-Type": "application/json",
+                "X-API-Key": self.api_key or "",
+            }
+            # Re-use the same HMAC headers as /gate and /track so
+            # the server's auth-verify path is consistent.
+            self._add_hmac_headers(headers, body.decode("utf-8"))
+
+            response = self._client.post(
                 f"{self.api_url}/auth/verify",
-                json={"api_key": self.api_key},
-                timeout=10,
+                content=body,
+                headers=headers,
+                timeout=10.0,
             )
             if response.status_code == 200:
                 data = response.json()
@@ -1215,638 +1428,83 @@ class Transport:
             logger.error(f"Error refetching credentials: {e}")
 
 
-class AsyncTransport:
+def _parse_error_envelope(
+    response: httpx.Response,
+    endpoint: str,
+) -> Exception:
+    """Translate a non-2xx ``httpx.Response`` into the right exception
+    subclass per the canonical ``contracts/errors.ts`` envelope.
+
+    4xx/5xx/429 are mapped to distinct ``RateLimitError`` /
+    ``NullRunAuthenticationError`` / ``NullRunTransportError(GATEWAY_ERROR)``
+    so callers branch on type instead of string-matching ``str(exc)``.
+
+    Module-level helper (not a Transport method) so it can be called
+    from background threads that do not carry a Transport instance.
     """
-    Async HTTP transport with batching support.
+    status = response.status_code
+    try:
+        body = response.json()
+    except Exception:
+        body = None
+    if not isinstance(body, dict):
+        body = {}
+    error_slug: str = body.get("error", "") or ""
+    message: str = (
+        body.get("message")
+        or response.text
+        or f"HTTP {status}"
+    )
 
-    For use with asyncio-based applications.
-    """
-
-    def __init__(
-        self,
-        api_url: str,
-        api_key: str | None = None,
-        secret_key: str | None = None,
-        config: FlushConfig | None = None,
-        redis_client: Any = None,
-        pool_config: PoolConfig | None = None,
-    ):
-        self.api_url = api_url.rstrip("/")
-        self.api_key = api_key
-        self.secret_key = secret_key  # HMAC signing key
-        self.config = config or FlushConfig()
-        self._pool_config = pool_config or PoolConfig()
-        self._pool = AdaptivePool(self._pool_config)
-        self._buffer: list[dict[str, Any]] = []
-        self._in_flight: dict[str, dict[str, Any]] = {}  # event_id -> event for retry dedup
-        self._lock = asyncio.Lock()
-        self._client: httpx.AsyncClient | None = None
-        self._flush_task: asyncio.Task | None = None
-        self._running = False
-        self._redis_client = redis_client
-        self._circuit_breaker = CircuitBreaker(
-            failure_threshold=self.config.max_failed_flush,
-            recovery_timeout=30.0,
-            redis_client=redis_client,
-            name="async_transport",
-        )
-        self._last_retry_after_ms = 0.0  # P0: Store last retry_after for smart backoff
-        self._last_failure_policy_limit = False  # P0: Track if last failure was policy limit
-        self._last_retry_after_seconds = 0.0  # Honor Retry-After from backend (429 response)
-        self._policy_cache = PolicyCache(
-            maxsize=1000,
-            ttl_seconds=300.0,
+    if status in (401, 403):
+        return NullRunAuthenticationError(
+            f"Auth failed on {endpoint} (status {status}, "
+            f"error={error_slug!r}): {message}"
         )
 
-        # OpenTelemetry tracer initialization (lazy - only if opentelemetry is installed)
-        self._tracer = None
-        self._propagator = None
-        if _OTEL_AVAILABLE:
-            self._tracer = trace.get_tracer("nullrun.async_transport")
-            self._propagator = TraceContextTextMapPropagator()
-
-    def _persist_to_wal(self) -> None:
-        """Persist unflushed events to WAL file for replay on restart."""
-        if not self._buffer:
-            return
-        event_count = len(self._buffer)
-        wal_path = os.path.join(os.getcwd(), ".nullrun.wal")
-        with open(wal_path, "a") as f:
-            for event in self._buffer:
-                f.write(json.dumps(event) + "\n")
-        self._buffer.clear()
-        logger.debug(f"Persisted {event_count} events to WAL at {wal_path}")
-
-    async def _replay_from_wal_async(self) -> None:
-        """Replay events from WAL file on startup (async version)."""
-        wal_path = os.path.join(os.getcwd(), ".nullrun.wal")
-        if not os.path.exists(wal_path):
-            return
-        events = []
-        with open(wal_path, "r") as f:
-            for line in f:
+    if status == 429:
+        retry_after: float | None = None
+        ra_header = response.headers.get("Retry-After")
+        if ra_header:
+            try:
+                retry_after = float(ra_header)
+            except ValueError:
                 try:
-                    events.append(json.loads(line.strip()))
-                except json.JSONDecodeError:
-                    continue
-        if events:
-            self._buffer.extend(events)
-            await self._flush()
-        os.remove(wal_path)  # Clean up WAL after successful replay
-        logger.info(f"Replayed {len(events)} events from WAL")
-
-    async def track(self, event: dict[str, Any]) -> None:
-        """Add event to buffer. Non-blocking."""
-        async with self._lock:
-            # Generate event_id if not provided
-            if "event_id" not in event or not event["event_id"]:
-                event["event_id"] = str(uuid.uuid4())
-
-            # Store in-flight for retry dedup
-            self._in_flight[event["event_id"]] = event
-
-            self._buffer.append(event)
-            metrics.inc_transport("events_enqueued")
-            if len(self._buffer) >= self.config.batch_size:
-                await self._flush_locked()
-
-    async def start(self) -> None:
-        """Start background flush task."""
-        if self._running:
-            return
-        # Replay any events from WAL that were persisted due to previous crash
-        await self._replay_from_wal_async()
-        self._running = True
-        # Configure httpx.AsyncClient with adaptive pool limits
-        self._client = httpx.AsyncClient(
-            timeout=httpx.Timeout(
-                connect=5.0,
-                read=30.0,
-                write=10.0,
-                pool=self._pool_config.acquire_timeout,
-            ),
-            verify=True,
-            limits=httpx.Limits(
-                max_connections=self._pool_config.max_connections,
-                max_keepalive_connections=self._pool_config.max_keepalive,
-                keepalive_expiry=self._pool_config.idle_timeout,
-            ),
-        )
-        self._flush_task = asyncio.create_task(self._flush_loop())
-        logger.info(
-            f"AsyncTransport started with pool config: "
-            f"max_connections={self._pool_config.max_connections}, "
-            f"max_keepalive={self._pool_config.max_keepalive}"
+                    from email.utils import parsedate_to_datetime
+                    from datetime import datetime, timezone
+                    dt = parsedate_to_datetime(ra_header)
+                    retry_after = (
+                        dt - datetime.now(timezone.utc)
+                    ).total_seconds()
+                except Exception:
+                    retry_after = None
+        upgrade_url = body.get("upgrade_url") if isinstance(body, dict) else None
+        return RateLimitError(
+            f"Rate limited on {endpoint} (status 429, error={error_slug!r}): "
+            f"{message}",
+            source=TransportErrorSource.GATEWAY_ERROR,
+            endpoint=endpoint,
+            retry_after=retry_after,
+            upgrade_url=upgrade_url,
+            body=body,
         )
 
-    async def stop(self, timeout: float = 10.0) -> None:
-        """Stop background flush task and flush remaining events."""
-        self._running = False
-        if self._flush_task:
-            self._flush_task.cancel()
-            try:
-                await asyncio.wait_for(self._flush_task, timeout=timeout)
-            except asyncio.TimeoutError:
-                logger.warning("Flush task did not complete within timeout, proceeding with shutdown")
-            except asyncio.CancelledError:
-                pass
-        await self._flush()
-        self._persist_to_wal()  # WAL any remaining events
-        if self._client:
-            await self._client.aclose()
-        logger.info("AsyncTransport stopped")
+    if 500 <= status < 600:
+        return NullRunTransportError(
+            f"Gateway error on {endpoint} (status {status}, "
+            f"error={error_slug!r}): {message}",
+            source=TransportErrorSource.GATEWAY_ERROR,
+            endpoint=endpoint,
+            status_code=status,
+            error_slug=error_slug,
+        )
 
-    async def _flush_loop(self) -> None:
-        """Background loop that periodically flushes."""
-        while self._running:
-            await asyncio.sleep(self.config.flush_interval)
-            if self._running:
-                # Check if we should scale up the pool based on demand
-                await self._pool.scale_up_if_needed()
-                await self._flush()
+    return NullRunTransportError(
+        f"Client error on {endpoint} (status {status}, "
+        f"error={error_slug!r}): {message}",
+        source=TransportErrorSource.GATEWAY_ERROR,
+        endpoint=endpoint,
+        status_code=status,
+        error_slug=error_slug,
+    )
 
-    async def _flush(self) -> None:
-        """Perform the actual flush."""
-        async with self._lock:
-            await self._flush_locked()
-
-    async def _flush_locked(self) -> None:
-        """Flush under lock. Must be called with _lock held."""
-        if not self._buffer:
-            return
-
-        batch = self._buffer[:]
-        self._buffer.clear()
-
-        # Circuit breaker wrapped async send with pool backpressure
-        async def send_batch():
-            # Acquire from adaptive pool with backpressure
-            acquired = await self._pool.acquire()
-            if not acquired:
-                # Pool exhausted - apply backpressure
-                backoff = self._calculate_backoff()
-                logger.warning(
-                    f"Pool exhausted during flush, backing off {backoff:.2f}s "
-                    f"for batch of {len(batch)} events"
-                )
-                # Re-add entire batch to buffer for retry
-                self._buffer.extend(batch)
-                metrics.inc_transport("pool_backpressure_events", len(batch))
-                # Return a mock response that will trigger circuit breaker to re-queue
-                raise BreakerTransportError(f"Pool exhausted, batch of {len(batch)} re-queued")
-
-            try:
-                headers = {"Content-Type": "application/json"}
-                if self.api_key:
-                    headers["X-API-Key"] = self.api_key
-                headers["X-API-Version"] = __api_version__
-
-                # Add HMAC signature headers
-                body = json.dumps({"events": batch})
-                if self.secret_key and self.api_key:
-                    timestamp = int(time.time())
-                    signature = generate_hmac_signature(
-                        self.api_key,
-                        self.secret_key,
-                        timestamp,
-                        body,
-                    )
-                    headers["X-Signature-Timestamp"] = str(timestamp)
-                    headers["X-Signature"] = signature
-
-                # Inject trace context for distributed tracing (W3C Trace Context)
-                await self._inject_trace_context(headers)
-
-                response = await self._client.post(
-                    f"{self.api_url}/api/v1/track/batch",
-                    json={"events": batch},
-                    headers=headers,
-                )
-
-                # Extract retry info
-                retry_after_seconds = self._extract_retry_after(response)
-                is_policy_limit = self._is_policy_limit_response(response)
-                self._last_retry_after_seconds = retry_after_seconds or 0.0
-                self._last_failure_policy_limit = is_policy_limit
-
-                # Process actions_taken from server response
-                try:
-                    data = response.json()
-                    actions = data.get("actions_taken", [])
-                    for action in actions:
-                        action_type = action.get("type", "")
-                        workflow_id = action.get("workflow_id", "unknown")
-                        reason = action.get("reason", "")
-                        if action_type:
-                            handle_action(action_type, workflow_id, reason)
-
-                    # Remove accepted events from in-flight
-                    accepted_event_ids = data.get("accepted_event_ids", [])
-                    for event in batch:
-                        if event.get("event_id") in accepted_event_ids:
-                            self._in_flight.pop(event.get("event_id"), None)
-                except Exception as e:
-                    logger.warning(f"Failed to process actions_taken: {e}")
-
-                logger.debug(f"Batch track: sent {len(batch)} events")
-                # Update metrics on successful flush (thread-safe)
-                metrics.inc_transport("batches_sent")
-                metrics.inc_transport("events_sent", len(batch))
-                metrics.set_transport("last_flush_at", time.monotonic())
-                return response
-            finally:
-                self._pool.release()
-
-        try:
-            await self._circuit_breaker.call(send_batch)
-        except BreakerTransportError:
-            # Circuit breaker is open - re-add batch to buffer for retry later
-            logger.warning(
-                f"Circuit breaker OPEN. Batch of {len(batch)} events will be re-queued."
-            )
-            # Enforce max buffer size BEFORE re-queue to prevent unbounded growth
-            # Drop oldest events first to make room for new batch
-            available_space = self.config.max_buffer_size - len(self._buffer)
-            if available_space < len(batch):
-                overflow = len(batch) - available_space
-                if overflow > 0:
-                    # Drop oldest from front (batch) since it hasn't been sent yet
-                    logger.warning(f"Buffer overflow on CB OPEN: dropping {overflow} oldest events from pending batch")
-                    batch = batch[overflow:]  # type: ignore[assignment]
-                    metrics.inc_transport("events_dropped", overflow)
-            # Append to END (not front) so oldest events are retried first
-            self._buffer.extend(batch)
-            # Update metrics on failure (thread-safe)
-            metrics.inc_transport("batches_failed")
-
-        # Enforce max buffer size for any remaining overflow
-        if len(self._buffer) > self.config.max_buffer_size:
-            overflow = len(self._buffer) - self.config.max_buffer_size
-            logger.warning(f"Buffer overflow: dropping {overflow} oldest events")
-            self._buffer = self._buffer[overflow:]  # type: ignore[assignment]
-            metrics.inc_transport("events_dropped", overflow)
-
-    def _extract_retry_after(self, response: httpx.Response) -> float | None:
-        """Extract Retry-After header value as seconds.
-
-        Handles both:
-        - Integer seconds (e.g., "30")
-        - HTTP-date format (e.g., "Wed, 21 Oct 2015 07:28:00 GMT")
-
-        Returns seconds (not ms) to align with _last_retry_after_seconds.
-        """
-        retry_after = response.headers.get("Retry-After")
-        if not retry_after:
-            return None
-
-        # Try parsing as seconds (integer or float)
-        try:
-            return float(retry_after)
-        except ValueError:
-            pass
-
-        # Try parsing as HTTP datetime (RFC 7231)
-        try:
-            from email.utils import parsedate_to_datetime
-            dt = parsedate_to_datetime(retry_after)
-            from datetime import datetime, timezone
-            return (dt - datetime.now(timezone.utc)).total_seconds()
-        except Exception:
-            pass
-
-        return None
-
-    def _is_policy_limit_response(self, response: httpx.Response) -> bool:
-        """Check if response indicates policy limit failure."""
-        if response.status_code == 429:
-            try:
-                data = response.json()
-                if 'rejected' in data and data['rejected']:
-                    rejected_info = data['rejected']
-                    if (
-                        isinstance(rejected_info, dict) and
-                        rejected_info.get('reason') == 'policy_limit'
-                    ):
-                        return True
-            except Exception:
-                logger.debug("Non-JSON response, skipping parse")
-        return False
-
-    def _calculate_backoff(self) -> float:
-        """Calculate backoff delay based on retry info and jitter.
-
-        Uses exponential backoff with jitter for retry handling.
-        Honors Retry-After header from backend (in seconds) when available.
-        """
-        base_delay = 0.5
-        max_delay = 30.0
-        backoff_factor = 2.0
-        jitter = 0.1
-
-        # Honor Retry-After from backend if present (from 429 response)
-        if self._last_retry_after_seconds > 0:
-            delay = min(self._last_retry_after_seconds, max_delay)
-            # Add small jitter to prevent thundering herd when many clients
-            # have the same Retry-After value
-            jitter_amount = delay * jitter
-            delay = delay + random.uniform(-jitter_amount, jitter_amount)
-            delay = max(0.0, delay)
-            # Reset after use - next retry uses exponential backoff
-            self._last_retry_after_seconds = 0.0
-        else:
-            delay = base_delay
-
-        return delay
-
-    async def _inject_trace_context(self, headers: dict[str, str]) -> None:
-        """
-        Inject trace context into request headers (W3C Trace Context format).
-
-        This enables distributed tracing across SDK and backend.
-        Uses W3C Trace Context standard for trace_id propagation.
-        """
-        if not _OTEL_AVAILABLE or not self._propagator:
-            return
-
-        carrier: dict[str, str] = {}
-        self._propagator.inject(carrier)
-        headers.update(carrier)
-
-    async def flush_now(self) -> None:
-        """Force immediate flush."""
-        await self._flush()
-
-    # =============================================================================
-    # Execute (Strict Mode) - Phase 1
-    # =============================================================================
-
-    async def execute(
-        self,
-        organization_id: str,
-        execution_id: str,
-        trace_id: str,
-        tool: str,
-        input_data: dict[str, Any],
-        mode: str = "auto",
-        fallback_mode: str = FallbackMode.PERMISSIVE,
-        operation_id: str | None = None,
-    ) -> dict[str, Any]:
-        """
-        Pre-execution policy evaluation via unified gate endpoint.
-
-        Uses /api/v1/gate endpoint for unified execute + check functionality.
-
-        Args:
-            organization_id: Organization identifier
-            execution_id: Execution identifier
-            trace_id: Distributed trace ID
-            tool: Tool to execute
-            input_data: Tool input
-            mode: Execution mode ("auto", "inline", "strict")
-            fallback_mode: What to do if Gateway unavailable
-            operation_id: Optional idempotency key
-
-        Returns:
-            Dict with:
-                - decision: "allow" | "block" | "flag" | "pause" | "require_approval"
-                - decision_source: "gateway" | "cached" | "fallback"
-                - explanation: Human-readable explanation
-                - policy_version: Policy version used
-                - decision_context: Context for replay (if available)
-        """
-        if not self._client:
-            self._client = httpx.AsyncClient(
-                timeout=httpx.Timeout(
-                    connect=5.0,
-                    read=30.0,
-                    write=10.0,
-                    pool=self._pool_config.acquire_timeout,
-                ),
-                verify=True,
-                limits=httpx.Limits(
-                    max_connections=self._pool_config.max_connections,
-                    max_keepalive_connections=self._pool_config.max_keepalive,
-                    keepalive_expiry=self._pool_config.idle_timeout,
-                ),
-            )
-
-        gate_request = {
-            "organization_id": organization_id,
-            "execution_id": execution_id,
-            "trace_id": trace_id,
-            "tool": tool,
-            "input": input_data,
-            "mode": mode,
-            "operation_id": operation_id or str(uuid.uuid4()),
-        }
-
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["X-API-Key"] = self.api_key
-        headers["X-API-Version"] = __api_version__
-
-        # Add HMAC signature headers
-        body = json.dumps(gate_request)
-        if self.secret_key and self.api_key:
-            timestamp = int(time.time())
-            signature = generate_hmac_signature(
-                self.api_key,
-                self.secret_key,
-                timestamp,
-                body,
-            )
-            headers["X-Signature-Timestamp"] = str(timestamp)
-            headers["X-Signature"] = signature
-
-        # Inject trace context for distributed tracing (W3C Trace Context)
-        await self._inject_trace_context(headers)
-
-        # Try Gateway
-        for attempt in range(2):
-            try:
-                response = await self._client.post(
-                    f"{self.api_url}/api/v1/gate",
-                    json=gate_request,
-                    headers=headers,
-                    timeout=5.0,
-                )
-
-                if response.status_code == 200:
-                    data = response.json()
-                    data["decision_source"] = DecisionSource.GATEWAY
-                    # Cache successful decision for CACHED mode
-                    cache_key = self._policy_cache.make_key(
-                        organization_id,
-                        data.get("policy_version")
-                    )
-                    self._policy_cache.set(
-                        cache_key,
-                        data.get("decision", "allow"),
-                        data.get("policy_id"),
-                        data.get("policy_version")
-                    )
-                    return data  # type: ignore[no-any-return]
-                elif response.status_code >= 500:
-                    # Gateway error - try fallback
-                    logger.warning(f"Gateway returned {response.status_code}, trying fallback")
-                    continue
-                else:
-                    # 4xx - don't retry, return block
-                    return {
-                        "decision": "block",
-                        "decision_source": DecisionSource.FALLBACK,
-                        "explanation": f"Gateway returned {response.status_code}",
-                        "policy_version": 0,
-                    }
-            except Exception as e:
-                logger.warning(f"Execute attempt {attempt + 1} failed: {e}")
-                if attempt < 1:
-                    await asyncio.sleep(0.5)
-
-        # All attempts failed - apply fallback mode
-        if fallback_mode == FallbackMode.STRICT:
-            return {
-                "decision": "block",
-                "decision_source": DecisionSource.FALLBACK,
-                "explanation": "Gateway unavailable, fallback=STRICT",
-                "policy_version": 0,
-            }
-        elif fallback_mode == FallbackMode.CACHED:
-            # Use cached decision if available
-            cache_key = self._policy_cache.make_key(organization_id)
-            cached = self._policy_cache.get(cache_key)
-            if cached:
-                logger.warning("Gateway unreachable, using cached decision for %s", tool)
-                return {
-                    "decision": cached.decision,
-                    "decision_source": DecisionSource.CACHED,
-                    "explanation": "Gateway unavailable, using cached decision",
-                    "policy_version": int(cached.ttl_seconds) if cached.ttl_seconds > 0 else 0,
-                }
-            else:
-                logger.warning(
-                    "Gateway unreachable, no cache for %s, "
-                    "falling back to PERMISSIVE",
-                    tool
-                )
-                return {
-                    "decision": "allow",
-                    "decision_source": DecisionSource.FALLBACK,
-                    "explanation": "Gateway unavailable, no cache available",
-                    "policy_version": 0,
-                }
-        else:  # PERMISSIVE (default)
-            return {
-                "decision": "allow",
-                "decision_source": DecisionSource.FALLBACK,
-                "explanation": "Gateway unavailable, fallback=PERMISSIVE",
-                "policy_version": 0,
-            }
-
-    async def check(self, check_request: dict[str, Any]) -> dict[str, Any]:
-        """
-        Call /api/v1/gate endpoint for pre-execution budget checking.
-
-        Uses the unified gate endpoint with check_type for budget validation.
-        Async version for asyncio-based applications.
-
-        Args:
-            check_request: Dict with:
-                - organization_id: Organization identifier
-                - execution_id: Execution identifier
-                - operation_id: Operation identifier (for idempotency)
-                - check_type: "llm" or "tool"
-                - model: Model name (for LLM checks)
-                - tool_name: Tool name (for tool checks)
-                - estimated_tokens: Token count (for LLM checks)
-                - input: Optional input data
-
-        Returns:
-            Dict with:
-                - decision: "allow" | "block" | "throttle"
-                - reservation_id: Optional reservation ID
-                - remaining_budget_cents: Remaining budget
-                - projected_cost_cents: Projected cost for this operation
-                - explanations: List of explanation strings
-                - suggestions: List of suggestion strings
-        """
-        if not self._client:
-            self._client = httpx.AsyncClient(
-                timeout=httpx.Timeout(
-                    connect=5.0,
-                    read=30.0,
-                    write=10.0,
-                    pool=self._pool_config.acquire_timeout,
-                ),
-                verify=True,
-                limits=httpx.Limits(
-                    max_connections=self._pool_config.max_connections,
-                    max_keepalive_connections=self._pool_config.max_keepalive,
-                    keepalive_expiry=self._pool_config.idle_timeout,
-                ),
-            )
-
-        # Convert check_request to gate_request format
-        gate_request = {
-            "organization_id": check_request.get("organization_id"),
-            "execution_id": check_request.get("execution_id"),
-            "trace_id": check_request.get("trace_id", str(uuid.uuid4())),
-            "tool": check_request.get("tool_name") or check_request.get("tool"),
-            "input": check_request.get("input"),
-            "mode": "auto",
-            "check_type": check_request.get("check_type"),
-            "model": check_request.get("model"),
-            "estimated_tokens": check_request.get("estimated_tokens"),
-            "operation_id": check_request.get("operation_id") or str(uuid.uuid4()),
-        }
-
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["X-API-Key"] = self.api_key
-        headers["X-API-Version"] = __api_version__
-
-        # Add HMAC signature headers
-        body = json.dumps(gate_request)
-        if self.secret_key and self.api_key:
-            timestamp = int(time.time())
-            signature = generate_hmac_signature(
-                self.api_key,
-                self.secret_key,
-                timestamp,
-                body,
-            )
-            headers["X-Signature-Timestamp"] = str(timestamp)
-            headers["X-Signature"] = signature
-
-        # Inject trace context for distributed tracing (W3C Trace Context)
-        await self._inject_trace_context(headers)
-
-        try:
-            response = await self._client.post(
-                f"{self.api_url}/api/v1/gate",
-                json=gate_request,
-                headers=headers,
-                timeout=5.0,
-            )
-
-            if response.status_code == 200:
-                return response.json()  # type: ignore[no-any-return]
-            else:
-                return {
-                    "decision": "block",
-                    "reservation_id": None,
-                    "remaining_budget_cents": 0,
-                    "projected_cost_cents": 0,
-                    "explanations": [f"Gate endpoint returned {response.status_code}"],
-                    "suggestions": ["Check API availability"],
-                }
-        except Exception as e:
-            logger.warning(f"Gate request failed: {e}")
-            return {
-                "decision": "block",
-                "reservation_id": None,
-                "remaining_budget_cents": 0,
-                "projected_cost_cents": 0,
-                "explanations": [f"Gate request failed: {e}"],
-                "suggestions": ["Check API availability"],
-            }

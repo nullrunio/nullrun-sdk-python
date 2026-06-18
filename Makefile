@@ -1,21 +1,16 @@
-.PHONY: install test lint type-check coverage clean build publish-test publish protos
+.PHONY: install test lint type-check coverage clean build publish-test publish
 
 # ── Setup ─────────────────────────────────────────────────────
 install:
 	pip install -e ".[dev]"
 	pre-commit install
 
-# ── Protobuf generation (uses ./protos/, no backend dependency) ─
-protos:
-	@echo "Generating Python gRPC stubs from ./protos/..."
-	@mkdir -p src/nullrun/v1
-	python -m grpc_tools.protoc \
-		-I./protos \
-		--python_out=./src/nullrun/v1 \
-		--grpc_python_out=./src/nullrun/v1 \
-		./protos/nullrun/v1/track.proto
-	@touch src/nullrun/v1/__init__.py
-	@echo "Done. Generated files: src/nullrun/v1/track_pb2.py, track_pb2_grpc.py"
+# Sprint 3.5 (B10): the ``protos`` target was removed. The
+# ``./protos/nullrun/v1/track.proto`` directory was deleted
+# when the gRPC transport was frozen in 0.3.1 (CHANGELOG
+# 0.3.1:217-218). The target would fail on a current checkout
+# with ``No such file or directory``. Re-introduce it ONLY
+# when gRPC is unblocked (see README §"gRPC transport").
 
 # ── Tests ─────────────────────────────────────────────────────
 test:

@@ -1,112 +1,19 @@
 """
-src/nullrun/observability.py
+NullRun observability — thread-safe in-process metrics counters.
 
-Structured logging + metrics for production readiness.
-This is a new module - add to src/nullrun/ and import in runtime.py and transport.py.
+Exposes ``metrics`` for counter / gauge reporting; transport and runtime
+modules call into it for thread-safe increments. No external
+dependencies; integrate with Prometheus / OpenTelemetry on top.
 """
 
 from __future__ import annotations
 
 import logging
-import time
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from threading import Lock
 from typing import Any
-
-# ----------------------------------------------------------------
-# Structured Logger
-# ----------------------------------------------------------------
-
-class StructuredLogger:
-    """
-    Logger with JSON-structured format for production.
-
-    Usage:
-        logger = StructuredLogger("nullrun.transport")
-        logger.info("batch_sent", events=50, duration_ms=12.3)
-        logger.error("batch_failed", error="timeout", attempt=2)
-    """
-
-    def __init__(self, name: str) -> None:
-        self._logger = logging.getLogger(name)
-
-    def _log(self, level: int, event: str, **kwargs: Any) -> None:
-        extra = {"structured": {"event": event, **kwargs}}
-        self._logger.log(level, event, extra=extra)
-
-    def debug(self, event: str, **kwargs: Any) -> None:
-        self._log(logging.DEBUG, event, **kwargs)
-
-    def info(self, event: str, **kwargs: Any) -> None:
-        self._log(logging.INFO, event, **kwargs)
-
-    def warning(self, event: str, **kwargs: Any) -> None:
-        self._log(logging.WARNING, event, **kwargs)
-
-    def error(self, event: str, **kwargs: Any) -> None:
-        self._log(logging.ERROR, event, **kwargs)
-
-
-def get_logger(name: str) -> StructuredLogger:
-    """Logger factory. Use instead of logging.getLogger() in SDK."""
-    return StructuredLogger(f"nullrun.{name}")
-
-
-# ----------------------------------------------------------------
-# Tenant Context Filter for Structured Logging
-# ----------------------------------------------------------------
-
-class TenantFilter(logging.Filter):
-    """Adds tenant context to all log records for structured logging isolation.
-
-    This filter automatically adds org_id, organization_id, and api_key_id
-    from the nullrun context to every log record.
-
-    Usage:
-        import logging
-
-        # Add filter to root logger
-        handler = logging.StreamHandler()
-        handler.addFilter(TenantFilter())
-
-        # Or add to specific logger
-        logger = logging.getLogger("nullrun.transport")
-        logger.addFilter(TenantFilter())
-
-    Tenant fields are pulled from nullrun.context module via ContextVars,
-    so they automatically propagate to all log calls within a tenant_context().
-    """
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        # Import here to avoid circular imports
-        from nullrun.context import get_org_id, get_organization_id, get_api_key_id
-
-        # Add tenant fields to the record for structured logging
-        record.org_id = get_org_id() or "none"
-        record.organization_id = get_organization_id() or "none"
-        record.api_key_id = get_api_key_id() or "none"
-
-        return True
-
-
-def configure_logging_with_tenant_context() -> None:
-    """Configure SDK logging to include tenant context in all log records.
-
-    Call this once at SDK initialization time to enable tenant-isolated logging.
-
-    Usage:
-        from nullrun.observability import configure_logging_with_tenant_context
-
-        configure_logging_with_tenant_context()
-    """
-    # Add TenantFilter to all nullrun loggers
-    for logger_name in ["nullrun.transport", "nullrun.runtime", "nullrun.breaker",
-                        "nullrun.observability", "nullrun.context"]:
-        logger = logging.getLogger(logger_name)
-        logger.addFilter(TenantFilter())
-
 
 # ----------------------------------------------------------------
 # SDK Metrics (in-memory, no external dependencies)
@@ -129,6 +36,14 @@ class TransportMetrics:
     circuit_half_open_count: int = 0
     circuit_closed_count: int = 0
     fallback_mode_activations: int = 0
+    # Sprint 1.5 (B13): HMAC verification failures on the control
+    # plane WebSocket. Pre-fix, a signature mismatch on a signed
+    # ``state_change`` / ``key_rotated`` / ``policy_invalidated``
+    # message was logged at WARNING and the message was silently
+    # dropped — meaning a forged or mis-rotated kill command could
+    # be lost without a counter to alert on. The metric here is
+    # what a SRE alerts on for "control plane signature integrity".
+    hmac_verify_failures_total: int = 0
 
 
 @dataclass
@@ -224,6 +139,7 @@ class MetricsRegistry:
                     "circuit_half_open_count": self.transport.circuit_half_open_count,
                     "circuit_closed_count": self.transport.circuit_closed_count,
                     "fallback_mode_activations": self.transport.fallback_mode_activations,
+                    "hmac_verify_failures_total": self.transport.hmac_verify_failures_total,
                 },
                 "runtime": {
                     "track_calls": self.runtime.track_calls,
@@ -245,77 +161,3 @@ class MetricsRegistry:
 
 # Global singleton registry
 metrics = MetricsRegistry()
-
-
-# ----------------------------------------------------------------
-# Timer context manager (for logging duration_ms)
-# ----------------------------------------------------------------
-
-@contextmanager
-def timed(logger: StructuredLogger, event: str, **kwargs: Any) -> Generator[None, None, None]:
-    """
-    Context manager for measuring operation time.
-
-    Usage:
-        with timed(logger, "batch_flush", batch_size=50):
-            send_batch(events)
-        # Logs: batch_flush duration_ms=12.3 batch_size=50
-    """
-    start = time.monotonic()
-    try:
-        yield
-        duration_ms = (time.monotonic() - start) * 1000
-        logger.info(event, duration_ms=round(duration_ms, 2), **kwargs)
-    except Exception as exc:
-        duration_ms = (time.monotonic() - start) * 1000
-        logger.error(
-            f"{event}_error",
-            duration_ms=round(duration_ms, 2),
-            error=type(exc).__name__,
-            detail=str(exc)[:200],
-            **kwargs,
-        )
-        raise
-
-
-# ----------------------------------------------------------------
-# How to integrate in transport.py and runtime.py
-# ----------------------------------------------------------------
-#
-# In transport.py replace:
-#   import logging
-#   logger = logging.getLogger(__name__)
-#
-# With:
-#   from nullrun.observability import get_logger, metrics, timed
-#   logger = get_logger("transport")
-#
-# In _do_flush_locked():
-#   with timed(logger, "batch_flush", batch_size=len(batch)):
-#       result = self._circuit_breaker.call(self._send_batch, batch)
-#   metrics.transport.batches_sent += 1
-#   metrics.transport.events_sent += len(batch)
-#
-# On flush error:
-#   metrics.transport.batches_failed += 1
-#   metrics.transport.last_error = str(exc)[:200]
-#
-# On enqueue():
-#   metrics.transport.events_enqueued += 1
-#
-# On drop (buffer overflow):
-#   metrics.transport.events_dropped += 1
-#
-# In circuit_breaker.py _on_success / _on_failure:
-#   if newly_opened:
-#       metrics.transport.circuit_breaker_opens += 1
-#
-# In runtime.py track():
-#   metrics.runtime.track_calls += 1
-#
-# In runtime.py execute():
-#   metrics.runtime.execute_calls += 1
-#   if result.allowed:
-#       metrics.runtime.execute_allowed += 1
-#   else:
-#       metrics.runtime.execute_blocked += 1
