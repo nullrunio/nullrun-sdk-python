@@ -1,9 +1,10 @@
-name: Publish to PyPI
+name: publish
 
 on:
   push:
     tags:
-      - 'v*'   # триггер только по тегу: git tag v0.1.0 && git push --tags
+      - "v*"
+  workflow_dispatch:
 
 jobs:
   test:
@@ -21,23 +22,20 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: |
-          pip install -e ".[dev]"
+        run: pip install -e ".[dev]"
 
       - name: Run tests
         run: pytest tests/ -v
 
   publish:
     name: Build and publish
-    needs: test   # сначала все тесты зелёные — потом публикация
+    needs: test
     runs-on: ubuntu-latest
-
     environment:
       name: pypi
-      url: https://pypi.org/p/nullrun-sdk
-
+      url: https://pypi.org/p/nullrun
     permissions:
-      id-token: write   # для trusted publishing (без токена, рекомендуется PyPI)
+      id-token: write
 
     steps:
       - uses: actions/checkout@v4
@@ -46,24 +44,15 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Build package
+      - name: Build
         run: |
-          pip install hatchling build
+          pip install --upgrade build
           python -m build
 
-      - name: Check dist contents
+      - name: Check dist
         run: |
           pip install twine
           twine check dist/*
 
-      # Вариант 1: Trusted Publishing (рекомендуется, не нужен токен)
-      # Настроить на pypi.org: Account → Publishing → Add publisher
-      # Publisher: GitHub, repo: maltsev-dev/nullrun-sdk, workflow: publish.yml
       - name: Publish to PyPI (Trusted Publishing)
         uses: pypa/gh-action-pypi-publish@release/v1
-
-      # Вариант 2: API токен (раскомментируй если не используешь Trusted Publishing)
-      # - name: Publish to PyPI (API token)
-      #   uses: pypa/gh-action-pypi-publish@release/v1
-      #   with:
-      #     password: ${{ secrets.PYPI_API_TOKEN }}
