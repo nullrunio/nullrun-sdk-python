@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "nullrun"
-version = "0.4.0"
+version = "0.5.2"
 description = "NullRun Python SDK — Enforcement gateway for AI agents."
 readme = "README.md"
 license = { text = "Apache-2.0" }

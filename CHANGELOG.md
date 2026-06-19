@@ -132,7 +132,14 @@ surface is unchanged. Aligns the SDK with the contracts in
   description of an older design that did not match the
   shipped SDK.
 
-## [Unreleased]
+## [0.5.2] — 2026-06-19
+
+This release bundles the Sprint 2.5 production-readiness hardening
+alongside the Phase 0 contract / lifecycle fixes. The two streams were
+shipped as separate `[Unreleased]` sections during development; they
+are merged here into a single canonical entry so release tooling that
+scans for the `[Unreleased]` anchor picks up the complete change set
+exactly once.
 
 ### Added (production-readiness hardening)
 
@@ -209,6 +216,26 @@ surface is unchanged. Aligns the SDK with the contracts in
   fingerprint used by `track_event` (the existing
   `_fingerprint_for` is for HTTP responses keyed on host+body+status).
 
+- **Async Policy Cache**: `AsyncTransport` now uses `PolicyCache` for CACHED fallback mode. Previously the async transport always fell back to PERMISSIVE when gateway was unreachable. Now it caches successful execute decisions and uses them when gateway is unavailable.
+
+- **Custom Sensitive Tools API**: Added `add_sensitive_tool()`, `remove_sensitive_tool()`, `register_sensitive_tools()`, and `get_sensitive_tools()` methods to `NullRunRuntime`. Users can now register custom tools as sensitive requiring strict mode enforcement.
+
+- **`NullRunBlockedException.tool_name` attribute** (FIX-5): The `tool_name`
+  kwarg is now a first-class attribute on `NullRunBlockedException`
+  (and its subclasses `LoopDetectedException`, etc.) instead of being
+  absorbed into `**details`. Cookbook examples that read `exc.tool_name`
+  no longer raise `AttributeError`. Backwards-compatible: `tool_name`
+  defaults to `None` and does not appear in `exc.details` when unset.
+  The stringified exception now includes `tool={name}` when set.
+
+- **`check_control_plane` is case-insensitive on the state value.**
+  SDK now normalises the state with `.lower()` before comparing to
+  `"paused"` / `"killed"`. Pre-fix a backend regression to UPPERCASE
+  (e.g. `"KILLED"` in `state_change`) would have silently failed the
+  match and let a killed workflow keep running. Backend already emits
+  PascalCase per the `as_pascal_case()` normaliser in
+  `handlers.rs:9258`; this is defensive per `analyze.md` §11.6.
+
 ### Removed (Phase 5)
 
 - **Empty placeholder modules deleted.** `src/nullrun/flow/`,
@@ -238,32 +265,88 @@ surface is unchanged. Aligns the SDK with the contracts in
   behalf) to `X-API-Key`, and from the non-existent `/usage`
   endpoint to the canonical `/quota` per `contracts/openapi.yaml`.
 
-### Notes
+- **P0-1 (PCI-DSS / GDPR): positional PII masking.** Sensitive tools
+  called positionally (e.g. ``charge("4111-1111-1111-1111", 50)``) now
+  mask positional args the same way kwargs already do, by introspecting
+  the function signature with ``inspect.signature(fn)`` and applying
+  ``SENSITIVE_ARG_KEYS`` to the matching parameter name. Pre-fix the
+  PAN at position 0 was forwarded as-is into ``/execute`` and landed
+  in the audit log.
 
-- Public surface unchanged. `init`, `protect`, `track_llm`,
-  `track_tool`, `track_event` retain the same call signatures
-  documented in the existing examples. The platform's
-  `docs/sdk/README.md` describes an alternative 7-symbol surface
-  (with `wrap` alias and a different `init(organization_id, ...)`
-  signature) — that doc is out of sync with the SDK; an update
-  to the platform docs is tracked separately. Per the production
-  plan's user decisions, the SDK's surface is the source of truth.
+- **P0-3 (OOM): streaming response memory cap.** Sync and async
+  httpx transports now use bounded chunked reads capped at
+  ``MAX_RESPONSE_BYTES`` (16 MiB by default; ``NULLRUN_MAX_RESPONSE_BYTES``
+  env var to override). When the cap is exceeded, tracking is skipped
+  and ``_coverage_streaming_skipped`` is incremented so the dashboard
+  sees which hosts are producing oversized responses. Pre-fix
+  ``response.read()`` / ``await response.aread()`` buffered the entire
+  response body in memory — a 16+ MB allocation per streaming LLM
+  call under load.
 
-## [Unreleased]
+- **P0-4 (cost-audit): drop-newest on buffer overflow.** The CB-OPEN
+  re-queue path in ``Transport._do_flush_locked`` now drops the
+  NEWEST non-critical events instead of the oldest. The oldest
+  events (start-of-incident, start-of-billing-period) are exactly
+  what a billing investigator needs to reconstruct — losing them
+  silently broke monthly rollups. Control-plane events
+  (``state_change`` / ``kill_received`` / ``policy_invalidated`` /
+  ``key_rotated``) are preserved regardless of position so the
+  dashboard's KILL switch continues to land even under sustained
+  backend outage.
 
-### Added
+- **P0-6 + P3-3 (security): redact-before-truncate.** ``_safe_repr``
+  now runs ``_strip_details_balanced`` on the FULL repr before
+  truncating to ``max_len=50``. Pre-fix the truncate ran first, and
+  if ``details={...}`` lived past position 50 in the original repr
+  (common for httpx.HTTPError with a long URL), the redact pass
+  saw nothing on the truncated slice and the raw payload leaked
+  into ``span_end`` audit events.
 
-- **Async Policy Cache**: `AsyncTransport` now uses `PolicyCache` for CACHED fallback mode. Previously the async transport always fell back to PERMISSIVE when gateway was unreachable. Now it caches successful execute decisions and uses them when gateway is unavailable.
-- **Custom Sensitive Tools API**: Added `add_sensitive_tool()`, `remove_sensitive_tool()`, `register_sensitive_tools()`, and `get_sensitive_tools()` methods to `NullRunRuntime`. Users can now register custom tools as sensitive requiring strict mode enforcement.
-- **`NullRunBlockedException.tool_name` attribute** (FIX-5): The `tool_name`
-  kwarg is now a first-class attribute on `NullRunBlockedException`
-  (and its subclasses `LoopDetectedException`, etc.) instead of being
-  absorbed into `**details`. Cookbook examples that read `exc.tool_name`
-  no longer raise `AttributeError`. Backwards-compatible: `tool_name`
-  defaults to `None` and does not appear in `exc.details` when unset.
-  The stringified exception now includes `tool={name}` when set.
+- **S-8 / P2-4: ``agent_id`` is now a real UUID with dashes.**
+  ``agent()`` context manager emits ``str(uuid.uuid4())`` (e.g.
+  ``95ca7c0b-8334-478a-af23-2788803ef3b8``) for auto-generated ids.
+  Pre-fix the format was ``f"agent-{uuid.uuid4().hex}"`` — 32 hex
+  chars with no dashes; backend UUID-typed columns silently
+  dropped these to NULL on insert. User-supplied names are still
+  preserved verbatim.
 
-### Fixed
+- **S-9: LRU cap on ``NullRunCallback._active_runs``** (4096 entries,
+  FIFO eviction with WARN log). Pre-fix this dict grew unbounded
+  when ``on_chain_end`` did not fire (errors in the chain body
+  short-circuited the end hook for some LangChain versions),
+  leaking memory in long-running services.
+
+- **S-10: WebSocket reconnect max-attempts cap** (10 consecutive
+  failures). Pre-fix the loop was unbounded (``while not
+  self._closed:``) and leaked the WS thread forever when the backend
+  was permanently down. After the cap the SDK falls back to
+  HTTP-poll for control-plane state delivery.
+
+- **P2-1: ``_coverage_seen`` now bumps in the httpx path.**
+  Pre-fix the counter was only incremented in the ``requests``
+  path (``auto_requests.py:185``), so the dashboard's coverage
+  view was empty for the dominant httpx traffic (every OpenAI /
+  Anthropic / Gemini / Mistral / Cohere call). Now both sync and
+  async httpx ``_emit`` bump the counter.
+
+- **P3-2: webhook delivery uses exponential backoff** (cap 30s).
+  Pre-fix the schedule was linear (``0.5 * (attempt + 1)``); under
+  sustained outage this produced a tight retry storm on the dead
+  endpoint — each KILL/PAUSE spawned its own delivery thread.
+  Post-fix the schedule is ``0.5 * 2**attempt`` capped at 30s:
+  0.5s, 1.0s, 2.0s, 4.0s, 8.0s, 16.0s, 30.0s.
+
+### Tests
+
+Added regression tests for every item above (57 new tests across 9
+new test files: ``test_agent_id_uuid.py``, ``test_args_pii_masked.py``,
+``test_streaming_oom_cap.py``, ``test_lru_active_runs.py``,
+``test_reconnect_cap.py``, ``test_coverage_seen_httpx.py``,
+``test_webhook_backoff.py``, ``test_redact.py``; existing
+``test_buffer_invariants.py`` extended with drop-newest + critical-event
+preservation cases).
+
+### Legacy
 
 - **P0-1 (PCI-DSS / GDPR): positional PII masking.** Sensitive tools
   called positionally (e.g. ``charge("4111-1111-1111-1111", 50)``) now
@@ -351,6 +434,17 @@ preservation cases).
   contract of `nullrun.init()`. Aligns with the T3-S2 invariant that
   the SDK has no local mode: a missing API key is a hard error, not a
   silent allow-all.
+
+### Notes
+
+- Public surface unchanged. `init`, `protect`, `track_llm`,
+  `track_tool`, `track_event` retain the same call signatures
+  documented in the existing examples. The platform's
+  `docs/sdk/README.md` describes an alternative 7-symbol surface
+  (with `wrap` alias and a different `init(organization_id, ...)`
+  signature) — that doc is out of sync with the SDK; an update
+  to the platform docs is tracked separately. Per the production
+  plan's user decisions, the SDK's surface is the source of truth.
 
 ---
 
@@ -571,6 +665,6 @@ _No breaking changes yet. Watch this file._
 
 ---
 
-[Unreleased]: https://github.com/maltsev-dev/nullrun-sdk/compare/v0.1.1...HEAD
+[0.5.2]: https://github.com/maltsev-dev/nullrun-sdk/compare/v0.4.0...v0.5.2
 [0.1.1]: https://github.com/maltsev-dev/nullrun-sdk/releases/tag/v0.1.1
 [0.1.0]: https://github.com/maltsev-dev/nullrun-sdk/releases/tag/v0.1.0
