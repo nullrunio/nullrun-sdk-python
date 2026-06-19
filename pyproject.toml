@@ -192,12 +192,21 @@ pythonpath = ["."]
 [tool.coverage.run]
 source = ["src/nullrun"]
 omit = ["tests/*"]
+# Branch coverage: every if/else, try/except, ternary contributes two
+# branches instead of one. Disabled by default in the stdlib config;
+# the SDK has too many error / fallback paths to leave these invisible.
+branch = true
 
 [tool.coverage.report]
-fail_under = 70
+fail_under = 82
 show_missing = true
+# Branch coverage makes the report noisier; precision=2 keeps the
+# numbers readable. skip_empty drops files with no statements.
+precision = 2
+skip_empty = true
 exclude_lines = [
     "pragma: no cover",
     "if TYPE_CHECKING:",
     "raise NotImplementedError",
+    "if __name__ == .__main__.:",
 ]
