@@ -38,6 +38,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import threading
 from collections import OrderedDict
 from collections.abc import Callable
@@ -1143,10 +1144,9 @@ DEDUP_LRU_MAX = 4096  # Phase 6 #6.7: 4096 entries give a 410ms dedup window at 
 # Env-var override: NULLRUN_MAX_RESPONSE_BYTES. None disables the cap
 # (escape hatch for users who really need full-body inspection and
 # can tolerate the memory cost).
-import os as _os
 _DEFAULT_MAX_RESPONSE_BYTES = 16 * 1024 * 1024  # 16 MiB
 MAX_RESPONSE_BYTES = int(
-    _os.environ.get("NULLRUN_MAX_RESPONSE_BYTES", _DEFAULT_MAX_RESPONSE_BYTES)
+    os.environ.get("NULLRUN_MAX_RESPONSE_BYTES", _DEFAULT_MAX_RESPONSE_BYTES)
 ) or _DEFAULT_MAX_RESPONSE_BYTES
 
 
