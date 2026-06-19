@@ -962,13 +962,22 @@ class NullRunRuntime:
             remote_state = self._remote_state_for(workflow_id)
         state = remote_state.get("state", "Normal")
 
-        if state == "Paused":
+        # S-4: case-insensitive compare per analyze.md §11.6. The backend
+        # already emits PascalCase via the `as_pascal_case()` normaliser
+        # in `handlers.rs:9258`, but a future regression to UPPERCASE
+        # (or any other casing) would silently fail the match and let a
+        # killed workflow keep running. Normalise here so the SDK
+        # survives any wire-format drift without needing a coordinated
+        # backend change.
+        state_normalized = state.lower() if isinstance(state, str) else "normal"
+
+        if state_normalized == "paused":
             reason = remote_state.get("reason", "remote pause")
             raise WorkflowPausedException(
                 workflow_id=workflow_id,
                 reason=reason,
             )
-        elif state == "Killed":
+        elif state_normalized == "killed":
             reason = remote_state.get("reason", "remote kill")
             raise WorkflowKilledInterrupt(
                 workflow_id=workflow_id,
