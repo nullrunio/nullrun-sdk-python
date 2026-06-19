@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import random
+import tempfile
 import threading
 import time
 import uuid
@@ -622,14 +623,18 @@ class Transport:
 
         Honours ``NULLRUN_WAL_PATH`` so crash-recovery lands on a
         writable mount in containers with
-        ``readOnlyRootFilesystem: true``. Default
-        ``/tmp/nullrun.wal`` matches the convention other agents
-        use for ephemeral crash-recovery state.
+        ``readOnlyRootFilesystem: true``. Default lands in the
+        platform temp dir (``tempfile.gettempdir()`` — typically
+        ``/tmp`` on Linux, ``/var/folders/...`` on macOS,
+        ``%TEMP%`` on Windows). Using the platform helper rather
+        than a hardcoded ``/tmp`` keeps us off S108's insecure
+        path list and lets the SDK work on Windows out of the
+        box.
         """
         env_path = os.environ.get("NULLRUN_WAL_PATH")
         if env_path:
             return env_path
-        return os.path.join("/tmp", "nullrun.wal")
+        return os.path.join(tempfile.gettempdir(), "nullrun.wal")
 
     def _rotate_wal_if_needed(self) -> None:
         """Rotate ``<path>`` to ``<path>.1`` if it exceeds the size cap."""
