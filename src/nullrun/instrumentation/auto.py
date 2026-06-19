@@ -348,7 +348,27 @@ class NullRunSyncTransport(httpx.BaseTransport):
             return self._inner.handle_request(request)
         response = self._inner.handle_request(request)
         try:
-            body = response.read()
+            # P0-3: bounded read — never buffer more than
+            # MAX_RESPONSE_BYTES for tracking purposes. Above the cap,
+            # we skip tracking (the user still gets the full body via
+            # the rebuilt response below). The body still needs to
+            # be reconstructed for downstream consumers, so when the
+            # cap is hit we fall through to ``read()`` for the
+            # rebuild path only.
+            body = _read_body_with_cap(response, MAX_RESPONSE_BYTES)
+            if body is None:
+                # Body exceeded the cap. Drain it (so callers don't
+                # see a half-consumed response) but don't track.
+                _safe_bump_coverage(self._runtime, "_coverage_streaming_skipped", host)
+                logger.debug(
+                    "NullRun transport: response from %s exceeded %d bytes; "
+                    "skipping usage tracking",
+                    host, MAX_RESPONSE_BYTES,
+                )
+                try:
+                    return self._rebuild(response, response.read(), request)
+                except Exception:
+                    return response
         except Exception as e:  # pragma: no cover — defensive
             logger.debug("NullRun transport: failed to read body: %s", e)
             return response
@@ -412,6 +432,15 @@ class NullRunSyncTransport(httpx.BaseTransport):
         body: bytes,
         status: int,
     ) -> None:
+        # P2-1 (plan §10): bump the coverage counter so the dashboard
+        # can see which LLM hosts the agent is talking to. Pre-fix
+        # this counter was only incremented in the ``requests`` path
+        # (auto_requests.py:185). The httpx path is the dominant
+        # one (every OpenAI / Anthropic / Gemini / Mistral / Cohere
+        # call goes through httpx), so without this bump the
+        # ``coverage_seen`` view in the dashboard would be empty for
+        # the majority of customers.
+        _safe_bump_coverage(self._runtime, "_coverage_seen", host)
         try:
             self._runtime.track(
                 {
@@ -462,7 +491,19 @@ class NullRunAsyncTransport(httpx.AsyncBaseTransport):
             return await self._inner.handle_async_request(request)
         response = await self._inner.handle_async_request(request)
         try:
-            body = await response.aread()
+            # P0-3: bounded read (see sync path for full rationale).
+            body = await _aread_body_with_cap(response, MAX_RESPONSE_BYTES)
+            if body is None:
+                _safe_bump_coverage(self._runtime, "_coverage_streaming_skipped", host)
+                logger.debug(
+                    "NullRun transport: async response from %s exceeded %d bytes; "
+                    "skipping usage tracking",
+                    host, MAX_RESPONSE_BYTES,
+                )
+                try:
+                    return self._rebuild(response, await response.aread(), request)
+                except Exception:
+                    return response
         except Exception as e:  # pragma: no cover — defensive
             logger.debug("NullRun transport: failed to read async body: %s", e)
             return response
@@ -521,6 +562,10 @@ class NullRunAsyncTransport(httpx.AsyncBaseTransport):
         body: bytes,
         status: int,
     ) -> None:
+        # P2-1 (plan §10): mirror the sync path — bump the coverage
+        # counter so the dashboard's ``coverage_seen`` view shows
+        # httpx-path traffic (the dominant path).
+        _safe_bump_coverage(self._runtime, "_coverage_seen", host)
         try:
             self._runtime.track(
                 {
@@ -608,6 +653,19 @@ def _fingerprint_for_event_dict(event: dict[str, Any]) -> str:
 
 _httpx_patched = False
 _httpx_lock = threading.Lock()
+# §7.2 #47: separate locks for the langchain / langgraph
+# patch functions. The pre-fix code did ``if _x_patched:
+# return True`` and ``getattr(SomeClass, "_nullrun_patched",
+# False)`` without a lock — two threads racing through
+# ``auto_instrument`` simultaneously could both pass the early
+# check, both fall through to ``_orig_init = SomeClass.__init__``,
+# and double-wrap the class. With CPython's GIL the race is
+# narrow but real; on free-threaded builds (PEP 703) it's wide
+# open. One lock per framework, held for the entire patch
+# sequence so the read and the write are atomic from any other
+# thread's view.
+_langchain_lock = threading.Lock()
+_langgraph_lock = threading.Lock()
 # Originals are stashed on first patch so `reset_for_tests` can fully
 # restore httpx.Client / AsyncClient to the un-patched state. Without
 # this, a second `patch_httpx` would no-op (class marker still set)
@@ -679,44 +737,55 @@ _langchain_patched = False
 def patch_langchain_callback(runtime: Any) -> bool:
     """Install NullRunCallback into the LangChain callback manager so all
     LLM calls (including mock providers) flow through it. Idempotent.
+
+    §7.2 #47: the pre-fix code did ``if _langchain_patched: return``
+    and ``getattr(BaseCallbackManager, "_nullrun_patched", False)``
+    without a lock; two threads racing through ``auto_instrument``
+    simultaneously could both pass the early check, then both
+    fall through to ``_orig_init = BaseCallbackManager.__init__``,
+    capturing the same original and double-wrapping the class.
+    We hold ``_langchain_lock`` for the entire patch sequence so
+    the read and the write happen atomically from any other
+    thread's view.
     """
     global _langchain_patched
-    if _langchain_patched:
-        return True
-    try:
-        from langchain_core.callbacks import BaseCallbackManager
-    except ImportError:
-        logger.debug("langchain-core not installed; LangChain callback path skipped")
-        return False
-
-    if getattr(BaseCallbackManager, "_nullrun_patched", False):
-        _langchain_patched = True
-        return True
-
-    _orig_init = BaseCallbackManager.__init__
-
-    def _wrap_init(self: Any, *args: Any, **kwargs: Any) -> None:
-        _orig_init(self, *args, **kwargs)
+    with _langchain_lock:
+        if _langchain_patched:
+            return True
         try:
-            handlers = getattr(self, "handlers", None) or []
-            if any(isinstance(h, NullRunCallback) for h in handlers):
-                return
-            # Add a NullRun callback for this manager. We use the
-            # add_handler API when available; otherwise we set handlers
-            # directly (older LangChain).
-            if hasattr(self, "add_handler"):
-                self.add_handler(NullRunCallback(runtime=runtime))
-            else:
-                handlers.append(NullRunCallback(runtime=runtime))
-                self.handlers = handlers
-        except Exception as e:  # pragma: no cover — defensive
-            logger.debug("NullRun: failed to add callback to manager: %s", e)
+            from langchain_core.callbacks import BaseCallbackManager
+        except ImportError:
+            logger.debug("langchain-core not installed; LangChain callback path skipped")
+            return False
 
-    BaseCallbackManager.__init__ = _wrap_init  # type: ignore[method-assign]
-    BaseCallbackManager._nullrun_patched = True  # type: ignore[attr-defined]
-    _langchain_patched = True
-    logger.info("LangChain callback auto-instrumentation installed")
-    return True
+        if getattr(BaseCallbackManager, "_nullrun_patched", False):
+            _langchain_patched = True
+            return True
+
+        _orig_init = BaseCallbackManager.__init__
+
+        def _wrap_init(self: Any, *args: Any, **kwargs: Any) -> None:
+            _orig_init(self, *args, **kwargs)
+            try:
+                handlers = getattr(self, "handlers", None) or []
+                if any(isinstance(h, NullRunCallback) for h in handlers):
+                    return
+                # Add a NullRun callback for this manager. We use the
+                # add_handler API when available; otherwise we set handlers
+                # directly (older LangChain).
+                if hasattr(self, "add_handler"):
+                    self.add_handler(NullRunCallback(runtime=runtime))
+                else:
+                    handlers.append(NullRunCallback(runtime=runtime))
+                    self.handlers = handlers
+            except Exception as e:  # pragma: no cover — defensive
+                logger.debug("NullRun: failed to add callback to manager: %s", e)
+
+        BaseCallbackManager.__init__ = _wrap_init  # type: ignore[method-assign]
+        BaseCallbackManager._nullrun_patched = True  # type: ignore[attr-defined]
+        _langchain_patched = True
+        logger.info("LangChain callback auto-instrumentation installed")
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -841,85 +910,94 @@ def patch_langgraph_compiled(runtime: Any) -> bool:
     `config["callbacks"]` list on every call, unless the user already
     supplied one. Idempotent. Returns False if `langgraph` is not
     importable.
+
+    §7.2 #47: same fix as ``patch_langchain_callback`` — the
+    pre-fix code read the patched flag and the class-level marker
+    without a lock, so two threads racing through
+    ``auto_instrument`` could both fall through to
+    ``Pregel.invoke = _wrap_invoke`` and double-wrap the class.
+    With ``_langgraph_lock`` held, the read and the write happen
+    atomically from any other thread's view.
     """
     global _langgraph_compiled_patched
-    if _langgraph_compiled_patched:
-        return True
-    try:
-        from langgraph.pregel import Pregel
-    except ImportError:
-        logger.debug("langgraph not installed; compiled-graph auto-patch skipped")
-        return False
+    with _langgraph_lock:
+        if _langgraph_compiled_patched:
+            return True
+        try:
+            from langgraph.pregel import Pregel
+        except ImportError:
+            logger.debug("langgraph not installed; compiled-graph auto-patch skipped")
+            return False
 
-    if getattr(Pregel, "_nullrun_patched", False):
-        _langgraph_compiled_patched = True
-        return True
+        if getattr(Pregel, "_nullrun_patched", False):
+            _langgraph_compiled_patched = True
+            return True
 
-    def _make_callback() -> Any:
-        return NullRunCallback(runtime=runtime)
+        def _make_callback() -> Any:
+            return NullRunCallback(runtime=runtime)
 
-    def _ensure_callback(config: Any) -> dict[str, Any]:
-        """
-        Inject a NullRunCallback into `config["callbacks"]` if the
-        user did not already supply one. We never *replace* the
-        list — user-supplied callbacks (other observability
-        tools, custom handlers) are preserved.
-        """
-        if config is None:
-            config = {}
-        if not isinstance(config, dict):
-            return config
-        callbacks = config.get("callbacks")
-        if callbacks is None:
-            callbacks = []
-        else:
-            try:
-                if any(isinstance(cb, NullRunCallback) for cb in callbacks):
-                    return config
-            except TypeError:
+        def _ensure_callback(config: Any) -> dict[str, Any]:
+            """
+            Inject a NullRunCallback into `config["callbacks"]` if the
+            user did not already supply one. We never *replace* the
+            list — user-supplied callbacks (other observability
+            tools, custom handlers) are preserved.
+            """
+            if config is None:
+                config = {}
+            if not isinstance(config, dict):
                 return config
-        callbacks = list(callbacks) + [_make_callback()]
-        config = dict(config)
-        config["callbacks"] = callbacks
-        return config
+            callbacks = config.get("callbacks")
+            if callbacks is None:
+                callbacks = []
+            else:
+                try:
+                    if any(isinstance(cb, NullRunCallback) for cb in callbacks):
+                        return config
+                except TypeError:
+                    return config
+            callbacks = list(callbacks) + [_make_callback()]
+            config = dict(config)
+            config["callbacks"] = callbacks
+            return config
 
-    _orig_invoke = Pregel.invoke
-    _orig_stream = Pregel.stream
-    _orig_ainvoke = Pregel.ainvoke
-    _orig_astream = Pregel.astream
+        _orig_invoke = Pregel.invoke
+        _orig_stream = Pregel.stream
+        _orig_ainvoke = Pregel.ainvoke
+        _orig_astream = Pregel.astream
 
-    # Stash originals so reset_for_tests can restore the un-patched
-    # class methods. The wrapped closures capture `runtime` in
-    # scope — without restoring, a second test pass would silently
-    # drop events from later runtimes (same hazard as httpx patch).
-    global _orig_pregel_invoke, _orig_pregel_stream
-    global _orig_pregel_ainvoke, _orig_pregel_astream
-    _orig_pregel_invoke = _orig_invoke
-    _orig_pregel_stream = _orig_stream
-    _orig_pregel_ainvoke = _orig_ainvoke
-    _orig_pregel_astream = _orig_astream
+        # Stash originals so reset_for_tests can restore the un-patched
+        # class methods. The wrapped closures capture `runtime` in
+        # scope — without restoring, a second test pass would silently
+        # drop events from later runtimes (same hazard as httpx patch).
+        global _orig_pregel_invoke, _orig_pregel_stream
+        global _orig_pregel_ainvoke, _orig_pregel_astream
+        _orig_pregel_invoke = _orig_invoke
+        _orig_pregel_stream = _orig_stream
+        _orig_pregel_ainvoke = _orig_ainvoke
+        _orig_pregel_astream = _orig_astream
 
-    def _wrap_invoke(self: Any, input: Any, config: Any = None, **kwargs: Any) -> Any:
-        return _orig_invoke(self, input, _ensure_callback(config), **kwargs)
+        def _wrap_invoke(self: Any, input: Any, config: Any = None, **kwargs: Any) -> Any:
+            return _orig_invoke(self, input, _ensure_callback(config), **kwargs)
 
-    def _wrap_stream(self: Any, input: Any, config: Any = None, **kwargs: Any) -> Any:
-        return _orig_stream(self, input, _ensure_callback(config), **kwargs)
+        def _wrap_stream(self: Any, input: Any, config: Any = None, **kwargs: Any) -> Any:
+            return _orig_stream(self, input, _ensure_callback(config), **kwargs)
 
-    async def _wrap_ainvoke(self: Any, input: Any, config: Any = None, **kwargs: Any) -> Any:
-        return await _orig_ainvoke(self, input, _ensure_callback(config), **kwargs)
+        async def _wrap_ainvoke(self: Any, input: Any, config: Any = None, **kwargs: Any) -> Any:
+            return await _orig_ainvoke(self, input, _ensure_callback(config), **kwargs)
 
-    async def _wrap_astream(self: Any, input: Any, config: Any = None, **kwargs: Any) -> Any:
-        async for chunk in _orig_astream(self, input, _ensure_callback(config), **kwargs):
-            yield chunk
+        async def _wrap_astream(self: Any, input: Any, config: Any = None, **kwargs: Any) -> Any:
+            async for chunk in _orig_astream(self, input, _ensure_callback(config), **kwargs):
+                yield chunk
 
-    Pregel.invoke = _wrap_invoke  # type: ignore[method-assign]
-    Pregel.stream = _wrap_stream  # type: ignore[method-assign]
-    Pregel.ainvoke = _wrap_ainvoke  # type: ignore[method-assign]
-    Pregel.astream = _wrap_astream  # type: ignore[method-assign]
-    Pregel._nullrun_patched = True  # type: ignore[attr-defined]
-    _langgraph_compiled_patched = True
-    logger.info("LangGraph compiled-graph auto-instrumentation installed (Pregel.invoke/stream/ainvoke/astream)")
-    return True
+        Pregel.invoke = _wrap_invoke  # type: ignore[method-assign]
+        Pregel.stream = _wrap_stream  # type: ignore[method-assign]
+        Pregel.ainvoke = _wrap_ainvoke  # type: ignore[method-assign]
+        Pregel.astream = _wrap_astream  # type: ignore[method-assign]
+        Pregel._nullrun_patched = True  # type: ignore[attr-defined]
+        _langgraph_compiled_patched = True
+        logger.info("LangGraph compiled-graph auto-instrumentation installed (Pregel.invoke/stream/ainvoke/astream)")
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -1050,6 +1128,90 @@ def reset_for_tests() -> None:
 # without poking into the runtime module.
 
 DEDUP_LRU_MAX = 4096  # Phase 6 #6.7: 4096 entries give a 410ms dedup window at 10K events/sec
+
+# P0-3 (plan §10): streaming-OOM cap. Pre-fix, the sync transport
+# called ``response.read()`` and the async transport called
+# ``await response.aread()`` — both buffer the ENTIRE response body
+# in memory. For an OpenAI streaming completion with max_tokens=8192,
+# that's 16+ MB held per request. Under load (10+ concurrent streams)
+# this is a real OOM risk.
+#
+# Cap at 16 MB. Above that, we skip tracking and increment
+# ``_coverage_streaming_skipped`` so the dashboard can see which
+# hosts are producing oversized responses.
+#
+# Env-var override: NULLRUN_MAX_RESPONSE_BYTES. None disables the cap
+# (escape hatch for users who really need full-body inspection and
+# can tolerate the memory cost).
+import os as _os
+_DEFAULT_MAX_RESPONSE_BYTES = 16 * 1024 * 1024  # 16 MiB
+MAX_RESPONSE_BYTES = int(
+    _os.environ.get("NULLRUN_MAX_RESPONSE_BYTES", _DEFAULT_MAX_RESPONSE_BYTES)
+) or _DEFAULT_MAX_RESPONSE_BYTES
+
+
+def _read_body_with_cap(response: httpx.Response, max_bytes: int) -> bytes | None:
+    """Read the response body, aborting at ``max_bytes``.
+
+    Returns the body bytes if it fits within the cap, or ``None`` if
+    the body exceeded the cap (the caller should skip tracking and
+    increment ``_coverage_streaming_skipped``).
+
+    Strategy:
+      1. If Content-Length is known and > cap, return None
+         immediately (no read — no allocation).
+      2. Otherwise stream-read in 64 KB chunks, aborting the moment
+         we cross the cap. This protects against both content-length-
+         known and content-length-unknown (chunked) responses.
+      3. We also abort cleanly if the response is already closed /
+         streaming has been consumed elsewhere.
+
+    The sync mirror for async is ``_aread_body_with_cap``.
+    """
+    cl = response.headers.get("content-length")
+    if cl is not None:
+        try:
+            if int(cl) > max_bytes:
+                return None
+        except ValueError:
+            pass  # malformed Content-Length — fall through to chunked read
+    out = bytearray()
+    try:
+        for chunk in response.iter_bytes(chunk_size=64 * 1024):
+            if len(out) + len(chunk) > max_bytes:
+                return None
+            out.extend(chunk)
+    except Exception:
+        # Stream already consumed / connection closed — fall back to
+        # ``read()`` so the caller still gets the body for the user.
+        try:
+            return response.read()
+        except Exception:
+            return None
+    return bytes(out)
+
+
+async def _aread_body_with_cap(response: httpx.Response, max_bytes: int) -> bytes | None:
+    """Async mirror of ``_read_body_with_cap``."""
+    cl = response.headers.get("content-length")
+    if cl is not None:
+        try:
+            if int(cl) > max_bytes:
+                return None
+        except ValueError:
+            pass
+    out = bytearray()
+    try:
+        async for chunk in response.aiter_bytes(chunk_size=64 * 1024):
+            if len(out) + len(chunk) > max_bytes:
+                return None
+            out.extend(chunk)
+    except Exception:
+        try:
+            return await response.aread()
+        except Exception:
+            return None
+    return bytes(out)
 
 
 def make_dedup_state() -> OrderedDict[str, None]:

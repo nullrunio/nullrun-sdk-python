@@ -120,6 +120,15 @@ def verify_hmac_signature(
     # Check timestamp freshness
     current_time = int(time.time())
     if abs(current_time - timestamp) > max_age_seconds:
+        # §7.2 #6: separate counter so SRE can distinguish
+        # "our clock drifted" from "someone is forging packets".
+        # The two cases need different runbooks — NTP sync
+        # vs. incident response.
+        try:
+            from nullrun.observability import metrics
+            metrics.inc_transport("hmac_verify_expired_total")
+        except Exception:  # noqa: BLE001 — best-effort counter
+            pass
         logger.warning(f"Request timestamp too old: {timestamp} vs current {current_time}")
         return False
 
@@ -588,35 +597,116 @@ class Transport:
             "manager or call stop() explicitly."
         )
 
+    # P1-5b: rotate the WAL when it grows past this many bytes.
+    # Default 64 MB — large enough to absorb a multi-minute
+    # backend outage on a busy agent, small enough that one
+    # rotated file plus the active WAL never exceeds the typical
+    # K8s emptyDir limit. Operators can override via
+    # ``NULLRUN_WAL_MAX_BYTES``.
+    _WAL_MAX_BYTES_DEFAULT: int = 64 * 1024 * 1024
+
+    @property
+    def _wal_max_bytes(self) -> int:
+        """Effective WAL rotation threshold."""
+        raw = os.environ.get("NULLRUN_WAL_MAX_BYTES", "").strip()
+        if not raw:
+            return self._WAL_MAX_BYTES_DEFAULT
+        try:
+            value = int(raw)
+            return value if value > 0 else self._WAL_MAX_BYTES_DEFAULT
+        except ValueError:
+            return self._WAL_MAX_BYTES_DEFAULT
+
+    def _wal_path(self) -> str:
+        """Resolve WAL path.
+
+        Honours ``NULLRUN_WAL_PATH`` so crash-recovery lands on a
+        writable mount in containers with
+        ``readOnlyRootFilesystem: true``. Default
+        ``/tmp/nullrun.wal`` matches the convention other agents
+        use for ephemeral crash-recovery state.
+        """
+        env_path = os.environ.get("NULLRUN_WAL_PATH")
+        if env_path:
+            return env_path
+        return os.path.join("/tmp", "nullrun.wal")
+
+    def _rotate_wal_if_needed(self) -> None:
+        """Rotate ``<path>`` to ``<path>.1`` if it exceeds the size cap."""
+        wal_path = self._wal_path()
+        try:
+            size = os.path.getsize(wal_path)
+        except OSError:
+            return
+        if size < self._wal_max_bytes:
+            return
+        rotated = f"{wal_path}.1"
+        try:
+            os.replace(wal_path, rotated)
+            logger.info(
+                f"WAL rotated: {wal_path} ({size} bytes) -> {rotated} "
+                f"after exceeding cap of {self._wal_max_bytes} bytes"
+            )
+        except OSError as e:
+            logger.warning(f"Failed to rotate WAL {wal_path}: {e}")
+
     def _persist_to_wal(self) -> None:
         """Persist unflushed events to WAL file for replay on restart."""
         if not self._buffer:
             return
         event_count = len(self._buffer)
-        wal_path = os.path.join(os.getcwd(), ".nullrun.wal")
-        with open(wal_path, "a") as f:
-            for event in self._buffer:
-                f.write(json.dumps(event) + "\n")
-        self._buffer.clear()
-        logger.debug(f"Persisted {event_count} events to WAL at {wal_path}")
+        wal_path = self._wal_path()
+        self._rotate_wal_if_needed()
+        wal_dir = os.path.dirname(wal_path) or "."
+        try:
+            os.makedirs(wal_dir, exist_ok=True)
+        except OSError as e:
+            logger.warning(f"Cannot create WAL directory {wal_dir}: {e}")
+            return
+        tmp_path = f"{wal_path}.tmp.{os.getpid()}"
+        try:
+            with open(tmp_path, "a") as f:
+                for event in self._buffer:
+                    f.write(json.dumps(event) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, wal_path)
+            self._buffer.clear()
+            logger.debug(f"Persisted {event_count} events to WAL at {wal_path}")
+        except OSError as e:
+            logger.warning(f"Failed to persist {event_count} events to WAL: {e}")
 
     def _replay_from_wal(self) -> None:
-        """Replay events from WAL file on startup."""
-        wal_path = os.path.join(os.getcwd(), ".nullrun.wal")
-        if not os.path.exists(wal_path):
-            return
-        events = []
-        with open(wal_path) as f:
-            for line in f:
-                try:
-                    events.append(json.loads(line.strip()))
-                except json.JSONDecodeError:
-                    continue
+        """Replay events from WAL file on startup.
+
+        P1-5b: also drains the rotated ``.wal.1`` (oldest
+        surviving recovery window) before the active ``.wal`` so
+        a crash between rotation and replay doesn't lose events.
+        Both files are removed only after a successful flush.
+        """
+        events: list[dict[str, Any]] = []
+        for candidate in (f"{self._wal_path()}.1", self._wal_path()):
+            try:
+                with open(candidate) as f:
+                    for line in f:
+                        try:
+                            events.append(json.loads(line.strip()))
+                        except json.JSONDecodeError:
+                            continue
+            except FileNotFoundError:
+                continue
+            except OSError as e:
+                logger.warning(f"Failed to read WAL {candidate}: {e}")
+                continue
+            try:
+                os.remove(candidate)
+            except OSError as e:
+                logger.warning(f"Failed to remove WAL {candidate}: {e}")
         if events:
             self._buffer.extend(events)
             self._do_flush()
-        os.remove(wal_path)  # Clean up WAL after successful replay
-        logger.info(f"Replayed {len(events)} events from WAL")
+        if events:
+            logger.info(f"Replayed {len(events)} events from WAL")
 
     def track(self, event: dict[str, Any]) -> None:
         """
@@ -733,16 +823,20 @@ class Transport:
             logger.warning(
                 f"Circuit breaker OPEN. Batch of {len(batch)} events will be re-queued."
             )
-            # Enforce max buffer size BEFORE re-queue to prevent unbounded growth
-            # Drop oldest events first to make room for new batch
+            # P0-4 (plan §10): drop NEWEST non-critical events instead of
+            # oldest. For cost-audit the oldest events are the
+            # most valuable (incident start, billing-period start) —
+            # losing them would silently break per-customer monthly
+            # rollups. Critical control-plane events
+            # (state_change / kill_received / policy_invalidated /
+            # key_rotated) are preserved unconditionally because the
+            # dashboard's KILL switch has to land even under
+            # sustained backend outage.
             available_space = self.config.max_buffer_size - len(self._buffer)
             if available_space < len(batch):
                 overflow = len(batch) - available_space
                 if overflow > 0:
-                    # Drop oldest from front (batch) since it hasn't been sent yet
-                    logger.warning(f"Buffer overflow on CB OPEN: dropping {overflow} oldest events from pending batch")
-                    batch = batch[overflow:]  # type: ignore[assignment]
-                    metrics.inc_transport("events_dropped", overflow)
+                    batch = self._drop_newest_with_priority(batch, overflow)
             # Append to END (not front) so oldest events are retried first
             self._buffer.extend(batch)
             # Update metrics on failure (thread-safe)
@@ -762,6 +856,68 @@ class Transport:
             batch = list(self._buffer)
             del self._buffer[:]
             return batch
+
+    # Event types that MUST NOT be dropped on buffer overflow.
+    # These are control-plane events: the dashboard's KILL/PAUSE has
+    # to land even under sustained backend outage, otherwise the
+    # kill-switch promise is broken (plan §11.4 P0-4 recommendation).
+    _CRITICAL_EVENT_TYPES = frozenset({
+        "state_change",
+        "kill_received",
+        "policy_invalidated",
+        "key_rotated",
+    })
+
+    def _drop_newest_with_priority(
+        self,
+        batch: list[dict[str, Any]],
+        overflow: int,
+    ) -> list[dict[str, Any]]:
+        """Drop the ``overflow`` newest NON-CRITICAL events from
+        ``batch``, preserving critical events (state_change etc.)
+        even when they happen to be the newest.
+
+        Cost-audit invariant (plan §10 P0-4): under overflow we keep
+        the OLDEST events because the start of an incident / start of
+        the billing period is exactly what a billing investigator
+        will look up first. Dropping oldest silently breaks
+        monthly rollups; dropping newest does not.
+
+        Caller invariant: ``overflow`` is the number of events that
+        must be dropped to fit the buffer. We assume callers compute
+        this against ``max_buffer_size - len(self._buffer)``. We
+        never drop critical events even if that means slightly
+        exceeding the configured limit (defensive: a brief
+        transient overshoot of a few KB is cheaper than losing the
+        KILL).
+        """
+        if overflow <= 0:
+            return batch
+        # Walk from the newest backwards, drop non-critical until
+        # we've dropped `overflow` items. Critical events are kept in
+        # place (they keep their relative order — newest critical
+        # event comes after older critical events).
+        kept: list[dict[str, Any]] = []
+        dropped = 0
+        # Reverse so we can pop from the "newest" end first while
+        # rebuilding in original order.
+        for event in reversed(batch):
+            if (
+                dropped < overflow
+                and event.get("type") not in self._CRITICAL_EVENT_TYPES
+            ):
+                dropped += 1
+                continue
+            kept.append(event)
+        if dropped > 0:
+            logger.warning(
+                f"P0-4 buffer overflow: dropped {dropped} newest non-critical "
+                f"events (kept {len(kept)}, preserved {len(batch) - len(kept) - dropped} critical)"
+            )
+            metrics.inc_transport("events_dropped", dropped)
+        # Restore original order (we iterated in reverse above).
+        kept.reverse()
+        return kept
 
     @dataclass
     class SendResult:

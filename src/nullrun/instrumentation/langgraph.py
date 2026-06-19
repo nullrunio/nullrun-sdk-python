@@ -40,6 +40,13 @@ from nullrun.tracing import (
 
 logger = logging.getLogger(__name__)
 
+# S-9 (plan §10 P1-3): FIFO cap on NullRunCallback._active_runs.
+# Pre-fix this dict grew unbounded when ``on_chain_end`` did not fire
+# (errors in the chain body). 4096 mirrors DEDUP_LRU_MAX in auto.py
+# and is enough headroom for a typical agent workload without leaking
+# in long-running services.
+_ACTIVE_RUNS_MAX = 4096
+
 
 # =============================================================================
 # Usage Normalization (SDK extracts, backend computes)
@@ -201,7 +208,39 @@ class NullRunCallback(BaseCallbackHandler):
         # runs. We use the LangChain run_id as the key because
         # on_chain_end gives us the same run_id and we need to look
         # up the corresponding span to emit span_end.
-        self._active_runs: dict[str, SpanContext] = {}
+        #
+        # S-9 (plan §10 P1-3): bounded to ``_ACTIVE_RUNS_MAX`` entries
+        # with FIFO eviction. Pre-fix this dict grew without limit if
+        # ``on_chain_start`` ran without a matching ``on_chain_end``
+        # (error-heavy workloads: an exception in the chain body short-
+        # circuits ``on_chain_end`` for some LangChain versions, leaving
+        # the SpanContext stranded forever). Long-running services saw
+        # a slow memory leak.
+        #
+        # Eviction policy is FIFO (insertion order) rather than LRU:
+        # the most recent entries are the ones most likely to be
+        # looked up by an upcoming ``on_*_end``, so we drop the
+        # oldest-inserted. This matches the DEDUP_LRU_MAX pattern in
+        # auto.py but uses an OrderedDict for deterministic order.
+        from collections import OrderedDict
+
+        self._active_runs: OrderedDict[str, SpanContext] = OrderedDict()
+        self._active_runs_max: int = _ACTIVE_RUNS_MAX
+
+    def _register_active_run(self, run_id: str, ctx: SpanContext) -> None:
+        """Insert ``run_id -> ctx`` into ``_active_runs`` with FIFO cap.
+
+        If the dict is at capacity, evict the oldest-inserted entry
+        and log a warning so operators can detect chain-end drops.
+        """
+        if len(self._active_runs) >= self._active_runs_max:
+            evicted_id, _ = self._active_runs.popitem(last=False)
+            logger.warning(
+                f"NullRunCallback._active_runs cap reached "
+                f"({self._active_runs_max}); evicted oldest run_id "
+                f"{evicted_id!r} — on_*_end for that run will be a no-op"
+            )
+        self._active_runs[run_id] = ctx
 
     # ------------------------------------------------------------------
     # LLM hooks (existing — token extraction only, no span bookkeeping)
@@ -359,7 +398,7 @@ class NullRunCallback(BaseCallbackHandler):
             ctx = create_child_span(parent_ctx)
         else:
             ctx = create_root_span()
-        self._active_runs[run_id] = ctx
+        self._register_active_run(run_id, ctx)
         try:
             self.runtime.track_event(
                 event_type="span_start",
