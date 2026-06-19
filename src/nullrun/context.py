@@ -111,10 +111,21 @@ def workflow(name: str | None = None) -> Generator[str, None, None]:
     # was inconsistent with the rest of the SDK's id generation.
     workflow_id = name or str(uuid.uuid4())
     trace_id = generate_trace_id()
+    # §7.2 #16: a new workflow gets a fresh span_id too. The
+    # pre-fix code only reset workflow_id and trace_id, so a
+    # ``with span("inner"); with workflow("outer")`` block would
+    # leave the inner span_id visible inside the workflow scope —
+    # the span emitted by the workflow would carry the wrong
+    # parent. We set a new span_id here so the audit log can
+    # correctly nest the workflow's own span_start under the
+    # workflow_id (rather than under some earlier span that
+    # happened to be on the contextvar stack).
+    span_id = generate_span_id()
 
     # Save current values
     wf_token = _workflow_id_var.set(workflow_id)
     trace_token = _trace_id_var.set(trace_id)
+    span_token = _span_id_var.set(span_id)
 
     try:
         yield workflow_id
@@ -122,6 +133,7 @@ def workflow(name: str | None = None) -> Generator[str, None, None]:
         # Restore previous values
         _workflow_id_var.reset(wf_token)
         _trace_id_var.reset(trace_token)
+        _span_id_var.reset(span_token)
 
 
 @contextmanager
@@ -168,7 +180,15 @@ def agent(name: str | None = None) -> Generator[str, None, None]:
     Yields:
         The agent_id string
     """
-    agent_id = name or f"agent-{uuid.uuid4().hex}"
+    # P2-4 / S-8: emit a real UUID4 with dashes (matching
+    # ``generate_trace_id`` / ``generate_span_id``). The previous
+    # ``f"agent-{uuid.uuid4().hex}"`` format was 32 hex chars
+    # without dashes; backend UUID-typed columns (cost_events.
+    # agent_id, audit_log) silently dropped these to NULL on insert
+    # (``Uuid::parse_str(...).ok()`` returned None). User-supplied
+    # ``name`` is preserved verbatim so existing dashboards continue
+    # to work for already-allocated agent ids.
+    agent_id = name or str(uuid.uuid4())
     token = _agent_id_var.set(agent_id)
 
     try:

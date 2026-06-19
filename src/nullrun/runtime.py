@@ -502,6 +502,34 @@ class NullRunRuntime:
             "admin.disable_user",
         }
         self._strict_mode_tools: set[str] = set()
+        # §7.2 #39: lock that guards every mutation of the
+        # sensitive-tools sets. The pre-fix code did
+        # ``self._strict_mode_tools.add(tool_name)`` from
+        # ``add_sensitive_tool`` without holding any lock; the
+        # reader in ``is_sensitive_tool`` (line 1270-ish) did
+        # ``tool_name in self._strict_mode_tools`` without a lock.
+        # Under CPython's GIL the set mutation is atomic at the
+        # bytecode level, but the snapshot you read can still be
+        # stale mid-mutation (a single-threaded read can see the
+        # new value fine, but a multi-threaded read can race with
+        # a concurrent ``add`` if both interleave on a free-threaded
+        # build). The lock is uncontended on the read path so the
+        # cost is one acquire per call.
+        #
+        # We also reuse this lock to guard the coverage-counter
+        # dicts (§7.2 #33) because the bump + prune sequence must
+        # be atomic — otherwise two threads could both observe the
+        # dict at length 4095, both bump their counter, and both
+        # evict a different entry, growing the dict to 4097
+        # before either prune lands. One lock, one source of
+        # truth, cheaper than two fine-grained ones.
+        self._tools_lock = threading.Lock()
+        # §7.2 #33: cap the per-host coverage counters. Without
+        # this, a long-running process that sees thousands of
+        # custom LLM endpoints over its lifetime would grow these
+        # dicts without bound — same hazard as
+        # ``NullRunCallback._active_runs`` (now capped at 4096).
+        self._COVERAGE_CAP: int = 4096
 
 
 
@@ -1266,8 +1294,27 @@ class NullRunRuntime:
 
         Returns:
             True if tool requires strict mode
+
+        P2-3: match is case-insensitive. The pre-fix code did an exact
+        ``tool_name in self._sensitive_tools`` check, so a tool
+        registered as ``"stripe.charge"`` would silently fail to
+        match a caller passing ``"Stripe.Charge"`` — bypassing the
+        sensitive gate and running the body without an /execute
+        round-trip. The fix normalises both sides to lowercase
+        before the membership test, matching the case-insensitive
+        style of ``_safe_kwargs``.
+
+        §7.2 #39: the read path takes ``_tools_lock`` so it sees a
+        consistent snapshot alongside any concurrent
+        ``add_sensitive_tool``. The lock is uncontended under
+        CPython's GIL, so the cost is negligible.
         """
-        return tool_name in self._sensitive_tools or tool_name in self._strict_mode_tools
+        needle = tool_name.lower()
+        with self._tools_lock:
+            return (
+                needle in {t.lower() for t in self._sensitive_tools}
+                or needle in {t.lower() for t in self._strict_mode_tools}
+            )
 
     def coverage_report(self) -> dict[str, dict[str, int]]:
         """
@@ -1299,6 +1346,60 @@ class NullRunRuntime:
             "tracked": dict(self._coverage_tracked),
             "streaming_skipped": dict(self._coverage_streaming_skipped),
         }
+
+    def bump_coverage_counter(self, target_attr: str, host: str) -> None:
+        """Bump a per-host coverage counter with FIFO eviction at the cap.
+
+        §7.2 #33: replaces the previous direct-dict-mutation path
+        used by ``nullrun.instrumentation.auto._safe_bump_coverage``.
+        The pre-fix code just did ``target[host] = target.get(host,
+        0) + 1``, which let a process with many custom LLM
+        endpoints grow the dict without bound. We now:
+
+          1. Take ``_tools_lock`` so concurrent bumps from
+             multiple threads (sync httpx + async httpx + the
+             requests transport) can't both pass the cap check
+             and evict different entries.
+          2. If the dict already has the key, increment (LRU
+             bump via dict insertion order).
+          3. If the key is new and we're at the cap, evict the
+             oldest entry before inserting.
+
+        Tolerates a missing attribute (stub runtimes in tests):
+        no-op when ``getattr(self, target_attr, None)`` returns
+        ``None``. Tolerates a non-dict target (also a test-only
+        scenario): logs DEBUG and moves on.
+        """
+        with self._tools_lock:
+            target = getattr(self, target_attr, None)
+            if target is None:
+                return
+            if not isinstance(target, dict):
+                logger.debug(
+                    "bump_coverage_counter: %s is not a dict (%s); skipping",
+                    target_attr,
+                    type(target).__name__,
+                )
+                return
+            if host in target:
+                # Insertion-order LRU bump: re-insert so this
+                # host moves to the end of the dict.
+                target[host] = int(target.get(host, 0)) + 1
+                # Re-set to refresh insertion order (Python dicts
+                # don't auto-promote on value update).
+                value = target.pop(host)
+                target[host] = value
+            else:
+                if len(target) >= self._COVERAGE_CAP:
+                    evicted_host, _ = next(iter(target.items()))
+                    del target[evicted_host]
+                    logger.warning(
+                        "coverage counter %s hit cap %d; evicting oldest host=%s",
+                        target_attr,
+                        self._COVERAGE_CAP,
+                        evicted_host,
+                    )
+                target[host] = 1
 
     def get_org_status(self, org_id: str | None = None) -> dict[str, Any]:
         """Public helper for reading ``/api/v1/orgs/{org_id}/status``.
@@ -1345,8 +1446,14 @@ class NullRunRuntime:
         Example:
             runtime = NullRunRuntime.get_instance()
             runtime.add_sensitive_tool("my.custom_tool")
+
+        §7.2 #39: takes ``_tools_lock`` so the mutation is atomic
+        against concurrent ``is_sensitive_tool`` reads and other
+        ``add``/``remove`` calls. Without the lock a free-threaded
+        build could observe a torn set state during the mutation.
         """
-        self._strict_mode_tools.add(tool_name)
+        with self._tools_lock:
+            self._strict_mode_tools.add(tool_name)
 
     def remove_sensitive_tool(self, tool_name: str) -> None:
         """
@@ -1358,8 +1465,11 @@ class NullRunRuntime:
         Example:
             runtime = NullRunRuntime.get_instance()
             runtime.remove_sensitive_tool("my.custom_tool")
+
+        §7.2 #39: takes ``_tools_lock`` to mirror ``add_sensitive_tool``.
         """
-        self._strict_mode_tools.discard(tool_name)
+        with self._tools_lock:
+            self._strict_mode_tools.discard(tool_name)
 
     def register_sensitive_tools(self, tool_names: list[str]) -> None:
         """

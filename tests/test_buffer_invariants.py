@@ -79,10 +79,14 @@ class TestBufferIsInPlace:
         assert batch is None
 
 
-class TestOverflowDropsOldest:
+class TestOverflowDropsNewest:
     """The CB-OPEN re-queue must enforce `max_buffer_size` and drop
-    the oldest events from the batch (not from the buffer) when the
-    batch is larger than the limit. The pre-fix code was a no-op."""
+    the NEWEST events from the batch (not from the buffer) when the
+    batch is larger than the limit. Pre-fix this was a no-op
+    (the buffer was already empty by the time the overflow check
+    ran); then it dropped OLDEST, which broke monthly cost
+    rollups (plan §10 P0-4). Critical control-plane events
+    (state_change / kill_received / etc.) are preserved."""
 
     def test_batch_within_max_buffer_size_is_kept_verbatim(self, transport):
         """If `len(batch) <= max_buffer_size`, no events are dropped."""
@@ -96,10 +100,11 @@ class TestOverflowDropsOldest:
         # All 50 events are re-queued (no drop).
         assert len(transport._buffer) == 50
 
-    def test_batch_larger_than_max_buffer_drops_oldest(self, transport):
-        """If `len(batch) > max_buffer_size`, the oldest events in
-        the batch are dropped before re-queuing. (Pre-fix: this was
-        a no-op because the buffer was already empty.)"""
+    def test_batch_larger_than_max_buffer_drops_newest(self, transport):
+        """If `len(batch) > max_buffer_size`, the NEWEST events in
+        the batch are dropped before re-queuing. The survivors are
+        the FIRST events (the cost-audit invariant from plan §10
+        P0-4: oldest events are most valuable)."""
         transport.config = FlushConfig(batch_size=200, max_buffer_size=10)
         for i in range(20):
             transport._buffer.append({"event_id": f"e{i:02d}"})
@@ -108,11 +113,74 @@ class TestOverflowDropsOldest:
         ):
             transport._do_flush_locked()
         # The batch (20) was larger than max_buffer_size (10), so
-        # 10 oldest events are dropped. The remaining 10 are
-        # re-queued. The survivors are the LAST 10 events.
+        # 10 newest events are dropped. The survivors are the FIRST
+        # 10 events — these are the ones we'd want a billing
+        # investigator to be able to reconstruct.
         assert len(transport._buffer) == 10
         survivors = [e["event_id"] for e in transport._buffer]
-        assert survivors == [f"e{i:02d}" for i in range(10, 20)]
+        assert survivors == [f"e{i:02d}" for i in range(0, 10)], (
+            f"survivors should be the OLDEST 10 events (cost-audit invariant); "
+            f"got {survivors}"
+        )
+
+    def test_critical_state_change_events_are_preserved(self, transport):
+        """Even when overflow would force a drop, state_change /
+        kill_received / policy_invalidated / key_rotated events are
+        kept regardless of position. The dashboard's KILL switch
+        has to land even under sustained backend outage (plan
+        §11.4 P0-4 recommendation)."""
+        transport.config = FlushConfig(batch_size=200, max_buffer_size=4)
+        # 6 llm_call + 1 state_change at the very end.
+        events = [
+            {"event_id": "e00", "type": "llm_call"},
+            {"event_id": "e01", "type": "llm_call"},
+            {"event_id": "e02", "type": "llm_call"},
+            {"event_id": "e03", "type": "llm_call"},
+            {"event_id": "e04", "type": "llm_call"},
+            {"event_id": "e05", "type": "llm_call"},
+            {"event_id": "e06", "type": "state_change"},  # NEWEST, critical
+        ]
+        for e in events:
+            transport._buffer.append(e)
+
+        with patch.object(
+            transport._circuit_breaker, "call", side_effect=BreakerTransportError("open")
+        ):
+            transport._do_flush_locked()
+
+        survivors = [e["event_id"] for e in transport._buffer]
+        # The 1 critical event MUST survive even at the cost of a brief
+        # overshoot above max_buffer_size.
+        assert "e06" in survivors, (
+            f"critical state_change event dropped — kill switch is "
+            f"silently broken under CB OPEN. survivors: {survivors}"
+        )
+
+    def test_oldest_non_critical_kept_when_mixed(self, transport):
+        """Mixed batch: oldest critical, newest non-critical. The
+        critical survives, AND the oldest non-critical survives
+        (cost-audit invariant — we drop newest, keep oldest)."""
+        transport.config = FlushConfig(batch_size=200, max_buffer_size=3)
+        events = [
+            {"event_id": "e00", "type": "llm_call"},       # OLDEST non-critical
+            {"event_id": "e01", "type": "llm_call"},
+            {"event_id": "e02", "type": "llm_call"},
+            {"event_id": "e03", "type": "state_change"},   # critical, mid-batch
+            {"event_id": "e04", "type": "llm_call"},       # NEWEST
+        ]
+        for e in events:
+            transport._buffer.append(e)
+        with patch.object(
+            transport._circuit_breaker, "call", side_effect=BreakerTransportError("open")
+        ):
+            transport._do_flush_locked()
+
+        survivors = [e["event_id"] for e in transport._buffer]
+        # e00 (oldest) and e03 (critical) MUST survive.
+        # e04 (newest, non-critical) MUST be dropped.
+        assert "e00" in survivors, "oldest non-critical was dropped — cost audit broken"
+        assert "e03" in survivors, "critical state_change was dropped — kill switch broken"
+        assert "e04" not in survivors, "newest non-critical should be dropped first"
 
 
 class TestConcurrentTrackDuringFlush:

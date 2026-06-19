@@ -265,6 +265,81 @@ surface is unchanged. Aligns the SDK with the contracts in
 
 ### Fixed
 
+- **P0-1 (PCI-DSS / GDPR): positional PII masking.** Sensitive tools
+  called positionally (e.g. ``charge("4111-1111-1111-1111", 50)``) now
+  mask positional args the same way kwargs already do, by introspecting
+  the function signature with ``inspect.signature(fn)`` and applying
+  ``SENSITIVE_ARG_KEYS`` to the matching parameter name. Pre-fix the
+  PAN at position 0 was forwarded as-is into ``/execute`` and landed
+  in the audit log.
+- **P0-3 (OOM): streaming response memory cap.** Sync and async
+  httpx transports now use bounded chunked reads capped at
+  ``MAX_RESPONSE_BYTES`` (16 MiB by default; ``NULLRUN_MAX_RESPONSE_BYTES``
+  env var to override). When the cap is exceeded, tracking is skipped
+  and ``_coverage_streaming_skipped`` is incremented so the dashboard
+  sees which hosts are producing oversized responses. Pre-fix
+  ``response.read()`` / ``await response.aread()`` buffered the entire
+  response body in memory — a 16+ MB allocation per streaming LLM
+  call under load.
+- **P0-4 (cost-audit): drop-newest on buffer overflow.** The CB-OPEN
+  re-queue path in ``Transport._do_flush_locked`` now drops the
+  NEWEST non-critical events instead of the oldest. The oldest
+  events (start-of-incident, start-of-billing-period) are exactly
+  what a billing investigator needs to reconstruct — losing them
+  silently broke monthly rollups. Control-plane events
+  (``state_change`` / ``kill_received`` / ``policy_invalidated`` /
+  ``key_rotated``) are preserved regardless of position so the
+  dashboard's KILL switch continues to land even under sustained
+  backend outage.
+- **P0-6 + P3-3 (security): redact-before-truncate.** ``_safe_repr``
+  now runs ``_strip_details_balanced`` on the FULL repr before
+  truncating to ``max_len=50``. Pre-fix the truncate ran first, and
+  if ``details={...}`` lived past position 50 in the original repr
+  (common for httpx.HTTPError with a long URL), the redact pass
+  saw nothing on the truncated slice and the raw payload leaked
+  into ``span_end`` audit events.
+- **S-8 / P2-4: ``agent_id`` is now a real UUID with dashes.**
+  ``agent()`` context manager emits ``str(uuid.uuid4())`` (e.g.
+  ``95ca7c0b-8334-478a-af23-2788803ef3b8``) for auto-generated ids.
+  Pre-fix the format was ``f"agent-{uuid.uuid4().hex}"`` — 32 hex
+  chars with no dashes; backend UUID-typed columns silently
+  dropped these to NULL on insert. User-supplied names are still
+  preserved verbatim.
+- **S-9: LRU cap on ``NullRunCallback._active_runs``** (4096 entries,
+  FIFO eviction with WARN log). Pre-fix this dict grew unbounded
+  when ``on_chain_end`` did not fire (errors in the chain body
+  short-circuited the end hook for some LangChain versions),
+  leaking memory in long-running services.
+- **S-10: WebSocket reconnect max-attempts cap** (10 consecutive
+  failures). Pre-fix the loop was unbounded (``while not
+  self._closed:``) and leaked the WS thread forever when the
+  backend was permanently down. After the cap the SDK falls back
+  to HTTP-poll for control-plane state delivery.
+- **P2-1: ``_coverage_seen`` now bumps in the httpx path.**
+  Pre-fix the counter was only incremented in the ``requests``
+  path (``auto_requests.py:185``), so the dashboard's coverage
+  view was empty for the dominant httpx traffic (every OpenAI /
+  Anthropic / Gemini / Mistral / Cohere call). Now both sync and
+  async httpx ``_emit`` bump the counter.
+- **P3-2: webhook delivery uses exponential backoff** (cap 30s).
+  Pre-fix the schedule was linear (``0.5 * (attempt + 1)``); under
+  sustained outage this produced a tight retry storm on the dead
+  endpoint — each KILL/PAUSE spawned its own delivery thread.
+  Post-fix the schedule is ``0.5 * 2**attempt`` capped at 30s:
+  0.5s, 1.0s, 2.0s, 4.0s, 8.0s, 16.0s, 30.0s.
+
+### Tests
+
+Added regression tests for every item above (57 new tests across 9
+new test files: ``test_agent_id_uuid.py``, ``test_args_pii_masked.py``,
+``test_streaming_oom_cap.py``, ``test_lru_active_runs.py``,
+``test_reconnect_cap.py``, ``test_coverage_seen_httpx.py``,
+``test_webhook_backoff.py``, ``test_redact.py``; existing
+``test_buffer_invariants.py`` extended with drop-newest + critical-event
+preservation cases).
+
+### Legacy
+
 - **SDK silent runtime fallback removed** (FIX-4): `_get_or_create_runtime`
   in `nullrun.decorators` no longer wraps `NullRunRuntime.get_instance()`
   in a `try/except Exception` that rebuilds a no-arg `NullRunRuntime()`.

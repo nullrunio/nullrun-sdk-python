@@ -372,6 +372,20 @@ class ActionHandler:
             logger.warning("httpx not installed, cannot send webhook")
             return
 
+        # P3-2 (plan §10): exponential backoff between attempts with a
+        # 30s cap. Pre-fix the schedule was linear (``0.5 * (attempt+1)``
+        # → 0.5s, 1.0s, 1.5s, ...). Linear doesn't back off fast enough
+        # when the destination is down — a transient outage produced
+        # 100+ retries in seconds, and each KILL/PAUSE from the server
+        # spawns its own delivery thread, so 1000 events/min generated
+        # 1000 spinning daemon threads hammering the dead endpoint.
+        #
+        # Schedule: 0.5s, 1.0s, 2.0s, 4.0s, 8.0s, 16.0s, 30.0s (capped).
+        # Total worst-case wait over 7 retries is ~62s — long enough to
+        # ride out a brief blip, short enough that one stuck thread
+        # doesn't block forever.
+        _BACKOFF_BASE = 0.5
+        _BACKOFF_CAP = 30.0
         for attempt in range(webhook.retries):
             try:
                 response = httpx.post(
@@ -386,7 +400,8 @@ class ActionHandler:
             except Exception as e:
                 logger.warning(f"Webhook attempt {attempt + 1} failed: {e}")
                 if attempt < webhook.retries - 1:
-                    time.sleep(0.5 * (attempt + 1))
+                    delay = min(_BACKOFF_BASE * (2 ** attempt), _BACKOFF_CAP)
+                    time.sleep(delay)
 
     def stop_webhooks(self) -> None:
         """Stop webhook delivery thread."""

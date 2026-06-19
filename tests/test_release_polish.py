@@ -142,14 +142,19 @@ def test_decision_history_module_does_not_exist():
 def test_open_to_halfopen_sleep_capped_at_5s():
     """The OPEN -> HALF_OPEN jitter sleep is bounded by 5.0s.
 
-    We pin the cap by reading the source of CircuitBreaker.call --
-    simpler and faster than monkeypatching time.sleep through
-    `nullrun.breaker.circuit_breaker` (which `import time` locally).
+    We pin the cap by reading the source of the jitter helpers
+    — §7.2 #35 split the cap into ``_maybe_apply_open_jitter_sync``
+    and ``_maybe_apply_open_jitter_async`` so async callers can
+    await instead of blocking the event loop. The cap itself
+    stays at 5.0s in both branches.
     """
     import inspect
 
     from nullrun.breaker import circuit_breaker
 
-    src = inspect.getsource(circuit_breaker.CircuitBreaker.call)
-    assert "random.uniform(0, 5.0)" in src
-    assert "random.uniform(0, 30.0)" not in src
+    sync_src = inspect.getsource(circuit_breaker.CircuitBreaker._maybe_apply_open_jitter_sync)
+    async_src = inspect.getsource(circuit_breaker.CircuitBreaker._maybe_apply_open_jitter_async)
+    assert "random.uniform(0, 5.0)" in sync_src
+    assert "random.uniform(0, 5.0)" in async_src
+    assert "random.uniform(0, 30.0)" not in sync_src
+    assert "random.uniform(0, 30.0)" not in async_src

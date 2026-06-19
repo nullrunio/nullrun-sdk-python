@@ -41,6 +41,14 @@ class TransportMetrics:
     # be lost without a counter to alert on. The metric here is
     # what a SRE alerts on for "control plane signature integrity".
     hmac_verify_failures_total: int = 0
+    # §7.2 #6: separate counter for the timestamp-expired branch
+    # of verify_hmac_signature. A spike here is almost always
+    # a clock-skew issue (NTP drift, VM resume, container clock
+    # jump) rather than a forged packet — operators should
+    # investigate date / chrony before suspecting tampering.
+    # We split it from hmac_verify_failures_total so the two
+    # alert paths can have different runbooks.
+    hmac_verify_expired_total: int = 0
 
 
 @dataclass
@@ -137,6 +145,7 @@ class MetricsRegistry:
                     "circuit_closed_count": self.transport.circuit_closed_count,
                     "fallback_mode_activations": self.transport.fallback_mode_activations,
                     "hmac_verify_failures_total": self.transport.hmac_verify_failures_total,
+                    "hmac_verify_expired_total": self.transport.hmac_verify_expired_total,
                 },
                 "runtime": {
                     "track_calls": self.runtime.track_calls,

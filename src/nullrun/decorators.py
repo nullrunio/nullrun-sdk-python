@@ -88,8 +88,38 @@ SENSITIVE_ARG_KEYS = frozenset({
 
 
 def _safe_repr(value: object, max_len: int = 50) -> str:
-    """Safe representation of an argument for logging."""
+    """Safe representation of an argument for logging.
+
+    P0-6 (plan §10): redaction happens BEFORE truncation, not after.
+    Pre-fix the order was truncate-then-redact: ``_safe_repr`` cut the
+    repr to 50 chars first, and ``_strip_details_balanced`` then tried
+    to find ``details={...}`` in that 50-char slice. If ``details=``
+    lived past position 50 (a common case — repr() of an HTTPError
+    with a long URL places the dict payload well into the string), the
+    substring was gone, the redact pass saw nothing, and the raw
+    ``details={...}`` payload leaked into the audit log.
+
+    Post-fix the order is redact-then-truncate: call
+    ``_strip_details_balanced`` first (which works on the full repr),
+    then truncate. The cost is a single string scan over ``len(repr)``
+    instead of ``len(repr[:50])`` — irrelevant for the 200-byte
+    strings we actually pass through this code path.
+
+    P3-3 (plan §10): also consolidates the two-pass flow that
+    previously lived as separate ``_safe_repr`` + ``_strip_details_balanced``
+    calls — there are now two callers that compose them, and the
+    invariant ``redact BEFORE truncate`` was being maintained by
+    convention only. ``_safe_repr`` is now the single source of truth.
+    """
     r = repr(value)
+    # Phase 1: redact ``details={...}`` substrings on the FULL repr.
+    # Cheap (single linear scan over the string), and ensures the
+    # ``details=`` substring is replaced before we potentially
+    # truncate it away.
+    r = _strip_details_balanced(r)
+    # Phase 2: truncate to ``max_len`` so a giant repr doesn't bloat
+    # span events. We append ``...<truncated>`` so consumers can
+    # see the cut happened.
     if len(r) > max_len:
         return r[:max_len] + "...<truncated>"
     return r
@@ -101,6 +131,43 @@ def _safe_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
         k: "***" if k.lower() in SENSITIVE_ARG_KEYS else _safe_repr(v)
         for k, v in kwargs.items()
     }
+
+
+def _safe_args(fn: Callable[..., Any], args: tuple[Any, ...]) -> list[Any]:
+    """Mask sensitive positional args (P0-1, plan §10).
+
+    Pre-fix only kwargs were masked via SENSITIVE_ARG_KEYS. A
+    ``def charge(card_number, amount)`` with positional call
+    ``charge("4111-1111-1111-1111", 50)`` would leak the PAN into the
+    audit log. We now introspect ``fn``'s signature, bind the positional
+    args to parameter names, and apply the same ``SENSITIVE_ARG_KEYS``
+    mask that kwargs already use.
+
+    Extra positional args (``*args``) have no parameter name to key on —
+    we still redact them with ``_safe_repr`` so we don't ship a full
+    repr of an arbitrary object to the audit log, but we cannot tell
+    them apart from benign primitives. This is the same posture as the
+    kwargs branch (apply mask by name; otherwise best-effort repr).
+    """
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        # C-extension / built-in without a signature — fall back to
+        # safe repr for every arg so we still don't leak raw
+        # repr(value) of an arbitrary object.
+        return [_safe_repr(a) for a in args]
+
+    bound_params = list(sig.parameters.items())[: len(args)]
+    masked: list[Any] = []
+    for (pname, _param), value in zip(bound_params, args):
+        if pname.lower() in SENSITIVE_ARG_KEYS:
+            masked.append("***")
+        else:
+            masked.append(_safe_repr(value))
+    # Trailing *args have no name — best-effort safe repr.
+    for value in args[len(bound_params):]:
+        masked.append(_safe_repr(value))
+    return masked
 
 
 # SEC-29: strip the `details={...}` payload from an exception's
@@ -496,6 +563,11 @@ def _enforce_sensitive_tool(
     if not runtime.is_sensitive_tool(fn.__name__):
         return
     masked = _safe_kwargs(kwargs)
+    # P0-1: positional args are masked the same way as kwargs. Without
+    # this, a sensitive tool called positionally (e.g.
+    # ``charge("4111-1111-1111-1111", 50)``) would leak the PAN into
+    # the /execute payload that lands in the audit log.
+    masked_args = _safe_args(fn, args)
 
     # ADR-008: prefer `on_transport_error` (raise classified
     # NullRunTransportError); fall back to legacy `fallback_mode` for
@@ -518,7 +590,7 @@ def _enforce_sensitive_tool(
         # uniformly.
         result = runtime.execute(
             fn.__name__,
-            {"args": list(args), "kwargs": masked},
+            {"args": masked_args, "kwargs": masked},
             on_transport_error="raise",
         )
     except NullRunBlockedException:
