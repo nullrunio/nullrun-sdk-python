@@ -157,9 +157,16 @@ def _safe_args(fn: Callable[..., Any], args: tuple[Any, ...]) -> list[Any]:
         # repr(value) of an arbitrary object.
         return [_safe_repr(a) for a in args]
 
+    # `bound_params` is sliced to at most `len(args)`, so when the
+    # function has FEWER positional parameters than args provided
+    # (e.g. `*args`-style callables), `bound_params` is shorter
+    # than `args` and the trailing loop below handles the excess.
+    # We use `strict=False` to make that tolerance explicit and
+    # satisfy B905; without it the two iterables must be exactly
+    # the same length, which they are not in the *args case.
     bound_params = list(sig.parameters.items())[: len(args)]
     masked: list[Any] = []
-    for (pname, _param), value in zip(bound_params, args):
+    for (pname, _param), value in zip(bound_params, args, strict=False):
         if pname.lower() in SENSITIVE_ARG_KEYS:
             masked.append("***")
         else:
