@@ -1,0 +1,18 @@
+# PEP 561 marker for the `nullrun` package.
+#
+# The presence of this file (even when empty) tells type checkers
+# (mypy, pyright, pylance) that the package ships inline type
+# annotations and they should be honoured instead of falling back
+# to `Any`. See https://peps.python.org/pep-0561/.
+#
+# The SDK is currently PARTIAL — most public surface is typed but
+# `dict[str, Any]` returns, `Optional` fall-throughs, and a few
+# transport callbacks leak `Any` for now. As those land in follow-up
+# releases this marker stays the same; the inline annotations carry
+# the granularity. A future `py.typed` -> `py.typed.full` rename is
+# the standard PEP 561 upgrade path once we go 100% typed.
+#
+# For projects that need strict typing today: pin mypy with
+# `--disallow-any-explicit=false --warn-unused-ignores=true` and
+# ignore the residual `Any` from the public surface until
+# coverage improves.
