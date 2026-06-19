@@ -1,35 +1,30 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/nullrunio/nullrun-sdk-python/master/docs/nullrun-logo.png"
-       alt="NullRun" width="320"/>
-</p>
-
-<p align="center">
   <a href="https://pypi.org/project/nullrun/"><img
-    src="https://img.shields.io/pypi/v/nullrun?style=for-the-badge&logo=pypi&logoColor=white"
+    src="https://img.shields.io/pypi/v/nullrun?style=flat&logo=pypi&logoColor=white"
     alt="PyPI version"/></a>
   <a href="https://pypi.org/project/nullrun/#files"><img
-    src="https://img.shields.io/pypi/pyversions/nullrun?style=for-the-badge&logo=python&logoColor=white"
+    src="https://img.shields.io/pypi/pyversions/nullrun?style=flat&logo=python&logoColor=white"
     alt="Python versions"/></a>
   <a href="https://github.com/nullrunio/nullrun-sdk-python/blob/master/LICENSE"><img
-    src="https://img.shields.io/pypi/l/nullrun?style=for-the-badge"
+    src="https://img.shields.io/pypi/l/nullrun?style=flat"
     alt="License"/></a>
   <a href="https://pypi.org/project/nullrun/"><img
-    src="https://img.shields.io/pypi/dm/nullrun?style=for-the-badge&color=blue"
+    src="https://img.shields.io/pypi/dm/nullrun?style=flat&color=blue"
     alt="Downloads"/></a>
 </p>
 
 <p align="center">
   <a href="https://github.com/nullrunio/nullrun-sdk-python/actions/workflows/ci.yml"><img
-    src="https://img.shields.io/github/actions/workflow/status/nullrunio/nullrun-sdk-python/ci.yml?style=for-the-badge&logo=github&label=CI"
+    src="https://img.shields.io/github/actions/workflow/status/nullrunio/nullrun-sdk-python/ci.yml?style=flat&logo=github&label=CI"
     alt="CI"/></a>
   <a href="https://codecov.io/gh/nullrunio/nullrun-sdk-python"><img
-    src="https://img.shields.io/codecov/c/github/nullrunio/nullrun-sdk-python?style=for-the-badge&logo=codecov&logoColor=white"
+    src="https://img.shields.io/codecov/c/github/nullrunio/nullrun-sdk-python?style=flat&logo=codecov&logoColor=white"
     alt="Coverage"/></a>
   <a href="https://github.com/nullrunio/nullrun-sdk-python"><img
-    src="https://img.shields.io/github/stars/nullrunio/nullrun-sdk-python?style=for-the-badge&logo=github"
+    src="https://img.shields.io/github/stars/nullrunio/nullrun-sdk-python?style=flat&logo=github"
     alt="Stars"/></a>
   <a href="https://docs.nullrun.io"><img
-    src="https://img.shields.io/badge/docs-nullrun.io-0A66C2?style=for-the-badge&logo=readthedocs&logoColor=white"
+    src="https://img.shields.io/badge/docs-nullrun.io-0A66C2?style=flat&logo=readthedocs&logoColor=white"
     alt="Documentation"/></a>
 </p>
 
