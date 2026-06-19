@@ -23,6 +23,14 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# S-10 (plan §10): cap on consecutive WebSocket reconnect failures.
+# Pre-fix the reconnect loop ran forever (``while not self._closed``),
+# leaking the WS thread and flooding logs when the backend was
+# permanently down. We now give up after this many attempts and let
+# the caller fall back to HTTP-poll (the SDK still tracks / gates /
+# cost-rolls; only the WS push latency advantage is lost).
+_MAX_RECONNECT_ATTEMPTS = 10
+
 
 def compute_hmac_signature(api_key: str, secret_key: str, timestamp: int, payload: bytes) -> str:
     """
@@ -83,6 +91,14 @@ def verify_hmac_signature(
     age = abs(current_time - timestamp)
 
     if age > max_age_seconds:
+        # §7.2 #6 mirror: increment the same counter as the
+        # HTTP verify path so SRE gets one alert ladder for
+        # clock-skew issues, not two.
+        try:
+            from nullrun.observability import metrics
+            metrics.inc_transport("hmac_verify_expired_total")
+        except Exception:  # noqa: BLE001 — best-effort counter
+            pass
         logger.warning(f"WS signature timestamp expired: age={age}s, max={max_age_seconds}s")
         return False
 
@@ -152,6 +168,9 @@ class WebSocketConnection:
         self._receive_task: asyncio.Task | None = None
         self._reconnect_task: asyncio.Task | None = None
         self._closed = False
+        # S-10: counter for the consecutive reconnect-failure cap.
+        # Reset to 0 on a successful ``_connect()``.
+        self._consecutive_reconnect_failures: int = 0
         # Per-workflow monotonic version dedup (ADR-007).
         # Drop incoming state changes with ``version <= last`` to
         # survive the at-least-once delivery semantics of the WS
@@ -198,10 +217,33 @@ class WebSocketConnection:
                 await asyncio.sleep(0.5)
                 continue
 
+            # S-10 (plan §10): cap reconnect attempts. Pre-fix the
+            # loop was unbounded (``while not self._closed``) so a
+            # permanently-down backend kept the SDK's WS thread
+            # spinning forever, leaking the thread and producing log
+            # spam at the operator. We now stop after
+            # ``MAX_RECONNECT_ATTEMPTS`` consecutive failures. The
+            # receive loop's ``finally`` already set ``_running = False``
+            # so this loop will exit and ``connect()`` returns
+            # control to the caller; the SDK falls back to HTTP-poll
+            # via ``runtime._poll_commands``.
+            if self._consecutive_reconnect_failures >= _MAX_RECONNECT_ATTEMPTS:
+                logger.warning(
+                    f"WebSocket reconnect gave up after "
+                    f"{_MAX_RECONNECT_ATTEMPTS} consecutive failures; "
+                    f"falling back to HTTP-poll. url={self.url}"
+                )
+                # Mark the connection as closed so the loop exits.
+                # The runtime will continue to operate via HTTP-poll.
+                self._closed = True
+                self._running = False
+                break
+
             # Connection is down. Try to reconnect with backoff.
             try:
                 await self._connect()
                 delay = 1.0  # reset on success
+                self._consecutive_reconnect_failures = 0
                 logger.info(f"WebSocket reconnected successfully: {self.url}")
                 # A fresh server connection may re-deliver events the
                 # client has already seen (or has never seen) — clear
@@ -211,7 +253,12 @@ class WebSocketConnection:
                 # ``resync_required``.
                 self.clear_local_state()
             except Exception as e:
-                logger.warning(f"WebSocket reconnect failed, retrying in {delay}s: {e}")
+                self._consecutive_reconnect_failures += 1
+                logger.warning(
+                    f"WebSocket reconnect failed "
+                    f"({self._consecutive_reconnect_failures}/{_MAX_RECONNECT_ATTEMPTS}), "
+                    f"retrying in {delay}s: {e}"
+                )
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, max_delay)
 

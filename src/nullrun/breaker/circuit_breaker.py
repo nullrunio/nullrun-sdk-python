@@ -251,8 +251,19 @@ class CircuitBreaker:
             return self._state
 
     def call(self, func: Callable[..., Any], *args, **kwargs) -> Any:
-        """Execute func through circuit breaker. Supports both sync and async functions."""
+        """Execute func through circuit breaker. Supports both sync and async functions.
 
+        §7.2 #35: the pre-fix code did the OPEN→HALF_OPEN jitter
+        via ``time.sleep`` here, BEFORE dispatching to
+        ``_call_sync`` / ``_call_async``. That meant an async
+        caller invoking ``breaker.call(async_func, ...)`` from
+        inside an event loop would block that loop on a sync
+        sleep — turning every HALF_OPEN probe into a 0–5 second
+        stall of the entire coroutine scheduler. The fix decides
+        here whether jitter is needed and lets the dispatch path
+        use ``time.sleep`` for sync callers and ``asyncio.sleep``
+        for async ones.
+        """
         # Check global Redis state first - reject if another instance has it open
         if not self._global_state_allows_call():
             raise BreakerTransportError(
@@ -260,41 +271,56 @@ class CircuitBreaker:
                 f"Retry in {self._recovery_timeout:.0f}s"
             )
 
-        # Add jitter before transitioning from OPEN to HALF_OPEN to prevent thundering herd
+        # Decide whether jitter is needed; the actual sleep happens
+        # in the dispatch path so it can be ``time.sleep`` for sync
+        # callers and ``asyncio.sleep`` for async ones.
+        needs_open_jitter = (
+            self._state == CBState.OPEN
+            and self._opened_at is not None
+            and (time.monotonic() - self._opened_at) >= self._recovery_timeout
+        )
+
+        # Check if func is a coroutine function (async) before
+        # grabbing any locks — async callers need an awaitable.
+        import inspect
+        if inspect.iscoroutinefunction(func):
+            return self._call_async(func, needs_open_jitter, *args, **kwargs)
+        return self._call_sync(func, needs_open_jitter, *args, **kwargs)
+
+    def _maybe_apply_open_jitter_sync(self) -> None:
+        """Sync version of the OPEN→HALF_OPEN jitter. See §7.2 #35."""
         if self._state == CBState.OPEN and self._opened_at is not None:
             time_in_open = time.monotonic() - self._opened_at
             if time_in_open >= self._recovery_timeout:
-                # Add random jitter (0-30 seconds) to prevent thundering herd
-                # Phase 8: cap at 5s (was 30s). The previous value
-                # blocked the caller's thread for up to 30s on
-                # every OPEN->HALF_OPEN transition. 5s is plenty
-                # to spread reconnects across workers.
+                # Phase 8: cap at 5s (was 30s). 5s is plenty to
+                # spread reconnects across workers.
                 jitter = random.uniform(0, 5.0)
                 time.sleep(jitter)
 
-        state = self.state
+    async def _maybe_apply_open_jitter_async(self) -> None:
+        """Async version of the OPEN→HALF_OPEN jitter. Awaits
+        instead of blocking the event loop. See §7.2 #35."""
+        if self._state == CBState.OPEN and self._opened_at is not None:
+            time_in_open = time.monotonic() - self._opened_at
+            if time_in_open >= self._recovery_timeout:
+                jitter = random.uniform(0, 5.0)
+                await asyncio.sleep(jitter)
 
+    def _call_sync(self, func: Callable[..., Any], needs_open_jitter: bool, *args, **kwargs) -> Any:
+        """Execute sync func through circuit breaker."""
+        if needs_open_jitter:
+            self._maybe_apply_open_jitter_sync()
+        state = self.state
         if state == CBState.OPEN:
             raise BreakerTransportError(
                 f"Circuit breaker OPEN -- service unavailable. "
                 f"Retry in {self._recovery_timeout:.0f}s"
             )
-
         if state == CBState.HALF_OPEN:
             with self._lock:
                 if self._half_open_calls >= self._half_open_max_calls:
                     raise BreakerTransportError("Circuit breaker HALF_OPEN -- waiting")
                 self._half_open_calls += 1
-
-        # Check if func is a coroutine function (async)
-        import inspect
-        if inspect.iscoroutinefunction(func):
-            return self._call_async(func, *args, **kwargs)
-        else:
-            return self._call_sync(func, *args, **kwargs)
-
-    def _call_sync(self, func: Callable[..., Any], *args, **kwargs) -> Any:
-        """Execute sync func through circuit breaker."""
         try:
             result = func(*args, **kwargs)
             self._on_success()
@@ -303,8 +329,21 @@ class CircuitBreaker:
             self._on_failure()
             raise
 
-    async def _call_async(self, func: Callable[..., Any], *args, **kwargs) -> Any:
+    async def _call_async(self, func: Callable[..., Any], needs_open_jitter: bool, *args, **kwargs) -> Any:
         """Execute async func through circuit breaker."""
+        if needs_open_jitter:
+            await self._maybe_apply_open_jitter_async()
+        state = self.state
+        if state == CBState.OPEN:
+            raise BreakerTransportError(
+                f"Circuit breaker OPEN -- service unavailable. "
+                f"Retry in {self._recovery_timeout:.0f}s"
+            )
+        if state == CBState.HALF_OPEN:
+            with self._lock:
+                if self._half_open_calls >= self._half_open_max_calls:
+                    raise BreakerTransportError("Circuit breaker HALF_OPEN -- waiting")
+                self._half_open_calls += 1
         try:
             result = await func(*args, **kwargs)
             await self._on_success_async()
