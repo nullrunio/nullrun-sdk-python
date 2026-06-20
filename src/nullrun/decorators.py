@@ -694,8 +694,20 @@ def sensitive(fn: F) -> F:
         # tests that build a custom runtime.
         rt = _get_or_create_runtime()
         rt.add_sensitive_tool(fn.__name__)
-    except Exception as exc:  # noqa: BLE001 — never let registration fail the import
-        logger.debug(f"@sensitive: failed to register {fn.__name__!r}: {exc}")
+    except Exception as exc:
+        # Sensitive tool registration is part of the fail-CLOSED contract
+        # (ADR-008 / CLAUDE.md sensitive-tool-fail-closed memory). If we
+        # cannot reach the runtime to register the tool, the body MUST NOT
+        # execute later — but since `@sensitive` only registers the name
+        # and the wrapper enforces it on each call, raising here is the
+        # correct signal. The earlier `except Exception` quietly turned a
+        # registration failure into a body that ran without pre-execution
+        # check — a security regression under partial initialization.
+        raise RuntimeError(
+            f"@sensitive registration failed for {fn.__name__!r}: {exc}. "
+            "Cannot proceed without runtime; tool will be blocked until "
+            "NullRun initializes correctly."
+        ) from exc
     return fn
 
 

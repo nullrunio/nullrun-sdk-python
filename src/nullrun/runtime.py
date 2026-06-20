@@ -1356,6 +1356,86 @@ class NullRunRuntime:
             "streaming_skipped": dict(self._coverage_streaming_skipped),
         }
 
+    def track_coverage(self) -> dict[str, Any] | None:
+        """Emit a `coverage_report` event with the current per-host counters.
+
+        Returned from ``track_event`` so the caller can observe the
+        transport-side outcome (queued, deduped, breaker open, etc.).
+        Returns ``None`` when there are no counters to report yet
+        (cold start, no LLM traffic) — the backend doesn't need an
+        empty row per minute per process.
+
+        Background emission is driven by ``start_coverage_reporter``;
+        most callers don't invoke this method directly.
+        """
+        stats = self.coverage_report()
+        seen_total = sum(stats["seen"].values())
+        if seen_total == 0:
+            # Nothing to report — avoid empty rows.
+            return None
+        return self.track_event("coverage_report", **{
+            "seen": stats["seen"],
+            "tracked": stats["tracked"],
+            "streaming_skipped": stats["streaming_skipped"],
+        })
+
+    _COVERAGE_REPORT_INTERVAL_SECONDS = 60.0
+
+    def start_coverage_reporter(self) -> None:
+        """Start a background thread that emits ``coverage_report`` events
+        every ``_COVERAGE_REPORT_INTERVAL_SECONDS``.
+
+        Idempotent — second call is a no-op. Caller is responsible
+        for calling :meth:`stop_coverage_reporter` on shutdown, but
+        the thread is a daemon so a missed stop does not block exit.
+        """
+        if getattr(self, "_coverage_reporter_thread", None) is not None:
+            return
+        thread = threading.Thread(
+            target=self._coverage_reporter_loop,
+            name="nullrun-coverage-reporter",
+            daemon=True,
+        )
+        self._coverage_reporter_thread = thread
+        thread.start()
+
+    def stop_coverage_reporter(self, timeout: float = 2.0) -> None:
+        """Signal the coverage reporter to exit and join its thread."""
+        self._coverage_reporter_stop = True
+        thread = getattr(self, "_coverage_reporter_thread", None)
+        if thread is not None:
+            thread.join(timeout=timeout)
+
+    def _coverage_reporter_loop(self) -> None:
+        """Loop body for the coverage reporter thread.
+
+        Emits a coverage report on entry (so the dashboard has data
+        within ~1s of process start), then every interval until
+        ``stop_coverage_reporter`` is called.
+        """
+        self._coverage_reporter_stop = False
+        # Emit once on entry — gives the backend a row even if the
+        # process is short-lived (CI, batch jobs).
+        try:
+            self.track_coverage()
+        except Exception as e:  # noqa: BLE001 — background loop
+            logger.debug(f"coverage_reporter: initial emit failed: {e}")
+        while not getattr(self, "_coverage_reporter_stop", False):
+            # Sleep in short slices so shutdown is responsive.
+            slept = 0.0
+            while (
+                slept < self._COVERAGE_REPORT_INTERVAL_SECONDS
+                and not getattr(self, "_coverage_reporter_stop", False)
+            ):
+                time.sleep(min(0.5, self._COVERAGE_REPORT_INTERVAL_SECONDS - slept))
+                slept += 0.5
+            if getattr(self, "_coverage_reporter_stop", False):
+                break
+            try:
+                self.track_coverage()
+            except Exception as e:  # noqa: BLE001 — background loop
+                logger.debug(f"coverage_reporter: emit failed: {e}")
+
     def bump_coverage_counter(self, target_attr: str, host: str) -> None:
         """Bump a per-host coverage counter with FIFO eviction at the cap.
 

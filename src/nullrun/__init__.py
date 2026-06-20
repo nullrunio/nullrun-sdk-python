@@ -148,6 +148,12 @@ def init(
     from nullrun.instrumentation.auto import auto_instrument
     auto_instrument(runtime)
 
+    # Start the coverage reporter so the backend gets a coverage_report
+    # event every 60s. Daemon thread; safe to leak across re-init.
+    # The coverage reporter is a no-op when no LLM traffic has been
+    # observed (see ``track_coverage``).
+    runtime.start_coverage_reporter()
+
     return runtime
 
 

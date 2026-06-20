@@ -347,6 +347,10 @@ class TestRetry:
 
     @respx.mock
     def test_retry_on_500(self):
+        """P0 #2: 5xx on /track/batch is retried. Pre-fix this test asserted
+        ``pytest.raises(Exception)`` because the old code did NOT retry and
+        the 500 surfaced immediately. Post-fix the helper backs off and
+        the third attempt succeeds (200), so no exception is raised."""
         call_count = 0
 
         def handler(request):
@@ -354,13 +358,14 @@ class TestRetry:
             call_count += 1
             if call_count < 3:
                 return httpx.Response(500)
-            return httpx.Response(200, json={})
+            return httpx.Response(200, json={"accepted_event_ids": ["e1"]})
 
         respx.post("https://api.test.nullrun.io/api/v1/track/batch").mock(side_effect=handler)
 
         t = Transport(api_url="https://api.test.nullrun.io", api_key="test-key")
-        with pytest.raises(Exception):
-            t._send_batch_with_retry_info([{"event": "test"}])
+        result = t._send_batch_with_retry_info([{"event": "e1"}])
+        assert call_count == 3
+        assert "e1" in result.accepted_event_ids
         t.stop()
 
 
