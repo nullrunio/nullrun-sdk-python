@@ -1040,7 +1040,15 @@ class Transport:
         return None
 
     def _send_batch_with_retry_info(self, batch: list[dict[str, Any]]) -> 'SendResult':
-        """Send batch to server using batch endpoint. Returns SendResult with retry info."""
+        """Send batch to server using batch endpoint. Returns SendResult with retry info.
+
+        P0 #2: the post() call below is wrapped with _retry_with_backoff so a
+        transient backend 5xx no longer drops the entire batch. Pre-fix the
+        call was a single self._client.post(...) followed by raise_for_status;
+        a 500 raised out of the flush path, the buffer was cleared at the
+        call site, and every event in the batch was lost. See
+        audit_result.md §16.B (P0 #2).
+        """
         logger.debug(f"Sending batch of {len(batch)} events to {self.api_url}/api/v1/track/batch")
         headers = {"Content-Type": "application/json", "X-API-Version": __api_version__}
         if self.api_key:
@@ -1059,10 +1067,32 @@ class Transport:
         # payload with httpx defaults (compact separators) and produces
         # a body that does not match the body the HMAC signature was
         # computed over. See plan B6.
-        response = self._client.post(
-            f"{self.api_url}/api/v1/track/batch",
-            content=body,
-            headers=headers,
+        # The inner function is the unit of retry:
+        # * 5xx → raise_for_status() raises HTTPStatusError → retry helper backs off
+        #   and re-attempts. 429 is included in this category (the helper honors
+        #   Retry-After when present).
+        # * 4xx (other than 429) → return as-is, the outer raise_for_status()
+        #   surfaces it. These are real client bugs (auth, payload) and must
+        #   NOT be retried — retrying a 401 just wastes the user's budget.
+        def _post_batch() -> httpx.Response:
+            resp = self._client.post(
+                f"{self.api_url}/api/v1/track/batch",
+                content=body,
+                headers=headers,
+            )
+            if resp.status_code >= 500 or resp.status_code == 429:
+                # raise_for_status turns this into HTTPStatusError; the retry
+                # helper wraps that into BreakerTransportError after retries.
+                resp.raise_for_status()
+            return resp
+
+        response = _retry_with_backoff(
+            _post_batch,
+            max_retries=3,
+            base_delay=0.5,
+            max_delay=10.0,
+            backoff_factor=2.0,
+            jitter=0.1,
         )
 
         # P0: Extract retry_after from response headers or body
@@ -1569,7 +1599,11 @@ class Transport:
             self._add_hmac_headers(headers, body.decode("utf-8"))
 
             response = self._client.post(
-                f"{self.api_url}/auth/verify",
+                # P0 #5: contract drift — other auth-verify call sites
+                # in this file use `/api/v1/auth/verify` (see runtime.py:599).
+                # Align this rotation call site to the same v1 prefix so the
+                # contract-drift-guard CI catches future divergence.
+                f"{self.api_url}/api/v1/auth/verify",
                 content=body,
                 headers=headers,
                 timeout=10.0,
