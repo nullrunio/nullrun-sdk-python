@@ -7,7 +7,8 @@ Phase 5 of the production-readiness plan:
 - #5.3: get_instance() atomic credential rotation.
 - #5.5: _fetch_remote_state uses shared transport client.
 - #5.6: workflow() emits UUID4 (was wf-{hex32}).
-- #5.7: @sensitive propagates NullRunAuthenticationError.
+- #5.7: @sensitive fails CLOSED on registration error (wraps original
+  #      exception as RuntimeError with chained __cause__).
 - #5.8: Custom-host KILL reach.
 - #5.10: Transport.execute on_transport_error callback.
 """
@@ -135,7 +136,12 @@ def test_workflow_uses_explicit_name():
 # ===========================================================================
 
 def test_sensitive_raises_on_missing_api_key(monkeypatch):
-    """`@sensitive` now propagates NullRunAuthenticationError when no api_key."""
+    """`@sensitive` fails CLOSED when no api_key (ADR-008):
+
+    applying the decorator raises ``RuntimeError`` and chains the
+    original ``NullRunAuthenticationError`` via ``__cause__`` so the
+    call site can still introspect *why* registration failed.
+    """
     monkeypatch.delenv("NULLRUN_API_KEY", raising=False)
     # Reset singleton so the env change is picked up.
     from nullrun.runtime import NullRunRuntime
@@ -147,14 +153,16 @@ def test_sensitive_raises_on_missing_api_key(monkeypatch):
         import nullrun.decorators as dec
         from nullrun.breaker.exceptions import NullRunAuthenticationError
 
-        @dec.sensitive
-        def my_func(x):
-            return x
+        with pytest.raises(
+            RuntimeError,
+            match=r"@sensitive registration failed for 'my_func'",
+        ) as excinfo:
+            @dec.sensitive
+            def my_func(x):
+                return x
 
-        # First call constructs the runtime; should raise NullRunAuthenticationError.
-        with pytest.raises(NullRunAuthenticationError):
-            # Trigger lazy runtime creation via a real method call.
-            NullRunRuntime.get_instance()
+        # The wrapper must surface the original auth error via __cause__.
+        assert isinstance(excinfo.value.__cause__, NullRunAuthenticationError)
     finally:
         # Restore singleton state.
         NullRunRuntime.reset_instance()
