@@ -1,4 +1,4 @@
-<p align="center">
+<p align="Left">
   <a href="https://pypi.org/project/nullrun/"><img
     src="https://img.shields.io/pypi/v/nullrun?style=flat&logo=pypi&logoColor=white"
     alt="PyPI version"/></a>
@@ -13,7 +13,7 @@
     alt="Downloads"/></a>
 </p>
 
-<p align="center">
+<p align="left">
   <a href="https://github.com/nullrunio/nullrun-sdk-python/actions/workflows/ci.yml"><img
     src="https://img.shields.io/github/actions/workflow/status/nullrunio/nullrun-sdk-python/ci.yml?style=flat&logo=github&label=CI"
     alt="CI"/></a>
