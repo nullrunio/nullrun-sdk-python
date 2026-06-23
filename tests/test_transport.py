@@ -164,7 +164,10 @@ class TestTransport:
     @respx.mock
     def test_execute_success_caches_decision(self, transport):
         """Successful execute caches the decision for future fallback."""
-        respx.post("https://api.test.nullrun.io/api/v1/gate").mock(
+        # Audit F-R2-01 (2026-06-22): Transport.execute now hits
+        # /api/v1/execute (was /gate) so the backend checks the
+        # `execute` scope.
+        respx.post("https://api.test.nullrun.io/api/v1/execute").mock(
             return_value=httpx.Response(200, json={
                 "decision": "allow",
                 "policy_id": "policy-123",

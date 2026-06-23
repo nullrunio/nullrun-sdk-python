@@ -533,7 +533,7 @@ def test_connect_websocket_rejects_non_http_scheme():
         asyncio.run(t.connect_websocket(organization_id="org-1"))
 
 
-def test_connect_websocket_uses_wss_for_https():
+def test_connect_websocket_uses_wss_for_https(monkeypatch):
     t = _build_transport()
     t.api_url = "https://api.nullrun.io"
 
@@ -550,7 +550,11 @@ def test_connect_websocket_uses_wss_for_https():
             return self
 
     monkey_url = "wss://api.nullrun.io/ws/control/org-1"
-    tw_mod.WebSocketConnection = _FakeConn
+    # monkeypatch restores the original WebSocketConnection on test
+    # teardown — without it, the leaked fake class breaks every later
+    # test that imports ``WebSocketConnection`` from the module
+    # (e.g. test_reconnect_cap.py's ``inspect.getsource`` assertions).
+    monkeypatch.setattr(tw_mod, "WebSocketConnection", _FakeConn)
 
     import asyncio
 
@@ -558,7 +562,7 @@ def test_connect_websocket_uses_wss_for_https():
     assert captured["url"] == monkey_url
 
 
-def test_connect_websocket_uses_ws_for_http_localhost():
+def test_connect_websocket_uses_ws_for_http_localhost(monkeypatch):
     """Loopback http:// → ws:// (not wss://) for local dev."""
     t = Transport(
         api_url="http://localhost:8080",
@@ -578,7 +582,8 @@ def test_connect_websocket_uses_ws_for_http_localhost():
         async def connect(self):
             return self
 
-    tw_mod.WebSocketConnection = _FakeConn
+    # Same leak fix as the wss test above — monkeypatch auto-restores.
+    monkeypatch.setattr(tw_mod, "WebSocketConnection", _FakeConn)
 
     import asyncio
 

@@ -22,6 +22,7 @@ The contract verified here:
   6. Replayed signed_payload from a different message body -> rejected
      (signature binds the body, not the envelope).
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -37,7 +38,6 @@ from nullrun.transport_websocket import (
     compute_hmac_signature,
     verify_hmac_signature,
 )
-
 
 # --- helpers ---------------------------------------------------------------
 
@@ -58,6 +58,40 @@ def _build_signed_envelope(message: dict, api_key: str, secret_key: str) -> dict
     envelope["timestamp"] = timestamp
     envelope["api_key_id"] = api_key
     envelope["signed_payload"] = payload_json.encode("utf-8").hex()
+    return envelope
+
+
+def _build_real_server_envelope(
+    message: dict,
+    user_facing_api_key: str,
+    api_key_id: str,
+    secret_key: str,
+) -> dict:
+    """Mimic the real server's signing shape (FIX-D): the HMAC is
+    computed over ``api_key_id`` (the UUID key_id from
+    ``auth_context.key_id()``), NOT over the user-facing
+    ``nr_live_...`` api_key. The envelope publishes only
+    ``api_key_id`` — the user-facing key never appears on the wire.
+
+    The previous helper ``_build_signed_envelope`` used the same value
+    for both, which masked the bug fixed in FIX-D.
+    """
+    timestamp = int(time.time())
+    payload_json = json.dumps(message, separators=(",", ":"))
+    signature = compute_hmac_signature(
+        api_key_id, secret_key, timestamp, payload_json.encode("utf-8")
+    )
+    envelope = dict(message)
+    envelope["signature"] = signature
+    envelope["timestamp"] = timestamp
+    envelope["api_key_id"] = api_key_id
+    envelope["signed_payload"] = payload_json.encode("utf-8").hex()
+    # Note: ``user_facing_api_key`` is intentionally NOT included in the
+    # envelope — that's exactly how the real server behaves.
+    assert user_facing_api_key != api_key_id, (
+        "Test setup error: user-facing key and api_key_id must differ "
+        "to reproduce the FIX-D bug condition."
+    )
     return envelope
 
 
@@ -90,17 +124,11 @@ def test_compute_and_verify_hmac_round_trip():
     payload = b'{"type":"state_change","workflow_id":"wf-1","state":"Killed","version":2}'
     ts = int(time.time())
     sig = compute_hmac_signature("api_key_123", "secret_xyz", ts, payload)
-    assert verify_hmac_signature(
-        "api_key_123", "secret_xyz", ts, payload, sig
-    )
+    assert verify_hmac_signature("api_key_123", "secret_xyz", ts, payload, sig)
     # Different secret -> reject
-    assert not verify_hmac_signature(
-        "api_key_123", "wrong_secret", ts, payload, sig
-    )
+    assert not verify_hmac_signature("api_key_123", "wrong_secret", ts, payload, sig)
     # Different payload -> reject
-    assert not verify_hmac_signature(
-        "api_key_123", "secret_xyz", ts, payload + b" ", sig
-    )
+    assert not verify_hmac_signature("api_key_123", "secret_xyz", ts, payload + b" ", sig)
 
 
 def test_verify_hmac_signature_rejects_expired_timestamp():
@@ -347,9 +375,9 @@ async def test_replayed_signed_payload_with_spliced_body_is_rejected(monkeypatch
     # And a real forgery — replacing the signed_payload bytes to
     # say "Killed" without re-signing — must be rejected.
     state_changes.clear()
-    forged["signed_payload"] = json.dumps(
-        {**legit, "state": "Killed"}, separators=(",", ":")
-    ).encode("utf-8").hex()
+    forged["signed_payload"] = (
+        json.dumps({**legit, "state": "Killed"}, separators=(",", ":")).encode("utf-8").hex()
+    )
     raw2 = json.dumps(forged)
     await conn._handle_message(raw2)
     assert state_changes == []  # signature no longer matches
@@ -396,3 +424,252 @@ async def test_acknowledged_states_use_pascalcase(monkeypatch):
     raw = json.dumps(envelope)
     await conn._handle_message(raw)
     assert any(b'"type": "ack"' in s and b"msg-ack" in s for s in stub.sent)
+
+
+# --- Audit-2026-06-22 #6: WS ACK case-insensitive defensive ---
+
+
+@pytest.mark.asyncio
+async def test_ws_ack_lowercase_state_still_sends_ack(monkeypatch):
+    """Audit-2026-06-22 #6: the WS path used to exact-match PascalCase
+    only. A server regression to ``"killed"``/``"paused"`` would
+    silently drop the ACK. The defensive helper
+    ``_is_acknowledged_state`` accepts both, while the
+    ``ACKNOWLEDGED_STATES`` set stays PascalCase-only so the
+    ``test_acknowledged_states_use_pascalcase`` invariant is
+    preserved."""
+    state_changes: list[dict] = []
+    conn = WebSocketConnection(
+        url="wss://example.invalid/ws/control/org-1",
+        headers={},
+        api_key="api_key_123",
+        secret_key="secret_xyz",
+        on_state_change=state_changes.append,
+    )
+    stub = _StubWS()
+    monkeypatch.setattr(conn, "_conn", stub)
+    conn._running = True
+
+    for lowercase_state in ("killed", "paused"):
+        state_changes.clear()
+        stub.sent.clear()
+        msg = {
+            "type": "state_change",
+            "workflow_id": f"wf-{lowercase_state}",
+            "state": lowercase_state,  # server regression to lowercase
+            "version": 5,
+            "message_id": f"msg-{lowercase_state}",
+        }
+        envelope = _build_signed_envelope(msg, "api_key_123", "secret_xyz")
+        raw = json.dumps(envelope)
+        await conn._handle_message(raw)
+
+        # ACK must be sent even with lowercase state.
+        assert any(
+            b'"type": "ack"' in s and lowercase_state.encode() in s
+            for s in stub.sent
+        ), f"ACK not sent for lowercase state={lowercase_state!r}"
+
+    # ACKNOWLEDGED_STATES itself stays PascalCase — pin that.
+    assert "Killed" in WebSocketConnection.ACKNOWLEDGED_STATES
+    assert "Paused" in WebSocketConnection.ACKNOWLEDGED_STATES
+    assert "killed" not in WebSocketConnection.ACKNOWLEDGED_STATES
+    assert "paused" not in WebSocketConnection.ACKNOWLEDGED_STATES
+
+    # And _is_acknowledged_state returns True for both casings.
+    assert WebSocketConnection._is_acknowledged_state("Killed")
+    assert WebSocketConnection._is_acknowledged_state("killed")
+    assert WebSocketConnection._is_acknowledged_state("Paused")
+    assert WebSocketConnection._is_acknowledged_state("paused")
+    assert not WebSocketConnection._is_acknowledged_state("Normal")
+    assert not WebSocketConnection._is_acknowledged_state("flagged")
+
+
+# --- FIX-D regression: server signs with api_key_id (UUID), not user-facing key ---
+
+
+@pytest.mark.asyncio
+async def test_real_server_envelope_with_distinct_api_key_id_is_accepted(monkeypatch):
+    """FIX-D regression: the real NULLRUN backend signs HMAC over
+    ``api_key_id`` (the UUID key_id from ``auth_context.key_id()``),
+    NOT the user-facing ``nr_live_...`` api_key passed to
+    ``nullrun.init()``. The SDK must read ``api_key_id`` from the
+    envelope and use it as the HMAC identifier — otherwise every
+    signed WS message is rejected with "Invalid HMAC signature".
+
+    Pre-FIX-D behaviour: SDK called ``verify_hmac_signature(
+    self.api_key, ...)`` with the user-facing key, which never matched
+    the server's UUID-based signature. This test would fail under that
+    code path with the same production error reported on 2026-06-22.
+    """
+    state_changes: list[dict] = []
+    USER_FACING_KEY = "nr_live_SsBF9OMYcVCgRCNcCVcJ4khTOPKx79JG"
+    API_KEY_ID = "0b7632e8-11d8-4247-8666-c72b5320b4f6"  # UUID
+    SECRET = "secret-from-_authenticate"
+
+    conn = WebSocketConnection(
+        url="wss://api.nullrun.io/ws/control/org-x",
+        headers={},
+        api_key=USER_FACING_KEY,
+        secret_key=SECRET,
+        on_state_change=state_changes.append,
+    )
+    stub = _StubWS()
+    monkeypatch.setattr(conn, "_conn", stub)
+    conn._running = True
+
+    msg = {
+        "type": "state_change",
+        "workflow_id": "wf-1",
+        "state": "Normal",
+        "version": 5,
+    }
+    envelope = _build_real_server_envelope(
+        msg,
+        user_facing_api_key=USER_FACING_KEY,
+        api_key_id=API_KEY_ID,
+        secret_key=SECRET,
+    )
+    # Sanity: the envelope must NOT carry the user-facing key (the
+    # real server only ships the api_key_id UUID on the wire).
+    assert "api_key" not in envelope
+    assert envelope["api_key_id"] == API_KEY_ID
+
+    raw = json.dumps(envelope)
+    await conn._handle_message(raw)
+
+    # The signature was computed with API_KEY_ID, so the SDK must
+    # accept it and dispatch the state_change.
+    assert len(state_changes) == 1
+    assert state_changes[0]["workflow_id"] == "wf-1"
+    assert state_changes[0]["state"] == "Normal"
+
+
+@pytest.mark.asyncio
+async def test_real_server_envelope_with_wrong_user_facing_key_still_accepted(monkeypatch):
+    """Belt-and-braces for FIX-D: even if the user-facing key
+    accidentally differs from the api_key_id the server used to sign
+    (which is the actual server shape — the server never sees the
+    user-facing key for HMAC purposes), the SDK still accepts the
+    message because it reads ``api_key_id`` from the envelope.
+
+    This pins the contract: HMAC verification identity MUST come from
+    the envelope's ``api_key_id`` field, not from ``self.api_key``.
+    """
+    state_changes: list[dict] = []
+    USER_FACING_KEY = "nr_live_wrong-key-sdk-never-uses-this-for-verify"
+    API_KEY_ID = "0b7632e8-11d8-4247-8666-c72b5320b4f6"
+    SECRET = "secret-from-_authenticate"
+
+    conn = WebSocketConnection(
+        url="wss://api.nullrun.io/ws/control/org-x",
+        headers={},
+        api_key=USER_FACING_KEY,
+        secret_key=SECRET,
+        on_state_change=state_changes.append,
+    )
+    stub = _StubWS()
+    monkeypatch.setattr(conn, "_conn", stub)
+    conn._running = True
+
+    msg = {"type": "state_change", "workflow_id": "wf-x", "state": "Normal", "version": 1}
+    envelope = _build_real_server_envelope(msg, USER_FACING_KEY, API_KEY_ID, SECRET)
+    raw = json.dumps(envelope)
+    await conn._handle_message(raw)
+
+    assert len(state_changes) == 1
+    assert state_changes[0]["workflow_id"] == "wf-x"
+
+
+@pytest.mark.asyncio
+async def test_legacy_envelope_without_api_key_id_falls_back_to_user_facing_key(monkeypatch):
+    """FIX-D backwards-compat: a pre-FIX-D server (no ``api_key_id``
+    field on the envelope) signed HMAC over the user-facing api_key.
+    The SDK must fall back to ``self.api_key`` in that case so legacy
+    round-trip tests and any pre-FIX-D deployments keep working.
+
+    We build an envelope without ``api_key_id`` and sign with the
+    user-facing key — the pre-FIX-D shape.
+    """
+    state_changes: list[dict] = []
+    USER_FACING_KEY = "nr_live_legacy-test"
+    SECRET = "legacy-secret"
+
+    conn = WebSocketConnection(
+        url="wss://example.invalid/ws/control/org-1",
+        headers={},
+        api_key=USER_FACING_KEY,
+        secret_key=SECRET,
+        on_state_change=state_changes.append,
+    )
+    stub = _StubWS()
+    monkeypatch.setattr(conn, "_conn", stub)
+    conn._running = True
+
+    msg = {"type": "state_change", "workflow_id": "wf-legacy", "state": "Normal", "version": 1}
+    # Sign with the user-facing key, drop api_key_id to simulate a
+    # pre-FIX-D envelope.
+    envelope = _build_signed_envelope(msg, USER_FACING_KEY, SECRET)
+    envelope.pop("api_key_id")
+    raw = json.dumps(envelope)
+    await conn._handle_message(raw)
+
+    # Legacy path: SDK uses self.api_key as fallback, signature
+    # verifies, dispatch happens.
+    assert len(state_changes) == 1
+    assert state_changes[0]["workflow_id"] == "wf-legacy"
+
+
+# ---------------------------------------------------------------------------
+# Wire-format contract tests (audit 2026-06-22 #3+#8)
+# ---------------------------------------------------------------------------
+
+
+def test_ws_hmac_identity_field_constant():
+    """The wire-format HMAC identity field name is pinned via
+    ``WS_HMAC_IDENTITY_FIELD``. Both sides of the WS push protocol
+    (NULLRUN backend's ``SignedWsMessage`` struct and the SDK
+    receiver in transport_websocket.py) agree on this field name.
+
+    Without this pin, a future struct rename on either side silently
+    breaks signature verification on every push — exactly the
+    regression class that audit 2026-06-22 #8 captured.
+    """
+    from nullrun.transport_websocket import WS_HMAC_IDENTITY_FIELD
+
+    assert WS_HMAC_IDENTITY_FIELD == "api_key"
+
+
+def test_ws_hmac_identity_field_used_in_receiver():
+    """Receiver must read the pinned field name (not a free-form
+    string literal) so the constant is the single source of truth.
+
+    Reads the source file directly (not ``inspect.getsource`` on the
+    class) so the test is robust to ``test_transport_branches.py``
+    monkey-patching ``transport_websocket.WebSocketConnection`` to a
+    fake class without restoring it (a pre-existing test-isolation
+    leak — see the ``_FakeConn`` assignments at test_transport_branches.py:553
+    and :581). With ``inspect.getsource`` the patched fake class has
+    no ``_handle_message`` and this test crashes; with direct file
+    reads we verify the source-of-truth bytes regardless of class
+    identity at test time.
+    """
+    from pathlib import Path
+
+    from nullrun.transport_websocket import WS_HMAC_IDENTITY_FIELD
+
+    src_path = Path(__file__).parent.parent / "src" / "nullrun" / "transport_websocket.py"
+    src = src_path.read_text(encoding="utf-8")
+
+    # The receiver code (the body of the ``_handle_message`` method)
+    # must reference the constant. Look for the constant by name
+    # rather than by literal value to confirm the pin is wired up.
+    assert "WS_HMAC_IDENTITY_FIELD" in src, (
+        "transport_websocket.py no longer references the "
+        "WS_HMAC_IDENTITY_FIELD constant — wire-format pin is gone"
+    )
+
+    # And the constant must keep its expected wire-format value
+    # (separate from the source-level reference so a refactor that
+    # changes the value is caught too).
+    assert WS_HMAC_IDENTITY_FIELD == "api_key"
