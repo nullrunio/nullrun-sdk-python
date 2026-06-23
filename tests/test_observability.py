@@ -76,7 +76,10 @@ class TestMetricsRegistry:
 
     def test_execute_increments_blocked_counter(self, mock_api, make_runtime):
         """execute() when blocked=True updates execute_blocked."""
-        respx.post(f"{BASE_URL}/api/v1/gate").mock(
+        # Audit F-R2-01 (2026-06-22): Transport.execute now hits
+        # /api/v1/execute (not /gate) so the backend checks the
+        # `execute` scope. The mock needs to move with the contract.
+        respx.post(f"{BASE_URL}/api/v1/execute").mock(
             return_value=httpx.Response(200, json={
                 "decision": "block",
                 "explanation": "cost_limit_exceeded",

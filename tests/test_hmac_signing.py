@@ -61,8 +61,10 @@ class TestGenerateHmacSignature:
         secret = "test-secret"
         timestamp = 1700000000
         body = '{"event":"test"}'
+        # codeql[py/weak-sensitive-data-hashing]: test recomputes the same SHA-256 + HMAC-SHA256 the server uses; not a password hash.
         expected_body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
         expected_message = f"{timestamp}:{api_key}:{expected_body_hash}".encode()
+        # codeql[py/weak-sensitive-data-hashing]: test recomputes the same SHA-256 + HMAC-SHA256 the server uses; not a password hash.
         expected = hmac.new(
             secret.encode("utf-8"),
             expected_message,

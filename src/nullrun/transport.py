@@ -4,6 +4,7 @@ Transport layer for NullRun SDK.
 Handles HTTP communication with batching and background flush.
 Includes fallback modes for Gateway unavailability.
 """
+# codeql[py/clear-text-logging-sensitive-data]: False positives — CodeQL flags the function entry line (e.g. CircuitBreaker() ctor at line 555) where `secret_key` data-flow enters via class attrs, but no logger call in this file emits `secret_key`. api_key IS redacted to `api_key[:8] + "***"` at line 567 before logging.
 
 import hashlib
 import hmac
@@ -39,6 +40,7 @@ from nullrun.observability import metrics
 try:
     from opentelemetry import trace
     from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+
     _OTEL_AVAILABLE = True
 except ImportError:
     _OTEL_AVAILABLE = False
@@ -48,15 +50,13 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-
-
-
 __api_version__ = "1.0"
 
 
 # =============================================================================
 # HMAC Request Signing (Task 11)
 # =============================================================================
+
 
 def generate_hmac_signature(
     api_key: str,
@@ -84,13 +84,19 @@ def generate_hmac_signature(
     Returns:
         Hex-encoded HMAC-SHA256 signature
     """
-    body_hash = hashlib.sha256(body.encode('utf-8')).hexdigest()
+    # SHA-256 is the standard hash for HMAC-SHA256 (RFC 2104). secret_key
+    # is an HMAC shared key, not a password; replacing with a slow KDF
+    # would break the HMAC contract because the server must recompute
+    # the exact same bytes. body_hash is a payload fingerprint, not a
+    # password. False positive of py/weak-cryptographic-hash — CodeQL
+    # mis-classifies variables ending in `_key` as passwords.
+    # codeql[py/weak-sensitive-data-hashing]: HMAC-SHA256 standard hash; secret_key is HMAC key not a password.
+    body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
     message = f"{timestamp}:{api_key}:{body_hash}"
 
+    # codeql[py/weak-sensitive-data-hashing]: HMAC-SHA256 standard hash; secret_key is HMAC key not a password.
     signature = hmac.new(
-        secret_key.encode('utf-8'),
-        message.encode('utf-8'),
-        hashlib.sha256
+        secret_key.encode("utf-8"), message.encode("utf-8"), hashlib.sha256
     ).hexdigest()
 
     return signature
@@ -127,6 +133,7 @@ def verify_hmac_signature(
         # vs. incident response.
         try:
             from nullrun.observability import metrics
+
             metrics.inc_transport("hmac_verify_expired_total")
         except Exception:  # noqa: BLE001 — best-effort counter
             pass
@@ -143,6 +150,7 @@ def verify_hmac_signature(
 # =============================================================================
 # Policy Cache for CACHED fallback mode
 # =============================================================================
+
 
 class CachedDecision:
     """Represents a cached execute decision."""
@@ -195,7 +203,9 @@ class PolicyCache:
         self._hits += 1
         return decision
 
-    def set(self, key: str, decision: str, policy_id: str = None, policy_version: int = None) -> None:
+    def set(
+        self, key: str, decision: str, policy_id: str = None, policy_version: int = None
+    ) -> None:
         if key in self._cache:
             self._cache.move_to_end(key)
         elif len(self._cache) >= self._maxsize:
@@ -231,8 +241,6 @@ class PolicyCache:
         return len(self._cache)
 
 
-
-
 def _signed_request_body(payload: dict[str, Any]) -> bytes:
     """Serialise a JSON payload to the canonical bytes the HMAC
     signature is computed over.
@@ -250,6 +258,7 @@ def _signed_request_body(payload: dict[str, Any]) -> bytes:
     """
     return json.dumps(payload, separators=(",", ":")).encode("utf-8")
 
+
 # =============================================================================
 # Retry with exponential backoff + jitter
 # =============================================================================
@@ -257,6 +266,7 @@ def _signed_request_body(payload: dict[str, Any]) -> bytes:
 """
 Retry with exponential backoff + jitter + Retry-After header support
 """
+
 
 def _retry_with_backoff(
     func: Callable[[], Any],
@@ -345,7 +355,7 @@ def _retry_with_backoff(
                     type(exc).__name__,
                 )
             else:
-                delay = min(base_delay * (backoff_factor ** attempt), max_delay)
+                delay = min(base_delay * (backoff_factor**attempt), max_delay)
                 jitter_amount = delay * jitter
                 # Standard jitter for retry delay -- not crypto-sensitive
                 actual_delay = delay + random.uniform(-jitter_amount, jitter_amount)  # noqa: S311
@@ -360,13 +370,13 @@ def _retry_with_backoff(
 
             time.sleep(actual_delay)
 
-    raise BreakerTransportError(
-        f"Request failed after {max_retries + 1} attempts"
-    ) from last_exc
+    raise BreakerTransportError(f"Request failed after {max_retries + 1} attempts") from last_exc
+
 
 # =============================================================================
 # Fallback Modes (Phase 1 - SDK Resilience)
 # =============================================================================
+
 
 class FallbackMode:
     """
@@ -375,6 +385,7 @@ class FallbackMode:
     This is CRITICAL for production - Gateway unavailability should NOT
     block agent execution, but behavior must be defined and logged.
     """
+
     # Block if Gateway unavailable (for critical tools)
     STRICT = "strict"
     # Allow if Gateway unavailable, log locally (DEFAULT)
@@ -387,6 +398,7 @@ class DecisionSource:
     """
     Where the decision originated - for provenance tracking.
     """
+
     GATEWAY = "gateway"
     CACHED = "cached"
     FALLBACK = "fallback"
@@ -396,6 +408,7 @@ class DecisionSource:
 @dataclass
 class FlushConfig:
     """Configuration for transport flush behavior."""
+
     batch_size: int = 50
     flush_interval: float = 5.0  # seconds
     max_retries: int = 3
@@ -407,6 +420,7 @@ class FlushConfig:
 @dataclass
 class ExecuteConfig:
     """Configuration for execute (strict mode) behavior."""
+
     # Fallback mode when Gateway is unavailable
     fallback_mode: str = FallbackMode.PERMISSIVE
     # Gateway timeout in seconds
@@ -488,9 +502,7 @@ class Transport:
                 )
         if "NULLRUN_FLUSH_INTERVAL_MS" in os.environ:
             try:
-                self.config.flush_interval = (
-                    int(os.environ["NULLRUN_FLUSH_INTERVAL_MS"]) / 1000.0
-                )
+                self.config.flush_interval = int(os.environ["NULLRUN_FLUSH_INTERVAL_MS"]) / 1000.0
             except ValueError:
                 logger.warning(
                     "NULLRUN_FLUSH_INTERVAL_MS=%r is not an int; ignoring",
@@ -499,9 +511,9 @@ class Transport:
         self._buffer: list[dict[str, Any]] = []
         self._in_flight: dict[str, dict[str, Any]] = {}  # event_id -> event for retry dedup
         self._lock = threading.RLock()  # RLock so re-entrant acquisition (e.g.
-                                        # test fixtures that hold the lock
-                                        # while calling lock-acquiring
-                                        # methods) doesn't deadlock.
+        # test fixtures that hold the lock
+        # while calling lock-acquiring
+        # methods) doesn't deadlock.
         self._flush_thread: threading.Thread | None = None
         self._running = False
 
@@ -825,9 +837,7 @@ class Transport:
             self._circuit_breaker.call(send_batch)
         except BreakerTransportError:
             # Circuit breaker is open - re-add batch to buffer for retry later
-            logger.warning(
-                f"Circuit breaker OPEN. Batch of {len(batch)} events will be re-queued."
-            )
+            logger.warning(f"Circuit breaker OPEN. Batch of {len(batch)} events will be re-queued.")
             # P0-4 (plan §10): drop NEWEST non-critical events instead of
             # oldest. For cost-audit the oldest events are the
             # most valuable (incident start, billing-period start) —
@@ -866,12 +876,14 @@ class Transport:
     # These are control-plane events: the dashboard's KILL/PAUSE has
     # to land even under sustained backend outage, otherwise the
     # kill-switch promise is broken (plan §11.4 P0-4 recommendation).
-    _CRITICAL_EVENT_TYPES = frozenset({
-        "state_change",
-        "kill_received",
-        "policy_invalidated",
-        "key_rotated",
-    })
+    _CRITICAL_EVENT_TYPES = frozenset(
+        {
+            "state_change",
+            "kill_received",
+            "policy_invalidated",
+            "key_rotated",
+        }
+    )
 
     def _drop_newest_with_priority(
         self,
@@ -907,10 +919,7 @@ class Transport:
         # Reverse so we can pop from the "newest" end first while
         # rebuilding in original order.
         for event in reversed(batch):
-            if (
-                dropped < overflow
-                and event.get("type") not in self._CRITICAL_EVENT_TYPES
-            ):
+            if dropped < overflow and event.get("type") not in self._CRITICAL_EVENT_TYPES:
                 dropped += 1
                 continue
             kept.append(event)
@@ -982,12 +991,28 @@ class Transport:
         }
         if self.api_key:
             headers["X-API-Key"] = self.api_key
+            # FIX-F3 (counterpart of backend csrf.rs has_bearer_auth):
+            # The backend's CSRF middleware bypasses cookie-based
+            # double-submit checks whenever the request carries any
+            # non-empty Authorization header (see
+            # backend/src/auth/csrf.rs::has_bearer_auth). Without this
+            # header the SDK POSTs hit the "state-changing request
+            # without session cookie" branch and get 403 — which the
+            # SDK's try/except in /gate, /track, /check, /execute
+            # silently swallowed, so every SDK-side enforcement was
+            # effectively fail-OPEN on production traffic.
+            #
+            # We use the user-facing api_key as the Bearer value so the
+            # bypass header is meaningful for debugging; the actual
+            # SDK auth path is still X-API-Key (+ HMAC when configured).
+            # Bearer-style bypass is documented as safe in csrf.rs:80-95
+            # because browsers never auto-attach Authorization to
+            # cross-site requests, so this is not a CSRF regression.
+            headers["Authorization"] = f"Bearer {self.api_key}"
         if body is not None and self.secret_key and self.api_key:
             body_str = body if isinstance(body, str) else body.decode("utf-8")
             timestamp = int(time.time())
-            signature = generate_hmac_signature(
-                self.api_key, self.secret_key, timestamp, body_str
-            )
+            signature = generate_hmac_signature(self.api_key, self.secret_key, timestamp, body_str)
             headers["X-Signature-Timestamp"] = str(timestamp)
             headers["X-Signature"] = signature
         if extra:
@@ -1031,15 +1056,17 @@ class Transport:
         # Try parsing as HTTP datetime (RFC 7231)
         try:
             from email.utils import parsedate_to_datetime
+
             dt = parsedate_to_datetime(retry_after)
             from datetime import datetime, timezone
+
             return (dt - datetime.now(timezone.utc)).total_seconds()
         except Exception:
             pass
 
         return None
 
-    def _send_batch_with_retry_info(self, batch: list[dict[str, Any]]) -> 'SendResult':
+    def _send_batch_with_retry_info(self, batch: list[dict[str, Any]]) -> "SendResult":
         """Send batch to server using batch endpoint. Returns SendResult with retry info.
 
         P0 #2: the post() call below is wrapped with _retry_with_backoff so a
@@ -1053,6 +1080,8 @@ class Transport:
         headers = {"Content-Type": "application/json", "X-API-Version": __api_version__}
         if self.api_key:
             headers["X-API-Key"] = self.api_key
+            # FIX-F3: Bearer header for CSRF bypass (see _build_signed_headers).
+            headers["Authorization"] = f"Bearer {self.api_key}"
 
         # Add HMAC signature headers
         body = json.dumps({"events": batch})
@@ -1107,12 +1136,12 @@ class Transport:
         try:
             data = response.json()
             # Check for rejection info
-            if 'rejected' in data and data['rejected']:
-                rejected_info = data['rejected']
+            if "rejected" in data and data["rejected"]:
+                rejected_info = data["rejected"]
                 if isinstance(rejected_info, dict):
-                    if 'retry_after_ms' in rejected_info:
-                        retry_after_ms = rejected_info['retry_after_ms']
-                    if 'reason' in rejected_info and rejected_info['reason'] == 'policy_limit':
+                    if "retry_after_ms" in rejected_info:
+                        retry_after_ms = rejected_info["retry_after_ms"]
+                    if "reason" in rejected_info and rejected_info["reason"] == "policy_limit":
                         is_policy_limit = True
         except Exception:  # noqa: S110
             pass
@@ -1149,12 +1178,12 @@ class Transport:
             logger.warning(f"Failed to process actions_taken: {e}")
 
         # Return accepted event_ids for retry dedup
-        accepted_event_ids = data.get("accepted_event_ids", []) if 'data' in locals() else []
+        accepted_event_ids = data.get("accepted_event_ids", []) if "data" in locals() else []
         logger.debug(f"Batch track: sent {len(batch)} events")
         return self.SendResult(
             accepted_event_ids=accepted_event_ids,
             retry_after_ms=retry_after_ms,
-            is_policy_limit=is_policy_limit
+            is_policy_limit=is_policy_limit,
         )
 
     def flush_now(self) -> None:
@@ -1178,10 +1207,17 @@ class Transport:
         on_transport_error: Callable[[Exception], dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """
-        Pre-execution policy evaluation via unified gate endpoint.
+        Pre-execution policy evaluation via the /api/v1/execute endpoint.
 
         This is the PRIMARY enforcement point - decision is made BEFORE execution.
-        Uses /api/v1/gate endpoint for unified execute + check functionality.
+        Per audit F-R2-01 (2026-06-22): the SDK MUST call /api/v1/execute (which
+        checks the ``execute`` scope on the API key) rather than /api/v1/gate
+        (advisory, no scope check). Calling /gate here would let an API key
+        with only ``read``/``write`` scopes drive a sensitive-tool decision --
+        scope gate would be skipped entirely.
+
+        /api/v1/gate is reserved for budget pre-flight (``Transport.check``);
+        see CLAUDE.md ``fail-CLOSED`` table for sensitive tools.
 
         Args:
             organization_id: Organization identifier
@@ -1214,13 +1250,24 @@ class Transport:
             "trace_id": trace_id,
             "tool": tool,
             "input": input_data,
+            # Audit F-R2-19 (2026-06-22): `mode` field is wire-present
+            # but never read by the backend
+            # (`backend/src/proxy/http/gate/internal.rs:42-54`). The
+            # backend's `EnforcementMode` is selected by the route
+            # handler (`gate.rs:33`, `check.rs:?`, `execute.rs:59`),
+            # NOT by this string. We keep the field for now to avoid a
+            # breaking change for any third-party proxies that mirror
+            # the wire shape, but the SDK does NOT honour this value
+            # for any local decision.
             "mode": mode,
             "operation_id": operation_id or str(uuid.uuid4()),
         }
 
-        headers = {"Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json", "X-API-Version": __api_version__}
         if self.api_key:
             headers["X-API-Key"] = self.api_key
+            # FIX-F3: Bearer header for CSRF bypass (see _build_signed_headers).
+            headers["Authorization"] = f"Bearer {self.api_key}"
 
         # HMAC fix: serialise via the canonical-bytes helper and send
         # via content=body so the wire bytes match the signed bytes.
@@ -1231,9 +1278,9 @@ class Transport:
         # Inject trace context for distributed tracing (W3C Trace Context)
         self._inject_trace_context(headers)
 
-        def do_gate_request() -> httpx.Response:
+        def do_execute_request() -> httpx.Response:
             return self._client.post(
-                f"{self.api_url}/api/v1/gate",
+                f"{self.api_url}/api/v1/execute",
                 content=body,
                 headers=headers,
                 timeout=5.0,
@@ -1242,7 +1289,7 @@ class Transport:
         # Try Gateway with retry backoff
         try:
             response = _retry_with_backoff(
-                do_gate_request,
+                do_execute_request,
                 max_retries=2,
                 base_delay=0.5,
                 on_transport_error=on_transport_error,
@@ -1252,15 +1299,12 @@ class Transport:
                 data = response.json()
                 data["decision_source"] = DecisionSource.GATEWAY
                 # Cache successful decision for CACHED mode
-                cache_key = self._policy_cache.make_key(
-                    organization_id,
-                    data.get("policy_version")
-                )
+                cache_key = self._policy_cache.make_key(organization_id, data.get("policy_version"))
                 self._policy_cache.set(
                     cache_key,
                     data.get("decision", "allow"),
                     data.get("policy_id"),
-                    data.get("policy_version")
+                    data.get("policy_version"),
                 )
                 return data  # type: ignore[no-any-return]
             elif response.status_code >= 400:
@@ -1346,9 +1390,7 @@ class Transport:
                 }
             else:
                 logger.warning(
-                    "Gateway unreachable, no cache for %s, "
-                    "falling back to PERMISSIVE",
-                    tool
+                    "Gateway unreachable, no cache for %s, falling back to PERMISSIVE", tool
                 )
                 return {
                     "decision": "allow",
@@ -1412,6 +1454,8 @@ class Transport:
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["X-API-Key"] = self.api_key
+            # FIX-F3: Bearer header for CSRF bypass (see _build_signed_headers).
+            headers["Authorization"] = f"Bearer {self.api_key}"
         headers["X-API-Version"] = __api_version__
 
         # HMAC fix: serialise via the canonical-bytes helper and send
@@ -1480,7 +1524,7 @@ class Transport:
 
     def clear_policy_cache(self) -> None:
         """Clear the policy cache, forcing next gate/execute to fetch fresh policy."""
-        if hasattr(self, '_policy_cache'):
+        if hasattr(self, "_policy_cache"):
             self._policy_cache._cache.clear()
             logger.debug("Policy cache cleared")
 
@@ -1519,11 +1563,10 @@ class Transport:
         from urllib.parse import urlparse, urlunparse
 
         from nullrun.transport_websocket import WebSocketConnection
+
         parsed = urlparse(self.api_url)
         if parsed.scheme not in ("http", "https"):
-            raise ValueError(
-                f"Unsupported scheme for control plane: {parsed.scheme!r}"
-            )
+            raise ValueError(f"Unsupported scheme for control plane: {parsed.scheme!r}")
         ws_scheme = "wss" if parsed.scheme == "https" else "ws"
         ws_url = urlunparse(
             parsed._replace(
@@ -1538,6 +1581,8 @@ class Transport:
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["X-API-Key"] = self.api_key
+            # FIX-F3: Bearer header for CSRF bypass (see _build_signed_headers).
+            headers["Authorization"] = f"Bearer {self.api_key}"
 
         # Wrap the policy invalidated callback to clear local cache
         async def wrapped_policy_invalidated(ws_id: str, policy_id: str, new_version: int) -> None:
@@ -1593,6 +1638,8 @@ class Transport:
             headers: dict[str, str] = {
                 "Content-Type": "application/json",
                 "X-API-Key": self.api_key or "",
+                # FIX-F3: Bearer header for CSRF bypass (see _build_signed_headers).
+                "Authorization": f"Bearer {self.api_key}" if self.api_key else "",
             }
             # Re-use the same HMAC headers as /gate and /track so
             # the server's auth-verify path is consistent.
@@ -1622,6 +1669,29 @@ class Transport:
             logger.error(f"Error refetching credentials: {e}")
 
 
+# Audit F-R2-13 (2026-06-22): the module-level ``_parse_error_envelope``
+# helper below is documented as "canonical" but is NOT called from any
+# live wire path — every endpoint does its own ad-hoc
+# ``response.raise_for_status()`` or status-code branch.
+#
+# The audit's recommendation was "either delete the helper (it's
+# misleading), OR wire it up everywhere". We chose "keep but mark
+# test-only" because:
+#
+#   1. ``tests/test_error_envelope.py`` and
+#      ``tests/test_transport_branches.py`` import this helper as a
+#      pure-function reference for the canonical envelope→exception
+#      mapping (the test fixtures encode the contract that a future
+#      refactor will need to match).
+#   2. Tests are documentation. Deleting it forces the tests to
+#      duplicate the mapping table, which is exactly the kind of
+#      drift the helper exists to prevent.
+#
+# DO NOT add a new caller that uses this helper from the SDK wire
+# path until every endpoint is refactored to route through it. The
+# helper is currently a frozen contract test, not a live translator.
+# If you wire it up everywhere, delete this comment and rename to a
+# non-underscored name (it's no longer private).
 def _parse_error_envelope(
     response: httpx.Response,
     endpoint: str,
@@ -1635,6 +1705,9 @@ def _parse_error_envelope(
 
     Module-level helper (not a Transport method) so it can be called
     from background threads that do not carry a Transport instance.
+
+    **Audit F-R2-13 (2026-06-22):** no live wire path uses this. It
+    exists for tests only. See the comment block above.
     """
     status = response.status_code
     try:
@@ -1644,16 +1717,11 @@ def _parse_error_envelope(
     if not isinstance(body, dict):
         body = {}
     error_slug: str = body.get("error", "") or ""
-    message: str = (
-        body.get("message")
-        or response.text
-        or f"HTTP {status}"
-    )
+    message: str = body.get("message") or response.text or f"HTTP {status}"
 
     if status in (401, 403):
         return NullRunAuthenticationError(
-            f"Auth failed on {endpoint} (status {status}, "
-            f"error={error_slug!r}): {message}"
+            f"Auth failed on {endpoint} (status {status}, error={error_slug!r}): {message}"
         )
 
     if status == 429:
@@ -1666,16 +1734,14 @@ def _parse_error_envelope(
                 try:
                     from datetime import datetime, timezone
                     from email.utils import parsedate_to_datetime
+
                     dt = parsedate_to_datetime(ra_header)
-                    retry_after = (
-                        dt - datetime.now(timezone.utc)
-                    ).total_seconds()
+                    retry_after = (dt - datetime.now(timezone.utc)).total_seconds()
                 except Exception:
                     retry_after = None
         upgrade_url = body.get("upgrade_url") if isinstance(body, dict) else None
         return RateLimitError(
-            f"Rate limited on {endpoint} (status 429, error={error_slug!r}): "
-            f"{message}",
+            f"Rate limited on {endpoint} (status 429, error={error_slug!r}): {message}",
             source=TransportErrorSource.GATEWAY_ERROR,
             endpoint=endpoint,
             retry_after=retry_after,
@@ -1685,8 +1751,7 @@ def _parse_error_envelope(
 
     if 500 <= status < 600:
         return NullRunTransportError(
-            f"Gateway error on {endpoint} (status {status}, "
-            f"error={error_slug!r}): {message}",
+            f"Gateway error on {endpoint} (status {status}, error={error_slug!r}): {message}",
             source=TransportErrorSource.GATEWAY_ERROR,
             endpoint=endpoint,
             status_code=status,
@@ -1694,11 +1759,9 @@ def _parse_error_envelope(
         )
 
     return NullRunTransportError(
-        f"Client error on {endpoint} (status {status}, "
-        f"error={error_slug!r}): {message}",
+        f"Client error on {endpoint} (status {status}, error={error_slug!r}): {message}",
         source=TransportErrorSource.GATEWAY_ERROR,
         endpoint=endpoint,
         status_code=status,
         error_slug=error_slug,
     )
-

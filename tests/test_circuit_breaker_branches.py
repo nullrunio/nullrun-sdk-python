@@ -26,7 +26,6 @@ from nullrun.breaker.circuit_breaker import (
     CircuitBreakerMetrics,
 )
 
-
 # ─── CircuitBreakerMetrics ───────────────────────────────────────────
 
 

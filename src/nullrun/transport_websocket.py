@@ -5,6 +5,7 @@ Provides real-time workflow state updates via WebSocket connection.
 Replaces polling pattern: SDK connects to WS, receives push updates
 when workflow state changes (KILL/PAUSE).
 """
+# codeql[py/clear-text-logging-sensitive-data]: False positives — CodeQL flags handler-branch lines (resync_required / subscribed / _handle_state_change_with_ack) where `secret_key` data-flow enters via `self.secret_key`. The actual logger calls log public identifiers (`key_id` UUID, `organization_id`), NOT the HMAC secret_key.
 
 import asyncio
 import hashlib
@@ -17,6 +18,7 @@ from typing import Any
 
 try:
     import websockets
+
     WEBSOCKETS_AVAILABLE = True
 except ImportError:
     WEBSOCKETS_AVAILABLE = False
@@ -30,6 +32,25 @@ logger = logging.getLogger(__name__)
 # the caller fall back to HTTP-poll (the SDK still tracks / gates /
 # cost-rolls; only the WS push latency advantage is lost).
 _MAX_RECONNECT_ATTEMPTS = 10
+
+# HMAC identity field on the WS wire format.
+#
+# The backend's ``SignedWsMessage`` struct (NULLRUN/backend/src/proxy/
+# http/ws_control.rs:43) serializes the HMAC identity under the field
+# name ``api_key``. Pre-FIX-F4 the wire field was named ``api_key_id``
+# (the rename happened in the backend struct comment but not in every
+# test fixture — see tests/test_ws_signed_payload.py for the historical
+# mock shape). The SDK reads this field and uses the value to verify
+# the HMAC signature; without a constant pin, a future struct rename
+# silently breaks signature verification on every push.
+#
+# HTTP path uses a different field name — ``X-API-Key`` (see
+# Transport._build_signed_headers). The two transports agree on the
+# field NAME but disagree on the VALUE: HTTP carries the user-facing
+# ``nr_live_...`` string, WS carries the internal UUID from
+# ``auth_context.key_id()``. Both are internally consistent, but the
+# split is a known regression risk — see audit 2026-06-22 #3+#8.
+WS_HMAC_IDENTITY_FIELD = "api_key"
 
 
 def compute_hmac_signature(api_key: str, secret_key: str, timestamp: int, payload: bytes) -> str:
@@ -48,17 +69,21 @@ def compute_hmac_signature(api_key: str, secret_key: str, timestamp: int, payloa
     Returns:
         Hex-encoded HMAC-SHA256 signature
     """
-    # Compute payload hash: SHA256(payload)
+    # SHA-256 is the standard hash for HMAC-SHA256 (RFC 2104). secret_key
+    # is an HMAC shared key, not a password; replacing with a slow KDF
+    # would break the HMAC contract because the server must recompute
+    # the exact same bytes. payload_hash is a payload fingerprint, not
+    # a password. False positive of py/weak-cryptographic-hash — CodeQL
+    # mis-classifies variables ending in `_key` as passwords.
+    # codeql[py/weak-sensitive-data-hashing]: HMAC-SHA256 standard hash; secret_key is HMAC key not a password.
     payload_hash = hashlib.sha256(payload).hexdigest()
 
     # Construct message: timestamp:api_key:payload_hash
     message = f"{timestamp}:{api_key}:{payload_hash}"
 
-    # Compute HMAC-SHA256
+    # codeql[py/weak-sensitive-data-hashing]: HMAC-SHA256 standard hash; secret_key is HMAC key not a password.
     signature = hmac.new(
-        secret_key.encode('utf-8'),
-        message.encode('utf-8'),
-        hashlib.sha256
+        secret_key.encode("utf-8"), message.encode("utf-8"), hashlib.sha256
     ).hexdigest()
 
     return signature
@@ -96,6 +121,7 @@ def verify_hmac_signature(
         # clock-skew issues, not two.
         try:
             from nullrun.observability import metrics
+
             metrics.inc_transport("hmac_verify_expired_total")
         except Exception:  # noqa: BLE001 — best-effort counter
             pass
@@ -131,6 +157,19 @@ class WebSocketConnection:
     # path stays dead and the server's pending-ack queue grows
     # without ever being drained.
     ACKNOWLEDGED_STATES = {"Killed", "Paused"}
+
+    @classmethod
+    def _is_acknowledged_state(cls, state: str) -> bool:
+        """Case-insensitive membership check against ``ACKNOWLEDGED_STATES``.
+
+        Audit-2026-06-22: added a lowercase fallback so a server
+        regression to ``"killed"``/``"paused"`` doesn't silently
+        drop the ACK. Exact PascalCase is still the happy path and
+        is checked first; the lowercase branch is defensive only.
+        """
+        if state in cls.ACKNOWLEDGED_STATES:
+            return True
+        return state.lower() in {s.lower() for s in cls.ACKNOWLEDGED_STATES}
 
     def __init__(
         self,
@@ -268,9 +307,7 @@ class WebSocketConnection:
 
         Internal method used by connect() and reconnect loop.
         """
-        self._conn = await websockets.connect(
-            self.url, additional_headers=self.headers
-        )
+        self._conn = await websockets.connect(self.url, additional_headers=self.headers)
         self._running = True
         self._receive_task = asyncio.create_task(self._receive_loop())
 
@@ -284,8 +321,7 @@ class WebSocketConnection:
         """
         if not WEBSOCKETS_AVAILABLE:
             raise ImportError(
-                "websockets library not available. "
-                "Install with: pip install nullrun[websocket]"
+                "websockets library not available. Install with: pip install nullrun[websocket]"
             )
 
         self._closed = False
@@ -354,7 +390,7 @@ class WebSocketConnection:
                         # so we still have a chance to accept it; the
                         # signature check will fail in either case
                         # and we'll reject with the standard error.
-                        verify_payload = message.encode('utf-8')
+                        verify_payload = message.encode("utf-8")
                 else:
                     # Pre-FIX-C server: verify against full wire
                     # bytes. Will pass only on round-trip tests where
@@ -362,10 +398,43 @@ class WebSocketConnection:
                     # do; in real life this is the byte-mismatch path
                     # and the message should be rejected. Kept as
                     # best-effort backwards compatibility.
-                    verify_payload = message.encode('utf-8')
+                    verify_payload = message.encode("utf-8")
+
+                # FIX-F4 (counterpart of backend ws_control.rs FIX-F4): the server
+                # signs HMAC over the user-facing API key the SDK has
+                # (``nr_live_...``). The envelope publishes the same
+                # value under the ``api_key`` field — we MUST read it
+                # back from there and use it as the HMAC identifier.
+                #
+                # Pre-FIX-F4 this branch read ``data["api_key_id"]``,
+                # which used to be the wire field name on the server
+                # side. That field now carries the same user-facing
+                # value (no longer the internal UUID key_id), so for
+                # backwards compat we accept either field name —
+                # pre-FIX-F4 envelopes may still arrive with
+                # ``api_key_id`` carrying the user-facing string
+                # because the server's only consumers were pre-FIX-F4
+                # SDKs.
+                #
+                # Fall back to ``self.api_key`` only when the envelope
+                # has neither field (a pre-FIX-D server without
+                # signed_payload), which is a degraded path that
+                # already 403'd in real life per the FIX-C comments.
+                envelope_api_key = (
+                    data.get(WS_HMAC_IDENTITY_FIELD)
+                    if isinstance(data.get(WS_HMAC_IDENTITY_FIELD), str) and data.get(WS_HMAC_IDENTITY_FIELD)
+                    else data.get("api_key_id")
+                )
+                if isinstance(envelope_api_key, str) and envelope_api_key:
+                    verify_api_key = envelope_api_key
+                else:
+                    # Pre-FIX-D server: no api_key/api_key_id
+                    # published. Round-trip only — never expected in
+                    # production after the FIX-C deployment.
+                    verify_api_key = self.api_key
 
                 if not verify_hmac_signature(
-                    self.api_key,
+                    verify_api_key,
                     self.secret_key,
                     msg_timestamp,
                     verify_payload,
@@ -396,6 +465,7 @@ class WebSocketConnection:
                     # observability imports nothing from us, so this
                     # is safe and lazy.
                     from nullrun.observability import metrics
+
                     metrics.inc_transport("hmac_verify_failures_total")
                     return
 
@@ -418,9 +488,7 @@ class WebSocketConnection:
             if signature and timestamp and self.api_key and self.secret_key:
                 if isinstance(signed_payload_hex, str) and signed_payload_hex:
                     try:
-                        trusted = json.loads(
-                            bytes.fromhex(signed_payload_hex).decode("utf-8")
-                        )
+                        trusted = json.loads(bytes.fromhex(signed_payload_hex).decode("utf-8"))
                     except (ValueError, json.JSONDecodeError):
                         # Malformed signed_payload — the signature
                         # check above will already have rejected this
@@ -440,11 +508,14 @@ class WebSocketConnection:
                     # envelope is signed, parse each entry from its
                     # embedded signed_payload if present, else fall
                     # back to the outer dict.
-                    if isinstance(wf, dict) and wf.get("signed_payload") and self.api_key and self.secret_key:
+                    if (
+                        isinstance(wf, dict)
+                        and wf.get("signed_payload")
+                        and self.api_key
+                        and self.secret_key
+                    ):
                         try:
-                            inner = json.loads(
-                                bytes.fromhex(wf["signed_payload"]).decode("utf-8")
-                            )
+                            inner = json.loads(bytes.fromhex(wf["signed_payload"]).decode("utf-8"))
                             self._dispatch_state(inner)
                             continue
                         except (ValueError, json.JSONDecodeError, KeyError):
@@ -461,7 +532,9 @@ class WebSocketConnection:
                 organization_id = data.get("organization_id", "")
                 policy_id = data.get("policy_id", "")
                 new_version = data.get("new_version", 0)
-                logger.info(f"Policy invalidated: {policy_id} v{new_version}, org: {organization_id}")
+                logger.info(
+                    f"Policy invalidated: {policy_id} v{new_version}, org: {organization_id}"
+                )
                 if self.on_policy_invalidated:
                     try:
                         self.on_policy_invalidated(organization_id, policy_id, new_version)
@@ -552,7 +625,27 @@ class WebSocketConnection:
         message_id = source.get("message_id")
 
         # Check if this state requires acknowledgment
-        if state in self.ACKNOWLEDGED_STATES and message_id:
+        #
+        # Audit-2026-06-22 case-defensive: the HTTP-poll path
+        # (`runtime.py`) lowercases before comparing so it survives a
+        # server regression to lowercase states. The WS path used to
+        # exact-match only. Without this fallback, a server regression
+        # would silently drop the ACK (the existing test pins
+        # PascalCase as the happy path, but does not pin what happens
+        # if the server emits ``"killed"``).
+        #
+        # ACK semantics contract (audit 2026-06-22): the server
+        # currently treats ACK as a BEST-EFFORT INFORMATIONAL signal
+        # (see ``backend/src/proxy/http/ws_control.rs`` ACK handler
+        # comment for the full contract). Only `Killed`/`Paused` are
+        # ACKed; the other 3 WsWorkflowState variants
+        # (Normal/Flagged/Tripped) are dispatched to the callback but
+        # do not trigger an ACK. This is by design — the backend
+        # pending-ack queue is dead code, so a missing ACK does not
+        # block state propagation today. If a future refactor makes
+        # the server gate on ACK arrival, the SDK must extend its
+        # ACK set to all 5 states or states will silently stick.
+        if self._is_acknowledged_state(state) and message_id:
             # Send ACK immediately
             await self._send_ack(message_id)
             logger.debug(f"Sent ACK for message {message_id} ({state} for workflow {workflow_id})")
@@ -568,6 +661,16 @@ class WebSocketConnection:
 
         Args:
             message_id: The message ID to acknowledge
+
+        Audit F-R2-14 (2026-06-22): this ACK is plain JSON — no
+        HMAC signature. CHANGELOG 0.5.2 overclaimed "signed outgoing
+        ACKs". The backend does NOT currently verify ACK authenticity
+        (``backend/src/proxy/http/ws_control.rs:842-848`` is a TODO).
+        If the backend ever enables ACK verification, this method must
+        add a signature field — and the test
+        ``TestOutgoingAckIsPlainJson`` in
+        ``tests/test_integration_contract.py`` must be updated to
+        match.
         """
         if not self._conn or not self._running:
             logger.warning("Cannot send ACK - WebSocket not connected")
@@ -577,7 +680,14 @@ class WebSocketConnection:
             ack = {
                 "type": "ack",
                 "message_id": message_id,
-                "received_at": int(time.time() * 1000),  # milliseconds
+                # FIX-F5: backend declares ``received_at: i64`` on
+                # ``WsMessage::Ack`` (backend/src/proxy/http/ws_control.rs)
+                # and its fallback path stamps ``Utc::now().timestamp()`` —
+                # unix seconds. Sending milliseconds here would silently
+                # diverge by 1000x in any future telemetry / analytics
+                # consumer that reads this field. Pin the unit to seconds
+                # to match the contract on both sides.
+                "received_at": int(time.time()),
             }
             await self._conn.send(json.dumps(ack))
             logger.debug(f"ACK sent for message {message_id}")
@@ -671,4 +781,3 @@ class WebSocketConnection:
     def is_connected(self) -> bool:
         """Check if connection is active."""
         return self._running and self._conn is not None and not self._closed
-
