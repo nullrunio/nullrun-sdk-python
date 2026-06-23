@@ -217,7 +217,7 @@ class TestEnforceSensitiveToolFailClosed:
     ):
         """Network error on /execute → NullRunBlockedException,
         body does NOT run. Regression for bug #2."""
-        respx.post(f"{BASE_URL}/api/v1/gate").mock(
+        respx.post(f"{BASE_URL}/api/v1/execute").mock(
             side_effect=httpx.ConnectError("connection refused")
         )
         rt, charge_card, calls = self._build_protected_sensitive_tool(
@@ -236,7 +236,7 @@ class TestEnforceSensitiveToolFailClosed:
         """The reason on the raised NullRunBlockedException includes
         the classified source (NETWORK_ERROR / GATEWAY_ERROR /
         BREAKER_OPEN) so the audit trail can distinguish them."""
-        respx.post(f"{BASE_URL}/api/v1/gate").mock(
+        respx.post(f"{BASE_URL}/api/v1/execute").mock(
             side_effect=httpx.ConnectError("connection refused")
         )
         rt, charge_card, calls = self._build_protected_sensitive_tool(
@@ -254,7 +254,9 @@ class TestEnforceSensitiveToolFailClosed:
     def test_5xx_fails_closed(self, make_runtime, mock_api):
         """HTTP 5xx on /execute → NullRunBlockedException, body
         does not run."""
-        respx.post(f"{BASE_URL}/api/v1/gate").mock(
+        # Audit F-R2-01 (2026-06-22): sensitive-tool enforcement now
+        # hits /api/v1/execute (was /gate). The mock must follow.
+        respx.post(f"{BASE_URL}/api/v1/execute").mock(
             return_value=httpx.Response(502, text="Bad Gateway")
         )
         rt, charge_card, calls = self._build_protected_sensitive_tool(
@@ -306,7 +308,7 @@ class TestEnforceSensitiveToolFailClosed:
         back into fail-OPEN behavior — for dev / test environments
         where the policy engine is intentionally absent."""
         monkeypatch.setenv("NULLRUN_SENSITIVE_FAIL_OPEN", "1")
-        respx.post(f"{BASE_URL}/api/v1/gate").mock(
+        respx.post(f"{BASE_URL}/api/v1/execute").mock(
             side_effect=httpx.ConnectError("connection refused")
         )
         rt, charge_card, calls = self._build_protected_sensitive_tool(
@@ -325,7 +327,10 @@ class TestEnforceSensitiveToolFailClosed:
         fail-CLOSED rule applies to *both* transport failure and
         real policy blocks — the opt-out is scoped to transport
         errors only."""
-        respx.post(f"{BASE_URL}/api/v1/gate").mock(
+        # Audit F-R2-01 (2026-06-22): /api/v1/execute is the canonical
+        # sensitive-tool route. /api/v1/gate is reserved for budget
+        # pre-flight only.
+        respx.post(f"{BASE_URL}/api/v1/execute").mock(
             return_value=httpx.Response(200, json={
                 "decision": "block",
                 "explanation": "blocked by policy",
@@ -475,7 +480,7 @@ class TestTransportClassification:
         """transport.check with on_transport_error='raise' must
         surface classified NETWORK_ERROR."""
         from nullrun.transport import Transport
-        respx.post(f"{BASE_URL}/api/v1/gate").mock(
+        respx.post(f"{BASE_URL}/api/v1/execute").mock(
             side_effect=httpx.ConnectError("connection refused")
         )
         rt = Transport(api_url=BASE_URL, api_key="k")
@@ -490,7 +495,9 @@ class TestTransportClassification:
         """transport.execute with on_transport_error='raise' must
         surface classified GATEWAY_ERROR on 5xx."""
         from nullrun.transport import Transport
-        respx.post(f"{BASE_URL}/api/v1/gate").mock(
+        # Audit F-R2-01 (2026-06-22): Transport.execute routes to
+        # /api/v1/execute (not /gate) — see transport.py:1188.
+        respx.post(f"{BASE_URL}/api/v1/execute").mock(
             return_value=httpx.Response(500, text="boom")
         )
         rt = Transport(api_url=BASE_URL, api_key="k")
@@ -509,7 +516,7 @@ class TestTransportClassification:
         that want the dict shape (e.g. for audit, not for
         enforcement)."""
         from nullrun.transport import Transport
-        respx.post(f"{BASE_URL}/api/v1/gate").mock(
+        respx.post(f"{BASE_URL}/api/v1/execute").mock(
             side_effect=httpx.ConnectError("connection refused")
         )
         rt = Transport(api_url=BASE_URL, api_key="k")
@@ -525,7 +532,7 @@ class TestTransportClassification:
         """transport.execute with on_transport_error='closed' returns
         a synthetic block with FALLBACK_* source."""
         from nullrun.transport import Transport
-        respx.post(f"{BASE_URL}/api/v1/gate").mock(
+        respx.post(f"{BASE_URL}/api/v1/execute").mock(
             side_effect=httpx.ConnectError("connection refused")
         )
         rt = Transport(api_url=BASE_URL, api_key="k")

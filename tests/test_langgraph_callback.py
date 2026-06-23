@@ -20,12 +20,11 @@ from unittest.mock import MagicMock
 import pytest
 
 from nullrun.instrumentation.langgraph import (
-    NullRunCallback,
     _ACTIVE_RUNS_MAX,
+    NullRunCallback,
     _extract_node_name,
     extract_usage_from_response,
 )
-
 
 # ─── extract_usage_from_response ─────────────────────────────────────
 

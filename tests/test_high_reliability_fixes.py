@@ -87,26 +87,42 @@ def test_cached_decision_exposes_policy_version():
 # ===========================================================================
 
 def test_fetch_remote_state_uses_transport_client(monkeypatch):
-    """`_fetch_remote_state` routes through `self._transport._client.get`."""
+    """`_fetch_remote_state` routes through `self._transport._client.get`
+    and hits the org-scoped workflow endpoint (FIX-F2).
+
+    Pre-FIX-F2 the URL was ``/api/v1/status/{workflow_id}`` which 404'd
+    on the backend. The fix uses
+    ``/api/v1/orgs/{org_id}/workflows/{workflow_id}`` so the legacy
+    HTTP-poll fallback can actually observe a remote state.
+    """
     from nullrun.runtime import NullRunRuntime
 
     runtime = NullRunRuntime(api_key="test", _test_mode=True)
+    # FIX-F2: org_id is now required because the workflow endpoint is
+    # org-scoped. Set explicitly here.
+    runtime.organization_id = "00000000-0000-0000-0000-000000000abc"
 
     called = []
 
     class FakeClient:
         def get(self, url, headers=None, timeout=None):
             called.append(url)
+
             class FakeResp:
                 status_code = 200
+
                 def json(self):
                     return {"state": "Killed", "version": 1, "reason": "test"}
+
             return FakeResp()
 
     runtime._transport._client = FakeClient()
     runtime._fetch_remote_state("wf-1")
     assert len(called) == 1
-    assert "/api/v1/status/wf-1" in called[0]
+    assert (
+        "/api/v1/orgs/00000000-0000-0000-0000-000000000abc/workflows/wf-1"
+        in called[0]
+    )
 
 
 # ===========================================================================

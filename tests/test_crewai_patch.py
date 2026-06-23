@@ -74,8 +74,9 @@ def test_patch_crewai_returns_false_when_missing(monkeypatch, fresh_patch_module
 
 def test_patch_crewai_idempotent(monkeypatch, fresh_patch_module):
     _install_fake_crewai(monkeypatch)
-    from nullrun.instrumentation.crewai import patch_crewai
     from crewai import Crew
+
+    from nullrun.instrumentation.crewai import patch_crewai
 
     assert patch_crewai(MagicMock()) is True
     wrapped = Crew.kickoff
@@ -86,8 +87,9 @@ def test_patch_crewai_idempotent(monkeypatch, fresh_patch_module):
 
 def test_patch_crewai_skips_when_class_marker_present(monkeypatch, fresh_patch_module):
     _install_fake_crewai(monkeypatch)
-    from nullrun.instrumentation.crewai import patch_crewai
     from crewai import Crew
+
+    from nullrun.instrumentation.crewai import patch_crewai
 
     Crew._nullrun_patched = True
     try:
@@ -101,8 +103,9 @@ def test_patch_crewai_without_async_kickoff(monkeypatch, fresh_patch_module):
     installs the sync wrap and silently skips the async wrap.
     """
     _install_fake_crewai(monkeypatch, with_async=False)
-    from nullrun.instrumentation.crewai import patch_crewai
     from crewai import Crew
+
+    from nullrun.instrumentation.crewai import patch_crewai
 
     assert patch_crewai(MagicMock()) is True
 
@@ -118,8 +121,9 @@ def test_kickoff_emits_usage_metrics_per_model(monkeypatch, fresh_patch_module):
     recorder = {"track": [], "track_event": []}
     rt = _fake_runtime(recorder)
 
-    from nullrun.instrumentation.crewai import patch_crewai
     from crewai import Crew
+
+    from nullrun.instrumentation.crewai import patch_crewai
 
     assert patch_crewai(rt) is True
 
@@ -152,8 +156,9 @@ def test_kickoff_without_usage_metrics_no_emit(monkeypatch, fresh_patch_module):
     recorder = {"track": [], "track_event": []}
     rt = _fake_runtime(recorder)
 
-    from nullrun.instrumentation.crewai import patch_crewai
     from crewai import Crew
+
+    from nullrun.instrumentation.crewai import patch_crewai
 
     assert patch_crewai(rt) is True
 
@@ -171,8 +176,9 @@ def test_kickoff_non_dict_usage_metrics(monkeypatch, fresh_patch_module):
     recorder = {"track": [], "track_event": []}
     rt = _fake_runtime(recorder)
 
-    from nullrun.instrumentation.crewai import patch_crewai
     from crewai import Crew
+
+    from nullrun.instrumentation.crewai import patch_crewai
 
     assert patch_crewai(rt) is True
 
@@ -188,8 +194,9 @@ def test_kickoff_non_dict_metric_value_skipped(monkeypatch, fresh_patch_module):
     recorder = {"track": [], "track_event": []}
     rt = _fake_runtime(recorder)
 
-    from nullrun.instrumentation.crewai import patch_crewai
     from crewai import Crew
+
+    from nullrun.instrumentation.crewai import patch_crewai
 
     assert patch_crewai(rt) is True
 
@@ -209,8 +216,9 @@ def test_kickoff_step_callback_installed_when_missing(monkeypatch, fresh_patch_m
     recorder = {"track": [], "track_event": []}
     rt = _fake_runtime(recorder)
 
-    from nullrun.instrumentation.crewai import patch_crewai
     from crewai import Crew
+
+    from nullrun.instrumentation.crewai import patch_crewai
 
     assert patch_crewai(rt) is True
 
@@ -229,8 +237,9 @@ def test_kickoff_preserves_user_step_callback(monkeypatch, fresh_patch_module):
     _install_fake_crewai(monkeypatch)
     rt = _fake_runtime({})
 
-    from nullrun.instrumentation.crewai import patch_crewai
     from crewai import Crew
+
+    from nullrun.instrumentation.crewai import patch_crewai
 
     sentinel = MagicMock()
     assert patch_crewai(rt) is True
@@ -251,8 +260,9 @@ async def test_kickoff_async_emits_usage_metrics(monkeypatch, fresh_patch_module
     recorder = {"track": [], "track_event": []}
     rt = _fake_runtime(recorder)
 
-    from nullrun.instrumentation.crewai import patch_crewai
     from crewai import Crew
+
+    from nullrun.instrumentation.crewai import patch_crewai
 
     assert patch_crewai(rt) is True
 
@@ -276,8 +286,9 @@ def test_kickoff_track_failure_is_swallowed(monkeypatch, fresh_patch_module):
     rt.track.side_effect = RuntimeError("down")
     rt.track_event.side_effect = lambda **kw: None
 
-    from nullrun.instrumentation.crewai import patch_crewai
     from crewai import Crew
+
+    from nullrun.instrumentation.crewai import patch_crewai
 
     assert patch_crewai(rt) is True
     crew = Crew()
@@ -290,8 +301,9 @@ def test_kickoff_track_failure_is_swallowed(monkeypatch, fresh_patch_module):
 
 def test_unpatch_restores_original(monkeypatch, fresh_patch_module):
     _install_fake_crewai(monkeypatch)
-    from nullrun.instrumentation.crewai import patch_crewai, unpatch_crewai
     from crewai import Crew
+
+    from nullrun.instrumentation.crewai import patch_crewai, unpatch_crewai
 
     original_kickoff = Crew.kickoff
     assert patch_crewai(MagicMock()) is True

@@ -113,7 +113,11 @@ class TestNullRunRuntimeExecute:
         assert result["decision"] == "allow"
 
     def test_execute_blocked_raises(self, make_runtime, mock_api):
-        respx.post(f"{BASE_URL}/api/v1/gate").mock(
+        # Audit F-R2-01 (2026-06-22): runtime.execute → Transport.execute
+        # now hits /api/v1/execute (not /gate). Pre-fix this mocked
+        # /gate which silently swallowed the request (no scope check)
+        # and let an API key without `execute` scope drive the block.
+        respx.post(f"{BASE_URL}/api/v1/execute").mock(
             return_value=httpx.Response(200, json={
                 "decision": "block",
                 "explanation": "cost_limit_exceeded",

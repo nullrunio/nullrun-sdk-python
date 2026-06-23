@@ -28,7 +28,6 @@ from nullrun.breaker.exceptions import (
     WorkflowKilledInterrupt,
 )
 
-
 # ─── ActionHandler ──────────────────────────────────────────────────
 
 

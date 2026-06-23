@@ -109,7 +109,6 @@ class LoopTracker:
         while self._calls[tool_name] and self._calls[tool_name][0] < before:
             self._calls[tool_name].popleft()
 
-
 class RateTracker:
     """
     In-memory rate tracking using deque with timestamps.
@@ -160,14 +159,13 @@ class RateTracker:
         while self._calls and self._calls[0] < before:
             self._calls.popleft()
 
-
 @dataclass
 class LocalDecision:
     """Decision from local check (no network round-trip)."""
+
     allowed: bool
     reason: str = None
     suggestion: str = None
-
 
 logger = logging.getLogger(__name__)
 
@@ -178,7 +176,6 @@ logger = logging.getLogger(__name__)
 # collision hazard). Wire compat: still a string.
 UNKNOWN_WORKFLOW_ID: str = "__nullrun_unknown__"
 
-
 @dataclass
 class Policy:
     """
@@ -186,6 +183,7 @@ class Policy:
 
     Defines the safety limits for an agent workflow.
     """
+
     budget_cents: int
     rate_limit: int  # cents per minute
     loop_threshold: int = 6  # same tool calls in window
@@ -205,18 +203,57 @@ class Policy:
         )
 
     @classmethod
+    def strict_local(cls) -> "Policy":
+        """Tight fail-CLOSED fallback used when policy fetch fails
+        AND there is no last-known-good cached policy.
+
+        Per audit F-R2-02 (2026-06-22): the previous ``default_local``
+        fallback silently widened every limit (no rate limit, $10
+        budget, 6-loop threshold). On any backend blip, the SDK ran
+        with zero enforcement until the next successful fetch — a
+        classic fail-OPEN regression on an enforcement path.
+
+        ``strict_local`` is tight on every axis: 0 budget cap forces
+        every cost-bearing operation through the backend's
+        reservation service (fail-CLOSED there too), 1-call rate
+        limit caps sustained throughput, and loop/retry thresholds
+        of 1 fire on the first suspicious repetition. Callers that
+        genuinely need the legacy permissive fallback can opt in
+        via ``NULLRUN_POLICY_FAIL_OPEN=1`` — that env var is the
+        only place the SDK keeps the old behaviour.
+        """
+        return cls(
+            budget_cents=0,  # zero cap → backend reservation rejects
+            rate_limit=1,  # 1 call/min ceiling
+            loop_threshold=1,  # first repetition trips loop detector
+            retry_threshold=1,  # first retry trips retry detector
+        )
+
+    @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Policy":
-        """Create Policy from API response dict."""
+        """Create Policy from a backend ``PolicyResponse`` dict.
+
+        Backend fields (see backend/src/proxy/http/policies.rs::
+        ``PolicyResponse``) and the SDK's local ``Policy`` class
+        describe overlapping but non-identical facets of the same
+        domain. We map the intersection and fall back to defaults
+        where the backend doesn't surface the field — in particular
+        ``budget_cents`` and ``retry_detection_enabled`` are SDK-local
+        concepts with no counterpart on the wire today.
+        """
         return cls(
             budget_cents=data.get("budget_cents", 1000),
-            rate_limit=data.get("rate_limit", 100),
+            # Backend field is rate_limit_per_minute; SDK keeps the
+            # legacy "rate_limit" attribute name (cents per minute).
+            rate_limit=data.get("rate_limit_per_minute", data.get("rate_limit", 100)),
             loop_threshold=data.get("loop_threshold", 6),
             retry_threshold=data.get("retry_threshold", 5),
             anomaly_detection_enabled=data.get("anomaly_detection_enabled", True),
             loop_detection_enabled=data.get("loop_detection_enabled", True),
+            # No backend flag for this today — default keeps existing
+            # behaviour intact when the field is absent.
             retry_detection_enabled=data.get("retry_detection_enabled", True),
         )
-
 
 class NullRunRuntime:
     """
@@ -235,7 +272,12 @@ class NullRunRuntime:
 
         # Manual
         rt = NullRunRuntime.get_instance()
-        rt.track({"type": "llm_call", "tokens": 100, "cost_cents": 5})
+        # Note: `cost_cents` is NOT a valid event key — the SDK strips
+        # it before sending (see ``track_event`` / wire payload below).
+        # The backend computes cost from tokens + the org's pricing
+        # policy. Use ``tokens`` (or, for llm_call specifically,
+        # ``input_tokens`` / ``output_tokens``) to feed cost math.
+        rt.track({"type": "llm_call", "tokens": 100})
     """
 
     _instance: Optional["NullRunRuntime"] = None
@@ -316,6 +358,12 @@ class NullRunRuntime:
         self.polling = polling
 
         self._policy: Policy | None = policy
+        # Audit F-R2-02 (2026-06-22): cache the last good policy so a
+        # transient backend outage doesn't silently widen enforcement.
+        # _fetch_policy() writes here on every successful 200; the
+        # failure path reads from it before falling through to
+        # Policy.strict_local().
+        self._last_good_policy: Policy | None = policy
         # Sprint 3.2: prefer the typed ``on_transport_error`` parameter
         # over the legacy string ``fallback_mode`` parameter. The
         # legacy string (and its NULLRUN_FALLBACK_MODE env var) is
@@ -329,6 +377,7 @@ class NullRunRuntime:
             # break) but the user is told to migrate to
             # ``on_transport_error`` on ``Transport.execute()``.
             import warnings as _w
+
             _w.warn(
                 "NULLRUN_FALLBACK_MODE is deprecated. Pass "
                 "``on_transport_error=`` to ``Transport.execute()`` "
@@ -368,6 +417,7 @@ class NullRunRuntime:
         # The fingerprint is computed at the observation point and passed
         # via the `_fingerprint` event field.
         from nullrun.instrumentation.auto import make_dedup_state
+
         self._seen_track_fingerprints = make_dedup_state()
 
         # Per ADR-008 the SDK does not track local cost. The two response
@@ -531,13 +581,7 @@ class NullRunRuntime:
         # ``NullRunCallback._active_runs`` (now capped at 4096).
         self._COVERAGE_CAP: int = 4096
 
-
-
-        logger.info(
-            f"NullRun Runtime initialized: "
-            f"mode=cloud, "
-            f"policy={self._policy}"
-        )
+        logger.info(f"NullRun Runtime initialized: mode=cloud, policy={self._policy}")
 
     @classmethod
     def get_instance(cls) -> "NullRunRuntime":
@@ -644,7 +688,7 @@ class NullRunRuntime:
                 new_secret_key = data.get("secret_key")
 
                 if new_key_version is not None and new_secret_key is not None:
-                    old_version = getattr(self, '_key_version', None)
+                    old_version = getattr(self, "_key_version", None)
                     if old_version != new_key_version:
                         logger.info(
                             f"Secret key rotation: version {old_version} -> {new_key_version}"
@@ -669,29 +713,147 @@ class NullRunRuntime:
             ) from e
 
     def _fetch_policy(self) -> None:
-        """Fetch policy from backend and cache locally."""
+        """Fetch policy from backend and cache locally.
+
+        Backend route: GET /api/v1/orgs/{org_id}/policies (see
+        backend/src/proxy/http/routes.rs). Pre-FIX-F1 the SDK POSTed
+        to /api/v1/policies with organization_id in the body — the
+        backend route is GET + org-scoped URL, so the call 404'd and
+        fell through to ``Policy.default_local()`` (silent fail-open
+        on every policy fetch).
+
+        Response shape: ``{"data": [...], "meta": {...}}`` where each
+        entry is a ``PolicyResponse`` (backend/src/proxy/http/policies.rs).
+        The SDK ``Policy`` class and backend ``PolicyResponse`` describe
+        different facets of the same domain — we map the overlap
+        (rate_limit_per_minute, loop_threshold, retry_threshold, and the
+        detection-enabled flags) and fall back to defaults for fields
+        the backend doesn't surface.
+
+        ## Fail-CLOSED contract (audit F-R2-02, 2026-06-22)
+
+        Pre-fix: any HTTP exception, non-200 status, or empty
+        ``{"data": []}`` response silently fell through to
+        ``Policy.default_local()`` — which has ``budget_cents=1000``,
+        ``rate_limit=100``, ``loop_threshold=6``, no tool block — i.e.
+        effectively unenforced. A 503 from the backend would keep the
+        customer's SDK running with zero enforcement for the rest of
+        the session.
+
+        Post-fix: the SDK enforces fail-CLOSED on this gate, mirroring
+        the broader CLAUDE.md fail-CLOSED policy. On any failure path
+        the SDK uses, in priority order:
+
+        1. The last known-good cached policy (``self._last_good_policy``).
+           The customer's existing limits are preserved across a
+           transient outage — they pay the cost of any policy
+           tightening baked into the last fetch, but do not lose
+           enforcement.
+        2. ``Policy.strict_local()`` — tight cap (zero budget,
+           1-call rate limit, first-repetition loop detection) that
+           forces every cost-bearing call through the backend's
+           reservation service, which is itself fail-CLOSED.
+
+        Opt-out: ``NULLRUN_POLICY_FAIL_OPEN=1`` restores the
+        pre-fix permissive fallback. Mirrors the shape of
+        ``NULLRUN_SKIP_BUDGET_CHECK=1`` and
+        ``NULLRUN_SENSITIVE_FAIL_OPEN=1`` — a single env var to
+        re-enable the legacy behaviour for tests or staging.
+        """
+        fail_open = os.environ.get("NULLRUN_POLICY_FAIL_OPEN", "").strip() == "1"
+
         if not self.organization_id:
-            self._policy = Policy.default_local()
+            self._policy = (
+                Policy.default_local() if fail_open else Policy.strict_local()
+            )
+            logger.warning(
+                "No organization_id; policy fetch skipped. fail-OPEN=%s "
+                "(NULLRUN_POLICY_FAIL_OPEN=1 to restore permissive fallback).",
+                fail_open,
+            )
             return
 
         try:
             # Use Transport's client for connection pooling, retry, and circuit breaker
-            response = self._transport._client.post(
-                f"{self.api_url}/api/v1/policies",
-                json={"organization_id": self.organization_id},
+            response = self._transport._client.get(
+                f"{self.api_url}/api/v1/orgs/{self.organization_id}/policies",
+                headers=self._auth_headers(),
+                timeout=5.0,
             )
 
             if response.status_code == 200:
-                data = response.json()
-                if data and len(data) > 0:
-                    self._policy = Policy.from_dict(data[0])
+                payload = response.json()
+                # Backend wraps the list in {"data": [...], "meta": ...}.
+                # The pre-FIX-F1 code assumed a bare list and would
+                # crash on len(payload[...]) of a dict.
+                entries = payload.get("data", []) if isinstance(payload, dict) else payload
+                # Find the most relevant active policy: prefer the
+                # first is_active entry; if all are inactive, skip the
+                # whole list (inactive policies should not tighten
+                # enforcement).
+                active = next(
+                    (p for p in entries if isinstance(p, dict) and p.get("is_active", True)),
+                    None,
+                )
+                if active is not None:
+                    fetched = Policy.from_dict(active)
+                    self._policy = fetched
+                    # Audit F-R2-02: cache the last good policy so
+                    # transient outages don't silently widen limits.
+                    self._last_good_policy = fetched
                     logger.info(f"Policy fetched: {self._policy}")
                     return
+                # 200 OK but no active policy — same shape as the
+                # pre-fix behaviour, but post-fix we drop to the
+                # cached or strict fallback rather than the permissive
+                # default. Without an active policy the backend is
+                # not asserting any limits, so the SDK cannot safely
+                # assume the legacy $10/100-rpm defaults reflect
+                # current intent.
+                logger.warning(
+                    "Policy fetch returned no active policies for org=%s",
+                    self.organization_id,
+                )
+            else:
+                logger.warning(
+                    "Policy fetch returned status=%s for org=%s",
+                    response.status_code,
+                    self.organization_id,
+                )
         except Exception as e:
-            logger.warning(f"Failed to fetch policy: {e}")
+            logger.warning(
+                "Failed to fetch policy for org=%s: %s", self.organization_id, e
+            )
 
-        # Fallback to default
-        self._policy = Policy.default_local()
+        # Audit F-R2-02: fail-CLOSED. Order of precedence:
+        #   1. last known-good cached policy (if any)
+        #   2. strict_local() (zero budget, 1-call rate limit)
+        #   3. opt-out env var NULLRUN_POLICY_FAIL_OPEN=1 → default_local()
+        if getattr(self, "_last_good_policy", None) is not None:
+            self._policy = self._last_good_policy
+            logger.warning(
+                "Policy fetch failed; using last known-good policy (fail-CLOSED). "
+                "Set NULLRUN_POLICY_FAIL_OPEN=1 to fall back to permissive defaults."
+            )
+            return
+
+        if fail_open:
+            self._policy = Policy.default_local()
+            logger.warning(
+                "No cached policy and NULLRUN_POLICY_FAIL_OPEN=1; "
+                "using permissive default policy (audit F-R2-02 fail-OPEN opt-in)."
+            )
+            return
+
+        self._policy = Policy.strict_local()
+        logger.warning(
+            "No cached policy available; activating Policy.strict_local() "
+            "(zero budget, 1-call rate limit). Backend unreachable — "
+            "every cost-bearing call will be rejected by the reservation "
+            "service until the next successful policy fetch. "
+            "Set NULLRUN_POLICY_FAIL_OPEN=1 to restore the legacy "
+            "permissive fallback for tests / staging."
+        )
 
     def _start_transport(self) -> None:
         """Start the transport layer with background flush.
@@ -719,9 +881,7 @@ class NullRunRuntime:
         """Legacy: poll the server every second for state changes."""
         self._poll_running = True
         self._poll_thread = threading.Thread(
-            target=self._poll_commands,
-            daemon=True,
-            name="nullrun-poller"
+            target=self._poll_commands, daemon=True, name="nullrun-poller"
         )
         self._poll_thread.start()
         logger.info("Started remote state poller (HTTP)")
@@ -749,9 +909,7 @@ class NullRunRuntime:
             name="nullrun-ws",
         )
         self._ws_thread.start()
-        logger.info(
-            "Started WS control plane listener (org=%s)", self.organization_id
-        )
+        logger.info("Started WS control plane listener (org=%s)", self.organization_id)
 
     def _ws_run(self) -> None:
         """Background thread entry point: run the WS connect/receive loop.
@@ -797,12 +955,15 @@ class NullRunRuntime:
                 if not workflow_id:
                     logger.debug("WS state message missing workflow_id: %s", state)
                     return
-                self._set_remote_state(workflow_id, {
-                    "state": state.get("state", "Normal"),
-                    "version": state.get("version", 0),
-                    "reason": state.get("reason"),
-                    "updated_at": state.get("updated_at", 0),
-                })
+                self._set_remote_state(
+                    workflow_id,
+                    {
+                        "state": state.get("state", "Normal"),
+                        "version": state.get("version", 0),
+                        "reason": state.get("reason"),
+                        "updated_at": state.get("updated_at", 0),
+                    },
+                )
                 logger.debug(
                     "WS state push: workflow=%s state=%s reason=%s",
                     workflow_id,
@@ -901,27 +1062,50 @@ class NullRunRuntime:
             self._remote_states[workflow_id] = dict(state)
 
     def _fetch_remote_state(self, workflow_id: str) -> None:
-        """Fetch remote state for a specific workflow from /status endpoint.
+        """Fetch remote state for a specific workflow via the org-scoped
+        workflow endpoint.
 
-        Phase 5 #5.5: route through ``self._transport._client`` so the
-        shared connection pool, retry policy, and circuit breaker
-        apply. The previous raw ``httpx.get`` call created a fresh
-        connection every time and bypassed the CB.
+        Pre-FIX-F2 the SDK hit ``/api/v1/status/{workflow_id}``, which
+        is not a registered route on the backend (the backend exposes
+        per-workflow state via
+        ``GET /api/v1/orgs/{org_id}/workflows/{workflow_id}``). The
+        pre-fix code therefore 404'd every poll and silently fell back
+        to local state — meaning the legacy HTTP-poll path could never
+        observe a remote kill/pause. WS push (the default mode since
+        Phase 5) does NOT go through this code path, so the WS control
+        plane is unaffected.
+
+        Backend ``WorkflowResponse`` (see
+        backend/src/proxy/http/workflows.rs:43) does not surface a
+        numeric ``version`` or ``reason`` for a workflow — those
+        fields are SDK-local only and remain at their cached values
+        when the remote response arrives. ``state`` is the only field
+        the kill/pause check (``check_control_plane``) actually reads,
+        so this is sufficient for correctness.
         """
+        if not self.organization_id:
+            # Legacy HTTP-poll was always org-bound; without org_id we
+            # cannot resolve the right route. Bail silently — the WS
+            # push path remains the authoritative source.
+            return
         try:
             response = self._transport._client.get(
-                f"{self.api_url}/api/v1/status/{workflow_id}",
+                f"{self.api_url}/api/v1/orgs/{self.organization_id}/workflows/{workflow_id}",
                 headers=self._auth_headers(),
                 timeout=5.0,
             )
             if response.status_code == 200:
                 data = response.json()
-                self._set_remote_state(workflow_id, {
-                    "state": data.get("state", "Normal"),
-                    "version": data.get("version", 0),
-                    "reason": data.get("reason"),
-                    "updated_at": data.get("updated_at", 0),
-                })
+                # Merge with existing cached state so version / reason /
+                # updated_at (SDK-local fields not on the wire) survive.
+                cached = self._remote_state_for(workflow_id)
+                self._set_remote_state(
+                    workflow_id,
+                    {
+                        **cached,
+                        "state": data.get("state", cached.get("state", "Normal")),
+                    },
+                )
                 logger.debug(
                     "Remote state for %s: %s",
                     workflow_id,
@@ -1049,9 +1233,7 @@ class NullRunRuntime:
         try:
             response = self._transport.check(check_req)
         except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                f"check_workflow_budget: /gate unavailable, failing open: {exc}"
-            )
+            logger.warning(f"check_workflow_budget: /gate unavailable, failing open: {exc}")
             return
 
         decision = response.get("decision", "allow")
@@ -1185,6 +1367,7 @@ class NullRunRuntime:
         fp = event.get("_fingerprint")
         if fp:
             from nullrun.instrumentation.auto import _fingerprint_is_seen
+
             if _fingerprint_is_seen(self._seen_track_fingerprints, fp):
                 logger.debug("track() dedup hit for fingerprint=%s", fp)
                 return {
@@ -1209,7 +1392,7 @@ class NullRunRuntime:
             }
 
         # Local check passed - record the call BEFORE sending to backend
-        tool_name = event.get('tool_name', 'unknown')
+        tool_name = event.get("tool_name", "unknown")
         self._loop_tracker.record(tool_name)
         self._rate_tracker.record()
 
@@ -1224,10 +1407,22 @@ class NullRunRuntime:
         # Register workflow for remote state polling. workflow_id
         # may be None on legacy keys -- that's fine, the no-op
         # branch in check_control_plane will skip polling.
+        #
+        # Audit F-R2-12 (2026-06-22): route through ``_remote_state_for``
+        # which takes ``_states_lock`` for the entire setdefault. The
+        # pre-fix code did `with self._states_lock: setdefault(...)`
+        # in a single lock entry but never held the lock across the
+        # subsequent state read — so a concurrent ``_set_remote_state``
+        # from a WS push could win the race and leave the entry as a
+        # freshly-empty dict again on the next track_event call (a
+        # remote PAUSE / KILL would silently lose its state between
+        # the WS push and the next event). Using the locked helper
+        # here keeps setdefault atomic against WS pushes, and we
+        # don't read the returned dict anywhere — we only need the
+        # side-effect of registering the workflow_id.
         workflow_id = enriched.get("workflow_id")
         if workflow_id:
-            with self._states_lock:
-                self._remote_states.setdefault(workflow_id, {})
+            self._remote_state_for(workflow_id)
 
         # Phase 0.3.1: the local cost / loop / retry-storm check
         # (``_check_local_limits``) has been removed. It read
@@ -1254,10 +1449,7 @@ class NullRunRuntime:
         # sink-only ``_fingerprint`` field is also stripped before
         # the wire send so the dedup key shape is not leaked to
         # anyone with audit-log access.
-        wire_event = {
-            k: v for k, v in enriched.items()
-            if k not in ("cost_cents", "_fingerprint")
-        }
+        wire_event = {k: v for k, v in enriched.items() if k not in ("cost_cents", "_fingerprint")}
         self._transport.track(wire_event)
 
         # Update metrics (thread-safe)
@@ -1320,10 +1512,9 @@ class NullRunRuntime:
         """
         needle = tool_name.lower()
         with self._tools_lock:
-            return (
-                needle in {t.lower() for t in self._sensitive_tools}
-                or needle in {t.lower() for t in self._strict_mode_tools}
-            )
+            return needle in {t.lower() for t in self._sensitive_tools} or needle in {
+                t.lower() for t in self._strict_mode_tools
+            }
 
     def coverage_report(self) -> dict[str, dict[str, int]]:
         """
@@ -1373,11 +1564,14 @@ class NullRunRuntime:
         if seen_total == 0:
             # Nothing to report — avoid empty rows.
             return None
-        return self.track_event("coverage_report", **{
-            "seen": stats["seen"],
-            "tracked": stats["tracked"],
-            "streaming_skipped": stats["streaming_skipped"],
-        })
+        return self.track_event(
+            "coverage_report",
+            **{
+                "seen": stats["seen"],
+                "tracked": stats["tracked"],
+                "streaming_skipped": stats["streaming_skipped"],
+            },
+        )
 
     _COVERAGE_REPORT_INTERVAL_SECONDS = 60.0
 
@@ -1423,9 +1617,8 @@ class NullRunRuntime:
         while not getattr(self, "_coverage_reporter_stop", False):
             # Sleep in short slices so shutdown is responsive.
             slept = 0.0
-            while (
-                slept < self._COVERAGE_REPORT_INTERVAL_SECONDS
-                and not getattr(self, "_coverage_reporter_stop", False)
+            while slept < self._COVERAGE_REPORT_INTERVAL_SECONDS and not getattr(
+                self, "_coverage_reporter_stop", False
             ):
                 time.sleep(min(0.5, self._COVERAGE_REPORT_INTERVAL_SECONDS - slept))
                 slept += 0.5
@@ -1686,8 +1879,7 @@ class NullRunRuntime:
         # version to avoid breaking callers that imported it. It
         # will be deleted in the next release.
         logger.debug(
-            "runtime.start_recording() is a no-op; "
-            "decision history moved to the backend dashboard."
+            "runtime.start_recording() is a no-op; decision history moved to the backend dashboard."
         )
         return ""
 
@@ -1761,7 +1953,7 @@ class NullRunRuntime:
         Returns:
             LocalDecision with allowed/blocked status
         """
-        tool_name = event.get('tool_name', 'unknown')
+        tool_name = event.get("tool_name", "unknown")
 
         # Check loop count (6 same tool calls in 60s window)
         loop_count = self._loop_tracker.count(tool_name, window=60)
@@ -1771,18 +1963,12 @@ class NullRunRuntime:
             # of an agent stuck in a retry loop).
             metrics.inc_runtime("loop_detections")
             return LocalDecision(
-                allowed=False,
-                reason="loop_detected",
-                suggestion="retry after 60s"
+                allowed=False, reason="loop_detected", suggestion="retry after 60s"
             )
 
         # Check rate limit (max 1000/min default)
         if self._rate_tracker.exceeds_limit(self._local_rate_limit):
-            return LocalDecision(
-                allowed=False,
-                reason="rate_limit",
-                suggestion="slow down"
-            )
+            return LocalDecision(allowed=False, reason="rate_limit", suggestion="slow down")
 
         return LocalDecision(allowed=True)
 
@@ -1930,13 +2116,12 @@ class NullRunRuntime:
             from nullrun.instrumentation.auto import (
                 _fingerprint_for_event_dict,
             )
+
             event["_fingerprint"] = _fingerprint_for_event_dict(event)
         return self.track(event)
 
-
 # Module-level convenience functions
 _runtime: NullRunRuntime | None = None
-
 
 def get_runtime() -> NullRunRuntime:
     """Get or create the global runtime instance."""
@@ -1945,7 +2130,6 @@ def get_runtime() -> NullRunRuntime:
         _runtime = NullRunRuntime.get_instance()
     return _runtime
 
-
 def track(event: dict[str, Any]) -> dict[str, Any]:
     """
     Module-level track function.
@@ -1953,16 +2137,17 @@ def track(event: dict[str, Any]) -> dict[str, Any]:
     Usage:
         from nullrun import track
 
-        track({"type": "llm_call", "tokens": 100, "cost_cents": 5})
+        # Note: `cost_cents` is NOT a valid event key — the SDK strips
+        # it before sending. Use `tokens` (or input_tokens/output_tokens
+        # for track_llm).
+        track({"type": "llm_call", "tokens": 100})
     """
     return get_runtime().track(event)
-
 
 # Phase 3.4: explicit alias for `track()` -- same call signature, friendlier
 # name for users who reach for `track_event` first. Both names share the
 # same callable object, so `nullrun.track is nullrun.track_event` is True.
 track_event = track
-
 
 def track_llm(
     input_tokens: int,
@@ -1984,7 +2169,6 @@ def track_llm(
             latency_ms, metadata).
     """
     return get_runtime().track_llm(input_tokens, output_tokens, **kwargs)
-
 
 def track_tool(
     tool_name: str,

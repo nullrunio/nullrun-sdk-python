@@ -7,6 +7,133 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [0.6.0] — 2026-06-23
+
+Hardening pass driven by the 2026-06-22 SDK↔backend integration audit.
+Closes three classes of silent fail-OPEN regressions that the previous
+release shipped: SDK POSTs being rejected by the backend's CSRF
+middleware, WS HMAC identity field drift, and policy-fetch silently
+falling through to a permissive default on any backend blip. Coverage
+jumped from ~76% to **84.59%** (branch = true).
+
+### Security (P0 — must-fix)
+
+- **FIX-F3 — every signed POST now carries `Authorization: Bearer <api_key>`.**
+  The backend's CSRF middleware (`backend/src/auth/csrf.rs::has_bearer_auth`)
+  bypasses the cookie-double-submit check whenever any non-empty
+  `Authorization` header is present. Pre-fix the SDK only sent
+  `X-API-Key`, so every POST hit the "state-changing request without
+  session cookie" branch and got 403 — which the SDK's `try/except`
+  around `/gate`, `/track`, `/check`, and `/execute` silently
+  swallowed. The net effect was that **every SDK-side enforcement
+  gate was effectively fail-OPEN on production traffic**. The fix
+  uses the user-facing `api_key` as the Bearer value so the bypass
+  header is meaningful for debugging; the canonical auth path is
+  still `X-API-Key` (+ HMAC when configured). Safe per
+  `csrf.rs:80-95` (browsers never auto-attach `Authorization` to
+  cross-site requests, so this is not a CSRF regression).
+
+- **FIX-F4 — WebSocket HMAC identity field pinned to `api_key`.**
+  Added `WS_HMAC_IDENTITY_FIELD = "api_key"` constant in
+  `transport_websocket.py` matching the backend's
+  `SignedWsMessage` struct (`backend/src/proxy/http/ws_control.rs:43`).
+  The SDK now reads `data["api_key"]` (with `data["api_key_id"]` as
+  a backwards-compat fallback for pre-FIX-F4 servers) to verify the
+  HMAC signature. Pre-fix a future server-side rename would silently
+  break WS signature verification with no compile-time signal.
+
+### Security (P0 — fail-CLOSED contract)
+
+- **Policy fetch is now fail-CLOSED (F-R2-02).** Pre-fix, any HTTP
+  exception, non-200 status, or empty `{"data": []}` response silently
+  fell through to `Policy.default_local()` — which had
+  `budget_cents=1000`, `rate_limit=100`, `loop_threshold=6`, no tool
+  block, i.e. effectively unenforced. A 503 from the backend would
+  keep the customer's SDK running with zero enforcement for the rest
+  of the session. Post-fix the SDK resolves the policy on this gate in
+  priority order: (1) the last known-good cached policy
+  (`self._last_good_policy` — written by every successful
+  `_fetch_policy`), (2) `Policy.strict_local()` (zero budget cap
+  forces the backend reservation service, which is itself
+  fail-CLOSED), (3) opt-out via `NULLRUN_POLICY_FAIL_OPEN=1` to
+  restore the legacy permissive fallback for tests/staging.
+  Mirrors the shape of `NULLRUN_SKIP_BUDGET_CHECK=1` and
+  `NULLRUN_SENSITIVE_FAIL_OPEN=1`.
+
+- **`Policy.strict_local()` new classmethod.** Tight fail-CLOSED
+  fallback: `budget_cents=0`, `rate_limit=1`, `loop_threshold=1`,
+  `retry_threshold=1`. The zero budget cap forces every cost-bearing
+  operation through the backend's reservation service. The 1-call
+  rate limit caps sustained throughput. The threshold-of-1 loop and
+  retry detectors fire on the first suspicious repetition.
+
+### Fixed
+
+- **`Policy.from_dict` now reads `rate_limit_per_minute`** (the
+  backend field name from `PolicyResponse` in
+  `backend/src/proxy/http/policies.rs`). Falls back to legacy
+  `rate_limit` for backwards compat. SDK keeps the local attribute
+  name `rate_limit` (cents per minute) — only the wire-mapping
+  changes.
+
+- **`_is_acknowledged_state` case-insensitive fallback for WS.**
+  New helper on `WebSocketConnection` checks PascalCase first (the
+  happy path per `handlers.rs:9258` `as_pascal_case()` normaliser),
+  then falls back to lowercase for defensive coverage against server
+  regressions to `"killed"`/`"paused"`.
+
+- **Backend policy fetch uses the correct route.** Pre-fix the SDK
+  POSTed to `/api/v1/policies` with `organization_id` in the body —
+  the backend route is `GET /api/v1/orgs/{org_id}/policies`, so the
+  call 404'd and silently fell through to `Policy.default_local()`
+  (silent fail-OPEN on every policy fetch).
+
+- **`README.md` PyPI badge switched from `dm` to `dt`.** The daily
+  mirror (`dm`) was inflating the displayed download count from
+  mirror syncs; the total (`dt`) shows the canonical PyPI total.
+
+### Tests
+
+- **`tests/test_integration_contract.py`** (new, 675 lines, 12 test
+  classes). Pins the SDK↔backend wire-format contracts surfaced by
+  the 2026-06-22 audit: `Authorization` header on every signed POST
+  (FIX-F3), `/api/v1/orgs/{org_id}/policies` and
+  `/api/v1/orgs/{org_id}/workflows/{wf}` URL shapes, ACK unit
+  discrimination, WS HMAC identity field (FIX-F4), backend
+  `PolicyResponse` → SDK `Policy` field mapping, canonical-bytes
+  guard against silent re-serialisation drift, sensitive-tool
+  routing through `/execute`, fail-CLOSED policy fetch under
+  exceptions / 5xx / empty data, outgoing WS ACK is plain JSON (not
+  signed — corrects the 0.5.2 overclaim), all five workflow states
+  (`running` / `paused` / `killed` / `completed` / `failed`)
+  accepted, atomic remote-state registration across concurrent
+  reconnects. Each test is paired with a specific backend file —
+  update both sides in lock-step, do not edit one side alone.
+
+- **`tests/test_high_reliability_fixes.py`** — re-aligned with the
+  fail-CLOSED contract after the master merge; pins the
+  last-known-good policy cache priority.
+
+- **`tests/test_hmac_byte_equality.py`** — pinned the
+  `content=` vs `json=` body-byte equality that the legacy batch
+  path silently broke.
+
+- **`tests/test_ws_signed_payload.py`** — expanded to cover the
+  `api_key` / `api_key_id` dual-field WS HMAC identity contract.
+
+- **`tests/test_preflight_fail_policy.py`** — updated to cover
+  `NULLRUN_POLICY_FAIL_OPEN=1` opt-out alongside the default
+  fail-CLOSED path.
+
+- **Coverage:** 84.59% (branch = true, `fail_under = 82`). Per-file
+  leaders: `transport.py` 85.01%, `transport_websocket.py` 65.64%,
+  `runtime.py` 83.71%, `instrumentation/auto.py` 70.17% (LLM-vendor
+  patches — most remain opt-in), `instrumentation/langgraph.py`
+  93.69%, `instrumentation/crewai.py` 90.82%,
+  `instrumentation/autogen.py` 93.41%.
+
+---
+
 ## [0.3.1] — 2026-06-17
 
 Production-readiness hardening. No public-API changes; the curated 6-symbol
@@ -143,17 +270,39 @@ exactly once.
 
 ### Added (production-readiness hardening)
 
-- **HMAC always-on when `secret_key` is present.** The SDK now signs every
-  outgoing POST/GET (auth/verify, /track/batch, /gate, /evaluate, /status)
-  via the new `Transport._signed_post` / `_signed_request` helpers. The
-  outgoing WebSocket ACK is also signed (mirroring incoming-message
-  verification). Header set is built once via `_build_signed_headers`
-  (Content-Type, X-API-Version, X-API-Key, X-Signature,
-  X-Signature-Timestamp, W3C trace context). Previously only
-  /track/batch and /gate were signed; auth/verify, /status GET, and
-  WS ACKs were not. Compliant with the canonical
-  `HMAC-SHA256(secret_key, "<ts>:<api_key>:<sha256_hex(body)>")` formula
-  from `backend/src/auth/hmac.rs:6-9`.
+- **HMAC signing expanded (with documented exceptions, audit 2026-06-22
+  round 2 — F-R2-05 / F-R2-14).** The SDK now signs every
+  outgoing POST/GET that the backend's `HMAC_REQUIRED_PATHS` allowlist
+  requires: `/track/batch`, `/gate`, `/check`, `/execute`. The
+  header set is built via `_add_hmac_headers` (Content-Type,
+  X-Signature, X-Signature-Timestamp, X-API-Key, Authorization for
+  CSRF bypass). Compliance with the canonical
+  `HMAC-SHA256(secret_key, "<ts>:<api_key>:<sha256_hex(body)>")`
+  formula from `backend/src/auth/hmac.rs:6-9`.
+
+  **Explicitly NOT signed (chicken-and-egg / backend allowlist):**
+  - `runtime._authenticate` → `POST /api/v1/auth/verify` on initial
+    bootstrap: no `secret_key` exists yet (it is what /auth/verify
+    hands back). The key-rotation refetch
+    (`Transport._refetch_credentials` at transport.py:1588) IS
+    signed because `secret_key` is then populated.
+  - `runtime._fetch_policy` → `GET /api/v1/orgs/{id}/policies`.
+    Not in `HMAC_REQUIRED_PATHS` (`backend/src/proxy/middleware/
+    hmac_verify.rs:58`). Backend allowlist is authoritative.
+  - `runtime._fetch_remote_state` → `GET /api/v1/orgs/{id}/workflows/
+    {wf}`. Not in `HMAC_REQUIRED_PATHS`.
+  - `runtime.get_org_status` → `GET /api/v1/orgs/{id}/status`. Not in
+    `HMAC_REQUIRED_PATHS`.
+
+  **Outgoing WebSocket ACK is plain JSON, not signed.** Earlier
+  documentation overstated this — `transport_websocket._send_ack`
+  sends `{"type": "ack", "message_id", "received_at"}` as plain
+  JSON without an HMAC signature. The backend does not currently
+  verify ACK authenticity (`ws_control.rs:842-848` is a TODO).
+  If that ever changes, the SDK will sign the ACK using the
+  same `WS_HMAC_IDENTITY_FIELD` + `secret_key` path as incoming
+  messages — until then, treat CHANGELOG claims of "signed ACKs"
+  as inaccurate.
 
 - **WebSocket protocol compliance (Phase 2 of the plan).** The SDK now
   honours `resync_required` (closes the connection, clears local state,

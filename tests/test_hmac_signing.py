@@ -30,7 +30,6 @@ from nullrun.transport import (
 # Test fixture
 # ──────────────────────────────────────────────────────────────────────
 
-
 @pytest.fixture
 def transport_factory():
     """Factory that returns Transport with custom api_key/secret_key."""
@@ -46,11 +45,9 @@ def transport_factory():
 
     return _make
 
-
 # ──────────────────────────────────────────────────────────────────────
 # Pure-HMAC tests (no network)
 # ──────────────────────────────────────────────────────────────────────
-
 
 class TestGenerateHmacSignature:
     """The canonical signature formula matches the Rust backend."""
@@ -81,7 +78,6 @@ class TestGenerateHmacSignature:
         sig2 = generate_hmac_signature(api_key, secret, ts, body)
         assert sig1 == sig2
         assert len(sig1) == 64  # SHA-256 hex
-
 
 class TestVerifyHmacSignature:
     """The verify function accepts canonical signatures and rejects tampered ones."""
@@ -141,11 +137,9 @@ class TestVerifyHmacSignature:
             "subtle::ConstantTimeEq check)."
         )
 
-
 # ──────────────────────────────────────────────────────────────────────
 # Header construction (Transport._build_signed_headers)
 # ──────────────────────────────────────────────────────────────────────
-
 
 class TestBuildSignedHeaders:
     """_build_signed_headers applies the canonical header set."""
@@ -227,11 +221,9 @@ class TestBuildSignedHeaders:
         assert "X-API-Key" in headers
         assert "X-API-Version" in headers
 
-
 # ──────────────────────────────────────────────────────────────────────
 # Wire-level tests — every gateway endpoint goes through the signed path
 # ──────────────────────────────────────────────────────────────────────
-
 
 class TestSignedPostWirePath:
     """All four HTTP endpoints use the canonical signed header set."""

@@ -80,8 +80,9 @@ def test_patch_requests_returns_false_when_missing(monkeypatch, fresh_patch_modu
 def test_patch_requests_idempotent(monkeypatch, fresh_patch_module):
     """Calling patch_requests twice does not double-wrap Session.send."""
     _install_fake_requests(monkeypatch)
-    from nullrun.instrumentation.auto_requests import patch_requests
     from requests import Session
+
+    from nullrun.instrumentation.auto_requests import patch_requests
 
     assert patch_requests(MagicMock()) is True
     wrapped = Session.send
@@ -91,8 +92,9 @@ def test_patch_requests_idempotent(monkeypatch, fresh_patch_module):
 
 def test_patch_requests_skips_when_class_marker_present(monkeypatch, fresh_patch_module):
     _install_fake_requests(monkeypatch)
-    from nullrun.instrumentation.auto_requests import patch_requests
     from requests import Session
+
+    from nullrun.instrumentation.auto_requests import patch_requests
 
     Session._nullrun_patched = True
     try:
@@ -112,8 +114,9 @@ def test_session_send_emits_llm_call_for_openai(monkeypatch, fresh_patch_module)
     recorder = {"track": [], "track_event": []}
     rt = _fake_runtime(recorder)
 
-    from nullrun.instrumentation.auto_requests import patch_requests
     from requests import Session
+
+    from nullrun.instrumentation.auto_requests import patch_requests
 
     assert patch_requests(rt) is True
 
@@ -138,8 +141,9 @@ def test_session_send_marks_request_as_tracked(monkeypatch, fresh_patch_module):
     _install_fake_requests(monkeypatch)
     rt = _fake_runtime({})
 
-    from nullrun.instrumentation.auto_requests import patch_requests
     from requests import Session
+
+    from nullrun.instrumentation.auto_requests import patch_requests
 
     assert patch_requests(rt) is True
     req = SimpleNamespace(url="https://api.openai.com/v1/chat/completions", headers={})
@@ -153,8 +157,9 @@ def test_session_send_unknown_host_no_track(monkeypatch, fresh_patch_module):
     recorder = {"track": [], "track_event": []}
     rt = _fake_runtime(recorder)
 
-    from nullrun.instrumentation.auto_requests import patch_requests
     from requests import Session
+
+    from nullrun.instrumentation.auto_requests import patch_requests
 
     assert patch_requests(rt) is True
     req = SimpleNamespace(url="https://example.com/api", headers={})
@@ -170,8 +175,9 @@ def test_session_send_already_tracked_returns_unchanged(monkeypatch, fresh_patch
     recorder = {"track": [], "track_event": []}
     rt = _fake_runtime(recorder)
 
-    from nullrun.instrumentation.auto_requests import patch_requests
     from requests import Session
+
+    from nullrun.instrumentation.auto_requests import patch_requests
 
     assert patch_requests(rt) is True
     req = SimpleNamespace(url="https://api.openai.com/v1/chat/completions", headers={}, _nullrun_tracked=True)
@@ -191,8 +197,9 @@ def test_session_send_streaming_skips_track(monkeypatch, fresh_patch_module):
     rt._coverage_streaming_skipped = {}
     rt._bump_coverage_counter = MagicMock()
 
-    from nullrun.instrumentation.auto_requests import patch_requests
     from requests import Session
+
+    from nullrun.instrumentation.auto_requests import patch_requests
 
     assert patch_requests(rt) is True
     req = SimpleNamespace(url="https://api.openai.com/v1/chat/completions", headers={})
@@ -209,8 +216,9 @@ def test_session_send_accept_event_stream_header_skips_track(monkeypatch, fresh_
     recorder = {"track": [], "track_event": []}
     rt = _fake_runtime(recorder)
 
-    from nullrun.instrumentation.auto_requests import patch_requests
     from requests import Session
+
+    from nullrun.instrumentation.auto_requests import patch_requests
 
     assert patch_requests(rt) is True
     req = SimpleNamespace(url="https://api.openai.com/v1/chat/completions", headers={"Accept": "text/event-stream"})
@@ -224,8 +232,9 @@ def test_session_send_no_extractor_for_host_returns_response(monkeypatch, fresh_
     recorder = {"track": [], "track_event": []}
     rt = _fake_runtime(recorder)
 
-    from nullrun.instrumentation.auto_requests import patch_requests
     from requests import Session
+
+    from nullrun.instrumentation.auto_requests import patch_requests
 
     assert patch_requests(rt) is True
     req = SimpleNamespace(url="https://unknown.host.example/api", headers={})
@@ -241,8 +250,9 @@ def test_session_send_status_400_no_track(monkeypatch, fresh_patch_module):
     recorder = {"track": [], "track_event": []}
     rt = _fake_runtime(recorder)
 
-    from nullrun.instrumentation.auto_requests import patch_requests
     from requests import Session
+
+    from nullrun.instrumentation.auto_requests import patch_requests
 
     assert patch_requests(rt) is True
     req = SimpleNamespace(url="https://api.openai.com/v1/chat/completions", headers={})
@@ -276,8 +286,9 @@ def test_session_send_empty_body_no_track(monkeypatch, fresh_patch_module):
     recorder = {"track": [], "track_event": []}
     rt = _fake_runtime(recorder)
 
-    from nullrun.instrumentation.auto_requests import patch_requests
     from requests import Session
+
+    from nullrun.instrumentation.auto_requests import patch_requests
 
     assert patch_requests(rt) is True
     req = SimpleNamespace(url="https://api.openai.com/v1/chat/completions", headers={})
@@ -292,8 +303,9 @@ def test_session_send_track_failure_is_swallowed(monkeypatch, fresh_patch_module
     rt.track.side_effect = RuntimeError("down")
     rt.track_event.side_effect = lambda **kw: None
 
-    from nullrun.instrumentation.auto_requests import patch_requests
     from requests import Session
+
+    from nullrun.instrumentation.auto_requests import patch_requests
 
     assert patch_requests(rt) is True
     req = SimpleNamespace(url="https://api.openai.com/v1/chat/completions", headers={})
@@ -314,8 +326,9 @@ def test_session_send_seen_counter_bumped(monkeypatch, fresh_patch_module):
     rt._coverage_seen = {}
     rt._bump_coverage_counter = MagicMock()
 
-    from nullrun.instrumentation.auto_requests import patch_requests
     from requests import Session
+
+    from nullrun.instrumentation.auto_requests import patch_requests
 
     assert patch_requests(rt) is True
     req = SimpleNamespace(url="https://example.com/api", headers={})
@@ -329,8 +342,9 @@ def test_session_send_seen_counter_bumped(monkeypatch, fresh_patch_module):
 
 def test_reset_for_tests_restores_session(monkeypatch, fresh_patch_module):
     _install_fake_requests(monkeypatch)
-    from nullrun.instrumentation.auto_requests import patch_requests, reset_for_tests
     from requests import Session
+
+    from nullrun.instrumentation.auto_requests import patch_requests, reset_for_tests
 
     original_send = Session.send
     assert patch_requests(MagicMock()) is True
