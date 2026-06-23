@@ -144,8 +144,9 @@ def test_patch_autogen_without_ext_module(monkeypatch, fresh_patch_module):
 def test_patch_autogen_idempotent(monkeypatch, fresh_patch_module):
     """Calling ``patch_autogen`` twice does not double-wrap."""
     _install_fake_autogen(monkeypatch)
-    from nullrun.instrumentation.autogen import patch_autogen
     from autogen_agentchat.agents import BaseChatAgent
+
+    from nullrun.instrumentation.autogen import patch_autogen
 
     first_orig = BaseChatAgent.on_messages
     assert patch_autogen(MagicMock()) is True
@@ -160,8 +161,9 @@ def test_patch_autogen_skips_when_class_already_patched(monkeypatch, fresh_patch
     process installed it), the patch returns True without rewriting.
     """
     _install_fake_autogen(monkeypatch)
-    from nullrun.instrumentation.autogen import patch_autogen
     from autogen_agentchat.agents import BaseChatAgent
+
+    from nullrun.instrumentation.autogen import patch_autogen
 
     BaseChatAgent._nullrun_patched = True
     try:
@@ -181,8 +183,9 @@ def test_on_messages_success_emits_span_start_and_end(monkeypatch, fresh_patch_m
     recorder = {"track_event": [], "track": []}
     rt = _fake_runtime(recorder)
 
-    from nullrun.instrumentation.autogen import patch_autogen
     from autogen_agentchat.agents import BaseChatAgent
+
+    from nullrun.instrumentation.autogen import patch_autogen
 
     assert patch_autogen(rt) is True
     result = BaseChatAgent.on_messages(None, ["hello"])
@@ -231,8 +234,9 @@ def test_on_messages_track_event_failure_is_swallowed(monkeypatch, fresh_patch_m
 
     rt = MagicMock()
     rt.track_event.side_effect = [RuntimeError("down"), None]
-    from nullrun.instrumentation.autogen import patch_autogen
     from autogen_agentchat.agents import BaseChatAgent
+
+    from nullrun.instrumentation.autogen import patch_autogen
 
     assert patch_autogen(rt) is True
     # Should NOT raise even though track_event errored.
@@ -251,8 +255,9 @@ def test_openai_create_with_usage_emits_llm_call(monkeypatch, fresh_patch_module
     recorder = {"track_event": [], "track": []}
     rt = _fake_runtime(recorder)
 
-    from nullrun.instrumentation.autogen import patch_autogen
     from autogen_ext.models.openai import OpenAIChatCompletionClient
+
+    from nullrun.instrumentation.autogen import patch_autogen
 
     assert patch_autogen(rt) is True
 
@@ -303,8 +308,9 @@ def test_openai_create_track_failure_is_swallowed(monkeypatch, fresh_patch_modul
     rt.track.side_effect = RuntimeError("down")
     rt.track_event.side_effect = lambda **kw: None
 
-    from nullrun.instrumentation.autogen import patch_autogen
     from autogen_ext.models.openai import OpenAIChatCompletionClient
+
+    from nullrun.instrumentation.autogen import patch_autogen
 
     assert patch_autogen(rt) is True
     result = OpenAIChatCompletionClient.create(None)
@@ -320,9 +326,10 @@ def test_unpatch_restores_original(monkeypatch, fresh_patch_module):
     idempotency markers are cleared.
     """
     _install_fake_autogen(monkeypatch, with_ext=True)
-    from nullrun.instrumentation.autogen import patch_autogen, unpatch_autogen
     from autogen_agentchat.agents import BaseChatAgent
     from autogen_ext.models.openai import OpenAIChatCompletionClient
+
+    from nullrun.instrumentation.autogen import patch_autogen, unpatch_autogen
 
     original_on_messages = BaseChatAgent.on_messages
     original_create = OpenAIChatCompletionClient.create
