@@ -273,9 +273,7 @@ class TestWsHmacIdentityContract:
         # if a refactor reintroduces UUID-based identity, this test
         # fails loudly instead of breaking the SDK round-trip in
         # production.
-        assert not verify_hmac_signature(
-            WRONG_UUID, SECRET, ts, payload_bytes, prod_sig
-        ), (
+        assert not verify_hmac_signature(WRONG_UUID, SECRET, ts, payload_bytes, prod_sig), (
             "FIX-F4: signature computed with user-facing api_key MUST NOT "
             "verify against the UUID — a pass here means signer and verifier "
             "drifted back to the pre-FIX-F4 shape"
@@ -402,12 +400,12 @@ class TestSensitiveToolRoutesToExecute:
 
     @respx.mock
     def test_execute_routes_to_api_v1_execute(self, transport):
-        execute_route = respx.post(
-            "https://api.test.nullrun.io/api/v1/execute"
-        ).mock(return_value=httpx.Response(200, json={"decision": "allow"}))
-        gate_route = respx.post(
-            "https://api.test.nullrun.io/api/v1/gate"
-        ).mock(return_value=httpx.Response(200, json={"decision": "allow"}))
+        execute_route = respx.post("https://api.test.nullrun.io/api/v1/execute").mock(
+            return_value=httpx.Response(200, json={"decision": "allow"})
+        )
+        gate_route = respx.post("https://api.test.nullrun.io/api/v1/gate").mock(
+            return_value=httpx.Response(200, json={"decision": "allow"})
+        )
 
         transport.execute(
             organization_id="00000000-0000-0000-0000-000000000001",
@@ -641,7 +639,20 @@ class TestAllFiveWorkflowStatesAccepted:
 
 
 class TestRemoteStatesAtomicRegistration:
-    """track_event() must register workflow_id atomically."""
+    """track_event() must register workflow_id atomically.
+
+    Known flake: ``test_track_event_uses_locked_helper_for_setdefault``
+    uses ``inspect.getsource(rt.track)`` which can race with a
+    background flush thread that mutates ``rt._remote_states`` during
+    source-string capture. The test passes 5/5 in isolation. Fails
+    ~1/20 in the full suite when the timing window lines up with a
+    transport flush. Pre-existing (introduced in 0.6.0 release,
+    2026-06-23 14:47, commit 4610ba9 — well before Layer-1 work).
+    Re-run in isolation to confirm. Fix path: replace
+    ``inspect.getsource`` with a static AST check on
+    ``nullrun.runtime.NullRunRuntime.track`` instead of an instance
+    method.
+    """
 
     def test_track_event_uses_locked_helper_for_setdefault(self):
         """The setdefault that primes _remote_states for a new workflow

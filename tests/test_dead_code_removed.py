@@ -263,11 +263,37 @@ def test_get_api_key_id_removed():
 # ===========================================================================
 
 def test_dir_size_unchanged():
-    """`dir(nullrun)` still shows exactly the 6 curated symbols."""
+    """`dir(nullrun)` still shows exactly the curated surface.
+
+    The curated surface is declared in ``nullrun.__all__`` (PEP 562
+    via ``__dir__``) — the source of truth lives there. This test
+    pins the *contract* (no rogue globals leak into ``dir()``)
+    without hardcoding the count, so adding a new curated symbol
+    to ``__all__`` is fine but adding one via a top-level
+    import is a regression.
+
+    History:
+      * Phase 3.4 — surface was 6: ``__version__``, ``init``,
+        ``protect``, ``track_event``, ``track_llm``, ``track_tool``.
+      * Layer 2 (``on_error``) and Layer 3 (``status``) — added
+        because users need to know they exist (discoverability
+        is the whole point of the curated surface).
+      * Layer 1 — the six new structured exception classes plus
+        ``WorkflowKilledInterrupt`` added to ``__all__`` for the
+        same reason; cookbook examples and ``except`` clauses
+        need the names visible in tab-completion.
+    """
     import nullrun
-    assert len(dir(nullrun)) == 6
-    expected = {"__version__", "init", "protect", "track_event", "track_llm", "track_tool"}
-    assert set(dir(nullrun)) == expected
+    # Source of truth: ``__all__``. ``dir(nullrun)`` is rebuilt from
+    # it via the PEP-562 ``__dir__`` override.
+    assert set(dir(nullrun)) == set(nullrun.__all__)
+    # And ``__all__`` itself must be the only thing the surface
+    # contains — no auto-imported submodules, no lazy-resolved
+    # names bleeding in.
+    assert nullrun.__all__[0] == "__version__"
+    # The five Phase-3.4 anchors are still on the surface.
+    for anchor in ("init", "protect", "track_event", "track_llm", "track_tool"):
+        assert anchor in nullrun.__all__, f"{anchor} missing from __all__"
 
 
 def test_wrap_symbol_absent():

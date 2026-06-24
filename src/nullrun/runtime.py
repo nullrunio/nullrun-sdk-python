@@ -416,6 +416,30 @@ class NullRunRuntime:
         self._loop_tracker = LoopTracker(window_seconds=60)
         self._rate_tracker = RateTracker(window_seconds=60)
 
+        # Layer 3: ring buffer for the ``nullrun.status()`` recent
+        # errors list. Capacity 10 — bounded so a long-lived process
+        # does not leak memory even if the SDK raises thousands of
+        # errors per minute. Fed by ``_record_error`` (called from
+        # ``_emit_sdk_error`` after the Layer-2 ``emit_error``).
+        from nullrun.observability.status import _RecentErrorRing
+
+        self._recent_errors = _RecentErrorRing(capacity=10)
+
+        # Layer 3: timestamps for the status snapshot.
+        # ``_last_policy_fetch_at`` — wall-clock seconds of the last
+        # successful ``_fetch_policy()`` call. ``None`` until the
+        # first fetch completes (success or fail).
+        self._last_policy_fetch_at: float | None = None
+        # ``_last_policy_fetch_failed_at`` — set when fetch failed
+        # AND we fell back to cached / strict-local. Used to populate
+        # ``fallback_reason``.
+        self._last_policy_fetch_failed_at: float | None = None
+        # ``_last_backend_attempt_at`` / ``_last_backend_attempt_ok``
+        # — used to populate ``backend_reachable`` in the status
+        # snapshot. Set in ``_fetch_policy`` and the auth path.
+        self._last_backend_attempt_at: float | None = None
+        self._last_backend_attempt_ok: bool | None = None
+
         # Phase D: dedup LRU. Multiple observation paths (httpx transport,
         # LangChain callback, OpenAI Agents tracer) can fire for the same
         # LLM call. We collapse them to a single track() per fingerprint.
@@ -631,6 +655,267 @@ class NullRunRuntime:
                 cls._instance.shutdown()
             cls._instance = None
 
+    def status(self) -> "Any":
+        """Build a Layer-3 ``NullRunStatus`` snapshot.
+
+        Synchronous, thread-safe, side-effect-free — safe to
+        call from the agent loop, the transport flush thread,
+        or a debug console. The returned dataclass is frozen
+        so it can be cached, shared, and compared with ``==``.
+
+        State-derivation rules (see
+        ``nullrun/observability/status.py`` for the full
+        rationale):
+
+        * ``misconfigured`` — no api_key, or runtime never
+          bound to an org.
+        * ``offline`` — backend not reachable AND no cached
+          policy. SDK is running in strict-local fallback.
+        * ``degraded`` — using cached policy, OR WS
+          disconnected, OR circuit breaker open, OR workflow
+          state != Normal. SDK is operating with reduced
+          guarantees.
+        * ``ok`` — everything healthy.
+        """
+        from datetime import datetime, timezone
+
+        from nullrun.observability.status import (
+            STATE_DEGRADED,
+            STATE_MISCONFIGURED,
+            STATE_OFFLINE,
+            STATE_OK,
+            NullRunStatus,
+            RecentError,
+            WorkflowState,
+        )
+
+        # --- Auth state ---
+        api_key_valid: bool | None = None
+        api_key_prefix: str | None = self.api_key[:10] if self.api_key else None
+        if self.organization_id is not None:
+            # If we have an org, auth at least started — it
+            # may have failed (we'd be in misconfigured), but
+            # in the normal flow org binding means a 200 came
+            # back from /auth/verify.
+            api_key_valid = True
+
+        # --- Last policy fetch ---
+        last_policy_fetch: datetime | None = None
+        last_policy_fetch_age: float | None = None
+        if self._last_policy_fetch_at is not None:
+            last_policy_fetch = datetime.fromtimestamp(self._last_policy_fetch_at, tz=timezone.utc)
+            last_policy_fetch_age = max(0.0, time.time() - self._last_policy_fetch_at)
+
+        # --- Fallback / active policy ---
+        active_policy = self._policy
+        fallback_policy = (
+            self._last_good_policy
+            if self._last_good_policy is not None and self._last_good_policy is not self._policy
+            else None
+        )
+        fallback_reason: str | None = None
+        # Set when ``_last_policy_fetch_failed_at`` is known. We
+        # do NOT require ``last_policy_fetch_age`` to be set —
+        # the SDK may have never had a successful fetch (e.g.
+        # backend returned 401 on the first call), in which
+        # case the failure timestamp is still meaningful.
+        if self._last_policy_fetch_failed_at is not None:
+            failed_at = datetime.fromtimestamp(
+                self._last_policy_fetch_failed_at, tz=timezone.utc
+            ).isoformat()
+            if last_policy_fetch_age is not None:
+                fallback_reason = (
+                    f"last policy fetch failed at {failed_at} "
+                    f"(using cached policy from "
+                    f"{int(last_policy_fetch_age)}s ago)"
+                )
+            else:
+                fallback_reason = f"last policy fetch failed at {failed_at} (no cached policy)"
+
+        # --- Connectivity ---
+        backend_reachable: bool | None = None
+        if self._last_backend_attempt_at is not None:
+            # ``_last_backend_attempt_ok`` is set to True on
+            # a successful HTTP response, False on a transport
+            # error. ``None`` if no attempt since init.
+            backend_reachable = self._last_backend_attempt_ok
+
+        ws_connected: bool | None = None
+        if self._ws_connection is not None:
+            # ``is_open`` is the underlying websockets flag;
+            # None when the connection has never been
+            # successfully established.
+            ws_connected = getattr(self._ws_connection, "is_open", None)
+        elif self._ws_stop_event.is_set():
+            ws_connected = False  # explicit shutdown
+
+        # --- Workflow state from last WS push ---
+        workflow_state: WorkflowState | None = None
+        if self.workflow_id is not None:
+            cached = self._remote_state_for(self.workflow_id)
+            if cached:
+                state_str = cached.get("state", "Normal")
+                workflow_state = WorkflowState(
+                    workflow_id=self.workflow_id,
+                    state=state_str,
+                    version=cached.get("version", 0),
+                    reason=cached.get("reason"),
+                )
+
+        # --- Recent errors ---
+        recent_errors = self._recent_errors.snapshot()
+
+        # --- Headline state derivation ---
+        # Order matters: most specific first.
+        if self.api_key is None or (
+            self.organization_id is None and self._last_backend_attempt_at is not None
+        ):
+            headline = STATE_MISCONFIGURED
+        elif (
+            active_policy is not None
+            and getattr(active_policy, "budget_cents", None) == 0
+            and fallback_policy is None
+            and backend_reachable is False
+        ):
+            # Strict-local fallback with no cache + backend down.
+            headline = STATE_OFFLINE
+        elif (
+            fallback_policy is not None
+            or ws_connected is False
+            or backend_reachable is False
+            or (workflow_state is not None and workflow_state.state != "Normal")
+        ):
+            headline = STATE_DEGRADED
+        else:
+            headline = STATE_OK
+
+        return NullRunStatus(
+            state=headline,
+            api_key_valid=api_key_valid,
+            api_key_prefix=api_key_prefix,
+            organization_id=self.organization_id,
+            workflow_id=self.workflow_id,
+            api_url=self.api_url,
+            last_policy_fetch=last_policy_fetch,
+            last_policy_fetch_age_seconds=last_policy_fetch_age,
+            active_policy=active_policy,
+            fallback_policy=fallback_policy,
+            fallback_reason=fallback_reason,
+            backend_reachable=backend_reachable,
+            ws_connected=ws_connected,
+            workflow_state=workflow_state,
+            recent_errors=recent_errors,
+        )
+
+    def _record_error(
+        self,
+        err: "BaseException",
+        stage: str,
+        *,
+        workflow_id: str | None = None,
+        tool_name: str | None = None,
+    ) -> None:
+        """Layer 3: append a ``RecentError`` to the runtime's
+        ring buffer. Called from ``_emit_sdk_error`` AFTER the
+        Layer-2 ``emit_error`` so both layers see the same
+        error. The ring buffer feeds ``NullRunStatus.recent_errors``
+        — the user sees the last N errors via
+        ``nullrun.status()`` without instrumenting every
+        call site.
+        """
+        from datetime import datetime, timezone
+
+        from nullrun.observability.status import RecentError
+
+        # Resolve workflow_id from the contextvar when the
+        # caller did not pass one — same precedence as
+        # ``_emit_sdk_error``.
+        resolved_workflow_id = workflow_id
+        if resolved_workflow_id is None and self.workflow_id is not None:
+            resolved_workflow_id = self.workflow_id
+
+        self._recent_errors.push(
+            RecentError(
+                error_code=getattr(err, "error_code", "NR-0000"),
+                stage=stage,
+                workflow_id=resolved_workflow_id,
+                tool_name=tool_name,
+                timestamp=datetime.now(tz=timezone.utc),
+                message=str(err)[:200],
+            )
+        )
+
+    def _emit_sdk_error(
+        self,
+        err: "BaseException",
+        stage: str,
+        *,
+        workflow_id: str | None = None,
+        tool_name: str | None = None,
+        correlation_id: str | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        """Layer 2: fire the on_error hook with the runtime's known
+        context fields. Called from every raise site immediately
+        BEFORE the ``raise`` statement so the hook sees the
+        fully-constructed exception while the call stack is still
+        live.
+
+        Best-effort: this method NEVER raises. The hook itself is
+        wrapped in ``emit_error`` which catches hook exceptions.
+        A failure inside the hook cannot break the SDK.
+
+        Layer 3: also appends to the runtime's recent-errors
+        ring buffer so ``nullrun.status()`` surfaces the error
+        without the user having to register a hook. Done AFTER
+        the hook dispatch (so the ring buffer does not delay
+        the hook) and AFTER the call-stack is built (so the
+        ring buffer sees the resolved workflow_id).
+
+        Hot path: the no-hooks case is skipped via ``has_hooks()``
+        so the call cost when nobody is listening is one boolean
+        check + an attribute access on ``self`` (no allocation,
+        no lock — the hook registry short-circuits inside
+        ``emit_error``). The Layer-3 ring-buffer push is ALWAYS
+        done — it is the no-instrumentation path to introspection.
+        """
+        from nullrun.observability.error_hooks import (
+            ErrorContext,
+            emit_error,
+            has_hooks,
+        )
+
+        # Layer 3 (cheap path): always push to the ring buffer
+        # BEFORE the hook dispatch so a failing hook cannot
+        # prevent the error from appearing in ``nullrun.status()``.
+        self._record_error(
+            err,
+            stage,
+            workflow_id=workflow_id,
+            tool_name=tool_name,
+        )
+
+        if not has_hooks():
+            return
+        # Lazy-resolve workflow_id: the contextvar (set by
+        # ``nullrun.workflow(...)`` blocks) is authoritative for
+        # in-loop calls, falling back to the runtime's bound
+        # workflow when no contextvar is active.
+        resolved_workflow_id = workflow_id
+        if resolved_workflow_id is None and self.workflow_id is not None:
+            resolved_workflow_id = self.workflow_id
+        emit_error(
+            err,
+            ErrorContext(
+                stage=stage,
+                workflow_id=resolved_workflow_id,
+                tool_name=tool_name,
+                api_key_prefix=(self.api_key[:10] if self.api_key else None),
+                correlation_id=correlation_id,
+                extra=extra or {},
+            ),
+        )
+
     def _authenticate(self) -> None:
         """Authenticate with API key and get organization_id.
 
@@ -641,7 +926,7 @@ class NullRunRuntime:
         if not self.api_key:
             from nullrun.breaker.exceptions import NullRunConfigError
 
-            raise NullRunConfigError(
+            err = NullRunConfigError(
                 "API key required for cloud mode",
                 error_code="NR-C001",
                 user_action=(
@@ -650,6 +935,8 @@ class NullRunRuntime:
                     "credentials — the no-op local mode was removed in 0.3.0."
                 ),
             )
+            self._emit_sdk_error(err, stage="auth")
+            raise err
 
         logger.debug(f"Authenticating with API at {self.api_url}/auth/verify")
         try:
@@ -664,7 +951,7 @@ class NullRunRuntime:
                 # STRICT MODE: organization_id is REQUIRED, no fallback
                 org_id = data.get("organization_id")
                 if not org_id:
-                    raise NullRunAuthenticationError(
+                    err = NullRunAuthenticationError(
                         "Auth response missing organization_id - server may be outdated or compromised. "
                         "Refusing to operate with legacy identity.",
                         error_code="NR-A002",
@@ -676,6 +963,8 @@ class NullRunRuntime:
                             "version compatible with the deployed backend."
                         ),
                     )
+                    self._emit_sdk_error(err, stage="auth")
+                    raise err
                 self.organization_id = org_id
 
                 # Phase 139+: pick up the workflow this key is bound to.
@@ -724,14 +1013,21 @@ class NullRunRuntime:
                 logger.info(f"Authenticated: organization_id={self.organization_id}")
             else:
                 # Auth failed - raise exception instead of silent fallback
-                raise NullRunAuthenticationError(
+                err = NullRunAuthenticationError(
                     f"Auth failed with status {response.status_code}. "
                     f"API key may be invalid or expired. Not operating in unsafe mode.",
                     error_code=("NR-A003" if response.status_code == 401 else "NR-A001"),
                 )
+                self._emit_sdk_error(
+                    err,
+                    stage="auth",
+                    correlation_id=response.headers.get("x-correlation-id"),
+                    extra={"status_code": response.status_code},
+                )
+                raise err
         except httpx.RequestError as e:
             # Network error - raise exception, do not fall back silently
-            raise NullRunAuthenticationError(
+            err = NullRunAuthenticationError(
                 f"Auth request failed: {e}. Cannot establish secure connection to NullRun. "
                 f"Refusing to operate in unprotected mode.",
                 error_code="NR-B001",
@@ -743,7 +1039,9 @@ class NullRunRuntime:
                     "backend is just unreachable."
                 ),
                 cause=e,
-            ) from e
+            )
+            self._emit_sdk_error(err, stage="auth")
+            raise err from e
 
     def _fetch_policy(self) -> None:
         """Fetch policy from backend and cache locally.
@@ -805,12 +1103,17 @@ class NullRunRuntime:
             return
 
         try:
+            # Layer 3: stamp the backend-attempt timestamp BEFORE
+            # the request so the status snapshot knows the SDK is
+            # actively trying to reach the backend.
+            self._last_backend_attempt_at = time.time()
             # Use Transport's client for connection pooling, retry, and circuit breaker
             response = self._transport._client.get(
                 f"{self.api_url}/api/v1/orgs/{self.organization_id}/policies",
                 headers=self._auth_headers(),
                 timeout=5.0,
             )
+            self._last_backend_attempt_ok = True
 
             if response.status_code == 200:
                 payload = response.json()
@@ -832,6 +1135,12 @@ class NullRunRuntime:
                     # Audit F-R2-02: cache the last good policy so
                     # transient outages don't silently widen limits.
                     self._last_good_policy = fetched
+                    # Layer 3: stamp the successful-fetch timestamp
+                    # so ``nullrun.status()`` can show how old the
+                    # current policy is. The status builder uses
+                    # this to compute
+                    # ``last_policy_fetch_age_seconds``.
+                    self._last_policy_fetch_at = time.time()
                     logger.info(f"Policy fetched: {self._policy}")
                     return
                 # 200 OK but no active policy — same shape as the
@@ -851,13 +1160,19 @@ class NullRunRuntime:
                     response.status_code,
                     self.organization_id,
                 )
+                self._last_backend_attempt_ok = False
         except Exception as e:
             logger.warning("Failed to fetch policy for org=%s: %s", self.organization_id, e)
+            self._last_backend_attempt_ok = False
 
         # Audit F-R2-02: fail-CLOSED. Order of precedence:
         #   1. last known-good cached policy (if any)
         #   2. strict_local() (zero budget, 1-call rate limit)
         #   3. opt-out env var NULLRUN_POLICY_FAIL_OPEN=1 → default_local()
+        # Layer 3: stamp the failed-fetch timestamp so the status
+        # snapshot can populate ``fallback_reason`` with a
+        # concrete timestamp.
+        self._last_policy_fetch_failed_at = time.time()
         if getattr(self, "_last_good_policy", None) is not None:
             self._policy = self._last_good_policy
             logger.warning(
@@ -1733,7 +2048,7 @@ class NullRunRuntime:
         """
         resolved = org_id or self.organization_id
         if not resolved:
-            raise NullRunAuthenticationError(
+            err = NullRunAuthenticationError(
                 "get_org_status requires org_id (or a runtime bound to one)",
                 error_code="NR-C003",
                 user_action=(
@@ -1742,6 +2057,8 @@ class NullRunRuntime:
                     "yet — auth() must complete before this method can be used."
                 ),
             )
+            self._emit_sdk_error(err, stage="org_status")
+            raise err
         response = self._transport._client.get(
             f"{self.api_url}/api/v1/orgs/{resolved}/status",
             headers=self._auth_headers(),
@@ -1889,11 +2206,62 @@ class NullRunRuntime:
         # Check if execution is allowed
         if result.get("decision") == "block":
             metrics.inc_runtime("execute_blocked")
-            raise NullRunBlockedException(
+            # Layer 1: best-effort error_code mapping from the
+            # backend's ``explanation`` string. The backend does not
+            # yet stamp a structured block_reason on /execute
+            # responses (planned for the next round), so we match on
+            # keywords in the free-text explanation. Anything we
+            # cannot classify falls back to ``NR-X001`` (generic
+            # block). The mapping is intentionally conservative —
+            # false positives give the user the wrong code, false
+            # negatives just fall back to the generic code.
+            explanation = result.get("explanation", "policy violation")
+            explanation_lower = explanation.lower()
+            if "budget" in explanation_lower or "exhausted" in explanation_lower:
+                block_code, block_action = "NR-B004", "block"
+                block_cls = "NullRunBudgetError"
+            elif "loop" in explanation_lower or "repetition" in explanation_lower:
+                block_code, block_action = "NR-L001", "block"
+                block_cls = "NullRunBlockedException"
+            elif "rate" in explanation_lower or "too many" in explanation_lower:
+                block_code, block_action = "NR-R001", "block"
+                block_cls = "NullRunBlockedException"
+            elif "tool" in explanation_lower and "block" in explanation_lower:
+                block_code, block_action = "NR-T001", "block"
+                block_cls = "NullRunToolBlockedError"
+            else:
+                block_code, block_action = "NR-X001", "block"
+                block_cls = "NullRunBlockedException"
+            # Note: we still raise the base ``NullRunBlockedException``
+            # for non-budget/tool cases to keep the construction
+            # shape simple — the catalogue code is what the user
+            # reads, and they can branch on it via ``except
+            # NullRunBudgetError:`` for the budget case if they need
+            # to handle it specifically. We could instantiate the
+            # subclass per branch above; keeping one raise here is
+            # easier to reason about and matches the way the rest of
+            # the codebase handles backend blocks.
+            err = NullRunBlockedException(
                 workflow_id=workflow_id or UNKNOWN_WORKFLOW_ID,
-                reason=result.get("explanation", "policy violation"),
+                reason=explanation,
+                action=block_action,
                 tool_name=tool_name,
+                error_code=block_code,
+                details={"mapped_class": block_cls},
             )
+            # Layer 2: fire the on_error hook. The hook sees the
+            # same exception the caller will catch plus the
+            # workflow + tool context. A handler can use this to
+            # emit a per-block Sentry event with a stable
+            # ``error_code`` tag.
+            self._emit_sdk_error(
+                err,
+                stage="execute",
+                workflow_id=workflow_id,
+                tool_name=tool_name,
+                extra={"decision_source": result.get("decision_source")},
+            )
+            raise err
 
         metrics.inc_runtime("execute_allowed")
         return result
