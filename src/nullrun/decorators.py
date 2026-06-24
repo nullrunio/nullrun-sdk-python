@@ -524,11 +524,20 @@ def protect(fn: F | None = None) -> F | Callable[[F], F]:
                 # ``NR-W002`` (killed) vs ``NR-W003`` (paused). The
                 # block subclass carries the right user_action hint.
                 _code = "NR-W002" if isinstance(exc, WorkflowKilledInterrupt) else "NR-W003"
-                raise NullRunBlockedException(
+                err = NullRunBlockedException(
                     workflow_id=exc.workflow_id,
                     reason=exc.reason,
                     error_code=_code,
-                ) from exc
+                )
+                # Layer 2: fire the on_error hook. Kill/pause is a
+                # user-visible state change (the dashboard did
+                # this) so most observability hooks want to know
+                # about it. Note: the underlying kill signal
+                # itself (WorkflowKilledInterrupt) does NOT fire
+                # the hook (BaseException bypass) — only this
+                # re-wrapped form does.
+                runtime._emit_sdk_error(err, stage="decorator", workflow_id=exc.workflow_id)
+                raise err from exc
             raise
         finally:
             reset_span(token)
@@ -652,7 +661,7 @@ def _enforce_sensitive_tool(
             TransportErrorSource.AUTH_ERROR: "NR-A003",
             TransportErrorSource.BREAKER_OPEN: "NR-B005",
         }.get(exc.source, "NR-B001")
-        raise NullRunBlockedException(
+        err = NullRunBlockedException(
             workflow_id=workflow_id,
             reason=f"policy engine unavailable: {exc.source}",
             tool_name=fn.__name__,
@@ -664,7 +673,19 @@ def _enforce_sensitive_tool(
                 f"Set NULLRUN_SENSITIVE_FAIL_OPEN=1 to opt out for "
                 f"tests / staging — production should leave it off."
             ),
-        ) from exc
+        )
+        # Layer 2: fire the on_error hook. The sensitive-tool
+        # path is where a transport failure becomes a hard
+        # deny — observability hooks should see it even if the
+        # user's except clause swallows the exception.
+        runtime._emit_sdk_error(
+            err,
+            stage="sensitive_tool",
+            workflow_id=workflow_id,
+            tool_name=fn.__name__,
+            extra={"transport_source": exc.source.value},
+        )
+        raise err from exc
     except Exception as exc:  # noqa: BLE001
         # Any other exception is a transport / network / backend
         # failure. Re-raise as NullRunBlockedException so the caller
@@ -676,7 +697,7 @@ def _enforce_sensitive_tool(
                 f"{exc}. NULLRUN_SENSITIVE_FAIL_OPEN=1 — body will run."
             )
             return
-        raise NullRunBlockedException(
+        err = NullRunBlockedException(
             workflow_id=workflow_id,
             reason=f"policy engine unavailable: {exc}",
             tool_name=fn.__name__,
@@ -688,7 +709,17 @@ def _enforce_sensitive_tool(
                 f"chained exception (raise ... from exc) for the "
                 f"root cause."
             ),
-        ) from exc
+        )
+        # Layer 2: emit for the generic exception path too.
+        # (The NullRunTransportError path above already emits;
+        # this covers the catch-all ``except Exception`` arm.)
+        runtime._emit_sdk_error(
+            err,
+            stage="sensitive_tool",
+            workflow_id=workflow_id,
+            tool_name=fn.__name__,
+        )
+        raise err from exc
 
     # Defense in depth (ADR-008 Rule 1 + Rule 2): if `runtime.execute`
     # ever returns a dict with `decision_source` indicating a transport
@@ -724,7 +755,7 @@ def _enforce_sensitive_tool(
                 "AUTH_ERROR": "NR-A003",
                 "BREAKER_OPEN": "NR-B005",
             }.get(decision_source, "NR-B001")
-            raise NullRunBlockedException(
+            err = NullRunBlockedException(
                 workflow_id=workflow_id,
                 reason=f"policy engine unavailable: {decision_source}",
                 tool_name=fn.__name__,
@@ -737,6 +768,18 @@ def _enforce_sensitive_tool(
                     f"tests / staging."
                 ),
             )
+            # Layer 2: emit the on_error hook with the fallback
+            # source as extra metadata so Sentry rules can
+            # distinguish "policy engine is down" from "we
+            # tripped the local circuit breaker".
+            runtime._emit_sdk_error(
+                err,
+                stage="sensitive_tool",
+                workflow_id=workflow_id,
+                tool_name=fn.__name__,
+                extra={"decision_source": decision_source},
+            )
+            raise err
 
     # Real `decision=block` from the gateway is already converted to
     # NullRunBlockedException by `runtime.execute` — no second check

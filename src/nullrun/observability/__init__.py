@@ -1,9 +1,19 @@
 """
-NullRun observability — thread-safe in-process metrics counters.
+NullRun observability — thread-safe in-process metrics counters
+and the Layer-2 error hook registry.
 
-Exposes ``metrics`` for counter / gauge reporting; transport and runtime
-modules call into it for thread-safe increments. No external
-dependencies; integrate with Prometheus / OpenTelemetry on top.
+Modules:
+
+  * ``metrics`` (this file) — counter / gauge reporting. Transport
+    and runtime modules call into it for thread-safe increments.
+  * ``error_hooks`` — the ``nullrun.on_error()`` global hook
+    registry. See that module for the Layer-2 design.
+
+Both are reachable as ``nullrun.observability.metrics`` /
+``nullrun.observability.error_hooks`` for back-compat. The
+metrics singleton lives here (was previously a module-level
+constant in ``observability.py``) — moving it into a package
+was needed to make room for the ``error_hooks`` submodule.
 """
 
 from __future__ import annotations
@@ -12,13 +22,37 @@ from dataclasses import dataclass
 from threading import Lock
 from typing import Any
 
+# Re-export the Layer-2 registry so users can do
+# ``from nullrun.observability import ErrorContext`` without
+# reaching into the submodule. Also surfaces the
+# ``register_hook`` / ``emit_error`` primitives for advanced
+# callers (most users go through ``nullrun.on_error``).
+from nullrun.observability.error_hooks import (  # noqa: F401
+    ErrorContext,
+    emit_error,
+    has_hooks,
+    register_hook,
+)
+
+# Re-export the Layer-3 status dataclasses so users can do
+# ``from nullrun.observability import NullRunStatus`` without
+# reaching into the submodule. The instance is built by
+# ``nullrun.status()`` — these are the return-shape primitives.
+from nullrun.observability.status import (  # noqa: F401
+    NullRunStatus,
+    RecentError,
+    WorkflowState,
+)
+
 # ----------------------------------------------------------------
 # SDK Metrics (in-memory, no external dependencies)
 # ----------------------------------------------------------------
 
+
 @dataclass
 class TransportMetrics:
     """Transport layer metrics. Reset on reset()."""
+
     events_enqueued: int = 0
     events_sent: int = 0
     events_dropped: int = 0
@@ -54,6 +88,7 @@ class TransportMetrics:
 @dataclass
 class RuntimeMetrics:
     """Runtime layer metrics."""
+
     track_calls: int = 0
     execute_calls: int = 0
     execute_allowed: int = 0
@@ -109,7 +144,7 @@ class MetricsRegistry:
         """Thread-safe increment of runtime metric counter.
 
         Args:
-            field: Metric name (e.g., "track_calls", "execute_allowed")
+            field: Metric name (e.g., "track_calls", "execute_calls")
             value: Amount to increment (default 1)
         """
         with self._lock:
@@ -120,7 +155,7 @@ class MetricsRegistry:
         """Thread-safe set of transport metric field.
 
         Args:
-            field: Metric name (e.g., "last_error", "last_flush_at")
+            field: Metric field (e.g., "last_error", "last_flush_at")
             value: Value to set
         """
         with self._lock:
@@ -152,6 +187,7 @@ class MetricsRegistry:
                     "execute_calls": self.runtime.execute_calls,
                     "execute_allowed": self.runtime.execute_allowed,
                     "execute_blocked": self.runtime.execute_blocked,
+                    "check_calls": self.runtime.check_calls,
                     "cost_limit_exceeded": self.runtime.cost_limit_exceeded,
                     "timeouts": self.runtime.timeouts,
                     "loop_detections": self.runtime.loop_detections,

@@ -50,6 +50,46 @@ logger = logging.getLogger(__name__)
 
 __api_version__ = "1.0"
 
+
+def _emit_for_transport_error(
+    err: BaseException,
+    stage: str,
+    correlation_id: str | None,
+    *,
+    status_code: int | None = None,
+) -> None:
+    """Layer 2: fire the on_error hook for transport-level raises.
+
+    The transport module is stateless (no `self` carrying the
+    runtime's api_key / workflow_id), so the context is minimal
+    — just ``stage`` + ``correlation_id`` + ``status_code``. The
+    hook receives ``api_key_prefix=None`` and ``workflow_id=None``
+    because the transport layer does not have them.
+
+    Best-effort: never raises. ``emit_error`` swallows hook
+    exceptions internally.
+    """
+    from nullrun.observability.error_hooks import (
+        ErrorContext,
+        emit_error,
+        has_hooks,
+    )
+
+    if not has_hooks():
+        return
+    extra: dict[str, Any] = {}
+    if status_code is not None:
+        extra["status_code"] = status_code
+    emit_error(
+        err,
+        ErrorContext(
+            stage=stage,
+            correlation_id=correlation_id,
+            extra=extra,
+        ),
+    )
+
+
 # =============================================================================
 # HMAC Request Signing (Task 11)
 # =============================================================================
@@ -287,7 +327,7 @@ def _retry_with_backoff(
                 if result.status_code == 401:
                     from nullrun.breaker.exceptions import NullRunAuthError
 
-                    raise NullRunAuthError(
+                    err = NullRunAuthError(
                         "Invalid API key",
                         error_code="NR-A003",
                         user_action=(
@@ -298,6 +338,13 @@ def _retry_with_backoff(
                             "check the API_URL vs. where the key was issued."
                         ),
                     )
+                    _emit_for_transport_error(
+                        err,
+                        "execute",
+                        result.headers.get("x-correlation-id"),
+                        status_code=result.status_code,
+                    )
+                    raise err
                 if result.status_code >= 500 and on_transport_error == "raise":
                     # Round 3 (Phase 0.4.0): 5xx is a classified
                     # GATEWAY_ERROR. Don't retry -- this is a server
@@ -306,11 +353,18 @@ def _retry_with_backoff(
                     # via on_transport_error="raise".
                     from nullrun.breaker.exceptions import NullRunBackendError
 
-                    raise NullRunBackendError(
+                    err = NullRunBackendError(
                         f"Gateway returned {result.status_code}",
                         endpoint="execute",
                         status_code=result.status_code,
                     )
+                    _emit_for_transport_error(
+                        err,
+                        "execute",
+                        result.headers.get("x-correlation-id"),
+                        status_code=result.status_code,
+                    )
+                    raise err
                 if result.status_code >= 400:
                     result.raise_for_status()
 
