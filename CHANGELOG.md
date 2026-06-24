@@ -7,6 +7,153 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [0.6.1] — 2026-06-24
+
+Additive release — Layers 1, 2, and 3 of the "give the user a chance"
+design land together. Structured exceptions, a global error hook,
+and a synchronous runtime snapshot. No breaking changes.
+
+### Layer 1 — structured exception hierarchy
+
+Every public SDK exception now carries a stable, grep-able
+`error_code` (e.g. `NR-A001`, `NR-B002`, `NR-R001`) plus a short
+imperative `user_action` and a `retryable` flag, so cookbook
+examples and Sentry integrations can branch on the code instead
+of parsing the message string.
+
+- **`NullRunError` — structured base for every user-facing SDK
+  exception.** Carries four actionable fields:
+  - `error_code` — stable `NR-LETTERNNN` identifier
+    (documented per-code in `docs/errors/<code>.md`).
+  - `user_action` — short imperative next-step hint
+    ("Set NULLRUN_API_KEY", "Verify API key at …", "Retry in 30s
+    — backend is down", …). Empty when there is no actionable
+    step.
+  - `retryable` — `True` only for transient failures (5xx,
+    network blip, transient auth); `False` for config,
+    permission, and budget-exhausted (retrying without
+    changing something will just hit the same wall).
+  - `docs_url` — per-code docs page (falls back to the
+    `https://docs.nullrun.io/errors` index when the per-code
+    page does not exist yet).
+  - `cause` — optional chained `BaseException`.
+
+- **New specialized exception classes** (each is a subclass of
+  the existing user-facing class, so existing `except` clauses
+  keep matching):
+
+  | Class | Subclass of | `error_code` | `retryable` |
+  |---|---|---|---|
+  | `NullRunConfigError` | `NullRunError` | `NR-C001` | False |
+  | `NullRunAuthError` | `NullRunAuthenticationError` | `NR-A001` | False |
+  | `NullRunBackendError` | `NullRunTransportError` | `NR-B002` | **True** |
+  | `NullRunBudgetError` | `NullRunBlockedException` | `NR-X001` | False |
+  | `NullRunToolBlockedError` | `NullRunBlockedException` | `NR-T001` | False |
+
+- **Public re-exports** — `nullrun.NullRunError`,
+  `nullrun.NullRunAuthError`, `nullrun.NullRunConfigError`,
+  `nullrun.NullRunBackendError`, `nullrun.NullRunBudgetError`,
+  `nullrun.NullRunToolBlockedError`,
+  `nullrun.WorkflowKilledInterrupt` are now in
+  `nullrun.__all__` and show up in `dir(nullrun)` for
+  discoverability. The legacy types (`NullRunBlockedException`,
+  `NullRunAuthenticationError`, `WorkflowKilledException`,
+  `WorkflowPausedException`) stay importable via the lazy-export
+  table for back-compat — adding them here would change
+  `dir(nullrun)` for existing users.
+
+### Layer 2 — `nullrun.on_error()` global hook
+
+- **`nullrun.on_error(hook)` — global error hook.** Fires for
+  every structured `NullRunError` *before* the exception
+  propagates so the call stack is still live. Returns an
+  idempotent `unregister` callable.
+  - **Skipped** for `WorkflowKilledInterrupt` (BaseException
+    subclass — kill is a signal, not an error) and for
+    non-`NullRunError` exceptions.
+  - **Multiple hooks** fire in registration order.
+  - **Hook exceptions** are caught and logged at DEBUG — a
+    misbehaving hook cannot break the SDK.
+  - **Zero-cost fast path** when no hook is registered
+    (`has_hooks()` short-circuit before any allocation).
+- **Backed by** `nullrun.observability.error_hooks` —
+  `register_hook`, `unregister_hook`, `emit_error`, `clear_hooks`,
+  `STAGES`, `ErrorContext`.
+
+### Layer 3 — `nullrun.status()` introspection
+
+- **`nullrun.status()` — synchronous runtime snapshot.** Returns
+  a frozen `NullRunStatus` dataclass (state, version, reason,
+  auth state, policy state, connectivity, workflow state,
+  bounded recent-errors ring buffer).
+  - **Four headline states** derived automatically: `ok`,
+    `degraded`, `offline`, `misconfigured`.
+  - **Raises** `NullRunConfigError` (`NR-C004`) if no runtime
+    has been `init()`'d — never lazily creates a runtime as a
+    side effect.
+  - **Thread-safe** — safe to call from the agent loop, the
+    transport flush thread, or a debug console.
+- **Backed by** `nullrun.observability.status` —
+  `NullRunStatus`, `RecentError`, `WorkflowState`,
+  `_RecentErrorRing`.
+
+### Docs
+
+- **`docs/errors/`** — 15 per-code pages (`NR-A001..A003`,
+  `NR-B001..B005`, `NR-C001/C003`, `NR-L001`, `NR-R001`,
+  `NR-T001`, `NR-W002/W003`) plus a `README.md` index. Each
+  page documents the trigger conditions, the `user_action`,
+  the `retryable` hint, and a small reproducer / fix snippet.
+- **`docs/integration-baseline-2026-06-19.md`** — pinned
+  baseline for the next integration run.
+
+### Tests
+
+- **`tests/test_exception_hierarchy.py`** — pins the
+  hierarchy shape (class roots), the structured fields on every
+  public class, and the five back-compat invariants (`except`
+  clauses keep matching across the new subclasses;
+  `WorkflowKilledInterrupt` is the only public class not
+  catchable by `except Exception`).
+- **`tests/test_error_hooks.py`** — registry basics, `emit_error`
+  semantics (fires with both args, swallows hook exceptions,
+  one-bad-hook-isolated, unregister-mid-dispatch is safe),
+  `ErrorContext` validation, the `WorkflowKilledInterrupt` and
+  `WorkflowKilledException` bypass rules, and that the global
+  `nullrun.on_error` shim is wired through.
+- **`tests/test_status.py`** — no-runtime raises `NR-C004`,
+  with-runtime snapshot is frozen / equality-stable, key prefix
+  is truncated to 10 chars, state derivation (ok / degraded /
+  misconfigured), recent-errors ring buffer (capacity 10, fed
+  by `_emit_sdk_error`).
+- **`tests/test_integration_contract.py`** — `track_event`
+  `setdefault` race pinned against the locked helper.
+- **`tests/test_dead_code_removed.py::test_dir_size_unchanged`** —
+  rewritten to key off `nullrun.__all__` (source of truth for
+  the curated surface) instead of a hardcoded symbol count, so
+  the curated-surface contract is still pinned without
+  blocking legitimate additions.
+
+### Release plumbing
+
+- The previous `0.6.0` on TestPyPI is **yanked** (visible but
+  not installable via `pip install nullrun`) — it predates
+  the Layer-1 / Layer-2 / Layer-3 work merged in this release,
+  so users who pinned `0.6.0` on TestPyPI should upgrade to
+  `0.6.1` to pick up the new structured exceptions and
+  observability APIs.
+
+### Back-compat
+
+- Every existing `except` clause keeps matching — the new
+  exception classes are subclasses of the existing ones.
+- `from nullrun.breaker.exceptions import X` keeps working
+  unchanged.
+- `pip install nullrun==0.6.1` is a drop-in replacement for
+  `0.6.0`.
+
+---
+
 ## [0.6.0] — 2026-06-23
 
 Hardening pass driven by the 2026-06-22 SDK↔backend integration audit.
