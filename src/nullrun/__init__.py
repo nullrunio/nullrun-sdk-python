@@ -41,6 +41,113 @@ from nullrun.decorators import protect  # the gate decorator
 from nullrun.runtime import track_event, track_llm, track_tool
 
 
+def status():
+    """Return the current runtime state as a Layer-3
+    :class:`NullRunStatus` snapshot.
+
+    Synchronous, thread-safe, side-effect-free — safe to call
+    from the agent loop, the transport flush thread, or a
+    debug console. The returned dataclass is frozen so it can
+    be cached, shared, and compared with ``==``.
+
+    Designed for the "the agent is stuck, what's wrong?"
+    runbook:
+
+        >>> import nullrun
+        >>> print(nullrun.status().summary())
+        NullRunStatus(degraded fallback=last_good@42s reason=last policy fetch failed at 2026-06-24T10:30:15+00:00)
+
+    See ``nullrun.observability.status`` for the state
+    derivation rules (the four headline states:
+    ``ok`` / ``degraded`` / ``offline`` / ``misconfigured``).
+
+    Raises:
+        NullRunConfigError: ``nullrun.init()`` has not been
+            called yet, or the runtime was shut down. The
+            snapshot only makes sense when there is a runtime
+            to snapshot.
+    """
+    # Read the module-level ``_runtime`` directly so we do NOT
+    # trigger ``get_instance()``'s lazy construction. ``status()``
+    # must NEVER create a runtime as a side effect — a fresh
+    # import of ``nullrun`` followed by ``nullrun.status()``
+    # should report "no runtime" cleanly, not try to spin one
+    # up (which would itself raise a different config error
+    # about missing api_key).
+    import nullrun.runtime as _rt_mod
+    from nullrun.breaker.exceptions import NullRunConfigError
+
+    rt = _rt_mod._runtime
+    if rt is None:
+        raise NullRunConfigError(
+            "nullrun.status() requires a runtime. Call nullrun.init() first.",
+            error_code="NR-C004",
+            user_action=(
+                "Call nullrun.init(api_key='nr_live_...') before "
+                "calling nullrun.status(). The snapshot only makes "
+                "sense when there is a runtime to inspect."
+            ),
+        )
+    return rt.status()
+
+
+def on_error(hook):
+    """Register a global error hook. Layer 2 of the "give the user
+    a chance" design.
+
+    The hook is called for every structured SDK failure (every
+    subclass of :class:`NullRunError`) BEFORE the exception
+    propagates. The hook sees the same exception the caller will
+    catch plus an :class:`ErrorContext` describing where the
+    error fired. Multiple hooks are supported; they fire in
+    registration order. Hook exceptions are caught and logged
+    at DEBUG — a misbehaving hook does not break the SDK.
+
+    What does NOT fire the hook:
+
+    * :class:`WorkflowKilledInterrupt` (BaseException subclass)
+      — kill is a non-recoverable signal, not an error.
+    * Non-``NullRunError`` exceptions (e.g. raw ``httpx`` errors
+      from SDK-internal code paths not yet migrated to the
+      structured hierarchy).
+
+    Args:
+        hook: Callable ``(err: NullRunError, ctx: ErrorContext) -> None``.
+            Must be synchronous.
+
+    Returns:
+        Callable ``() -> None`` that unregisters the hook.
+        Idempotent — safe to call twice.
+
+    Example::
+
+        import nullrun
+        from nullrun.breaker.exceptions import NullRunError
+
+        def my_handler(err, ctx):
+            log.warning(
+                "NullRun error",
+                extra={
+                    "code": err.error_code,
+                    "stage": ctx.stage,
+                    "retryable": err.retryable,
+                    "user_action": err.user_action,
+                    "workflow_id": ctx.workflow_id,
+                },
+            )
+
+        unregister = nullrun.on_error(my_handler)
+        # ... later, in shutdown:
+        unregister()
+    """
+    # Lazy import — keeps ``import nullrun`` cheap and avoids
+    # pulling the observability module into the top-level
+    # namespace when the user only wants the static helpers.
+    from nullrun.observability.error_hooks import register_hook
+
+    return register_hook(hook)
+
+
 def init(
     api_key: str | None = None,
     api_url: str | None = None,
@@ -104,7 +211,7 @@ def init(
         # parsing the message.
         from nullrun.breaker.exceptions import NullRunAuthenticationError
 
-        raise NullRunAuthenticationError(
+        err = NullRunAuthenticationError(
             "nullrun.init() requires an api_key. Pass api_key='nr_live_...' "
             "explicitly or set the NULLRUN_API_KEY environment variable. "
             "(Silent no-op fallback was removed in 0.3.0 — see CHANGELOG.)",
@@ -117,6 +224,20 @@ def init(
                 "removed in 0.3.0 because it bypassed every backend gate."
             ),
         )
+        # Layer 2: fire the on_error hook BEFORE the raise so the
+        # hook sees the call stack still live. Stage = "init" so a
+        # log-based hook can attribute the failure to startup
+        # (e.g. "app crashed before any user code ran"). We skip
+        # the build cost when no hook is registered — see
+        # ``has_hooks()`` in observability/error_hooks.py.
+        from nullrun.observability.error_hooks import ErrorContext, emit_error, has_hooks
+
+        if has_hooks():
+            emit_error(
+                err,
+                ErrorContext(stage="init", api_key_prefix=None),
+            )
+        raise err
 
     # Imported lazily so we don't pull the runtime into the namespace
     # when the user only wants the static helpers.
@@ -234,9 +355,21 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "handle_action": ("nullrun.actions", "handle_action"),
     "register_action_handler": ("nullrun.actions", "register_action_handler"),
     "get_action_handler": ("nullrun.actions", "get_action_handler"),
-    # Exceptions (Phase 3)
+    # Exceptions (Phase 3 + Layer 1)
+    "NullRunError": ("nullrun.breaker.exceptions", "NullRunError"),
     "NullRunBlockedException": ("nullrun.breaker.exceptions", "NullRunBlockedException"),
     "NullRunAuthenticationError": ("nullrun.breaker.exceptions", "NullRunAuthenticationError"),
+    "NullRunAuthError": ("nullrun.breaker.exceptions", "NullRunAuthError"),
+    "NullRunConfigError": ("nullrun.breaker.exceptions", "NullRunConfigError"),
+    "NullRunBackendError": ("nullrun.breaker.exceptions", "NullRunBackendError"),
+    "NullRunBudgetError": ("nullrun.breaker.exceptions", "NullRunBudgetError"),
+    "NullRunToolBlockedError": ("nullrun.breaker.exceptions", "NullRunToolBlockedError"),
+    # Layer 2: on_error context type
+    "ErrorContext": ("nullrun.observability.error_hooks", "ErrorContext"),
+    # Layer 3: status dataclasses
+    "NullRunStatus": ("nullrun.observability.status", "NullRunStatus"),
+    "RecentError": ("nullrun.observability.status", "RecentError"),
+    "WorkflowState": ("nullrun.observability.status", "WorkflowState"),
     # Sprint 2.2: zombie exception classes removed. See the
     # NOTE block in breaker/exceptions.py for the list.
     "WorkflowPausedException": ("nullrun.breaker.exceptions", "WorkflowPausedException"),
@@ -284,6 +417,30 @@ __all__ = [
     "track_llm",
     "track_tool",
     "track_event",
+    # Layer 2: global on_error hook. Eager because it is the
+    # single most important "give the user a chance" API — the
+    # user has to know it exists to call it.
+    "on_error",
+    # Layer 3: status introspection — synchronous snapshot of the
+    # runtime's state, returns a frozen NullRunStatus.
+    "status",
+    # Layer 1: structured exception base + the most common subclasses
+    # the user is expected to ``except`` on. Including them in
+    # ``__all__`` means ``from nullrun import *`` and ``dir(nullrun)``
+    # surface them for tab-completion — the whole point of giving
+    # the user "a chance" is that they need to know the names exist
+    # to catch them. The legacy types (``NullRunBlockedException``,
+    # ``NullRunAuthenticationError``, ``WorkflowKilledException``,
+    # ``WorkflowPausedException``) stay importable via
+    # ``_LAZY_EXPORTS`` for back-compat — adding them here would
+    # change ``dir(nullrun)`` for existing users.
+    "NullRunError",
+    "NullRunAuthError",
+    "NullRunConfigError",
+    "NullRunBackendError",
+    "NullRunBudgetError",
+    "NullRunToolBlockedError",
+    "WorkflowKilledInterrupt",
 ]
 
 # Sprint 2.1: the SDK-side ``decision_history`` module was deleted.
