@@ -95,12 +95,27 @@ def init(
     # caught at startup rather than producing silent allow-all decisions.
     resolved_key = api_key or os.getenv("NULLRUN_API_KEY")
     if not resolved_key:
+        # Layer 1: raise the legacy type (``NullRunAuthenticationError``)
+        # so user code with ``except NullRunAuthenticationError:`` still
+        # catches this case, but stamp the structured ``error_code`` /
+        # ``user_action`` so a Layer-2 on_error hook (or a
+        # ``except NullRunError:`` clause) can branch on the catalog
+        # value ``NR-C001`` ("configuration: no api_key") without
+        # parsing the message.
         from nullrun.breaker.exceptions import NullRunAuthenticationError
 
         raise NullRunAuthenticationError(
             "nullrun.init() requires an api_key. Pass api_key='nr_live_...' "
             "explicitly or set the NULLRUN_API_KEY environment variable. "
-            "(Silent no-op fallback was removed in 0.3.0 — see CHANGELOG.)"
+            "(Silent no-op fallback was removed in 0.3.0 — see CHANGELOG.)",
+            error_code="NR-C001",
+            user_action=(
+                "Get an API key at https://app.nullrun.io/settings/api-keys, "
+                "then either pass api_key='nr_live_...' to nullrun.init() or "
+                "set the NULLRUN_API_KEY environment variable. The SDK cannot "
+                "operate without credentials — the silent no-op fallback was "
+                "removed in 0.3.0 because it bypassed every backend gate."
+            ),
         )
 
     # Imported lazily so we don't pull the runtime into the namespace
@@ -146,6 +161,7 @@ def init(
     # unconditional — we always have a remote LLM traffic source if
     # auto-instrumentation libraries are installed.
     from nullrun.instrumentation.auto import auto_instrument
+
     auto_instrument(runtime)
 
     # Start the coverage reporter so the backend gets a coverage_report
@@ -179,7 +195,6 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "get_trace_id": ("nullrun.context", "get_trace_id"),
     "get_span_id": ("nullrun.context", "get_span_id"),
     "get_agent_id": ("nullrun.context", "get_agent_id"),
-
     # Instrumentation
     "NullRunCallback": ("nullrun.instrumentation", "NullRunCallback"),
     # NOTE (Sprint 1.2 / B11-B12): `patch_openai` and `unpatch_openai`
@@ -191,14 +206,12 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     # a worse failure mode than a clean `ImportError` from
     # `from nullrun import patch_openai` failing because the symbol
     # is no longer in the lazy table.
-
     # Toolbox — framework-specific wrappers (Phase 1 Commit 6).
     # The previous `instrument()` helper lived at
     # `nullrun.instrumentation.langgraph.instrument`; it is now
     # `nullrun.toolbox.langgraph.wrapper`. Reachable as
     # `from nullrun import wrapper` for one-line import.
     "wrapper": ("nullrun.toolbox.langgraph", "wrapper"),
-
     # Span / trace context (Phase 2 Commit 3).
     # `tracing.py` is the structured replacement for the loose `_trace_id`
     # / `_span_id` contextvars in `nullrun.context`. `SpanContext` is a
@@ -211,10 +224,8 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "create_child_span": ("nullrun.tracing", "create_child_span"),
     "set_span": ("nullrun.tracing", "set_span"),
     "reset_span": ("nullrun.tracing", "reset_span"),
-
     # Decorators
     "sensitive": ("nullrun.decorators", "sensitive"),
-
     # Actions (Phase 3)
     "ActionHandler": ("nullrun.actions", "ActionHandler"),
     "ActionType": ("nullrun.actions", "ActionType"),
@@ -223,7 +234,6 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "handle_action": ("nullrun.actions", "handle_action"),
     "register_action_handler": ("nullrun.actions", "register_action_handler"),
     "get_action_handler": ("nullrun.actions", "get_action_handler"),
-
     # Exceptions (Phase 3)
     "NullRunBlockedException": ("nullrun.breaker.exceptions", "NullRunBlockedException"),
     "NullRunAuthenticationError": ("nullrun.breaker.exceptions", "NullRunAuthenticationError"),
@@ -265,13 +275,12 @@ def __dir__() -> list[str]:
 __all__ = [
     # Version (single value, always public)
     "__version__",
-
     # Phase 3.4: the curated public surface — six symbols.
     # Everything else stays importable as `from nullrun import X` for
     # backward compatibility, but does NOT appear in `dir(nullrun)`
     # until the user actually accesses it.
     "init",
-    "protect",         # gate decorator
+    "protect",  # gate decorator
     "track_llm",
     "track_tool",
     "track_event",
