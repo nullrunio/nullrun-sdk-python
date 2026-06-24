@@ -109,6 +109,7 @@ class LoopTracker:
         while self._calls[tool_name] and self._calls[tool_name][0] < before:
             self._calls[tool_name].popleft()
 
+
 class RateTracker:
     """
     In-memory rate tracking using deque with timestamps.
@@ -159,6 +160,7 @@ class RateTracker:
         while self._calls and self._calls[0] < before:
             self._calls.popleft()
 
+
 @dataclass
 class LocalDecision:
     """Decision from local check (no network round-trip)."""
@@ -166,6 +168,7 @@ class LocalDecision:
     allowed: bool
     reason: str = None
     suggestion: str = None
+
 
 logger = logging.getLogger(__name__)
 
@@ -175,6 +178,7 @@ logger = logging.getLogger(__name__)
 # to be named ``<unknown>`` (the previous literal was a
 # collision hazard). Wire compat: still a string.
 UNKNOWN_WORKFLOW_ID: str = "__nullrun_unknown__"
+
 
 @dataclass
 class Policy:
@@ -254,6 +258,7 @@ class Policy:
             # behaviour intact when the field is absent.
             retry_detection_enabled=data.get("retry_detection_enabled", True),
         )
+
 
 class NullRunRuntime:
     """
@@ -634,7 +639,17 @@ class NullRunRuntime:
         a secret key rotation. The SDK stores this and uses it for signing.
         """
         if not self.api_key:
-            raise BreakerError("API key required for cloud mode")
+            from nullrun.breaker.exceptions import NullRunConfigError
+
+            raise NullRunConfigError(
+                "API key required for cloud mode",
+                error_code="NR-C001",
+                user_action=(
+                    "Set NULLRUN_API_KEY env var or pass api_key='nr_live_...' "
+                    "to nullrun.init(). The SDK cannot operate without "
+                    "credentials — the no-op local mode was removed in 0.3.0."
+                ),
+            )
 
         logger.debug(f"Authenticating with API at {self.api_url}/auth/verify")
         try:
@@ -651,7 +666,15 @@ class NullRunRuntime:
                 if not org_id:
                     raise NullRunAuthenticationError(
                         "Auth response missing organization_id - server may be outdated or compromised. "
-                        "Refusing to operate with legacy identity."
+                        "Refusing to operate with legacy identity.",
+                        error_code="NR-A002",
+                        user_action=(
+                            "The NullRun backend returned a 200 but the response "
+                            "is missing organization_id. This usually means the "
+                            "backend is on an older version than the SDK expects — "
+                            "update the backend, or downgrade the SDK to a "
+                            "version compatible with the deployed backend."
+                        ),
                     )
                 self.organization_id = org_id
 
@@ -703,13 +726,23 @@ class NullRunRuntime:
                 # Auth failed - raise exception instead of silent fallback
                 raise NullRunAuthenticationError(
                     f"Auth failed with status {response.status_code}. "
-                    f"API key may be invalid or expired. Not operating in unsafe mode."
+                    f"API key may be invalid or expired. Not operating in unsafe mode.",
+                    error_code=("NR-A003" if response.status_code == 401 else "NR-A001"),
                 )
         except httpx.RequestError as e:
             # Network error - raise exception, do not fall back silently
             raise NullRunAuthenticationError(
                 f"Auth request failed: {e}. Cannot establish secure connection to NullRun. "
-                f"Refusing to operate in unprotected mode."
+                f"Refusing to operate in unprotected mode.",
+                error_code="NR-B001",
+                user_action=(
+                    "Could not reach the NullRun backend at "
+                    f"{self.api_url}. Check network connectivity and the "
+                    "configured api_url. This is a transport failure (not "
+                    "an auth failure) — the API key may be valid, the "
+                    "backend is just unreachable."
+                ),
+                cause=e,
             ) from e
 
     def _fetch_policy(self) -> None:
@@ -763,9 +796,7 @@ class NullRunRuntime:
         fail_open = os.environ.get("NULLRUN_POLICY_FAIL_OPEN", "").strip() == "1"
 
         if not self.organization_id:
-            self._policy = (
-                Policy.default_local() if fail_open else Policy.strict_local()
-            )
+            self._policy = Policy.default_local() if fail_open else Policy.strict_local()
             logger.warning(
                 "No organization_id; policy fetch skipped. fail-OPEN=%s "
                 "(NULLRUN_POLICY_FAIL_OPEN=1 to restore permissive fallback).",
@@ -821,9 +852,7 @@ class NullRunRuntime:
                     self.organization_id,
                 )
         except Exception as e:
-            logger.warning(
-                "Failed to fetch policy for org=%s: %s", self.organization_id, e
-            )
+            logger.warning("Failed to fetch policy for org=%s: %s", self.organization_id, e)
 
         # Audit F-R2-02: fail-CLOSED. Order of precedence:
         #   1. last known-good cached policy (if any)
@@ -1705,7 +1734,13 @@ class NullRunRuntime:
         resolved = org_id or self.organization_id
         if not resolved:
             raise NullRunAuthenticationError(
-                "get_org_status requires org_id (or a runtime bound to one)"
+                "get_org_status requires org_id (or a runtime bound to one)",
+                error_code="NR-C003",
+                user_action=(
+                    "Call nullrun.init() first, or pass org_id=<uuid> "
+                    "explicitly. The runtime is not bound to an organization "
+                    "yet — auth() must complete before this method can be used."
+                ),
             )
         response = self._transport._client.get(
             f"{self.api_url}/api/v1/orgs/{resolved}/status",
@@ -2120,8 +2155,10 @@ class NullRunRuntime:
             event["_fingerprint"] = _fingerprint_for_event_dict(event)
         return self.track(event)
 
+
 # Module-level convenience functions
 _runtime: NullRunRuntime | None = None
+
 
 def get_runtime() -> NullRunRuntime:
     """Get or create the global runtime instance."""
@@ -2129,6 +2166,7 @@ def get_runtime() -> NullRunRuntime:
     if _runtime is None:
         _runtime = NullRunRuntime.get_instance()
     return _runtime
+
 
 def track(event: dict[str, Any]) -> dict[str, Any]:
     """
@@ -2144,10 +2182,12 @@ def track(event: dict[str, Any]) -> dict[str, Any]:
     """
     return get_runtime().track(event)
 
+
 # Phase 3.4: explicit alias for `track()` -- same call signature, friendlier
 # name for users who reach for `track_event` first. Both names share the
 # same callable object, so `nullrun.track is nullrun.track_event` is True.
 track_event = track
+
 
 def track_llm(
     input_tokens: int,
@@ -2169,6 +2209,7 @@ def track_llm(
             latency_ms, metadata).
     """
     return get_runtime().track_llm(input_tokens, output_tokens, **kwargs)
+
 
 def track_tool(
     tool_name: str,

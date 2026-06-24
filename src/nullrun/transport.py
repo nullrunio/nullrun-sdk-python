@@ -54,6 +54,7 @@ __api_version__ = "1.0"
 # HMAC Request Signing (Task 11)
 # =============================================================================
 
+
 def generate_hmac_signature(
     api_key: str,
     secret_key: str,
@@ -88,6 +89,7 @@ def generate_hmac_signature(
     ).hexdigest()
 
     return signature
+
 
 def verify_hmac_signature(
     api_key: str,
@@ -133,9 +135,11 @@ def verify_hmac_signature(
     # Constant-time comparison to prevent timing attacks
     return hmac.compare_digest(expected, signature)
 
+
 # =============================================================================
 # Policy Cache for CACHED fallback mode
 # =============================================================================
+
 
 class CachedDecision:
     """Represents a cached execute decision."""
@@ -156,6 +160,7 @@ class CachedDecision:
 
     def is_expired(self) -> bool:
         return time.monotonic() - self.cached_at > self.ttl_seconds
+
 
 class PolicyCache:
     """
@@ -224,6 +229,7 @@ class PolicyCache:
     def __len__(self) -> int:
         return len(self._cache)
 
+
 def _signed_request_body(payload: dict[str, Any]) -> bytes:
     """Serialise a JSON payload to the canonical bytes the HMAC
     signature is computed over.
@@ -241,6 +247,7 @@ def _signed_request_body(payload: dict[str, Any]) -> bytes:
     """
     return json.dumps(payload, separators=(",", ":")).encode("utf-8")
 
+
 # =============================================================================
 # Retry with exponential backoff + jitter
 # =============================================================================
@@ -248,6 +255,7 @@ def _signed_request_body(payload: dict[str, Any]) -> bytes:
 """
 Retry with exponential backoff + jitter + Retry-After header support
 """
+
 
 def _retry_with_backoff(
     func: Callable[[], Any],
@@ -277,16 +285,29 @@ def _retry_with_backoff(
 
             if hasattr(result, "status_code"):
                 if result.status_code == 401:
-                    raise NullRunAuthenticationError("Invalid API key")
+                    from nullrun.breaker.exceptions import NullRunAuthError
+
+                    raise NullRunAuthError(
+                        "Invalid API key",
+                        error_code="NR-A003",
+                        user_action=(
+                            "The NullRun backend rejected the API key (401). "
+                            "Verify it at https://app.nullrun.io/settings/api-keys "
+                            "and rotate if it was revoked. The key may also be "
+                            "for a different environment (prod vs. staging) — "
+                            "check the API_URL vs. where the key was issued."
+                        ),
+                    )
                 if result.status_code >= 500 and on_transport_error == "raise":
                     # Round 3 (Phase 0.4.0): 5xx is a classified
                     # GATEWAY_ERROR. Don't retry -- this is a server
                     # bug, not a network blip. Only raise when the
                     # caller has opted into the typed-error contract
                     # via on_transport_error="raise".
-                    raise NullRunTransportError(
+                    from nullrun.breaker.exceptions import NullRunBackendError
+
+                    raise NullRunBackendError(
                         f"Gateway returned {result.status_code}",
-                        source=TransportErrorSource.GATEWAY_ERROR,
                         endpoint="execute",
                         status_code=result.status_code,
                     )
@@ -353,9 +374,11 @@ def _retry_with_backoff(
 
     raise BreakerTransportError(f"Request failed after {max_retries + 1} attempts") from last_exc
 
+
 # =============================================================================
 # Fallback Modes (Phase 1 - SDK Resilience)
 # =============================================================================
+
 
 class FallbackMode:
     """
@@ -372,6 +395,7 @@ class FallbackMode:
     # Use cached decision if Gateway unavailable
     CACHED = "cached"
 
+
 class DecisionSource:
     """
     Where the decision originated - for provenance tracking.
@@ -381,6 +405,7 @@ class DecisionSource:
     CACHED = "cached"
     FALLBACK = "fallback"
     LOCAL = "local"
+
 
 @dataclass
 class FlushConfig:
@@ -392,6 +417,7 @@ class FlushConfig:
     retry_delay: float = 1.0  # seconds
     max_buffer_size: int = 1000  # Max events before dropping oldest
     max_failed_flush: int = 10  # Circuit breaker: stop trying after this many failures
+
 
 @dataclass
 class ExecuteConfig:
@@ -407,6 +433,7 @@ class ExecuteConfig:
     cache_ttl: float = 60.0
     # Cache max size
     cache_max_size: int = 10000
+
 
 class Transport:
     """
@@ -1642,6 +1669,7 @@ class Transport:
                 logger.warning(f"Failed to refetch credentials: {response.status_code}")
         except Exception as e:
             logger.error(f"Error refetching credentials: {e}")
+
 
 # Audit F-R2-13 (2026-06-22): the module-level ``_parse_error_envelope``
 # helper below is documented as "canonical" but is NOT called from any

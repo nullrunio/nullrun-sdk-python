@@ -72,19 +72,41 @@ F = TypeVar("F", bound=Callable[..., Any])
 # ``_safe_kwargs`` would have shipped them in the audit log.
 # Matching is case-insensitive (see ``_safe_kwargs`` which calls
 # ``.lower()`` on the key).
-SENSITIVE_ARG_KEYS = frozenset({
-    # Credentials / secrets
-    "password", "passwd", "pwd",
-    "token", "secret", "api_key", "apikey",
-    "key", "auth", "authorization", "bearer",
-    "session", "session_id", "cookie",
-    "access_token", "refresh_token", "id_token",
-    "private_key", "secret_key",
-    # PII
-    "email", "phone", "ssn",
-    "credit_card", "credit_card_number", "cvv", "cvc", "pin",
-    "otp", "mfa",
-})
+SENSITIVE_ARG_KEYS = frozenset(
+    {
+        # Credentials / secrets
+        "password",
+        "passwd",
+        "pwd",
+        "token",
+        "secret",
+        "api_key",
+        "apikey",
+        "key",
+        "auth",
+        "authorization",
+        "bearer",
+        "session",
+        "session_id",
+        "cookie",
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "private_key",
+        "secret_key",
+        # PII
+        "email",
+        "phone",
+        "ssn",
+        "credit_card",
+        "credit_card_number",
+        "cvv",
+        "cvc",
+        "pin",
+        "otp",
+        "mfa",
+    }
+)
 
 
 def _safe_repr(value: object, max_len: int = 50) -> str:
@@ -128,8 +150,7 @@ def _safe_repr(value: object, max_len: int = 50) -> str:
 def _safe_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
     """Mask sensitive kwargs (case-insensitive)."""
     return {
-        k: "***" if k.lower() in SENSITIVE_ARG_KEYS else _safe_repr(v)
-        for k, v in kwargs.items()
+        k: "***" if k.lower() in SENSITIVE_ARG_KEYS else _safe_repr(v) for k, v in kwargs.items()
     }
 
 
@@ -172,7 +193,7 @@ def _safe_args(fn: Callable[..., Any], args: tuple[Any, ...]) -> list[Any]:
         else:
             masked.append(_safe_repr(value))
     # Trailing *args have no name — best-effort safe repr.
-    for value in args[len(bound_params):]:
+    for value in args[len(bound_params) :]:
         masked.append(_safe_repr(value))
     return masked
 
@@ -498,9 +519,15 @@ def protect(fn: F | None = None) -> F | Callable[[F], F]:
             # exception type so callers that distinguish hard vs
             # soft blocks keep that signal.
             if isinstance(exc, (WorkflowKilledInterrupt, WorkflowPausedException)):
+                # Layer 1: pass through the kill/pause error_code so
+                # the user can tell WHY the body did not run —
+                # ``NR-W002`` (killed) vs ``NR-W003`` (paused). The
+                # block subclass carries the right user_action hint.
+                _code = "NR-W002" if isinstance(exc, WorkflowKilledInterrupt) else "NR-W003"
                 raise NullRunBlockedException(
                     workflow_id=exc.workflow_id,
                     reason=exc.reason,
+                    error_code=_code,
                 ) from exc
             raise
         finally:
@@ -614,10 +641,29 @@ def _enforce_sensitive_tool(
                 f"{exc.source} on /{exc.endpoint}. NULLRUN_SENSITIVE_FAIL_OPEN=1 — body will run."
             )
             return
+        # Layer 1: stamp the source-specific error code so the
+        # caller can distinguish "backend is down" from "we tripped
+        # the local circuit breaker". Both are retryable in the
+        # sense that the body will run when the policy engine
+        # recovers, but the body still MUST NOT run now (fail-CLOSED).
+        _code = {
+            TransportErrorSource.NETWORK_ERROR: "NR-B001",
+            TransportErrorSource.GATEWAY_ERROR: "NR-B002",
+            TransportErrorSource.AUTH_ERROR: "NR-A003",
+            TransportErrorSource.BREAKER_OPEN: "NR-B005",
+        }.get(exc.source, "NR-B001")
         raise NullRunBlockedException(
             workflow_id=workflow_id,
             reason=f"policy engine unavailable: {exc.source}",
             tool_name=fn.__name__,
+            error_code=_code,
+            user_action=(
+                f"The NullRun policy engine is unreachable "
+                f"({exc.source.value}). The body of @sensitive "
+                f"'{fn.__name__}' did NOT run (fail-CLOSED). "
+                f"Set NULLRUN_SENSITIVE_FAIL_OPEN=1 to opt out for "
+                f"tests / staging — production should leave it off."
+            ),
         ) from exc
     except Exception as exc:  # noqa: BLE001
         # Any other exception is a transport / network / backend
@@ -634,6 +680,14 @@ def _enforce_sensitive_tool(
             workflow_id=workflow_id,
             reason=f"policy engine unavailable: {exc}",
             tool_name=fn.__name__,
+            error_code="NR-B001",
+            user_action=(
+                f"The NullRun policy engine raised an unexpected "
+                f"exception during the @sensitive pre-check of "
+                f"'{fn.__name__}'. The body did NOT run. Check the "
+                f"chained exception (raise ... from exc) for the "
+                f"root cause."
+            ),
         ) from exc
 
     # Defense in depth (ADR-008 Rule 1 + Rule 2): if `runtime.execute`
@@ -645,7 +699,8 @@ def _enforce_sensitive_tool(
         decision_source = result.get("decision_source", "")
         if isinstance(decision_source, str) and (
             decision_source.startswith("FALLBACK_")
-            or decision_source in {
+            or decision_source
+            in {
                 TransportErrorSource.NETWORK_ERROR,
                 TransportErrorSource.GATEWAY_ERROR,
                 TransportErrorSource.BREAKER_OPEN,
@@ -658,10 +713,29 @@ def _enforce_sensitive_tool(
                     f"{decision_source}; NULLRUN_SENSITIVE_FAIL_OPEN=1 — body will run."
                 )
                 return
+            # Layer 1: stamp the source-specific code on the
+            # fallback block so cookbook code can distinguish
+            # between "the policy engine said block" (NR-T001 etc.)
+            # and "we blocked because the policy engine never
+            # answered" (NR-B001/B002).
+            _code = {
+                "NETWORK_ERROR": "NR-B001",
+                "GATEWAY_ERROR": "NR-B002",
+                "AUTH_ERROR": "NR-A003",
+                "BREAKER_OPEN": "NR-B005",
+            }.get(decision_source, "NR-B001")
             raise NullRunBlockedException(
                 workflow_id=workflow_id,
                 reason=f"policy engine unavailable: {decision_source}",
                 tool_name=fn.__name__,
+                error_code=_code,
+                user_action=(
+                    f"The NullRun policy engine returned a fallback "
+                    f"({decision_source}) for @sensitive '{fn.__name__}'. "
+                    f"The body did NOT run. Retry once the policy engine "
+                    f"is back — or set NULLRUN_SENSITIVE_FAIL_OPEN=1 for "
+                    f"tests / staging."
+                ),
             )
 
     # Real `decision=block` from the gateway is already converted to
