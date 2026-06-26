@@ -11,6 +11,7 @@ If no span is active, the fields are omitted from the event and the
 existing `_enrich_event` fallback generates fresh IDs from the
 loose contextvars (or synthesises new ones).
 """
+
 from types import SimpleNamespace
 
 import pytest
@@ -25,6 +26,7 @@ from nullrun.tracing import (
 # ──────────────────────────────────────────────────────────────
 # Capture events from the runtime
 # ──────────────────────────────────────────────────────────────
+
 
 @pytest.fixture
 def capturing_runtime(make_runtime, mock_api):
@@ -59,6 +61,7 @@ def capturing_runtime(make_runtime, mock_api):
 # ──────────────────────────────────────────────────────────────
 # track_llm span context
 # ──────────────────────────────────────────────────────────────
+
 
 def test_track_llm_attaches_active_span(capturing_runtime):
     """track_llm inside an active SpanContext tags the event with
@@ -96,7 +99,7 @@ def test_track_llm_nested_span_has_parent(capturing_runtime):
 
     event = capturing_runtime.events[0]
     assert event["trace_id"] == outer.trace_id  # same trace
-    assert event["span_id"] == inner.span_id    # current span
+    assert event["span_id"] == inner.span_id  # current span
     assert event["parent_span_id"] == outer.span_id
     assert event["depth"] == 1
 
@@ -144,6 +147,7 @@ def test_track_llm_keyword_only_kwargs(capturing_runtime):
 # ──────────────────────────────────────────────────────────────
 # track_tool span context
 # ──────────────────────────────────────────────────────────────
+
 
 def test_track_tool_attaches_active_span(capturing_runtime):
     """Same span-tag behaviour as track_llm."""
@@ -194,6 +198,7 @@ def test_track_tool_is_retry_flag(capturing_runtime):
 # Module-level track_llm / track_tool
 # ──────────────────────────────────────────────────────────────
 
+
 def test_module_level_track_llm_attaches_span(capturing_runtime, monkeypatch):
     """The module-level `nullrun.track_llm` should also pick up the
     active span — it forwards to the runtime method, which is where
@@ -237,6 +242,7 @@ def test_module_level_track_llm_output_tokens_optional(mock_api):
 # End-to-end with @protect
 # ──────────────────────────────────────────────────────────────
 
+
 def test_protect_then_track_llm_attaches_to_protect_span(capturing_runtime, monkeypatch):
     """The integration story: @protect opens a span, a track_llm
     inside it inherits that span — no manual plumbing needed."""
@@ -244,11 +250,13 @@ def test_protect_then_track_llm_attaches_to_protect_span(capturing_runtime, monk
     import nullrun.decorators as dec
     from nullrun import runtime as runtime_mod
     from nullrun.decorators import reset as reset_decorator_runtime
+
     # Wire both: the @protect emit path (uses dec._runtime) AND the
     # module-level nullrun.track_llm path (uses runtime_mod.get_runtime).
     dec._runtime = capturing_runtime.runtime
     monkeypatch.setattr(runtime_mod, "get_runtime", lambda: capturing_runtime.runtime)
     try:
+
         @nullrun.protect
         def agent(q):
             nullrun.track_llm(input_tokens=20, output_tokens=10, model="gpt-4o")

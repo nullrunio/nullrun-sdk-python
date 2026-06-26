@@ -12,11 +12,13 @@ Phase 5 of the production-readiness plan:
 - #5.8: Custom-host KILL reach.
 - #5.10: Transport.execute on_transport_error callback.
 """
+
 from __future__ import annotations
 
 # ===========================================================================
 # 5.1: Remote state helpers
 # ===========================================================================
+
 
 def test_remote_states_lock_is_rlock():
     """`_states_lock` is an RLock so gate-check re-entry doesn't deadlock."""
@@ -57,34 +59,16 @@ def test_set_remote_state_replaces_atomically():
 
 
 # ===========================================================================
-# 5.2: PolicyCache
+# 5.2: PolicyCache / CachedDecision
 # ===========================================================================
-
-def test_policy_cache_preserves_ttl():
-    """`policy_version` must NOT be written into `ttl_seconds`."""
-    from nullrun.transport import PolicyCache
-
-    cache = PolicyCache(maxsize=10, ttl_seconds=300.0)
-    cache.set("k1", "allow", policy_id="p1", policy_version=42)
-    entry = cache._cache["k1"]
-    assert entry.ttl_seconds == 300.0  # unchanged
-    assert entry.policy_version == 42  # new dedicated field
-
-
-def test_cached_decision_exposes_policy_version():
-    """`CachedDecision` has a `policy_version` field that defaults to None."""
-    from nullrun.transport import CachedDecision
-
-    entry = CachedDecision(decision="allow", policy_id="p1")
-    assert entry.policy_version is None
-
-    entry2 = CachedDecision(decision="block", policy_id="p1", policy_version=5)
-    assert entry2.policy_version == 5
-
+# 0.7.0: PolicyCache and CachedDecision classes were removed along
+# with the FallbackMode.CACHED path. The SDK is now a thin client;
+# no local policy cache is maintained.
 
 # ===========================================================================
 # 5.5: _fetch_remote_state uses shared client
 # ===========================================================================
+
 
 def test_fetch_remote_state_uses_transport_client(monkeypatch):
     """`_fetch_remote_state` routes through `self._transport._client.get`
@@ -119,15 +103,13 @@ def test_fetch_remote_state_uses_transport_client(monkeypatch):
     runtime._transport._client = FakeClient()
     runtime._fetch_remote_state("wf-1")
     assert len(called) == 1
-    assert (
-        "/api/v1/orgs/00000000-0000-0000-0000-000000000abc/workflows/wf-1"
-        in called[0]
-    )
+    assert "/api/v1/orgs/00000000-0000-0000-0000-000000000abc/workflows/wf-1" in called[0]
 
 
 # ===========================================================================
 # 5.6: workflow() emits UUID4
 # ===========================================================================
+
 
 def test_workflow_emits_uuid4_when_no_name():
     """Auto-generated workflow IDs are UUID4 (not wf-{hex32})."""
@@ -151,6 +133,7 @@ def test_workflow_uses_explicit_name():
 # 5.7: @sensitive propagates auth error
 # ===========================================================================
 
+
 def test_sensitive_raises_on_missing_api_key(monkeypatch):
     """`@sensitive` fails CLOSED when no api_key (ADR-008):
 
@@ -161,6 +144,7 @@ def test_sensitive_raises_on_missing_api_key(monkeypatch):
     monkeypatch.delenv("NULLRUN_API_KEY", raising=False)
     # Reset singleton so the env change is picked up.
     from nullrun.runtime import NullRunRuntime
+
     NullRunRuntime.reset_instance()
 
     try:
@@ -173,6 +157,7 @@ def test_sensitive_raises_on_missing_api_key(monkeypatch):
             RuntimeError,
             match=r"@sensitive registration failed for 'my_func'",
         ) as excinfo:
+
             @dec.sensitive
             def my_func(x):
                 return x
@@ -187,6 +172,7 @@ def test_sensitive_raises_on_missing_api_key(monkeypatch):
 # ===========================================================================
 # 5.8: Custom-host KILL reach
 # ===========================================================================
+
 
 def test_kill_switch_honoured_for_custom_host():
     """The kill check no longer gates on the extractor table."""
@@ -227,6 +213,7 @@ def test_kill_switch_skipped_for_normal_state():
 # 5.10: Transport.execute on_transport_error callback
 # ===========================================================================
 
+
 def test_execute_on_transport_error_callback_receives_breaker_error(monkeypatch):
     """on_transport_error callback receives the BreakerTransportError.
 
@@ -254,9 +241,7 @@ def test_execute_on_transport_error_callback_receives_breaker_error(monkeypatch)
             return cb(BreakerTransportError("circuit open"))
         raise BreakerTransportError("circuit open")
 
-    monkeypatch.setattr(
-        runtime._transport, "execute", fake_transport_execute
-    )
+    monkeypatch.setattr(runtime._transport, "execute", fake_transport_execute)
 
     received = []
 
@@ -270,9 +255,13 @@ def test_execute_on_transport_error_callback_receives_breaker_error(monkeypatch)
     import pytest
 
     from nullrun.breaker.exceptions import NullRunBlockedException
+
     with pytest.raises(NullRunBlockedException):
         runtime.execute(
-            "test_tool", {}, mode="strict", on_transport_error=callback,
+            "test_tool",
+            {},
+            mode="strict",
+            on_transport_error=callback,
         )
     assert len(received) == 1
     assert isinstance(received[0], BreakerTransportError)

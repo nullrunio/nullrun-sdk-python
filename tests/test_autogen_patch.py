@@ -10,6 +10,7 @@ The pattern mirrors ``tests/test_blocker_fixes.py``: monkeypatch
 the vendor module, reload our patch module, then drive the wrapped
 class through ``MagicMock``-backed call sites.
 """
+
 from __future__ import annotations
 
 import importlib
@@ -46,6 +47,7 @@ def _install_fake_autogen(monkeypatch, *, with_ext: bool = True) -> dict:
     monkeypatch.setitem(sys.modules, "autogen_agentchat.agents", fake_agents_mod)
 
     if with_ext:
+
         class _Usage:
             prompt_tokens = 12
             completion_tokens = 34
@@ -214,6 +216,7 @@ def test_on_messages_exception_emits_span_end_with_error(monkeypatch, fresh_patc
     rt = _fake_runtime(recorder)
 
     from nullrun.instrumentation.autogen import patch_autogen
+
     assert patch_autogen(rt) is True
 
     with pytest.raises(RuntimeError, match="boom"):
@@ -293,6 +296,7 @@ def test_openai_create_without_usage_no_track(monkeypatch, fresh_patch_module):
     rt = _fake_runtime(recorder)
 
     from nullrun.instrumentation.autogen import patch_autogen
+
     assert patch_autogen(rt) is True
     OpenAIChatCompletionClient.create(None)
 

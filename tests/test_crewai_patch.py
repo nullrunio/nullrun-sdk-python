@@ -4,6 +4,7 @@ Regression tests for the crewai auto-instrumentation patch.
 Mirrors the autogen tests: inject a fake ``crewai`` module so the
 patch can run end-to-end without the (heavy) optional dep.
 """
+
 from __future__ import annotations
 
 import importlib
@@ -30,6 +31,7 @@ def _install_fake_crewai(monkeypatch, *, with_async: bool = True) -> dict:
             return SimpleNamespace(result="ok")
 
     if with_async:
+
         class _FakeCrewWithAsync(_FakeCrew):
             @staticmethod
             async def kickoff_async(self, inputs=None, **kwargs):
@@ -201,7 +203,10 @@ def test_kickoff_non_dict_metric_value_skipped(monkeypatch, fresh_patch_module):
     assert patch_crewai(rt) is True
 
     crew = Crew()
-    crew.usage_metrics = {"gpt-4o": "weird", "claude": {"prompt_tokens": 5, "completion_tokens": 6, "total_tokens": 11}}
+    crew.usage_metrics = {
+        "gpt-4o": "weird",
+        "claude": {"prompt_tokens": 5, "completion_tokens": 6, "total_tokens": 11},
+    }
     Crew.kickoff(crew)
 
     # Only the well-formed entry emitted.

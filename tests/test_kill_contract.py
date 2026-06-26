@@ -2,6 +2,7 @@
 
 Run from sdk-python/ root: python tests/test_kill_contract.py
 """
+
 import sys
 import warnings
 
@@ -88,6 +89,7 @@ def test_pause_still_caught_by_except_exception():
 def test_public_export():
     """The new class must be importable from the top-level package."""
     import nullrun
+
     assert hasattr(nullrun, "WorkflowKilledInterrupt")
     # And the old one still works
     assert hasattr(nullrun, "WorkflowKilledException")

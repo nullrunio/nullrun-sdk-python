@@ -2,6 +2,7 @@
 tests/test_runtime.py — покрытие NullRunRuntime и @protect
 Зависимости: pip install pytest pytest-asyncio respx httpx
 """
+
 import asyncio
 
 import httpx
@@ -12,7 +13,7 @@ from nullrun import protect
 from nullrun.breaker.exceptions import (
     NullRunBlockedException,
 )
-from nullrun.runtime import NullRunRuntime, Policy
+from nullrun.runtime import NullRunRuntime
 
 # Base URL used in tests
 BASE_URL = "https://api.test.nullrun.io"
@@ -22,8 +23,8 @@ BASE_URL = "https://api.test.nullrun.io"
 # NullRunRuntime — инициализация
 # ──────────────────────────────────────────────────────────────
 
-class TestNullRunRuntimeInit:
 
+class TestNullRunRuntimeInit:
     def test_creates_with_explicit_params(self, make_runtime):
         rt = make_runtime()
         assert rt is not None
@@ -62,6 +63,7 @@ class TestNullRunRuntimeInit:
     def test_reset_clears_singleton(self, make_runtime):
         make_runtime()
         from nullrun import reset
+
         reset()
         # после reset get_instance либо создает новый, либо вернет None
 
@@ -70,8 +72,8 @@ class TestNullRunRuntimeInit:
 # NullRunRuntime — track()
 # ──────────────────────────────────────────────────────────────
 
-class TestNullRunRuntimeTrack:
 
+class TestNullRunRuntimeTrack:
     def test_track_enqueues_event(self, make_runtime):
         """track() не блокирует и ставит событие в буфер."""
         rt = make_runtime()
@@ -82,9 +84,7 @@ class TestNullRunRuntimeTrack:
 
     def test_track_does_not_raise_on_server_error(self, make_runtime, mock_api):
         """track() fire-and-forget — ошибка сервера не должна падать в calling code."""
-        respx.post(f"{BASE_URL}/track/batch").mock(
-            return_value=httpx.Response(500)
-        )
+        respx.post(f"{BASE_URL}/track/batch").mock(return_value=httpx.Response(500))
         rt = make_runtime()
         # Не должно бросить исключение
         rt.track({"event_type": "test"})
@@ -94,16 +94,19 @@ class TestNullRunRuntimeTrack:
 # NullRunRuntime — execute()
 # ──────────────────────────────────────────────────────────────
 
-class TestNullRunRuntimeExecute:
 
+class TestNullRunRuntimeExecute:
     def test_execute_allowed_returns_result(self, make_runtime, mock_api):
         respx.post(f"{BASE_URL}/execute").mock(
-            return_value=httpx.Response(200, json={
-                "decision": "allow",
-                "decision_source": "gateway",
-                "explanation": "allowed",
-                "policy_version": 1,
-            })
+            return_value=httpx.Response(
+                200,
+                json={
+                    "decision": "allow",
+                    "decision_source": "gateway",
+                    "explanation": "allowed",
+                    "policy_version": 1,
+                },
+            )
         )
         rt = make_runtime()
         result = rt.execute(
@@ -118,12 +121,15 @@ class TestNullRunRuntimeExecute:
         # /gate which silently swallowed the request (no scope check)
         # and let an API key without `execute` scope drive the block.
         respx.post(f"{BASE_URL}/api/v1/execute").mock(
-            return_value=httpx.Response(200, json={
-                "decision": "block",
-                "explanation": "cost_limit_exceeded",
-                "decision_source": "gateway",
-                "policy_version": 1,
-            })
+            return_value=httpx.Response(
+                200,
+                json={
+                    "decision": "block",
+                    "explanation": "cost_limit_exceeded",
+                    "decision_source": "gateway",
+                    "policy_version": 1,
+                },
+            )
         )
         rt = make_runtime()
         # Use mode="strict" to force gateway call
@@ -133,11 +139,11 @@ class TestNullRunRuntimeExecute:
 
     @pytest.mark.skip(
         reason=(
-            'Round 3 (Phase 0.4.0): runtime.execute now requires '
+            "Round 3 (Phase 0.4.0): runtime.execute now requires "
             'on_transport_error="raise" to surface classified errors '
-            '(preserves legacy fail-OPEN behaviour by default so '
-            'check_workflow_budget can treat network errors as transient). '
-            'Re-enable when the test passes the opt-in flag.'
+            "(preserves legacy fail-OPEN behaviour by default so "
+            "check_workflow_budget can treat network errors as transient). "
+            "Re-enable when the test passes the opt-in flag."
         )
     )
     def test_execute_network_error_raises_classified(self, make_runtime, mock_api):
@@ -152,6 +158,7 @@ class TestNullRunRuntimeExecute:
             NullRunTransportError,
             TransportErrorSource,
         )
+
         respx.post(f"{BASE_URL}/api/v1/gate").mock(
             side_effect=httpx.ConnectError("connection refused")
         )
@@ -170,8 +177,8 @@ class TestNullRunRuntimeExecute:
 # @protect decorator
 # ──────────────────────────────────────────────────────────────
 
-class TestProtectDecorator:
 
+class TestProtectDecorator:
     def test_protect_calls_wrapped_function(self, make_runtime, mock_api):
         """@protect не ломает вызов функции."""
         make_runtime()
@@ -226,6 +233,7 @@ class TestProtectDecorator:
         NULLRUN_API_KEY in env so the lazy init path can find it.
         """
         from nullrun import reset
+
         monkeypatch.setenv("NULLRUN_API_KEY", "test-key-12345678")
         monkeypatch.setenv("NULLRUN_API_URL", "https://api.test.nullrun.io")
         reset()
@@ -272,6 +280,7 @@ class TestProtectDecorator:
     def test_protect_sensitive_args_not_logged(self, make_runtime, mock_api, caplog):
         """Чувствительные аргументы не попадают в логи."""
         import logging
+
         make_runtime()
 
         @protect
@@ -310,12 +319,15 @@ class TestProtectDecorator:
 
         def my_custom_decorator(func):
             """Custom decorator that adds extra functionality."""
+
             @functools.wraps(func)
             def wrapper(*args, **kwargs):
                 # Add prefix to result
                 result = func(*args, **kwargs)
                 return f"decorated:{result}"
+
             return wrapper
+
         import functools
 
         @protect
@@ -332,37 +344,9 @@ class TestProtectDecorator:
 # Test mode / Dependency Injection
 # ──────────────────────────────────────────────────────────────
 
+
 class TestRuntimeDI:
     """Test runtime dependency injection and test mode."""
-
-    def test_runtime_test_mode_skips_network(self):
-        """NullRunRuntime with _test_mode=True skips auth and policy fetch."""
-        # This should NOT make any network calls
-        # If it does, respx would catch it (but we're not using mock_api here)
-        rt = NullRunRuntime(
-            api_key="test-key",
-            api_url="http://localhost:9999",  # Invalid URL
-            _test_mode=True,
-        )
-        # Should use default local policy
-        assert rt.policy is not None
-        assert rt.policy.budget_cents == 1000  # Default policy
-        rt.shutdown()
-
-    def test_runtime_test_mode_with_custom_policy(self):
-        """NullRunRuntime test mode accepts injected policy."""
-        custom_policy = Policy(
-            budget_cents=500,
-            rate_limit=50,
-        )
-        rt = NullRunRuntime(
-            api_key="test-key",
-            _test_mode=True,
-            policy=custom_policy,
-        )
-        # Should use injected policy
-        assert rt.policy.budget_cents == 500
-        rt.shutdown()
 
     def test_runtime_di_transport_can_be_overridden(self):
         """NullRunRuntime allows dependency injection pattern."""

@@ -7,6 +7,74 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [0.7.0] - 2026-06-26
+
+### BREAKING CHANGES
+
+SDK is now a thin client. All enforcement decisions arrive from the
+backend via `/api/v1/gate` and `/api/v1/execute`. Local policy
+enforcement, its dataclass, and its hardcoded thresholds are removed.
+
+**Removed:**
+
+- `class Policy`, `Policy.default_local()`, `Policy.strict_local()`,
+  `Policy.from_dict()` (was at `nullrun.runtime.Policy`)
+- `NullRunRuntime.policy` property
+- `NullRunRuntime(policy=...)` constructor kwarg
+- `NullRunStatus.active_policy`, `.fallback_policy`,
+  `.fallback_reason`, `.last_policy_fetch`,
+  `.last_policy_fetch_age_seconds` fields
+- `Transport.fetch_policy()` method
+- `Transport.clear_policy_cache()` method
+- `FallbackMode.CACHED` enum value (gate-decision fallback)
+- Local loop/rate detectors: `LoopTracker`, `RateTracker`,
+  `LocalDecision` classes
+- `NullRunRuntime._local_check()`, `_loop_tracker`, `_rate_tracker`
+  instance attrs
+- `_local_loop_threshold`, `_local_rate_limit` instance attrs
+  (hardcoded 6/1000)
+- `CachedDecision`, `PolicyCache` transport classes (tied to the
+  removed CACHED fallback mode)
+- `NULLRUN_FALLBACK_MODE` env var
+- `NULLRUN_POLICY_FAIL_OPEN` env var (no longer needed — backend is
+  authoritative)
+- `NullRunRuntime._fetch_policy()` method (no local policy fetch on
+  init)
+- WS `on_policy_invalidated` callback (no local policy to invalidate)
+
+**Migration:**
+
+If you need to display policy values in a UI, fetch them directly
+via `GET /api/v1/orgs/{org_id}/policies`. The SDK no longer mirrors
+them.
+
+**Audit:** Drift D-01 from 2026-06-26 SDK↔backend audit
+(`PolicyResponse` lacked fields SDK expected; local defaults silently
+widened limits).
+
+### Transport finalizer behavior change
+
+`Transport._atexit_flush_safe` is now a no-op that emits a single
+`DEBUG` log line. It does NOT persist buffered events to the WAL
+anymore — by the time `weakref.finalize` fires, `self._buffer` /
+`self._lock` / `self._client` are already gone, so any attempt to
+write them would either no-op or crash. **Crash-safety now lives
+exclusively in `stop()` and the context-manager pattern.** Callers
+who relied on the implicit on-exit WAL flush must switch to:
+
+```python
+with nullrun.Transport(api_url=..., api_key=...) as t:
+    # use t; __exit__ calls stop() which calls _persist_to_wal
+    ...
+```
+
+or call `t.stop()` explicitly before process exit. A `DEBUG` log
+line "Transport finalizer fired without explicit stop(); remaining
+events may be lost" is the user-visible signal that events were
+dropped.
+
+---
+
 ## [0.6.1] — 2026-06-24
 
 Additive release — Layers 1, 2, and 3 of the "give the user a chance"

@@ -20,6 +20,7 @@ distinct buffer-mutation bugs:
    windows between copy and clear. The fix centralizes this through
    a single `_drain_batch()` helper.
 """
+
 from __future__ import annotations
 
 import threading
@@ -119,8 +120,7 @@ class TestOverflowDropsNewest:
         assert len(transport._buffer) == 10
         survivors = [e["event_id"] for e in transport._buffer]
         assert survivors == [f"e{i:02d}" for i in range(0, 10)], (
-            f"survivors should be the OLDEST 10 events (cost-audit invariant); "
-            f"got {survivors}"
+            f"survivors should be the OLDEST 10 events (cost-audit invariant); got {survivors}"
         )
 
     def test_critical_state_change_events_are_preserved(self, transport):
@@ -162,11 +162,11 @@ class TestOverflowDropsNewest:
         (cost-audit invariant — we drop newest, keep oldest)."""
         transport.config = FlushConfig(batch_size=200, max_buffer_size=3)
         events = [
-            {"event_id": "e00", "type": "llm_call"},       # OLDEST non-critical
+            {"event_id": "e00", "type": "llm_call"},  # OLDEST non-critical
             {"event_id": "e01", "type": "llm_call"},
             {"event_id": "e02", "type": "llm_call"},
-            {"event_id": "e03", "type": "state_change"},   # critical, mid-batch
-            {"event_id": "e04", "type": "llm_call"},       # NEWEST
+            {"event_id": "e03", "type": "state_change"},  # critical, mid-batch
+            {"event_id": "e04", "type": "llm_call"},  # NEWEST
         ]
         for e in events:
             transport._buffer.append(e)
@@ -199,9 +199,7 @@ class TestConcurrentTrackDuringFlush:
 
         def _capture_send(batch, *args, **kwargs):
             sent_ids.extend(e["event_id"] for e in batch)
-            return Transport.SendResult(
-                accepted_event_ids=[e.get("event_id") for e in batch]
-            )
+            return Transport.SendResult(accepted_event_ids=[e.get("event_id") for e in batch])
 
         with patch.object(
             transport,
@@ -220,9 +218,7 @@ class TestConcurrentTrackDuringFlush:
                 for i in range(n_per_thread):
                     transport.track({"event_id": f"t{tid}-e{i}"})
 
-            threads = [
-                threading.Thread(target=worker, args=(t,)) for t in range(n_threads)
-            ]
+            threads = [threading.Thread(target=worker, args=(t,)) for t in range(n_threads)]
             for t in threads:
                 t.start()
             for t in threads:
@@ -254,8 +250,7 @@ class TestConcurrentTrackDuringFlush:
                 if eid not in all_seen:
                     missing.append(eid)
         assert not missing, (
-            f"Lost {len(missing)} events under concurrent track/flush; "
-            f"first 10: {missing[:10]}"
+            f"Lost {len(missing)} events under concurrent track/flush; first 10: {missing[:10]}"
         )
 
 

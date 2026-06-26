@@ -176,100 +176,6 @@ def verify_hmac_signature(
     return hmac.compare_digest(expected, signature)
 
 
-# =============================================================================
-# Policy Cache for CACHED fallback mode
-# =============================================================================
-
-
-class CachedDecision:
-    """Represents a cached execute decision."""
-
-    def __init__(
-        self,
-        decision: str,
-        policy_id: str | None = None,
-        ttl_seconds: float = 300.0,
-        policy_version: int | None = None,
-    ):
-        self.decision = decision
-        self.policy_id = policy_id
-        self.cached_at = time.monotonic()
-        self.ttl_seconds = ttl_seconds
-        # Phase 5 #5.2: dedicated field, not a `ttl_seconds` repurpose.
-        self.policy_version = policy_version
-
-    def is_expired(self) -> bool:
-        return time.monotonic() - self.cached_at > self.ttl_seconds
-
-
-class PolicyCache:
-    """
-    LRU cache for execute decisions. Used in CACHED fallback mode.
-
-    Cache key is (organization_id, policy_version) to prevent cache thrashing.
-    At 1000+ users with unique workflow_ids, keying by tool caused constant eviction.
-    Now we key by organization + policy version, so all tools in an organization share
-    the same policy cached entry until the policy version changes.
-    """
-
-    def __init__(self, maxsize: int = 1000, ttl_seconds: float = 300.0):
-        self._cache: OrderedDict[str, CachedDecision] = OrderedDict()
-        self._maxsize = maxsize
-        self._ttl = ttl_seconds
-        self._hits = 0
-        self._misses = 0
-
-    def get(self, key: str) -> CachedDecision | None:
-        decision = self._cache.get(key)
-        if decision is None:
-            self._misses += 1
-            return None
-        if decision.is_expired():
-            del self._cache[key]
-            self._misses += 1
-            return None
-        self._cache.move_to_end(key)
-        self._hits += 1
-        return decision
-
-    def set(
-        self, key: str, decision: str, policy_id: str = None, policy_version: int = None
-    ) -> None:
-        if key in self._cache:
-            self._cache.move_to_end(key)
-        elif len(self._cache) >= self._maxsize:
-            self._cache.popitem(last=False)
-        # Phase 5 #5.2: pass policy_version as a dedicated field.
-        # The previous implementation wrote it into ttl_seconds, which
-        # corrupted the cache-lifetime check (see plan #5.2).
-        self._cache[key] = CachedDecision(
-            decision=decision,
-            policy_id=policy_id,
-            ttl_seconds=self._ttl,
-            policy_version=policy_version,
-        )
-
-    def make_key(self, organization_id: str, policy_version: int = None) -> str:
-        """Generate cache key from organization_id and policy_version."""
-        if policy_version is not None:
-            return f"{organization_id}:{policy_version}"
-        return f"{organization_id}:0"  # Default to version 0 if not provided
-
-    def get_stats(self) -> dict:
-        """Get cache statistics for observability."""
-        total = self._hits + self._misses
-        hit_rate = self._hits / total if total > 0 else 0.0
-        return {
-            "size": len(self._cache),
-            "hits": self._hits,
-            "misses": self._misses,
-            "hit_rate": hit_rate,
-        }
-
-    def __len__(self) -> int:
-        return len(self._cache)
-
-
 def _signed_request_body(payload: dict[str, Any]) -> bytes:
     """Serialise a JSON payload to the canonical bytes the HMAC
     signature is computed over.
@@ -446,8 +352,6 @@ class FallbackMode:
     STRICT = "strict"
     # Allow if Gateway unavailable, log locally (DEFAULT)
     PERMISSIVE = "permissive"
-    # Use cached decision if Gateway unavailable
-    CACHED = "cached"
 
 
 class DecisionSource:
@@ -616,10 +520,8 @@ class Transport:
             name="transport",
         )
         self._stopped = False  # Track if stop() was called
-        self._policy_cache = PolicyCache(
-            maxsize=1000,
-            ttl_seconds=300.0,
-        )
+        # 0.7.0 thin client: no local policy cache. The backend is
+        # authoritative on every gate/execute call.
         _masked = api_key[:8] + "***" if api_key and len(api_key) >= 8 else "***"
         logger.debug(f"Transport initialized: api_url={self.api_url}, api_key={_masked}")
 
@@ -1354,14 +1256,9 @@ class Transport:
             if response.status_code == 200:
                 data = response.json()
                 data["decision_source"] = DecisionSource.GATEWAY
-                # Cache successful decision for CACHED mode
-                cache_key = self._policy_cache.make_key(organization_id, data.get("policy_version"))
-                self._policy_cache.set(
-                    cache_key,
-                    data.get("decision", "allow"),
-                    data.get("policy_id"),
-                    data.get("policy_version"),
-                )
+                # 0.7.0 thin client: no local policy cache. The next
+                # /gate call re-reads from the backend, which is
+                # authoritative.
                 return data  # type: ignore[no-any-return]
             elif response.status_code >= 400:
                 # 4xx - don't retry, return block
@@ -1432,28 +1329,6 @@ class Transport:
                 "explanation": "Gateway unavailable, fallback=STRICT",
                 "policy_version": 0,
             }
-        elif fallback_mode == FallbackMode.CACHED:
-            # Use cached decision if available
-            cache_key = self._policy_cache.make_key(organization_id)
-            cached = self._policy_cache.get(cache_key)
-            if cached:
-                logger.warning("Gateway unreachable, using cached decision for %s", tool)
-                return {
-                    "decision": cached.decision,
-                    "decision_source": DecisionSource.CACHED,
-                    "explanation": "Gateway unavailable, using cached decision",
-                    "policy_version": cached.policy_version or 0,
-                }
-            else:
-                logger.warning(
-                    "Gateway unreachable, no cache for %s, falling back to PERMISSIVE", tool
-                )
-                return {
-                    "decision": "allow",
-                    "decision_source": DecisionSource.FALLBACK,
-                    "explanation": "Gateway unavailable, no cache available",
-                    "policy_version": 0,
-                }
         else:  # PERMISSIVE (default)
             return {
                 "decision": "allow",
@@ -1578,12 +1453,6 @@ class Transport:
     # WebSocket Connection (Task 6 - WebSocket Push)
     # =============================================================================
 
-    def clear_policy_cache(self) -> None:
-        """Clear the policy cache, forcing next gate/execute to fetch fresh policy."""
-        if hasattr(self, "_policy_cache"):
-            self._policy_cache._cache.clear()
-            logger.debug("Policy cache cleared")
-
     async def connect_websocket(
         self,
         organization_id: str,
@@ -1640,10 +1509,12 @@ class Transport:
             # FIX-F3: Bearer header for CSRF bypass (see _build_signed_headers).
             headers["Authorization"] = f"Bearer {self.api_key}"
 
-        # Wrap the policy invalidated callback to clear local cache
+        # Policy invalidation: 0.7.0 thin client. There is no local
+        # policy cache to clear -- the next /gate or /execute call
+        # re-reads from the backend. Just forward the notification
+        # to the caller if one was provided.
         async def wrapped_policy_invalidated(ws_id: str, policy_id: str, new_version: int) -> None:
-            logger.info(f"Policy {policy_id} invalidated (v{new_version}), clearing policy cache")
-            self.clear_policy_cache()
+            logger.info(f"Policy {policy_id} invalidated (v{new_version})")
             if on_policy_invalidated:
                 on_policy_invalidated(ws_id, policy_id, new_version)
 

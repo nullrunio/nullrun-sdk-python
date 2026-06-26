@@ -16,6 +16,7 @@ removed because they had no in-tree callers. The base-class
 attribute surface tests below still pin the contract for any future
 subclass.
 """
+
 from nullrun.breaker.exceptions import NullRunBlockedException
 
 

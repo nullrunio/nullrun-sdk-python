@@ -216,9 +216,7 @@ def test_ws_push_kill_state_fires_callback_within_200ms():
             await _on_state(data)
 
     # Run the client in a thread so we can time-bound it.
-    client_thread = threading.Thread(
-        target=lambda: asyncio.run(_client()), daemon=True
-    )
+    client_thread = threading.Thread(target=lambda: asyncio.run(_client()), daemon=True)
     client_thread.start()
     client_thread.join(timeout=2.0)
     assert not client_thread.is_alive(), "WS client did not finish in 2s"
@@ -366,8 +364,7 @@ def test_ws_reconnects_after_server_disconnect():
     assert received[0]["workflow_id"] == "wf-reconnect"
     # Sanity: server saw exactly 2 connections (initial + reconnect).
     assert connection_count[0] == 2, (
-        f"Expected server to see 2 connections (initial + reconnect), "
-        f"got {connection_count[0]}"
+        f"Expected server to see 2 connections (initial + reconnect), got {connection_count[0]}"
     )
 
 
@@ -518,14 +515,11 @@ def test_hmac_verify_failure_logs_error_and_bumps_metric(caplog):
 
     after = metrics.transport.hmac_verify_failures_total
     assert after == before + 1, (
-        f"hmac_verify_failures_total did not increment: "
-        f"before={before}, after={after}"
+        f"hmac_verify_failures_total did not increment: before={before}, after={after}"
     )
     # The bad message MUST NOT have reached the callback — signature
     # verification is the gate that prevents forged kill commands.
-    assert received == [], (
-        f"Forged message was dispatched to on_state_change: {received}"
-    )
+    assert received == [], f"Forged message was dispatched to on_state_change: {received}"
     # And the failure must be visible at ERROR level.
     error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
     assert any("HMAC" in r.getMessage() for r in error_records), (

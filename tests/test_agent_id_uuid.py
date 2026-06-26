@@ -13,6 +13,7 @@ Post-fix the auto-generated form is ``str(uuid.uuid4())`` (dashes
 included). A user-supplied ``name`` is preserved verbatim so existing
 dashboards continue to work for already-allocated agent ids.
 """
+
 import uuid
 
 import pytest

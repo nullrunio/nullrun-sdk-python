@@ -1,6 +1,7 @@
 """
 tests/test_transport.py — transport, circuit breaker, flush, retry coverage
 """
+
 import asyncio
 import threading
 import time
@@ -27,7 +28,6 @@ def cb():
 
 
 class TestTransport:
-
     @respx.mock
     def test_send_batch_success(self, transport):
         route = respx.post("https://api.test.nullrun.io/api/v1/track/batch").mock(
@@ -122,14 +122,9 @@ class TestTransport:
         assert result["decision_source"] == "fallback"
 
     @respx.mock
-    def test_execute_fallback_cached_uses_cache(self, transport):
-        """CACHED fallback mode uses cached decision when available."""
-        # Pre-populate the cache
-        cache_key = transport._policy_cache.make_key("ws-123")
-        transport._policy_cache.set(cache_key, "block", "policy-cached-123")
-
-        # Gateway unavailable
-        respx.post("https://api.test.nullrun.io/api/v1/gate").mock(
+    def test_execute_fallback_cached_degrades_to_permissive(self, transport):
+        """0.7.0: CACHED fallback mode degrades to PERMISSIVE (no local cache)."""
+        respx.post("https://api.test.nullrun.io/api/v1/execute").mock(
             return_value=httpx.Response(500, text="Server Error")
         )
         result = transport.execute(
@@ -140,39 +135,24 @@ class TestTransport:
             input_data={},
             fallback_mode="cached",
         )
-        assert result["decision"] == "block"
-        assert result["decision_source"] == "cached"
-        assert result["explanation"] == "Gateway unavailable, using cached decision"
-
-    @respx.mock
-    def test_execute_fallback_cached_no_cache_allows(self, transport):
-        """CACHED fallback allows when no cache available and Gateway unavailable."""
-        respx.post("https://api.test.nullrun.io/api/v1/gate").mock(
-            return_value=httpx.Response(500, text="Server Error")
-        )
-        result = transport.execute(
-            organization_id="ws-123",
-            execution_id="exec-456",
-            trace_id="trace-789",
-            tool="my.tool",
-            input_data={},
-            fallback_mode="cached",
-        )
+        # 0.7.0: thin client — no local cache to consult on gateway
+        # failure. CACHED silently degrades to PERMISSIVE.
         assert result["decision"] == "allow"
         assert result["decision_source"] == "fallback"
 
     @respx.mock
-    def test_execute_success_caches_decision(self, transport):
-        """Successful execute caches the decision for future fallback."""
-        # Audit F-R2-01 (2026-06-22): Transport.execute now hits
-        # /api/v1/execute (was /gate) so the backend checks the
-        # `execute` scope.
+    def test_execute_success_does_not_cache_decision(self, transport):
+        """0.7.0: successful execute no longer caches the decision.
+        The thin client re-reads from the backend on every call."""
         respx.post("https://api.test.nullrun.io/api/v1/execute").mock(
-            return_value=httpx.Response(200, json={
-                "decision": "allow",
-                "policy_id": "policy-123",
-                "policy_version": 5,
-            })
+            return_value=httpx.Response(
+                200,
+                json={
+                    "decision": "allow",
+                    "policy_id": "policy-123",
+                    "policy_version": 5,
+                },
+            )
         )
         result = transport.execute(
             organization_id="ws-123",
@@ -183,13 +163,10 @@ class TestTransport:
         )
         assert result["decision"] == "allow"
         assert result["decision_source"] == "gateway"
-
-        # Verify cache was populated
-        cache_key = transport._policy_cache.make_key("ws-123", 5)
-        cached = transport._policy_cache.get(cache_key)
-        assert cached is not None
-        assert cached.decision == "allow"
-        assert cached.policy_id == "policy-123"
+        # Pin: no _policy_cache attribute on Transport anymore.
+        assert not hasattr(transport, "_policy_cache"), (
+            "Transport._policy_cache re-introduced — thin-client invariant broken."
+        )
 
     @respx.mock
     def test_check_endpoint_returns_block_on_error(self, transport):
@@ -199,43 +176,49 @@ class TestTransport:
         respx.post("https://api.test.nullrun.io/api/v1/gate").mock(
             return_value=httpx.Response(500, text="Server Error")
         )
-        result = transport.check({
-            "workspace_id": "ws-123",
-            "execution_id": "exec-456",
-            "operation_id": "op-789",
-            "check_type": "llm",
-            "model": "claude-3",
-            "estimated_tokens": 100,
-        })
+        result = transport.check(
+            {
+                "workspace_id": "ws-123",
+                "execution_id": "exec-456",
+                "operation_id": "op-789",
+                "check_type": "llm",
+                "model": "claude-3",
+                "estimated_tokens": 100,
+            }
+        )
         assert result["decision"] == "block"
 
     @respx.mock
     def test_check_endpoint_returns_allow_on_success(self, transport):
         """Check endpoint returns allow decision on success."""
         respx.post("https://api.test.nullrun.io/api/v1/gate").mock(
-            return_value=httpx.Response(200, json={
-                "decision": "allow",
-                "reservation_id": "res-123",
-                "remaining_budget_cents": 500,
-                "projected_cost_cents": 10,
-                "explanations": [],
-                "suggestions": [],
-            })
+            return_value=httpx.Response(
+                200,
+                json={
+                    "decision": "allow",
+                    "reservation_id": "res-123",
+                    "remaining_budget_cents": 500,
+                    "projected_cost_cents": 10,
+                    "explanations": [],
+                    "suggestions": [],
+                },
+            )
         )
-        result = transport.check({
-            "organization_id": "ws-123",
-            "execution_id": "exec-456",
-            "operation_id": "op-789",
-            "check_type": "llm",
-            "model": "claude-3",
-            "estimated_tokens": 100,
-        })
+        result = transport.check(
+            {
+                "organization_id": "ws-123",
+                "execution_id": "exec-456",
+                "operation_id": "op-789",
+                "check_type": "llm",
+                "model": "claude-3",
+                "estimated_tokens": 100,
+            }
+        )
         assert result["decision"] == "allow"
         assert result["remaining_budget_cents"] == 500
 
 
 class TestCircuitBreaker:
-
     def test_initial_state_is_closed(self, cb):
         assert cb.state == CBState.CLOSED
 
@@ -347,7 +330,6 @@ class TestCircuitBreaker:
 
 
 class TestRetry:
-
     @respx.mock
     def test_retry_on_500(self):
         """P0 #2: 5xx on /track/batch is retried. Pre-fix this test asserted
@@ -390,7 +372,6 @@ class TestBoundedDict:
 
 
 class TestTransportFlush:
-
     @respx.mock
     def test_flush_on_batch_size(self, transport):
         """Events are flushed when batch_size is reached."""
@@ -496,89 +477,16 @@ class TestTransportFlush:
 # httpx client + background flush thread is non-blocking. See
 # ``tests/test_signal_safety.py`` for the new lifecycle contract.
 
-
-# ──────────────────────────────────────────────────────────────
-# PolicyCache tests
-# ──────────────────────────────────────────────────────────────
-
-class TestPolicyCache:
-
-    def test_cache_set_and_get(self):
-        """PolicyCache stores and retrieves decisions."""
-        from nullrun.transport import PolicyCache
-        cache = PolicyCache(maxsize=100, ttl_seconds=60)
-        cache.set("key1", "allow", "policy-123")
-        result = cache.get("key1")
-        assert result is not None
-        assert result.decision == "allow"
-        assert result.policy_id == "policy-123"
-
-    def test_cache_miss_returns_none(self):
-        """PolicyCache returns None for missing keys."""
-        from nullrun.transport import PolicyCache
-        cache = PolicyCache(maxsize=100, ttl_seconds=60)
-        result = cache.get("nonexistent")
-        assert result is None
-
-    def test_cache_expiry(self):
-        """PolicyCache evicts expired entries."""
-        import time
-
-        from nullrun.transport import PolicyCache
-        cache = PolicyCache(maxsize=100, ttl_seconds=0.1)  # 100ms TTL
-        cache.set("key1", "allow", "policy-123")
-        # Not expired yet
-        result = cache.get("key1")
-        assert result is not None
-        # Wait for expiry
-        time.sleep(0.15)
-        result = cache.get("key1")
-        assert result is None
-
-    def test_cache_lru_eviction(self):
-        """PolicyCache evicts least recently used when full."""
-        from nullrun.transport import PolicyCache
-        cache = PolicyCache(maxsize=3, ttl_seconds=60)
-        cache.set("key1", "allow")
-        cache.set("key2", "allow")
-        cache.set("key3", "allow")
-        # Adding 4th item should evict key1
-        cache.set("key4", "allow")
-        assert cache.get("key1") is None
-        assert cache.get("key2") is not None
-        assert cache.get("key3") is not None
-        assert cache.get("key4") is not None
-
-    def test_cache_make_key(self):
-        """PolicyCache.make_key generates correct keys."""
-        from nullrun.transport import PolicyCache
-        cache = PolicyCache()
-        # Key format: "<organization_id>:<policy_version>"
-        assert cache.make_key("ws-123") == "ws-123:0"
-        assert cache.make_key("ws-123", 5) == "ws-123:5"
-
-    def test_cache_update_moves_to_end(self):
-        """Updating existing key moves it to end (most recently used)."""
-        from nullrun.transport import PolicyCache
-        cache = PolicyCache(maxsize=3, ttl_seconds=60)
-        cache.set("key1", "allow")
-        cache.set("key2", "allow")
-        cache.set("key3", "allow")
-        # Update key1 - should become most recently used
-        cache.set("key1", "block")
-        # Adding new key should evict key2 (oldest after key1 update)
-        cache.set("key4", "allow")
-        assert cache.get("key1") is not None
-        assert cache.get("key1").decision == "block"
-        assert cache.get("key2") is None  # evicted
+# 0.7.0: PolicyCache class was removed along with
+# FallbackMode.CACHED. The SDK is a thin client; no local cache.
+# The corresponding TestPolicyCache class has been removed.
 
 
-# ──────────────────────────────────────────────────────────────
 # Sensitive Tools API tests
 # ──────────────────────────────────────────────────────────────
 
-class TestSensitiveToolsAPI:
 
+class TestSensitiveToolsAPI:
     def test_add_sensitive_tool(self, make_runtime):
         """add_sensitive_tool marks a tool as sensitive."""
         rt = make_runtime()
@@ -621,18 +529,19 @@ class TestSensitiveToolsAPI:
 # HMAC signature tests
 # ──────────────────────────────────────────────────────────────
 
-class TestTransportHMAC:
 
+class TestTransportHMAC:
     def test_generate_hmac_signature(self):
         """HMAC signature generation works."""
         import time
 
         from nullrun.transport import generate_hmac_signature
+
         sig = generate_hmac_signature(
             api_key="test-key",
             secret_key="secret-123",
             timestamp=int(time.time()),
-            body='{"event": "test"}'
+            body='{"event": "test"}',
         )
         assert sig is not None
         assert len(sig) == 64  # SHA256 hex
@@ -642,6 +551,7 @@ class TestTransportHMAC:
         import time
 
         from nullrun.transport import generate_hmac_signature, verify_hmac_signature
+
         api_key = "test-key"
         secret_key = "secret-123"
         timestamp = int(time.time())
@@ -655,12 +565,13 @@ class TestTransportHMAC:
         import time
 
         from nullrun.transport import verify_hmac_signature
+
         result = verify_hmac_signature(
             api_key="test-key",
             secret_key="secret-123",
             timestamp=int(time.time()),
             body='{"event": "test"}',
-            signature="invalid_signature"
+            signature="invalid_signature",
         )
         assert result is False
 
@@ -669,13 +580,16 @@ class TestTransportHMAC:
         import time
 
         from nullrun.transport import generate_hmac_signature, verify_hmac_signature
+
         api_key = "test-key"
         secret_key = "secret-123"
         body = '{"event": "test"}'
         # Use timestamp from 10 minutes ago (max_age is 5 minutes)
         old_timestamp = int(time.time()) - 600
         sig = generate_hmac_signature(api_key, secret_key, old_timestamp, body)
-        result = verify_hmac_signature(api_key, secret_key, old_timestamp, body, sig, max_age_seconds=300)
+        result = verify_hmac_signature(
+            api_key, secret_key, old_timestamp, body, sig, max_age_seconds=300
+        )
         assert result is False
 
 
@@ -745,13 +659,10 @@ class TestRefetchCredentialsUsesSharedClient:
         )
         # The URL must be the auth/verify endpoint on the configured api_url.
         args, kwargs = called[0]
-        assert args[0].endswith("/auth/verify"), (
-            f"Expected POST to /auth/verify, got {args[0]!r}"
-        )
+        assert args[0].endswith("/auth/verify"), f"Expected POST to /auth/verify, got {args[0]!r}"
         # The new secret must be picked up from the response.
         assert t.secret_key == new_secret, (
-            f"New secret_key was not stored on the transport: "
-            f"got {t.secret_key!r}"
+            f"New secret_key was not stored on the transport: got {t.secret_key!r}"
         )
 
     def test_refetch_does_not_import_requests(self):

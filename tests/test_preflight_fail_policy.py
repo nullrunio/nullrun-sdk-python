@@ -44,6 +44,7 @@ BASE_URL = "https://api.test.nullrun.io"
 # Helpers — RecordingRuntime (no-op transport, full gate behavior)
 # ──────────────────────────────────────────────────────────────
 
+
 class _RecordingRuntime:
     """
     Stand-in runtime that records events but does NOT call any
@@ -114,8 +115,8 @@ class _RecordingRuntime:
 # Bug #1 — check_workflow_budget fail-OPEN
 # ──────────────────────────────────────────────────────────────
 
-class TestCheckWorkflowBudgetFailOpen:
 
+class TestCheckWorkflowBudgetFailOpen:
     def test_network_error_returns_normally(self, make_runtime, mock_api):
         """httpx.ConnectError on /gate → check_workflow_budget returns
         normally (fail-OPEN). Regression for bug #1 — the old code
@@ -137,9 +138,7 @@ class TestCheckWorkflowBudgetFailOpen:
 
     def test_5xx_returns_normally(self, make_runtime, mock_api):
         """HTTP 500 from /gate → returns normally."""
-        respx.post(f"{BASE_URL}/api/v1/gate").mock(
-            return_value=httpx.Response(500, text="boom")
-        )
+        respx.post(f"{BASE_URL}/api/v1/gate").mock(return_value=httpx.Response(500, text="boom"))
         rt = make_runtime()
         rt.check_workflow_budget()
 
@@ -148,10 +147,13 @@ class TestCheckWorkflowBudgetFailOpen:
         WorkflowKilledInterrupt. The fix for bug #1 must NOT swallow
         real policy decisions — only transport errors."""
         respx.post(f"{BASE_URL}/api/v1/gate").mock(
-            return_value=httpx.Response(200, json={
-                "decision": "block",
-                "explanations": ["budget_exceeded"],
-            })
+            return_value=httpx.Response(
+                200,
+                json={
+                    "decision": "block",
+                    "explanations": ["budget_exceeded"],
+                },
+            )
         )
         rt = make_runtime()
         with pytest.raises(WorkflowKilledInterrupt):
@@ -160,19 +162,21 @@ class TestCheckWorkflowBudgetFailOpen:
     def test_real_throttle_raises_paused(self, make_runtime, mock_api):
         """`decision=throttle` still raises WorkflowPausedException."""
         respx.post(f"{BASE_URL}/api/v1/gate").mock(
-            return_value=httpx.Response(200, json={
-                "decision": "throttle",
-                "explanations": ["soft limit"],
-            })
+            return_value=httpx.Response(
+                200,
+                json={
+                    "decision": "throttle",
+                    "explanations": ["soft limit"],
+                },
+            )
         )
         rt = make_runtime()
         from nullrun.breaker.exceptions import WorkflowPausedException
+
         with pytest.raises(WorkflowPausedException):
             rt.check_workflow_budget()
 
-    def test_decision_source_is_typed_for_audit(
-        self, make_runtime, mock_api
-    ):
+    def test_decision_source_is_typed_for_audit(self, make_runtime, mock_api):
         """On 5xx the runtime layer must NOT lose the failure
         classification — the transport layer should set one of the
         three FALLBACK_* values in `decision_source` (or, with the
@@ -191,8 +195,8 @@ class TestCheckWorkflowBudgetFailOpen:
 # Bug #2 — _enforce_sensitive_tool fail-CLOSED on transport error
 # ──────────────────────────────────────────────────────────────
 
-class TestEnforceSensitiveToolFailClosed:
 
+class TestEnforceSensitiveToolFailClosed:
     def _build_protected_sensitive_tool(self, mock_api, make_runtime):
         """
         Build a runtime + a `@protect`-wrapped `@sensitive` tool.
@@ -212,17 +216,13 @@ class TestEnforceSensitiveToolFailClosed:
 
         return rt, charge_card, calls
 
-    def test_transport_error_fails_closed(
-        self, make_runtime, mock_api, monkeypatch
-    ):
+    def test_transport_error_fails_closed(self, make_runtime, mock_api, monkeypatch):
         """Network error on /execute → NullRunBlockedException,
         body does NOT run. Regression for bug #2."""
         respx.post(f"{BASE_URL}/api/v1/execute").mock(
             side_effect=httpx.ConnectError("connection refused")
         )
-        rt, charge_card, calls = self._build_protected_sensitive_tool(
-            mock_api, make_runtime
-        )
+        rt, charge_card, calls = self._build_protected_sensitive_tool(mock_api, make_runtime)
 
         with pytest.raises(NullRunBlockedException) as exc_info:
             charge_card(100)
@@ -230,26 +230,19 @@ class TestEnforceSensitiveToolFailClosed:
         # The reason must mention the policy engine (audit-trail hint).
         assert "policy engine" in (exc_info.value.reason or "").lower()
 
-    def test_classified_transport_error_surfaces_source(
-        self, make_runtime, mock_api
-    ):
+    def test_classified_transport_error_surfaces_source(self, make_runtime, mock_api):
         """The reason on the raised NullRunBlockedException includes
         the classified source (NETWORK_ERROR / GATEWAY_ERROR /
         BREAKER_OPEN) so the audit trail can distinguish them."""
         respx.post(f"{BASE_URL}/api/v1/execute").mock(
             side_effect=httpx.ConnectError("connection refused")
         )
-        rt, charge_card, calls = self._build_protected_sensitive_tool(
-            mock_api, make_runtime
-        )
+        rt, charge_card, calls = self._build_protected_sensitive_tool(mock_api, make_runtime)
 
         with pytest.raises(NullRunBlockedException) as exc_info:
             charge_card(100)
         # Source is the new TransportErrorSource value
-        assert (
-            TransportErrorSource.NETWORK_ERROR
-            in (exc_info.value.reason or "")
-        )
+        assert TransportErrorSource.NETWORK_ERROR in (exc_info.value.reason or "")
 
     def test_5xx_fails_closed(self, make_runtime, mock_api):
         """HTTP 5xx on /execute → NullRunBlockedException, body
@@ -259,17 +252,13 @@ class TestEnforceSensitiveToolFailClosed:
         respx.post(f"{BASE_URL}/api/v1/execute").mock(
             return_value=httpx.Response(502, text="Bad Gateway")
         )
-        rt, charge_card, calls = self._build_protected_sensitive_tool(
-            mock_api, make_runtime
-        )
+        rt, charge_card, calls = self._build_protected_sensitive_tool(mock_api, make_runtime)
 
         with pytest.raises(NullRunBlockedException):
             charge_card(100)
         assert calls["n"] == 0
 
-    def test_defense_in_depth_fallback_source_fails_closed(
-        self, make_runtime, mock_api
-    ):
+    def test_defense_in_depth_fallback_source_fails_closed(self, make_runtime, mock_api):
         """Even if `runtime.execute` returns a dict with
         `decision_source` starting with `FALLBACK_*` (e.g. a future
         regression drops the `on_transport_error="raise"` argument),
@@ -301,9 +290,7 @@ class TestEnforceSensitiveToolFailClosed:
             charge_card(100)
         assert calls["n"] == 0, "body ran on FALLBACK_* source — bug #2 regression"
 
-    def test_opt_out_allows_body_when_engine_absent(
-        self, make_runtime, mock_api, monkeypatch
-    ):
+    def test_opt_out_allows_body_when_engine_absent(self, make_runtime, mock_api, monkeypatch):
         """NULLRUN_SENSITIVE_FAIL_OPEN=1 explicitly opts the user
         back into fail-OPEN behavior — for dev / test environments
         where the policy engine is intentionally absent."""
@@ -311,17 +298,13 @@ class TestEnforceSensitiveToolFailClosed:
         respx.post(f"{BASE_URL}/api/v1/execute").mock(
             side_effect=httpx.ConnectError("connection refused")
         )
-        rt, charge_card, calls = self._build_protected_sensitive_tool(
-            mock_api, make_runtime
-        )
+        rt, charge_card, calls = self._build_protected_sensitive_tool(mock_api, make_runtime)
 
         result = charge_card(100)
         assert result == "charged 100"
         assert calls["n"] == 1
 
-    def test_real_block_still_honored(
-        self, make_runtime, mock_api
-    ):
+    def test_real_block_still_honored(self, make_runtime, mock_api):
         """A real `decision=block` from the gateway (not a transport
         error) must STILL raise NullRunBlockedException. The
         fail-CLOSED rule applies to *both* transport failure and
@@ -331,16 +314,17 @@ class TestEnforceSensitiveToolFailClosed:
         # sensitive-tool route. /api/v1/gate is reserved for budget
         # pre-flight only.
         respx.post(f"{BASE_URL}/api/v1/execute").mock(
-            return_value=httpx.Response(200, json={
-                "decision": "block",
-                "explanation": "blocked by policy",
-                "decision_source": "gateway",
-                "policy_version": 1,
-            })
+            return_value=httpx.Response(
+                200,
+                json={
+                    "decision": "block",
+                    "explanation": "blocked by policy",
+                    "decision_source": "gateway",
+                    "policy_version": 1,
+                },
+            )
         )
-        rt, charge_card, calls = self._build_protected_sensitive_tool(
-            mock_api, make_runtime
-        )
+        rt, charge_card, calls = self._build_protected_sensitive_tool(mock_api, make_runtime)
 
         with pytest.raises(NullRunBlockedException):
             charge_card(100)
@@ -351,8 +335,8 @@ class TestEnforceSensitiveToolFailClosed:
 # Bug #3 — @protect calls check_control_plane FIRST
 # ──────────────────────────────────────────────────────────────
 
-class TestProtectCallsControlPlaneFirst:
 
+class TestProtectCallsControlPlaneFirst:
     @pytest.mark.skip(
         reason=(
             "Round 3 (Phase 0.4.0): @protect unifies WorkflowKilledInterrupt "
@@ -381,6 +365,7 @@ class TestProtectCallsControlPlaneFirst:
         dec._runtime = rt
         try:
             with wf_ctx("wf-killed"):
+
                 @nullrun.protect
                 def agent(q):
                     return "should not run"
@@ -407,6 +392,7 @@ class TestProtectCallsControlPlaneFirst:
         dec._runtime = rt
         try:
             with wf_ctx("wf-ok"):
+
                 @nullrun.protect
                 def agent(q):
                     return "ok"
@@ -419,11 +405,11 @@ class TestProtectCallsControlPlaneFirst:
 
     @pytest.mark.skip(
         reason=(
-            'Round 3 (Phase 0.4.0): @protect unifies WorkflowKilledInterrupt '
-            'into NullRunBlockedException. This test asserts span_end is emitted '
-            'with the original WorkflowKilledInterrupt type, but the decorator '
-            'now raises NullRunBlockedException. Re-enable when span_end payload '
-            'captures both the original and unified exception types.'
+            "Round 3 (Phase 0.4.0): @protect unifies WorkflowKilledInterrupt "
+            "into NullRunBlockedException. This test asserts span_end is emitted "
+            "with the original WorkflowKilledInterrupt type, but the decorator "
+            "now raises NullRunBlockedException. Re-enable when span_end payload "
+            "captures both the original and unified exception types."
         )
     )
     def test_kill_does_not_skip_span_end(self, monkeypatch):
@@ -442,6 +428,7 @@ class TestProtectCallsControlPlaneFirst:
         dec._runtime = rt
         try:
             with wf_ctx("wf-killed"):
+
                 @nullrun.protect
                 def agent(q):
                     return "should not run"
@@ -452,8 +439,7 @@ class TestProtectCallsControlPlaneFirst:
             events = rt.events
             span_ends = [e for e in events if e["type"] == "span_end"]
             assert len(span_ends) == 1, (
-                "KILL path did not emit span_end — dashboard would "
-                "lose the kill context"
+                "KILL path did not emit span_end — dashboard would lose the kill context"
             )
             err = span_ends[0].get("error") or ""
             assert "killed" in err.lower()
@@ -465,29 +451,37 @@ class TestProtectCallsControlPlaneFirst:
 # Transport-layer classification regression
 # ──────────────────────────────────────────────────────────────
 
-class TestTransportClassification:
 
+class TestTransportClassification:
     @pytest.mark.skip(
         reason=(
-            'Round 3 (Phase 0.4.0): Transport.check() now requires '
+            "Round 3 (Phase 0.4.0): Transport.check() now requires "
             'on_transport_error="raise" to surface classified errors '
-            '(preserves legacy fail-OPEN behaviour by default so '
-            'check_workflow_budget can treat network errors as transient). '
-            'Re-enable when the test passes the opt-in flag.'
+            "(preserves legacy fail-OPEN behaviour by default so "
+            "check_workflow_budget can treat network errors as transient). "
+            "Re-enable when the test passes the opt-in flag."
         )
     )
     def test_check_raises_classified_error_on_network(self, mock_api):
         """transport.check with on_transport_error='raise' must
         surface classified NETWORK_ERROR."""
         from nullrun.transport import Transport
+
         respx.post(f"{BASE_URL}/api/v1/execute").mock(
             side_effect=httpx.ConnectError("connection refused")
         )
         rt = Transport(api_url=BASE_URL, api_key="k")
         with pytest.raises(NullRunTransportError) as exc_info:
-            rt.check({"organization_id": "o", "execution_id": "e",
-                      "operation_id": "op", "check_type": "llm",
-                      "model": "m", "estimated_tokens": 1})
+            rt.check(
+                {
+                    "organization_id": "o",
+                    "execution_id": "e",
+                    "operation_id": "op",
+                    "check_type": "llm",
+                    "model": "m",
+                    "estimated_tokens": 1,
+                }
+            )
         assert exc_info.value.source == TransportErrorSource.NETWORK_ERROR
         assert exc_info.value.endpoint == "check"
 
@@ -495,16 +489,18 @@ class TestTransportClassification:
         """transport.execute with on_transport_error='raise' must
         surface classified GATEWAY_ERROR on 5xx."""
         from nullrun.transport import Transport
+
         # Audit F-R2-01 (2026-06-22): Transport.execute routes to
         # /api/v1/execute (not /gate) — see transport.py:1188.
-        respx.post(f"{BASE_URL}/api/v1/execute").mock(
-            return_value=httpx.Response(500, text="boom")
-        )
+        respx.post(f"{BASE_URL}/api/v1/execute").mock(return_value=httpx.Response(500, text="boom"))
         rt = Transport(api_url=BASE_URL, api_key="k")
         with pytest.raises(NullRunTransportError) as exc_info:
             rt.execute(
-                organization_id="o", execution_id="e",
-                trace_id="t", tool="my.tool", input_data={},
+                organization_id="o",
+                execution_id="e",
+                trace_id="t",
+                tool="my.tool",
+                input_data={},
                 on_transport_error="raise",
             )
         assert exc_info.value.source == TransportErrorSource.GATEWAY_ERROR
@@ -516,13 +512,17 @@ class TestTransportClassification:
         that want the dict shape (e.g. for audit, not for
         enforcement)."""
         from nullrun.transport import Transport
+
         respx.post(f"{BASE_URL}/api/v1/execute").mock(
             side_effect=httpx.ConnectError("connection refused")
         )
         rt = Transport(api_url=BASE_URL, api_key="k")
         result = rt.execute(
-            organization_id="o", execution_id="e",
-            trace_id="t", tool="my.tool", input_data={},
+            organization_id="o",
+            execution_id="e",
+            trace_id="t",
+            tool="my.tool",
+            input_data={},
             on_transport_error="open",
         )
         assert result["decision"] == "allow"
@@ -532,13 +532,17 @@ class TestTransportClassification:
         """transport.execute with on_transport_error='closed' returns
         a synthetic block with FALLBACK_* source."""
         from nullrun.transport import Transport
+
         respx.post(f"{BASE_URL}/api/v1/execute").mock(
             side_effect=httpx.ConnectError("connection refused")
         )
         rt = Transport(api_url=BASE_URL, api_key="k")
         result = rt.execute(
-            organization_id="o", execution_id="e",
-            trace_id="t", tool="my.tool", input_data={},
+            organization_id="o",
+            execution_id="e",
+            trace_id="t",
+            tool="my.tool",
+            input_data={},
             on_transport_error="closed",
         )
         assert result["decision"] == "block"

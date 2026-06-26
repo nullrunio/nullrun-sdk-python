@@ -12,6 +12,7 @@ Additional transport branch tests covering gaps in
   - ``clear_policy_cache``
   - ``_parse_error_envelope`` for 401 / 403 / 429 / 500 / 502 / 400
 """
+
 from __future__ import annotations
 
 import time
@@ -275,27 +276,13 @@ def test_execute_fallback_strict_returns_block():
     assert "STRICT" in result["explanation"]
 
 
-def test_execute_fallback_cached_hit():
-    """fallback_mode=CACHED + cache hit → return cached decision."""
-    from nullrun.breaker.exceptions import BreakerTransportError
-
-    t = _build_transport()
-    t._policy_cache.set("org-1:0", "allow", policy_id="p1", policy_version=0)
-    t._client.post = MagicMock(side_effect=BreakerTransportError("down"))
-    result = t.execute(
-        organization_id="org-1",
-        execution_id="wf-1",
-        trace_id="t-1",
-        tool="x",
-        input_data={},
-        fallback_mode="cached",
-    )
-    assert result["decision"] == "allow"
-    assert result["decision_source"] == "cached"
+# 0.7.0: fallback_mode=CACHED + the local PolicyCache path were
+# removed. The thin-client SDK has no local cache to consult on
+# gateway failure. CACHED now degrades to PERMISSIVE.
 
 
-def test_execute_fallback_cached_miss():
-    """fallback_mode=CACHED + cache miss → fall through to permissive."""
+def test_execute_fallback_cached_degrades_to_permissive():
+    """fallback_mode=CACHED → degrade to PERMISSIVE (no local cache)."""
     from nullrun.breaker.exceptions import BreakerTransportError
 
     t = _build_transport()
@@ -308,10 +295,9 @@ def test_execute_fallback_cached_miss():
         input_data={},
         fallback_mode="cached",
     )
+    # 0.7.0: CACHED silently degrades to PERMISSIVE (allow).
     assert result["decision"] == "allow"
-    # Source is FALLBACK, explanation confirms no cache available.
     assert result["decision_source"] == "fallback"
-    assert "no cache available" in result["explanation"]
 
 
 def test_execute_fallback_permissive_default():
@@ -431,15 +417,9 @@ def test_check_network_error_without_raise_returns_block():
 
 
 # ─── clear_policy_cache ──────────────────────────────────────────────
-
-
-def test_clear_policy_cache_empties_cache():
-    t = _build_transport()
-    t._policy_cache.set("org-1:1", "allow", policy_id="p", policy_version=1)
-    assert len(t._policy_cache) == 1
-    t.clear_policy_cache()
-    assert len(t._policy_cache) == 0
-
+# 0.7.0: Transport.clear_policy_cache and Transport._policy_cache
+# were removed. The SDK is a thin client; there is no local cache
+# to clear.
 
 # ─── _parse_error_envelope ───────────────────────────────────────────
 

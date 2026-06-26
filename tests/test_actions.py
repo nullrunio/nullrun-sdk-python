@@ -117,9 +117,7 @@ class TestWebhookAction:
     def test_webhook_queues_payload(self, handler_with_webhook):
         """WEBHOOK action queues webhook payload."""
         # Should not raise
-        handler_with_webhook.handle(
-            ActionType.WEBHOOK, "wf-webhook", "Test webhook reason"
-        )
+        handler_with_webhook.handle(ActionType.WEBHOOK, "wf-webhook", "Test webhook reason")
         # Give time for async processing
         time.sleep(0.1)
         history = handler_with_webhook.get_action_history()
@@ -132,9 +130,7 @@ class TestWebhookAction:
         mock_response.raise_for_status = MagicMock()
         mock_post.return_value = mock_response
 
-        handler_with_webhook.handle(
-            ActionType.WEBHOOK, "wf-http", "Test webhook"
-        )
+        handler_with_webhook.handle(ActionType.WEBHOOK, "wf-http", "Test webhook")
         # Give time for webhook thread to process
         time.sleep(0.2)
 
@@ -152,9 +148,7 @@ class TestWebhookAction:
         mock_post.side_effect = Exception("Connection timeout")
 
         # Should not raise - webhook delivery is async
-        handler_with_webhook.handle(
-            ActionType.WEBHOOK, "wf-timeout", "Test timeout"
-        )
+        handler_with_webhook.handle(ActionType.WEBHOOK, "wf-timeout", "Test timeout")
         # Main flow should complete
         history = handler_with_webhook.get_action_history()
         assert len(history) == 1
@@ -310,6 +304,7 @@ class TestUnknownActionTypeFailOpen:
         is a first-class incident — not a routine diagnostic.
         """
         import logging
+
         handler = ActionHandler()
 
         with caplog.at_level(logging.ERROR, logger="nullrun.actions"):

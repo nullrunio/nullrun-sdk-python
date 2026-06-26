@@ -8,11 +8,18 @@ Phase 6:
 - #6.6: WS URL built via urllib.parse.
 - #6.7: DEDUP_LRU_MAX raised 512 -> 4096.
 """
+
 from __future__ import annotations
 
 # ===========================================================================
 # 6.1: NULLRUN_FALLBACK_MODE
 # ===========================================================================
+# 0.7.0: NULLRUN_FALLBACK_MODE env var was removed along with the
+# CACHED fallback mode. The constructor `fallback_mode=` parameter
+# is still accepted for STRICT / PERMISSIVE (CACHED silently degrades
+# to PERMISSIVE because there is no local cache to read from).
+# See CHANGELOG 0.7.0 for migration.
+
 
 def test_fallback_mode_default_is_permissive():
     """Default fallback_mode is PERMISSIVE."""
@@ -23,30 +30,29 @@ def test_fallback_mode_default_is_permissive():
     assert runtime._fallback_mode == FallbackMode.PERMISSIVE
 
 
-def test_fallback_mode_env_override(monkeypatch):
-    """NULLRUN_FALLBACK_MODE=strict sets FallbackMode.STRICT."""
+def test_fallback_mode_constructor_strict():
+    """Constructor `fallback_mode='strict'` sets FallbackMode.STRICT."""
     from nullrun.runtime import NullRunRuntime
     from nullrun.transport import FallbackMode
 
-    monkeypatch.setenv("NULLRUN_FALLBACK_MODE", "strict")
     NullRunRuntime.reset_instance()
     try:
-        runtime = NullRunRuntime(api_key="test", _test_mode=True)
+        runtime = NullRunRuntime(api_key="test", _test_mode=True, fallback_mode="strict")
         assert runtime._fallback_mode == FallbackMode.STRICT
     finally:
         NullRunRuntime.reset_instance()
 
 
-def test_fallback_mode_constructor_override(monkeypatch):
-    """Constructor argument overrides env var."""
+def test_fallback_mode_constructor_cached_degrades_to_permissive():
+    """Pre-0.7.0 CACHED fallback degrades to PERMISSIVE (no local cache)."""
     from nullrun.runtime import NullRunRuntime
     from nullrun.transport import FallbackMode
 
-    monkeypatch.setenv("NULLRUN_FALLBACK_MODE", "strict")
     NullRunRuntime.reset_instance()
     try:
         runtime = NullRunRuntime(api_key="test", _test_mode=True, fallback_mode="cached")
-        assert runtime._fallback_mode == FallbackMode.CACHED
+        # 0.7.0: CACHED is gone; pass-through to PERMISSIVE.
+        assert runtime._fallback_mode == FallbackMode.PERMISSIVE
     finally:
         NullRunRuntime.reset_instance()
 
@@ -54,6 +60,7 @@ def test_fallback_mode_constructor_override(monkeypatch):
 # ===========================================================================
 # 6.2: Transfer-Encoding strip
 # ===========================================================================
+
 
 def test_rebuild_strips_transfer_encoding():
     """_rebuild drops Transfer-Encoding headers."""
@@ -86,6 +93,7 @@ def test_rebuild_strips_transfer_encoding():
 # ===========================================================================
 # 6.6: WS URL via urllib.parse
 # ===========================================================================
+
 
 def test_ws_url_construction_handles_https():
     """HTTPS control plane produces wss:// URL."""
@@ -131,7 +139,9 @@ def test_ws_url_construction_rejects_unknown_scheme():
 # 6.7: DEDUP_LRU_MAX
 # ===========================================================================
 
+
 def test_dedup_lru_max_is_4096():
     """DEDUP_LRU_MAX is now 4096 (was 512)."""
     from nullrun.instrumentation.auto import DEDUP_LRU_MAX
+
     assert DEDUP_LRU_MAX == 4096

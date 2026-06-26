@@ -32,15 +32,20 @@ doing what I think it's doing?" without inspecting the rest:
   * ``"misconfigured"`` — no api_key, or ``init()`` raised a
     config error and the runtime was never bound. The SDK is
     not operating; fix the config.
-  * ``"offline"`` — backend is not reachable AND no cached
-    policy exists. Every cost-bearing call will be rejected
-    by the strict-local fallback. Fix the network / backend.
-  * ``"degraded"`` — one or more of: WS disconnected, using
-    cached policy after a recent failure, circuit breaker
-    open, workflow state != Normal. The SDK is operating but
-    with reduced guarantees. Surface the ``fallback_reason``
-    or ``workflow_state.reason`` to the user.
+  * ``"offline"`` — backend is not reachable AND no successful
+    ``/gate`` call has ever landed. Every cost-bearing call will
+    be rejected by the SDK's fail-CLOSED path. Fix the network /
+    backend.
+  * ``"degraded"`` — one or more of: WS disconnected, circuit
+    breaker open, workflow state != Normal. The SDK is operating
+    but with reduced guarantees. Surface the ``workflow_state.reason``
+    to the user.
   * ``"ok"`` — everything healthy. This is the steady state.
+
+Note (0.7.0): SDK no longer maintains a local ``Policy`` cache. All
+enforcement decisions arrive from the backend via ``/gate`` and
+``/execute``. The "cached policy" degradation state from prior
+versions is gone — SDK is either talking to the backend or it isn't.
 """
 
 from __future__ import annotations
@@ -108,10 +113,16 @@ class WorkflowState:
     Mirrors the shape of the WS ``state_change`` message so the
     user can read ``status.workflow_state.state`` and know
     whether the body will run on the next call.
+
+    CP1 fix (2026-06-26): the backend WsWorkflowState enum has 5
+    variants, not 3 — Flagged and Tripped were previously silently
+    treated as Normal. The SDK now handles all 5 explicitly in
+    ``runtime.check_control_plane``; this dataclass reflects the
+    full set so the operator-facing status mirrors reality.
     """
 
     workflow_id: str
-    state: str  # "Normal" | "Paused" | "Killed"
+    state: str  # "Normal" | "Paused" | "Killed" | "Flagged" | "Tripped"
     version: int
     reason: str | None = None
 
@@ -135,13 +146,6 @@ class NullRunStatus:
     organization_id: str | None
     workflow_id: str | None
     api_url: str
-
-    # Policy
-    last_policy_fetch: datetime | None  # UTC
-    last_policy_fetch_age_seconds: float | None
-    active_policy: Any  # Policy | None — forward-declared
-    fallback_policy: Any  # Policy | None — last known-good
-    fallback_reason: str | None  # why fallback is in use
 
     # Connectivity
     backend_reachable: bool | None  # None = never tested
@@ -169,8 +173,8 @@ class NullRunStatus:
 
         Example outputs:
             "NullRunStatus(ok, api_key=nr_live_S, org=…, wf=…)"
-            "NullRunStatus(degraded, fallback=last_good@3min, reason=5xx)"
-            "NullRunStatus(offline, no cached policy, ws=False)"
+            "NullRunStatus(degraded, wf_state=Killed, backend=unreachable)"
+            "NullRunStatus(offline, ws=False, errors=2)"
         """
         bits = [f"NullRunStatus({self.state}"]
         if self.api_key_prefix:
@@ -179,16 +183,6 @@ class NullRunStatus:
             bits.append(f"org={self.organization_id[:8]}")
         if self.workflow_id:
             bits.append(f"wf={self.workflow_id[:8]}")
-        if self.fallback_policy and self.fallback_policy is not self.active_policy:
-            # Always show that we are on a fallback — the user
-            # sees the string "fallback" and knows to look at
-            # ``fallback_reason`` for the cause.
-            if self.last_policy_fetch_age_seconds is not None:
-                bits.append(f"fallback=last_good@{int(self.last_policy_fetch_age_seconds)}s")
-            else:
-                bits.append("fallback=last_good")
-            if self.fallback_reason:
-                bits.append(f"reason={self.fallback_reason[:40]}")
         if self.workflow_state and self.workflow_state.state != "Normal":
             bits.append(f"wf_state={self.workflow_state.state}")
         if self.backend_reachable is False:

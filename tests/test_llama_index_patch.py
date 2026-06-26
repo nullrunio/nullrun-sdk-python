@@ -4,6 +4,7 @@ Regression tests for the llama-index auto-instrumentation patch.
 Installs a fake ``llama_index.core.instrumentation`` module so the
 patch can subscribe handlers without needing the real dep in CI.
 """
+
 from __future__ import annotations
 
 import importlib
@@ -53,7 +54,9 @@ def _install_fake_llama_index(monkeypatch) -> dict:
     monkeypatch.setitem(sys.modules, "llama_index.core.instrumentation", inst_mod)
     monkeypatch.setitem(sys.modules, "llama_index.core.instrumentation.events", events_mod)
     monkeypatch.setitem(sys.modules, "llama_index.core.instrumentation.events.llm", events_mod_llm)
-    monkeypatch.setitem(sys.modules, "llama_index.core.instrumentation.events.tool", events_mod_tool)
+    monkeypatch.setitem(
+        sys.modules, "llama_index.core.instrumentation.events.tool", events_mod_tool
+    )
 
     return dispatcher
 
@@ -111,12 +114,14 @@ def test_llm_chat_end_with_dict_usage_emits_track(monkeypatch, fresh_patch_modul
     rt = _fake_runtime()
 
     from nullrun.instrumentation.llama_index import patch_llama_index
+
     assert patch_llama_index(rt) is True
 
     # Two handlers registered: LLMChatEndEvent + FunctionCallEvent.
     assert len(dispatcher._captured) == 2
 
     import llama_index.core.instrumentation.events.llm as _llm_events
+
     _LLM = _llm_events.LLMChatEndEvent
 
     # Fire the LLMChatEndEvent handler manually.
@@ -151,15 +156,19 @@ def test_llm_chat_end_without_usage_no_emit(monkeypatch, fresh_patch_module):
     rt = _fake_runtime()
 
     from nullrun.instrumentation.llama_index import patch_llama_index
+
     assert patch_llama_index(rt) is True
 
     import llama_index.core.instrumentation.events.llm as _llm_events
+
     _LLM = _llm_events.LLMChatEndEvent
 
     for cls, handler in dispatcher._captured:
         if cls is _LLM:
             # Empty usage dict → all-zero → early return.
-            response = SimpleNamespace(raw={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}, model="x")
+            response = SimpleNamespace(
+                raw={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}, model="x"
+            )
             handler(SimpleNamespace(response=response))
             break
 
@@ -172,9 +181,11 @@ def test_llm_chat_end_response_without_raw(monkeypatch, fresh_patch_module):
     rt = _fake_runtime()
 
     from nullrun.instrumentation.llama_index import patch_llama_index
+
     assert patch_llama_index(rt) is True
 
     import llama_index.core.instrumentation.events.llm as _llm_events
+
     _LLM = _llm_events.LLMChatEndEvent
 
     for cls, handler in dispatcher._captured:
@@ -192,9 +203,11 @@ def test_llm_chat_end_object_usage_attr(monkeypatch, fresh_patch_module):
     rt = _fake_runtime()
 
     from nullrun.instrumentation.llama_index import patch_llama_index
+
     assert patch_llama_index(rt) is True
 
     import llama_index.core.instrumentation.events.llm as _llm_events
+
     _LLM = _llm_events.LLMChatEndEvent
 
     class _Usage:
@@ -208,7 +221,9 @@ def test_llm_chat_end_object_usage_attr(monkeypatch, fresh_patch_module):
             # ``hasattr(usage, "usage")`` branch unwraps once and then
             # ``usage.get(...)`` reads the dict.
             response = SimpleNamespace(
-                raw=SimpleNamespace(usage={"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}),
+                raw=SimpleNamespace(
+                    usage={"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
+                ),
                 model="x",
             )
             handler(SimpleNamespace(response=response))
@@ -227,9 +242,11 @@ def test_function_call_event_emits_tool_call(monkeypatch, fresh_patch_module):
     rt = _fake_runtime()
 
     from nullrun.instrumentation.llama_index import patch_llama_index
+
     assert patch_llama_index(rt) is True
 
     import llama_index.core.instrumentation.events.tool as _tool_events
+
     _FCE = _tool_events.FunctionCallEvent
 
     tool = SimpleNamespace(name="search")
@@ -250,9 +267,11 @@ def test_function_call_event_tool_without_name_uses_default(monkeypatch, fresh_p
     rt = _fake_runtime()
 
     from nullrun.instrumentation.llama_index import patch_llama_index
+
     assert patch_llama_index(rt) is True
 
     import llama_index.core.instrumentation.events.tool as _tool_events
+
     _FCE = _tool_events.FunctionCallEvent
 
     for cls, handler in dispatcher._captured:
@@ -271,9 +290,11 @@ def test_function_call_event_without_tool_uses_default(monkeypatch, fresh_patch_
     rt = _fake_runtime()
 
     from nullrun.instrumentation.llama_index import patch_llama_index
+
     assert patch_llama_index(rt) is True
 
     import llama_index.core.instrumentation.events.tool as _tool_events
+
     _FCE = _tool_events.FunctionCallEvent
 
     for cls, handler in dispatcher._captured:
@@ -295,10 +316,12 @@ def test_track_failure_is_swallowed(monkeypatch, fresh_patch_module):
     rt.track.side_effect = RuntimeError("down")
 
     from nullrun.instrumentation.llama_index import patch_llama_index
+
     assert patch_llama_index(rt) is True
 
     import llama_index.core.instrumentation.events.llm as _llm_events
     import llama_index.core.instrumentation.events.tool as _tool_events
+
     _LLM = _llm_events.LLMChatEndEvent
     _FCE = _tool_events.FunctionCallEvent
 

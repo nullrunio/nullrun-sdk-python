@@ -164,6 +164,7 @@ def test_two_identical_llm_calls_dedupe_to_one_track(runtime):
     dedup LRU, only the first call should reach `track()`; the second
     should short-circuit."""
     from nullrun.instrumentation.auto import _fingerprint_for
+
     body = _llm_body()
     fp = _fingerprint_for("api.openai.com", body, 200)
     # Pre-fill the dedup state to simulate "this fingerprint was already
@@ -203,6 +204,7 @@ def test_httpx_then_langchain_simulation_dedupes():
     transport embeds the SAME fingerprint for the same body, and that
     a re-emitted event with the same fingerprint is recognised by the
     LRU."""
+
     # Plain object with explicit attrs — no MagicMock magic on the LRU
     # field, since MagicMock auto-attributes would mask the real dict.
     class _Rt:
@@ -216,14 +218,10 @@ def test_httpx_then_langchain_simulation_dedupes():
     patch_httpx(rt)
     body = _llm_body()
     with respx.mock(base_url="https://api.openai.com") as mock:
-        mock.post("/v1/chat/completions").mock(
-            return_value=httpx.Response(200, content=body)
-        )
+        mock.post("/v1/chat/completions").mock(return_value=httpx.Response(200, content=body))
         with httpx.Client(base_url="https://api.openai.com") as client:
             # First call: track() called with an event that has a fingerprint.
-            response1 = client.post(
-                "/v1/chat/completions", json={"model": "gpt-4o-mini"}
-            )
+            response1 = client.post("/v1/chat/completions", json={"model": "gpt-4o-mini"})
             assert response1.status_code == 200
             assert rt.track.call_count == 1
             event1 = rt.track.call_args_list[0][0][0]
@@ -237,9 +235,7 @@ def test_httpx_then_langchain_simulation_dedupes():
             # Second call (same body, simulating LangChain firing on
             # the same LLMResult): the transport wraps again, so
             # track() is called again with the same fingerprint.
-            response2 = client.post(
-                "/v1/chat/completions", json={"model": "gpt-4o-mini"}
-            )
+            response2 = client.post("/v1/chat/completions", json={"model": "gpt-4o-mini"})
             assert response2.status_code == 200
             event2 = rt.track.call_args_list[1][0][0]
             assert event2["_fingerprint"] == fp1

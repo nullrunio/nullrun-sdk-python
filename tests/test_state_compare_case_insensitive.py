@@ -14,6 +14,7 @@ so the SDK survives any casing drift without needing a coordinated
 backend change. Backend already emits PascalCase per
 ``handlers.rs:9258``; this is defensive.
 """
+
 from __future__ import annotations
 
 import pytest

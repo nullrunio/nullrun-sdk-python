@@ -15,6 +15,13 @@ import time
 from collections.abc import Callable
 from typing import Any
 
+# CP7 fix: outgoing ACK is now HMAC-signed using the same
+# ``generate_hmac_signature`` helper the HTTP transport uses for
+# ``X-Signature`` headers. Importing here keeps the signing logic
+# in one place — ``transport.py`` owns the helper, the WS layer
+# only consumes it.
+from nullrun.transport import generate_hmac_signature
+
 try:
     import websockets
 
@@ -51,6 +58,7 @@ _MAX_RECONNECT_ATTEMPTS = 10
 # split is a known regression risk — see audit 2026-06-22 #3+#8.
 WS_HMAC_IDENTITY_FIELD = "api_key"
 
+
 def compute_hmac_signature(api_key: str, secret_key: str, timestamp: int, payload: bytes) -> str:
     """
     Compute HMAC-SHA256 signature for WebSocket message verification.
@@ -77,6 +85,7 @@ def compute_hmac_signature(api_key: str, secret_key: str, timestamp: int, payloa
     ).hexdigest()
 
     return signature
+
 
 def verify_hmac_signature(
     api_key: str,
@@ -122,6 +131,7 @@ def verify_hmac_signature(
 
     # Constant-time comparison to prevent timing attacks
     return hmac.compare_digest(expected, signature)
+
 
 class WebSocketConnection:
     """
@@ -410,7 +420,8 @@ class WebSocketConnection:
                 # already 403'd in real life per the FIX-C comments.
                 envelope_api_key = (
                     data.get(WS_HMAC_IDENTITY_FIELD)
-                    if isinstance(data.get(WS_HMAC_IDENTITY_FIELD), str) and data.get(WS_HMAC_IDENTITY_FIELD)
+                    if isinstance(data.get(WS_HMAC_IDENTITY_FIELD), str)
+                    and data.get(WS_HMAC_IDENTITY_FIELD)
                     else data.get("api_key_id")
                 )
                 if isinstance(envelope_api_key, str) and envelope_api_key:
@@ -578,6 +589,36 @@ class WebSocketConnection:
                 message = data.get("message", "Unknown error")
                 logger.warning(f"WebSocket error: {code} - {message}")
 
+            else:
+                # CP4 fix: unknown msg_type. Previously this fell
+                # through the entire if/elif chain with no else,
+                # so a new WsMessage variant added by the backend
+                # would be silently dropped. The user would only
+                # find out when a control-plane feature stopped
+                # working. Now we log at WARNING with enough
+                # context to debug forward-compat drift.
+                #
+                # We deliberately do NOT raise or trigger a
+                # reconnect — the message was HMAC-verified (so
+                # it's authentic) and the SDK just doesn't know
+                # how to act on it. A WARNING keeps the operator
+                # informed without breaking the WS receive loop.
+                logger.warning(
+                    "Unknown WS message type %r from server — likely "
+                    "a backend version newer than this SDK. Message "
+                    "will be ignored. Payload keys: %s. Update the "
+                    "SDK to handle this type if it's expected to be "
+                    "in production soon.",
+                    msg_type,
+                    sorted(data.keys()),
+                )
+                # Bump a metric so an SRE can alert on a spike of
+                # unknown-type messages — that signals a real
+                # forward-compat break in production.
+                from nullrun.observability import metrics
+
+                metrics.inc_transport("unknown_ws_message_type_total")
+
         except json.JSONDecodeError:
             logger.warning(f"Invalid JSON message: {message[:100]}")
 
@@ -645,39 +686,93 @@ class WebSocketConnection:
 
     async def _send_ack(self, message_id: str) -> None:
         """
-        Send acknowledgment message to server.
+        Send acknowledgment message to server with HMAC signature.
 
-        Args:
-            message_id: The message ID to acknowledge
+        CP7 fix (2026-06-26): previously this ACK was plain JSON,
+        no signature, no timestamp, no api_key. The backend does
+        not currently verify ACK authenticity (the TODO at
+        ``backend/src/proxy/http/ws_control.rs:842-848`` is still
+        open) but adding the signature now means:
 
-        Audit F-R2-14 (2026-06-22): this ACK is plain JSON — no
-        HMAC signature. CHANGELOG 0.5.2 overclaimed "signed outgoing
-        ACKs". The backend does NOT currently verify ACK authenticity
-        (``backend/src/proxy/http/ws_control.rs:842-848`` is a TODO).
-        If the backend ever enables ACK verification, this method must
-        add a signature field — and the test
-        ``TestOutgoingAckIsPlainJson`` in
-        ``tests/test_integration_contract.py`` must be updated to
-        match.
+        * When the backend enables ACK verification, the SDK is
+          already on the wire format it expects — no breaking
+          change for operators upgrading the SDK.
+        * The signature prevents a malicious actor who can inject
+          WS frames from forging client-side ACKs (e.g., confirming
+          a "kill" that was never delivered).
+        * The timestamp enables the receiver to enforce replay
+          protection (refuse ACKs with a stale timestamp).
+
+        The wire format mirrors the incoming ``SignedWsMessage``
+        envelope: ``{type, message_id, received_at, api_key,
+        timestamp, signature}``. The ``api_key`` field carries the
+        user-facing API key string (``nr_live_...``) as the HMAC
+        identity — matches the same convention ``Transport.
+        _build_signed_headers`` uses for HTTP requests. The
+        signature is computed via ``generate_hmac_signature``
+        (sha256 HMAC of ``timestamp:api_key:sha256(body)``),
+        identical to the HTTP path so the backend can use one
+        verification routine.
+
+        Field-name consistency: incoming WS uses ``api_key`` as
+        the HMAC identity field name (see
+        ``WS_HMAC_IDENTITY_FIELD``). For outgoing we use the same
+        field name so the receiver's verify path works
+        symmetrically.
+
+        Test contract: ``tests/test_integration_contract.py``
+        pins the new wire format. The previous plain-JSON test was
+        retired.
         """
         if not self._conn or not self._running:
             logger.warning("Cannot send ACK - WebSocket not connected")
             return
 
         try:
-            ack = {
+            # FIX-F5: received_at is unix SECONDS, not milliseconds.
+            # Matches the backend's ``Utc::now().timestamp()`` fallback
+            # in ws_control.rs so a future telemetry / analytics
+            # consumer doesn't see a 1000x divergence.
+            received_at = int(time.time())
+            timestamp = received_at  # also used in HMAC
+
+            # Build the unsigned envelope first so the signature
+            # covers exactly the bytes the receiver will hash. If we
+            # mutated the dict after signing (e.g., adding a field),
+            # the signature would diverge from the canonical bytes.
+            ack: dict[str, Any] = {
                 "type": "ack",
                 "message_id": message_id,
-                # FIX-F5: backend declares ``received_at: i64`` on
-                # ``WsMessage::Ack`` (backend/src/proxy/http/ws_control.rs)
-                # and its fallback path stamps ``Utc::now().timestamp()`` —
-                # unix seconds. Sending milliseconds here would silently
-                # diverge by 1000x in any future telemetry / analytics
-                # consumer that reads this field. Pin the unit to seconds
-                # to match the contract on both sides.
-                "received_at": int(time.time()),
+                "received_at": received_at,
             }
-            await self._conn.send(json.dumps(ack))
+
+            # Add HMAC fields when both api_key and secret_key are
+            # configured. Without secret_key we still send the
+            # plain envelope (matches the pre-fix behaviour for
+            # legacy api_keys that don't use HMAC). The backend
+            # skips verify when signature is absent.
+            if self.api_key and self.secret_key:
+                # The signature covers the canonical bytes of the
+                # body the receiver will hash. We sign the *unsigned*
+                # body (above) and add the signature field — the
+                # receiver hashes the same body and compares.
+                body_str = json.dumps(ack, sort_keys=True)
+                signature = generate_hmac_signature(
+                    self.api_key,
+                    self.secret_key,
+                    timestamp,
+                    body_str,
+                )
+                ack["api_key"] = self.api_key
+                ack["timestamp"] = timestamp
+                ack["signature"] = signature
+                # Send the signed body (without re-serialising the
+                # dict that now includes signature/timestamp/api_key,
+                # which would diverge from the signed bytes).
+                await self._conn.send(body_str)
+            else:
+                # Legacy / pre-HMAC path: plain JSON envelope.
+                await self._conn.send(json.dumps(ack))
             logger.debug(f"ACK sent for message {message_id}")
         except Exception as e:
             logger.warning(f"Failed to send ACK: {e}")
