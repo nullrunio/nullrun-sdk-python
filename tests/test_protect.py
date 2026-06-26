@@ -12,6 +12,7 @@ T3-S2 (0.3.0): the `NullRunNoop` fallback was removed — every runtime
 is a real `NullRunRuntime` with a bound workflow. The legacy
 "tolerate a noop runtime" behavior is no longer relevant.
 """
+
 import asyncio
 
 import pytest
@@ -22,6 +23,7 @@ from nullrun.tracing import get_current_span, reset_span, set_span
 # ──────────────────────────────────────────────────────────────
 # Fixtures
 # ──────────────────────────────────────────────────────────────
+
 
 @pytest.fixture
 def mock_runtime(make_runtime, mock_api):
@@ -65,6 +67,7 @@ class _RecordingRuntime:
 def recording_runtime():
     """Inject a _RecordingRuntime into the @protect slot."""
     import nullrun.decorators as dec
+
     rt = _RecordingRuntime()
     dec._runtime = rt
     try:
@@ -77,8 +80,10 @@ def recording_runtime():
 # Span hierarchy
 # ──────────────────────────────────────────────────────────────
 
+
 def test_protect_creates_root_span(recording_runtime):
     """Outermost @protect call: parent_span_id is None, depth is 0."""
+
     @nullrun.protect
     def agent(q):
         return get_current_span()
@@ -94,6 +99,7 @@ def test_protect_creates_root_span(recording_runtime):
 def test_protect_nested_creates_child_span(recording_runtime):
     """A nested @protect call is a child of the outer one (parent_span_id set,
     depth=1) AND shares the trace_id."""
+
     @nullrun.protect
     def orchestrator(q):
         return researcher(q)
@@ -119,6 +125,7 @@ def test_protect_nested_creates_child_span(recording_runtime):
 def test_protect_restores_context_after_call(recording_runtime):
     """After @protect returns, get_current_span() goes back to whatever
     was active before — usually None at the top of the test."""
+
     @nullrun.protect
     def agent(q):
         return get_current_span().trace_id
@@ -153,8 +160,10 @@ def test_protect_restores_outer_span_on_nested_exit(recording_runtime):
 # Span event emission
 # ──────────────────────────────────────────────────────────────
 
+
 def test_protect_emits_span_start_and_end(recording_runtime):
     """@protect must emit a span_start before the call and span_end after."""
+
     @nullrun.protect
     def agent(q):
         return q
@@ -173,6 +182,7 @@ def test_protect_emits_span_start_and_end(recording_runtime):
 
 def test_protect_emits_error_in_span_end(recording_runtime):
     """If the wrapped function raises, span_end carries the error string."""
+
     @nullrun.protect
     def boom(q):
         raise ValueError("kaboom")
@@ -188,6 +198,7 @@ def test_protect_emits_error_in_span_end(recording_runtime):
 def test_protect_resets_context_even_on_error(recording_runtime):
     """The contextvar is reset in `finally`, so an exception inside
     @protect must not leave a stale span on the stack."""
+
     @nullrun.protect
     def boom(q):
         raise RuntimeError("nope")
@@ -201,9 +212,11 @@ def test_protect_resets_context_even_on_error(recording_runtime):
 # Async support
 # ──────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_protect_async_creates_root_span(recording_runtime):
     """Async @protect wraps the coroutine in a span, returns the result."""
+
     @nullrun.protect
     async def async_agent(q):
         await asyncio.sleep(0)
@@ -217,6 +230,7 @@ async def test_protect_async_creates_root_span(recording_runtime):
 @pytest.mark.asyncio
 async def test_protect_async_nested_child(recording_runtime):
     """Async -> sync @protect still builds the parent/child tree."""
+
     @nullrun.protect
     async def outer(q):
         return await inner(q)
@@ -240,8 +254,10 @@ async def test_protect_async_nested_child(recording_runtime):
 # Decorator shape (must work with @protect AND @protect())
 # ──────────────────────────────────────────────────────────────
 
+
 def test_protect_with_empty_parens(recording_runtime):
     """`@nullrun.protect()` is the same as `@nullrun.protect`."""
+
     @nullrun.protect()
     def agent(q):
         return get_current_span()
@@ -252,6 +268,7 @@ def test_protect_with_empty_parens(recording_runtime):
 
 def test_protect_preserves_function_metadata(recording_runtime):
     """`@protect` must not strip __name__ / __doc__ from the wrapped fn."""
+
     @nullrun.protect
     def my_documented_func():
         """Important docstring."""
@@ -265,6 +282,7 @@ def test_protect_preserves_function_metadata(recording_runtime):
 # Manually-set span is preserved (don't clobber explicit context)
 # ──────────────────────────────────────────────────────────────
 
+
 def test_protect_respects_externally_set_span(recording_runtime):
     """If user code manually calls set_span(...) before @protect fires,
     the new span is a child of THAT, not a root."""
@@ -273,6 +291,7 @@ def test_protect_respects_externally_set_span(recording_runtime):
     outer = make_root()
     token = set_span(outer)
     try:
+
         @nullrun.protect
         def inner(q):
             return get_current_span()
@@ -288,6 +307,7 @@ def test_protect_respects_externally_set_span(recording_runtime):
 # ──────────────────────────────────────────────────────────────
 # Re-init wiring (regression: stale runtime in @protect cache)
 # ──────────────────────────────────────────────────────────────
+
 
 def test_init_replaces_stale_decorator_runtime_cache(mock_api):
     """`nullrun.init()` must update the @protect decorator's own

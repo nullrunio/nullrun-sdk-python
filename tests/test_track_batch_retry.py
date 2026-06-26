@@ -45,21 +45,21 @@ def transport():
 class TestTrackBatchRetry:
     @respx.mock
     def test_single_5xx_then_200_eventually_succeeds(self, transport):
-        route = respx.post(
-            "https://api.test.nullrun.io/api/v1/track/batch"
-        ).mock(side_effect=[
-            httpx.Response(500, json={"error": "internal"}),
-            httpx.Response(200, json={"accepted_event_ids": ["e1"]}),
-        ])
+        route = respx.post("https://api.test.nullrun.io/api/v1/track/batch").mock(
+            side_effect=[
+                httpx.Response(500, json={"error": "internal"}),
+                httpx.Response(200, json={"accepted_event_ids": ["e1"]}),
+            ]
+        )
         result = transport._send_batch_with_retry_info([{"event": "e1"}])
         assert route.call_count == 2
         assert "e1" in result.accepted_event_ids
 
     @respx.mock
     def test_three_consecutive_5xx_raises_after_retries(self, transport):
-        route = respx.post(
-            "https://api.test.nullrun.io/api/v1/track/batch"
-        ).mock(return_value=httpx.Response(500, json={"error": "boom"}))
+        route = respx.post("https://api.test.nullrun.io/api/v1/track/batch").mock(
+            return_value=httpx.Response(500, json={"error": "boom"})
+        )
         # _retry_with_backoff wraps the underlying HTTPStatusError into
         # BreakerTransportError so the caller can match a single exception
         # type without distinguishing 4xx vs 5xx vs network.
@@ -70,12 +70,12 @@ class TestTrackBatchRetry:
 
     @respx.mock
     def test_429_is_retried_then_succeeds(self, transport):
-        route = respx.post(
-            "https://api.test.nullrun.io/api/v1/track/batch"
-        ).mock(side_effect=[
-            httpx.Response(429, json={"error": "slow_down"}, headers={"Retry-After": "0"}),
-            httpx.Response(200, json={"accepted_event_ids": ["e1"]}),
-        ])
+        route = respx.post("https://api.test.nullrun.io/api/v1/track/batch").mock(
+            side_effect=[
+                httpx.Response(429, json={"error": "slow_down"}, headers={"Retry-After": "0"}),
+                httpx.Response(200, json={"accepted_event_ids": ["e1"]}),
+            ]
+        )
         result = transport._send_batch_with_retry_info([{"event": "e1"}])
         assert route.call_count == 2
         assert "e1" in result.accepted_event_ids
@@ -87,18 +87,19 @@ class TestTrackBatchRetry:
         budget. _retry_with_backoff converts 401 into NullRunAuthenticationError
         before the helper's normal retry path. We expect exactly one attempt."""
         from nullrun.breaker.exceptions import NullRunAuthenticationError
-        route = respx.post(
-            "https://api.test.nullrun.io/api/v1/track/batch"
-        ).mock(return_value=httpx.Response(401, json={"error": "unauthorized"}))
+
+        route = respx.post("https://api.test.nullrun.io/api/v1/track/batch").mock(
+            return_value=httpx.Response(401, json={"error": "unauthorized"})
+        )
         with pytest.raises(NullRunAuthenticationError):
             transport._send_batch_with_retry_info([{"event": "e1"}])
         assert route.call_count == 1
 
     @respx.mock
     def test_2xx_first_try_no_retry(self, transport):
-        route = respx.post(
-            "https://api.test.nullrun.io/api/v1/track/batch"
-        ).mock(return_value=httpx.Response(200, json={"accepted_event_ids": ["e1"]}))
+        route = respx.post("https://api.test.nullrun.io/api/v1/track/batch").mock(
+            return_value=httpx.Response(200, json={"accepted_event_ids": ["e1"]})
+        )
         result = transport._send_batch_with_retry_info([{"event": "e1"}])
         assert route.call_count == 1
         assert "e1" in result.accepted_event_ids

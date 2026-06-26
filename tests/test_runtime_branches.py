@@ -4,6 +4,7 @@ Additional runtime branch tests covering the gaps in
 the kill/pause case-insensitive state compare, coverage counter
 behaviour, and the ``execute()`` mode resolution.
 """
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -282,7 +283,9 @@ def test_bump_coverage_counter_evicts_at_cap(caplog):
 
 def test_execute_auto_sensitive_routes_to_strict():
     rt = _make_test_runtime()
-    rt._transport.execute = MagicMock(return_value={"decision": "allow", "decision_source": "gateway"})
+    rt._transport.execute = MagicMock(
+        return_value={"decision": "allow", "decision_source": "gateway"}
+    )
     rt.execute("stripe.charge", {"amount": 5})  # sensitive → strict
     call_args = rt._transport.execute.call_args
     # Runtime.execute() forwards mode as a kwarg.
@@ -294,7 +297,9 @@ def test_execute_auto_non_sensitive_routes_to_inline():
     so transport.execute is NOT called. Verify via the LOCAL decision_source.
     """
     rt = _make_test_runtime()
-    rt._transport.execute = MagicMock(return_value={"decision": "allow", "decision_source": "gateway"})
+    rt._transport.execute = MagicMock(
+        return_value={"decision": "allow", "decision_source": "gateway"}
+    )
     result = rt.execute("safe.tool", {"x": 1})
     assert result["decision_source"] == "local"
     rt._transport.execute.assert_not_called()
@@ -303,7 +308,9 @@ def test_execute_auto_non_sensitive_routes_to_inline():
 def test_execute_auto_sensitive_calls_transport():
     """Auto + sensitive tool → mode=strict → transport.execute is called."""
     rt = _make_test_runtime()
-    rt._transport.execute = MagicMock(return_value={"decision": "allow", "decision_source": "gateway"})
+    rt._transport.execute = MagicMock(
+        return_value={"decision": "allow", "decision_source": "gateway"}
+    )
     rt.execute("stripe.charge", {"amount": 5})
     rt._transport.execute.assert_called_once()
     assert rt._transport.execute.call_args.kwargs["mode"] == "strict"
@@ -322,18 +329,22 @@ def test_execute_inline_mode_short_circuits_local():
 def test_execute_inline_sensitive_still_calls_transport():
     """Inline mode + sensitive tool still routes to /execute."""
     rt = _make_test_runtime()
-    rt._transport.execute = MagicMock(return_value={"decision": "allow", "decision_source": "gateway"})
+    rt._transport.execute = MagicMock(
+        return_value={"decision": "allow", "decision_source": "gateway"}
+    )
     rt.execute("stripe.charge", {"amount": 5}, mode="inline")
     rt._transport.execute.assert_called_once()
 
 
 def test_execute_block_raises_NullRunBlockedException():
     rt = _make_test_runtime()
-    rt._transport.execute = MagicMock(return_value={
-        "decision": "block",
-        "decision_source": "gateway",
-        "explanation": "denied by policy",
-    })
+    rt._transport.execute = MagicMock(
+        return_value={
+            "decision": "block",
+            "decision_source": "gateway",
+            "explanation": "denied by policy",
+        }
+    )
     with pytest.raises(NullRunBlockedException) as excinfo:
         rt.execute("stripe.charge", {"amount": 5})  # sensitive → routes to /execute
     assert excinfo.value.reason == "denied by policy"
@@ -431,9 +442,9 @@ def test_authenticate_legacy_key_without_workflow_logs_warning(caplog):
 
     assert rt.organization_id == "org-x"
     assert rt.workflow_id is None
-    assert any(
-        "legacy key" in r.getMessage() for r in caplog.records
-    ), "expected a legacy-key warning"
+    assert any("legacy key" in r.getMessage() for r in caplog.records), (
+        "expected a legacy-key warning"
+    )
 
 
 def test_authenticate_rotates_secret_key():

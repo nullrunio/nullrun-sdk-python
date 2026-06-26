@@ -279,13 +279,9 @@ def test_match_extractor_known_hosts():
     assert _match_extractor("openai.azure.com") is _openai_extractor
     assert _match_extractor("api.mistral.ai") is _openai_extractor
     assert _match_extractor("api.anthropic.com") is _anthropic_extractor
-    assert (
-        _match_extractor("generativelanguage.googleapis.com") is _gemini_extractor
-    )
+    assert _match_extractor("generativelanguage.googleapis.com") is _gemini_extractor
     assert _match_extractor("api.cohere.ai") is _cohere_extractor
-    assert (
-        _match_extractor("bedrock-runtime.amazonaws.com") is _bedrock_extractor
-    )
+    assert _match_extractor("bedrock-runtime.amazonaws.com") is _bedrock_extractor
 
 
 def test_match_extractor_subdomain_match():

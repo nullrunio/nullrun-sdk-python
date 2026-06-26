@@ -15,6 +15,7 @@ becomes a no-op (the lookup misses, which is the same behaviour as
 the pre-fix code for any run_id that was never registered — silent
 no-op is the established contract).
 """
+
 import logging
 from collections import OrderedDict
 from unittest.mock import MagicMock
@@ -85,9 +86,9 @@ def test_active_runs_eviction_logs_warning(callback, caplog):
     with caplog.at_level(logging.WARNING, logger="nullrun.instrumentation.langgraph"):
         callback._register_active_run("c", create_root_span())
 
-    assert any(
-        "cap reached" in rec.message for rec in caplog.records
-    ), f"expected cap-reached warning; got: {[r.message for r in caplog.records]}"
+    assert any("cap reached" in rec.message for rec in caplog.records), (
+        f"expected cap-reached warning; got: {[r.message for r in caplog.records]}"
+    )
 
 
 def test_default_cap_matches_plan():

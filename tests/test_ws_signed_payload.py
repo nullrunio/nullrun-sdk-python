@@ -465,10 +465,9 @@ async def test_ws_ack_lowercase_state_still_sends_ack(monkeypatch):
         await conn._handle_message(raw)
 
         # ACK must be sent even with lowercase state.
-        assert any(
-            b'"type": "ack"' in s and lowercase_state.encode() in s
-            for s in stub.sent
-        ), f"ACK not sent for lowercase state={lowercase_state!r}"
+        assert any(b'"type": "ack"' in s and lowercase_state.encode() in s for s in stub.sent), (
+            f"ACK not sent for lowercase state={lowercase_state!r}"
+        )
 
     # ACKNOWLEDGED_STATES itself stays PascalCase — pin that.
     assert "Killed" in WebSocketConnection.ACKNOWLEDGED_STATES

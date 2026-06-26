@@ -12,6 +12,7 @@ The fix in 0.3.1: the ``state`` property calls
 ``_publish_half_open_state`` after the transition so the global
 state is in sync. This test pins the contract.
 """
+
 from __future__ import annotations
 
 from unittest.mock import MagicMock
@@ -20,7 +21,6 @@ from nullrun.breaker.circuit_breaker import CircuitBreaker
 
 
 class TestPublishHalfOpen:
-
     def test_publish_half_open_state_is_called_on_transition(self):
         """When the local state transitions from OPEN to HALF_OPEN,
         ``_publish_half_open_state`` must be called so other workers
@@ -34,6 +34,7 @@ class TestPublishHalfOpen:
         # Force into OPEN.
         cb._state = cb._state  # noqa: SLF001 (private access OK in test)
         from nullrun.breaker.circuit_breaker import CBState
+
         cb._state = CBState.OPEN
         cb._last_failure_time = 0.0  # far enough in the past
 
@@ -55,6 +56,7 @@ class TestPublishHalfOpen:
             name="test_cb_noop",
         )
         from nullrun.breaker.circuit_breaker import CBState
+
         # Default state is CLOSED.
         assert cb._state == CBState.CLOSED  # noqa: SLF001
 
@@ -83,7 +85,6 @@ class TestPublishHalfOpen:
 
 
 class TestHalfOpenConcurrencyLimit:
-
     def test_concurrent_calls_respect_half_open_max(self):
         """At most ``half_open_max_calls`` calls are admitted into the
         in-flight probe set; the rest are rejected before any

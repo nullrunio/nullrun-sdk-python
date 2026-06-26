@@ -4,6 +4,7 @@ Branch-coverage tests for ``nullrun.actions``, ``nullrun.context``,
 warning. Together these close the last 1-2 % lines that no other
 test file exercises.
 """
+
 from __future__ import annotations
 
 import threading

@@ -9,6 +9,7 @@ per minute = 1000 spinning threads hammering the dead endpoint.
 Post-fix the schedule is ``0.5 * 2**attempt`` capped at 30s:
 0.5s, 1.0s, 2.0s, 4.0s, 8.0s, 16.0s, 30.0s (cap).
 """
+
 import time
 from unittest.mock import MagicMock, patch
 
@@ -49,8 +50,9 @@ def test_webhook_uses_exponential_backoff():
     def fake_sleep(seconds):
         sleeps.append(seconds)
 
-    with patch("nullrun.actions.httpx.post", side_effect=ConnectionError("down")), patch(
-        "nullrun.actions.time.sleep", side_effect=fake_sleep
+    with (
+        patch("nullrun.actions.httpx.post", side_effect=ConnectionError("down")),
+        patch("nullrun.actions.time.sleep", side_effect=fake_sleep),
     ):
         handler._deliver_webhook(
             payload={"event": "kill"},
@@ -78,8 +80,9 @@ def test_webhook_backoff_capped_at_30_seconds():
     def fake_sleep(seconds):
         sleeps.append(seconds)
 
-    with patch("nullrun.actions.httpx.post", side_effect=ConnectionError("down")), patch(
-        "nullrun.actions.time.sleep", side_effect=fake_sleep
+    with (
+        patch("nullrun.actions.httpx.post", side_effect=ConnectionError("down")),
+        patch("nullrun.actions.time.sleep", side_effect=fake_sleep),
     ):
         handler._deliver_webhook(
             payload={"event": "kill"},
@@ -89,9 +92,7 @@ def test_webhook_backoff_capped_at_30_seconds():
     # 8 attempts → 7 sleeps.
     # Schedule: 0.5, 1, 2, 4, 8, 16, 30 (capped, would be 32 without cap).
     expected = [0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 30.0]
-    assert sleeps == expected, (
-        f"expected capped exponential backoff {expected}; got {sleeps}"
-    )
+    assert sleeps == expected, f"expected capped exponential backoff {expected}; got {sleeps}"
 
 
 def test_webhook_succeeds_on_first_try_no_sleep():
@@ -107,9 +108,10 @@ def test_webhook_succeeds_on_first_try_no_sleep():
     def fake_sleep(seconds):
         sleeps.append(seconds)
 
-    with patch(
-        "nullrun.actions.httpx.post", return_value=response
-    ), patch("nullrun.actions.time.sleep", side_effect=fake_sleep):
+    with (
+        patch("nullrun.actions.httpx.post", return_value=response),
+        patch("nullrun.actions.time.sleep", side_effect=fake_sleep),
+    ):
         handler._deliver_webhook(
             payload={"event": "kill"},
             webhook=handler._webhooks[0],
@@ -129,8 +131,9 @@ def test_webhook_no_sleep_after_final_attempt():
     def fake_sleep(seconds):
         sleeps.append(seconds)
 
-    with patch("nullrun.actions.httpx.post", side_effect=ConnectionError("down")), patch(
-        "nullrun.actions.time.sleep", side_effect=fake_sleep
+    with (
+        patch("nullrun.actions.httpx.post", side_effect=ConnectionError("down")),
+        patch("nullrun.actions.time.sleep", side_effect=fake_sleep),
     ):
         handler._deliver_webhook(
             payload={"event": "kill"},

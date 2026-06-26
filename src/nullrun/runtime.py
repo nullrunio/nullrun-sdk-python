@@ -37,9 +37,7 @@ import os
 import threading
 import time
 import uuid
-from collections import defaultdict, deque
 from collections.abc import Callable
-from dataclasses import dataclass
 from typing import Any, Optional
 
 import httpx
@@ -70,106 +68,6 @@ from nullrun.transport import (
     TransportErrorSource,
 )
 
-
-class LoopTracker:
-    """
-    In-memory loop detection using deque with timestamps.
-
-    Tracks calls per tool_name with a 60-second sliding window.
-    """
-
-    def __init__(self, window_seconds: int = 60):
-        self._calls = defaultdict(deque)
-        self._window_seconds = window_seconds
-
-    def record(self, tool_name: str) -> None:
-        """Record a call for a tool."""
-        now = time.time()
-        self._calls[tool_name].append(now)
-        self._prune(tool_name, before=now - self._window_seconds)
-
-    def count(self, tool_name: str, window: int = None) -> int:
-        """
-        Count calls for a tool within the time window.
-
-        Args:
-            tool_name: Name of the tool
-            window: Time window in seconds (defaults to init window)
-
-        Returns:
-            Number of calls in the window
-        """
-        if window is None:
-            window = self._window_seconds
-        self._prune(tool_name, before=time.time() - window)
-        return len(self._calls[tool_name])
-
-    def _prune(self, tool_name: str, before: float) -> None:
-        """Remove calls older than the threshold."""
-        while self._calls[tool_name] and self._calls[tool_name][0] < before:
-            self._calls[tool_name].popleft()
-
-
-class RateTracker:
-    """
-    In-memory rate tracking using deque with timestamps.
-
-    Tracks total calls per minute to enforce rate limits.
-    """
-
-    def __init__(self, window_seconds: int = 60):
-        self._calls = deque()
-        self._window_seconds = window_seconds
-
-    def record(self) -> None:
-        """Record a call."""
-        now = time.time()
-        self._calls.append(now)
-        self._prune(before=now - self._window_seconds)
-
-    def count(self, window: int = None) -> int:
-        """
-        Count calls within the time window.
-
-        Args:
-            window: Time window in seconds (defaults to init window)
-
-        Returns:
-            Number of calls in the window
-        """
-        if window is None:
-            window = self._window_seconds
-        self._prune(before=time.time() - window)
-        return len(self._calls)
-
-    def exceeds_limit(self, limit: int, window: int = None) -> bool:
-        """
-        Check if rate limit is exceeded.
-
-        Args:
-            limit: Maximum allowed calls in the window
-            window: Time window in seconds (defaults to init window)
-
-        Returns:
-            True if limit is exceeded
-        """
-        return self.count(window) >= limit
-
-    def _prune(self, before: float) -> None:
-        """Remove calls older than the threshold."""
-        while self._calls and self._calls[0] < before:
-            self._calls.popleft()
-
-
-@dataclass
-class LocalDecision:
-    """Decision from local check (no network round-trip)."""
-
-    allowed: bool
-    reason: str = None
-    suggestion: str = None
-
-
 logger = logging.getLogger(__name__)
 
 # Phase 0.3.1: sentinel used when a gate fires outside a
@@ -178,86 +76,6 @@ logger = logging.getLogger(__name__)
 # to be named ``<unknown>`` (the previous literal was a
 # collision hazard). Wire compat: still a string.
 UNKNOWN_WORKFLOW_ID: str = "__nullrun_unknown__"
-
-
-@dataclass
-class Policy:
-    """
-    Policy fetched from NullRun backend.
-
-    Defines the safety limits for an agent workflow.
-    """
-
-    budget_cents: int
-    rate_limit: int  # cents per minute
-    loop_threshold: int = 6  # same tool calls in window
-    retry_threshold: int = 5  # retries in window
-    anomaly_detection_enabled: bool = True
-    loop_detection_enabled: bool = True
-    retry_detection_enabled: bool = True
-
-    @classmethod
-    def default_local(cls) -> "Policy":
-        """Default policy for local mode (free tier)."""
-        return cls(
-            budget_cents=1000,  # $10
-            rate_limit=100,
-            loop_threshold=6,
-            retry_threshold=5,
-        )
-
-    @classmethod
-    def strict_local(cls) -> "Policy":
-        """Tight fail-CLOSED fallback used when policy fetch fails
-        AND there is no last-known-good cached policy.
-
-        Per audit F-R2-02 (2026-06-22): the previous ``default_local``
-        fallback silently widened every limit (no rate limit, $10
-        budget, 6-loop threshold). On any backend blip, the SDK ran
-        with zero enforcement until the next successful fetch — a
-        classic fail-OPEN regression on an enforcement path.
-
-        ``strict_local`` is tight on every axis: 0 budget cap forces
-        every cost-bearing operation through the backend's
-        reservation service (fail-CLOSED there too), 1-call rate
-        limit caps sustained throughput, and loop/retry thresholds
-        of 1 fire on the first suspicious repetition. Callers that
-        genuinely need the legacy permissive fallback can opt in
-        via ``NULLRUN_POLICY_FAIL_OPEN=1`` — that env var is the
-        only place the SDK keeps the old behaviour.
-        """
-        return cls(
-            budget_cents=0,  # zero cap → backend reservation rejects
-            rate_limit=1,  # 1 call/min ceiling
-            loop_threshold=1,  # first repetition trips loop detector
-            retry_threshold=1,  # first retry trips retry detector
-        )
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "Policy":
-        """Create Policy from a backend ``PolicyResponse`` dict.
-
-        Backend fields (see backend/src/proxy/http/policies.rs::
-        ``PolicyResponse``) and the SDK's local ``Policy`` class
-        describe overlapping but non-identical facets of the same
-        domain. We map the intersection and fall back to defaults
-        where the backend doesn't surface the field — in particular
-        ``budget_cents`` and ``retry_detection_enabled`` are SDK-local
-        concepts with no counterpart on the wire today.
-        """
-        return cls(
-            budget_cents=data.get("budget_cents", 1000),
-            # Backend field is rate_limit_per_minute; SDK keeps the
-            # legacy "rate_limit" attribute name (cents per minute).
-            rate_limit=data.get("rate_limit_per_minute", data.get("rate_limit", 100)),
-            loop_threshold=data.get("loop_threshold", 6),
-            retry_threshold=data.get("retry_threshold", 5),
-            anomaly_detection_enabled=data.get("anomaly_detection_enabled", True),
-            loop_detection_enabled=data.get("loop_detection_enabled", True),
-            # No backend flag for this today — default keeps existing
-            # behaviour intact when the field is absent.
-            retry_detection_enabled=data.get("retry_detection_enabled", True),
-        )
 
 
 class NullRunRuntime:
@@ -293,7 +111,6 @@ class NullRunRuntime:
         api_key: str | None = None,
         secret_key: str | None = None,
         api_url: str = "https://api.nullrun.io",
-        policy: Policy | None = None,
         fallback_mode: str | None = None,
         debug: bool = False,
         _test_mode: bool = False,
@@ -307,8 +124,6 @@ class NullRunRuntime:
                      NULLRUN_API_KEY env variable. If both None, uses local mode.
             secret_key: Secret key for HMAC request signing. If None, no signing.
             api_url: URL of NullRun proxy server. Defaults to https://api.nullrun.io.
-            policy: Optional policy to use. If None, fetches from backend
-                   (cloud mode) or uses default (local mode).
             debug: Enable debug logging.
             _test_mode: Internal flag to skip network calls (for testing).
             polling: Internal flag for tests/CI to skip the background
@@ -362,41 +177,13 @@ class NullRunRuntime:
         self._test_mode = _test_mode
         self.polling = polling
 
-        self._policy: Policy | None = policy
-        # Audit F-R2-02 (2026-06-22): cache the last good policy so a
-        # transient backend outage doesn't silently widen enforcement.
-        # _fetch_policy() writes here on every successful 200; the
-        # failure path reads from it before falling through to
-        # Policy.strict_local().
-        self._last_good_policy: Policy | None = policy
-        # Sprint 3.2: prefer the typed ``on_transport_error`` parameter
-        # over the legacy string ``fallback_mode`` parameter. The
-        # legacy string (and its NULLRUN_FALLBACK_MODE env var) is
-        # still honoured for one minor version, with a one-time
-        # ``DeprecationWarning`` so operators see the migration path.
-        fb_raw = fallback_mode
-        if fb_raw is None and os.environ.get("NULLRUN_FALLBACK_MODE"):
-            # Legacy env var: emit a one-time deprecation warning
-            # at construction. After Sprint 3.2 the env var
-            # continues to work (so existing deployments don't
-            # break) but the user is told to migrate to
-            # ``on_transport_error`` on ``Transport.execute()``.
-            import warnings as _w
-
-            _w.warn(
-                "NULLRUN_FALLBACK_MODE is deprecated. Pass "
-                "``on_transport_error=`` to ``Transport.execute()`` "
-                "instead (one of 'raise' | 'open' | 'closed'). "
-                "The env var will be removed in 0.5.0.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            fb_raw = os.environ.get("NULLRUN_FALLBACK_MODE", "permissive")
-        fb_upper = str(fb_raw).upper() if fb_raw is not None else "PERMISSIVE"
+        # The string ``fallback_mode`` parameter is deprecated and
+        # accepted only for backward compat — the CACHED variant
+        # was removed in 0.7.0 because the SDK no longer maintains
+        # a local policy cache (see CHANGELOG D-01).
+        fb_upper = str(fallback_mode).upper() if fallback_mode is not None else "PERMISSIVE"
         if fb_upper == "STRICT":
             self._fallback_mode = FallbackMode.STRICT
-        elif fb_upper == "CACHED":
-            self._fallback_mode = FallbackMode.CACHED
         else:
             self._fallback_mode = FallbackMode.PERMISSIVE
         self._timeout = 30
@@ -407,14 +194,11 @@ class NullRunRuntime:
         # Local enforcement state
         # Phase 0.3.1: the BoundedDict-based per-workflow cost /
         # loop / retry counters have been removed alongside
-        # ``_check_local_limits``. The local loop / rate checks
-        # (``_loop_tracker`` / ``_rate_tracker`` below) are
-        # independent and stay -- they do not depend on cost.
+        # ``_check_local_limits``. As of 0.7.0 ALL local
+        # enforcement (LoopTracker / RateTracker / _local_check /
+        # hardcoded thresholds) has been removed -- the SDK is a
+        # thin client, the backend is authoritative.
         self._workflow_start_time: float = time.time()
-
-        # Local loop and rate tracking (for _local_check in track())
-        self._loop_tracker = LoopTracker(window_seconds=60)
-        self._rate_tracker = RateTracker(window_seconds=60)
 
         # Layer 3: ring buffer for the ``nullrun.status()`` recent
         # errors list. Capacity 10 — bounded so a long-lived process
@@ -425,18 +209,9 @@ class NullRunRuntime:
 
         self._recent_errors = _RecentErrorRing(capacity=10)
 
-        # Layer 3: timestamps for the status snapshot.
-        # ``_last_policy_fetch_at`` — wall-clock seconds of the last
-        # successful ``_fetch_policy()`` call. ``None`` until the
-        # first fetch completes (success or fail).
-        self._last_policy_fetch_at: float | None = None
-        # ``_last_policy_fetch_failed_at`` — set when fetch failed
-        # AND we fell back to cached / strict-local. Used to populate
-        # ``fallback_reason``.
-        self._last_policy_fetch_failed_at: float | None = None
-        # ``_last_backend_attempt_at`` / ``_last_backend_attempt_ok``
-        # — used to populate ``backend_reachable`` in the status
-        # snapshot. Set in ``_fetch_policy`` and the auth path.
+        # Layer 3: backend connectivity timestamps for the status
+        # snapshot. Set in ``_authenticate`` and updated on every
+        # successful / failed backend call thereafter.
         self._last_backend_attempt_at: float | None = None
         self._last_backend_attempt_ok: bool | None = None
 
@@ -456,10 +231,6 @@ class NullRunRuntime:
         # removed in 0.3.1) which left `track()` raising AttributeError on
         # first call.
         self._local_cost_cents_estimate: int = 0
-
-        # Default thresholds for local check (Phase 1 - hardcoded, not from backend)
-        self._local_loop_threshold = 6
-        self._local_rate_limit = 1000  # calls per minute
 
         # Coverage counters (Phase 3 of the production-readiness plan).
         # The instrumentation layer in `nullrun.instrumentation.auto`
@@ -526,8 +297,7 @@ class NullRunRuntime:
 
         # Initialize
         if self._test_mode:
-            # Test mode: skip all network calls, use local policy
-            self._policy = self._policy or Policy.default_local()
+            # Test mode: skip all network calls
             self._transport.start()
         else:
             try:
@@ -539,7 +309,6 @@ class NullRunRuntime:
                     f"Auth request failed: {e}. Cannot establish secure connection to NullRun. "
                     f"Refusing to operate in unprotected mode."
                 ) from e
-            self._fetch_policy()
             self._transport.start()
             # Start remote polling unless disabled (internal `polling=False`
             # for tests/CI). Production always polls.
@@ -610,7 +379,7 @@ class NullRunRuntime:
         # ``NullRunCallback._active_runs`` (now capped at 4096).
         self._COVERAGE_CAP: int = 4096
 
-        logger.info(f"NullRun Runtime initialized: mode=cloud, policy={self._policy}")
+        logger.info("NullRun Runtime initialized: mode=cloud")
 
     @classmethod
     def get_instance(cls) -> "NullRunRuntime":
@@ -699,39 +468,6 @@ class NullRunRuntime:
             # back from /auth/verify.
             api_key_valid = True
 
-        # --- Last policy fetch ---
-        last_policy_fetch: datetime | None = None
-        last_policy_fetch_age: float | None = None
-        if self._last_policy_fetch_at is not None:
-            last_policy_fetch = datetime.fromtimestamp(self._last_policy_fetch_at, tz=timezone.utc)
-            last_policy_fetch_age = max(0.0, time.time() - self._last_policy_fetch_at)
-
-        # --- Fallback / active policy ---
-        active_policy = self._policy
-        fallback_policy = (
-            self._last_good_policy
-            if self._last_good_policy is not None and self._last_good_policy is not self._policy
-            else None
-        )
-        fallback_reason: str | None = None
-        # Set when ``_last_policy_fetch_failed_at`` is known. We
-        # do NOT require ``last_policy_fetch_age`` to be set —
-        # the SDK may have never had a successful fetch (e.g.
-        # backend returned 401 on the first call), in which
-        # case the failure timestamp is still meaningful.
-        if self._last_policy_fetch_failed_at is not None:
-            failed_at = datetime.fromtimestamp(
-                self._last_policy_fetch_failed_at, tz=timezone.utc
-            ).isoformat()
-            if last_policy_fetch_age is not None:
-                fallback_reason = (
-                    f"last policy fetch failed at {failed_at} "
-                    f"(using cached policy from "
-                    f"{int(last_policy_fetch_age)}s ago)"
-                )
-            else:
-                fallback_reason = f"last policy fetch failed at {failed_at} (no cached policy)"
-
         # --- Connectivity ---
         backend_reachable: bool | None = None
         if self._last_backend_attempt_at is not None:
@@ -772,16 +508,7 @@ class NullRunRuntime:
         ):
             headline = STATE_MISCONFIGURED
         elif (
-            active_policy is not None
-            and getattr(active_policy, "budget_cents", None) == 0
-            and fallback_policy is None
-            and backend_reachable is False
-        ):
-            # Strict-local fallback with no cache + backend down.
-            headline = STATE_OFFLINE
-        elif (
-            fallback_policy is not None
-            or ws_connected is False
+            ws_connected is False
             or backend_reachable is False
             or (workflow_state is not None and workflow_state.state != "Normal")
         ):
@@ -796,11 +523,6 @@ class NullRunRuntime:
             organization_id=self.organization_id,
             workflow_id=self.workflow_id,
             api_url=self.api_url,
-            last_policy_fetch=last_policy_fetch,
-            last_policy_fetch_age_seconds=last_policy_fetch_age,
-            active_policy=active_policy,
-            fallback_policy=fallback_policy,
-            fallback_reason=fallback_reason,
             backend_reachable=backend_reachable,
             ws_connected=ws_connected,
             workflow_state=workflow_state,
@@ -1042,162 +764,6 @@ class NullRunRuntime:
             )
             self._emit_sdk_error(err, stage="auth")
             raise err from e
-
-    def _fetch_policy(self) -> None:
-        """Fetch policy from backend and cache locally.
-
-        Backend route: GET /api/v1/orgs/{org_id}/policies (see
-        backend/src/proxy/http/routes.rs). Pre-FIX-F1 the SDK POSTed
-        to /api/v1/policies with organization_id in the body — the
-        backend route is GET + org-scoped URL, so the call 404'd and
-        fell through to ``Policy.default_local()`` (silent fail-open
-        on every policy fetch).
-
-        Response shape: ``{"data": [...], "meta": {...}}`` where each
-        entry is a ``PolicyResponse`` (backend/src/proxy/http/policies.rs).
-        The SDK ``Policy`` class and backend ``PolicyResponse`` describe
-        different facets of the same domain — we map the overlap
-        (rate_limit_per_minute, loop_threshold, retry_threshold, and the
-        detection-enabled flags) and fall back to defaults for fields
-        the backend doesn't surface.
-
-        ## Fail-CLOSED contract (audit F-R2-02, 2026-06-22)
-
-        Pre-fix: any HTTP exception, non-200 status, or empty
-        ``{"data": []}`` response silently fell through to
-        ``Policy.default_local()`` — which has ``budget_cents=1000``,
-        ``rate_limit=100``, ``loop_threshold=6``, no tool block — i.e.
-        effectively unenforced. A 503 from the backend would keep the
-        customer's SDK running with zero enforcement for the rest of
-        the session.
-
-        Post-fix: the SDK enforces fail-CLOSED on this gate, mirroring
-        the broader CLAUDE.md fail-CLOSED policy. On any failure path
-        the SDK uses, in priority order:
-
-        1. The last known-good cached policy (``self._last_good_policy``).
-           The customer's existing limits are preserved across a
-           transient outage — they pay the cost of any policy
-           tightening baked into the last fetch, but do not lose
-           enforcement.
-        2. ``Policy.strict_local()`` — tight cap (zero budget,
-           1-call rate limit, first-repetition loop detection) that
-           forces every cost-bearing call through the backend's
-           reservation service, which is itself fail-CLOSED.
-
-        Opt-out: ``NULLRUN_POLICY_FAIL_OPEN=1`` restores the
-        pre-fix permissive fallback. Mirrors the shape of
-        ``NULLRUN_SKIP_BUDGET_CHECK=1`` and
-        ``NULLRUN_SENSITIVE_FAIL_OPEN=1`` — a single env var to
-        re-enable the legacy behaviour for tests or staging.
-        """
-        fail_open = os.environ.get("NULLRUN_POLICY_FAIL_OPEN", "").strip() == "1"
-
-        if not self.organization_id:
-            self._policy = Policy.default_local() if fail_open else Policy.strict_local()
-            logger.warning(
-                "No organization_id; policy fetch skipped. fail-OPEN=%s "
-                "(NULLRUN_POLICY_FAIL_OPEN=1 to restore permissive fallback).",
-                fail_open,
-            )
-            return
-
-        try:
-            # Layer 3: stamp the backend-attempt timestamp BEFORE
-            # the request so the status snapshot knows the SDK is
-            # actively trying to reach the backend.
-            self._last_backend_attempt_at = time.time()
-            # Use Transport's client for connection pooling, retry, and circuit breaker
-            response = self._transport._client.get(
-                f"{self.api_url}/api/v1/orgs/{self.organization_id}/policies",
-                headers=self._auth_headers(),
-                timeout=5.0,
-            )
-            self._last_backend_attempt_ok = True
-
-            if response.status_code == 200:
-                payload = response.json()
-                # Backend wraps the list in {"data": [...], "meta": ...}.
-                # The pre-FIX-F1 code assumed a bare list and would
-                # crash on len(payload[...]) of a dict.
-                entries = payload.get("data", []) if isinstance(payload, dict) else payload
-                # Find the most relevant active policy: prefer the
-                # first is_active entry; if all are inactive, skip the
-                # whole list (inactive policies should not tighten
-                # enforcement).
-                active = next(
-                    (p for p in entries if isinstance(p, dict) and p.get("is_active", True)),
-                    None,
-                )
-                if active is not None:
-                    fetched = Policy.from_dict(active)
-                    self._policy = fetched
-                    # Audit F-R2-02: cache the last good policy so
-                    # transient outages don't silently widen limits.
-                    self._last_good_policy = fetched
-                    # Layer 3: stamp the successful-fetch timestamp
-                    # so ``nullrun.status()`` can show how old the
-                    # current policy is. The status builder uses
-                    # this to compute
-                    # ``last_policy_fetch_age_seconds``.
-                    self._last_policy_fetch_at = time.time()
-                    logger.info(f"Policy fetched: {self._policy}")
-                    return
-                # 200 OK but no active policy — same shape as the
-                # pre-fix behaviour, but post-fix we drop to the
-                # cached or strict fallback rather than the permissive
-                # default. Without an active policy the backend is
-                # not asserting any limits, so the SDK cannot safely
-                # assume the legacy $10/100-rpm defaults reflect
-                # current intent.
-                logger.warning(
-                    "Policy fetch returned no active policies for org=%s",
-                    self.organization_id,
-                )
-            else:
-                logger.warning(
-                    "Policy fetch returned status=%s for org=%s",
-                    response.status_code,
-                    self.organization_id,
-                )
-                self._last_backend_attempt_ok = False
-        except Exception as e:
-            logger.warning("Failed to fetch policy for org=%s: %s", self.organization_id, e)
-            self._last_backend_attempt_ok = False
-
-        # Audit F-R2-02: fail-CLOSED. Order of precedence:
-        #   1. last known-good cached policy (if any)
-        #   2. strict_local() (zero budget, 1-call rate limit)
-        #   3. opt-out env var NULLRUN_POLICY_FAIL_OPEN=1 → default_local()
-        # Layer 3: stamp the failed-fetch timestamp so the status
-        # snapshot can populate ``fallback_reason`` with a
-        # concrete timestamp.
-        self._last_policy_fetch_failed_at = time.time()
-        if getattr(self, "_last_good_policy", None) is not None:
-            self._policy = self._last_good_policy
-            logger.warning(
-                "Policy fetch failed; using last known-good policy (fail-CLOSED). "
-                "Set NULLRUN_POLICY_FAIL_OPEN=1 to fall back to permissive defaults."
-            )
-            return
-
-        if fail_open:
-            self._policy = Policy.default_local()
-            logger.warning(
-                "No cached policy and NULLRUN_POLICY_FAIL_OPEN=1; "
-                "using permissive default policy (audit F-R2-02 fail-OPEN opt-in)."
-            )
-            return
-
-        self._policy = Policy.strict_local()
-        logger.warning(
-            "No cached policy available; activating Policy.strict_local() "
-            "(zero budget, 1-call rate limit). Backend unreachable — "
-            "every cost-bearing call will be rejected by the reservation "
-            "service until the next successful policy fetch. "
-            "Set NULLRUN_POLICY_FAIL_OPEN=1 to restore the legacy "
-            "permissive fallback for tests / staging."
-        )
 
     def _start_transport(self) -> None:
         """Start the transport layer with background flush.
@@ -1653,11 +1219,6 @@ class NullRunRuntime:
         NullRunRuntime._instance = None
         logger.info("NullRun Runtime shutdown")
 
-    @property
-    def policy(self) -> Policy:
-        """Get current policy."""
-        return self._policy or Policy.default_local()
-
     def track(
         self,
         event: dict[str, Any],
@@ -1721,24 +1282,10 @@ class NullRunRuntime:
                     "deduped": True,
                 }
 
-        # Phase 1: LOCAL CHECK FIRST (before any network call)
-        # This provides instant blocking without round-trip latency
-        local_decision = self._local_check(event)
-        if not local_decision.allowed:
-            # Blocked locally - return immediately without backend call
-            logger.debug(f"Local check blocked: {local_decision.reason}")
-            return {
-                "allowed": False,
-                "actions": ["block"],
-                "blocked_reason": local_decision.reason,
-                "blocked_suggestion": local_decision.suggestion,
-                "local_cost_cents": 0,
-            }
-
-        # Local check passed - record the call BEFORE sending to backend
-        tool_name = event.get("tool_name", "unknown")
-        self._loop_tracker.record(tool_name)
-        self._rate_tracker.record()
+        # 0.7.0 thin-client: NO local check here. All enforcement
+        # decisions arrive from the backend via /gate and /execute.
+        # The SDK forwards the event to the transport and lets the
+        # backend decide.
 
         # Enrich event with context
         enriched = self._enrich_event(event)
@@ -2342,38 +1889,6 @@ class NullRunRuntime:
             enriched["operation_name"] = None
 
         return enriched
-
-    def _local_check(self, event: dict[str, Any]) -> LocalDecision:
-        """
-        Local check BEFORE sending to backend.
-
-        This runs before the event is sent to the backend and provides
-        instant blocking without network round-trip.
-
-        Args:
-            event: Event dict with tool_name
-
-        Returns:
-            LocalDecision with allowed/blocked status
-        """
-        tool_name = event.get("tool_name", "unknown")
-
-        # Check loop count (6 same tool calls in 60s window)
-        loop_count = self._loop_tracker.count(tool_name, window=60)
-        if loop_count >= self._local_loop_threshold:
-            # Sprint 3.1 (B23): bump the ``loop_detections`` counter
-            # so an SRE can alert on a sudden spike (often a sign
-            # of an agent stuck in a retry loop).
-            metrics.inc_runtime("loop_detections")
-            return LocalDecision(
-                allowed=False, reason="loop_detected", suggestion="retry after 60s"
-            )
-
-        # Check rate limit (max 1000/min default)
-        if self._rate_tracker.exceeds_limit(self._local_rate_limit):
-            return LocalDecision(allowed=False, reason="rate_limit", suggestion="slow down")
-
-        return LocalDecision(allowed=True)
 
     def track_llm(
         self,

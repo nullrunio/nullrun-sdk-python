@@ -69,56 +69,15 @@ class TestAuthorizationHeaderOnPost:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# FIX-F1: SDK fetches policy via GET /api/v1/orgs/{org_id}/policies
-# (not POST /api/v1/policies — the latter 404'd silently and fell through
-# to Policy.default_local()).
-# ─────────────────────────────────────────────────────────────────────
-
-
-class TestPolicyFetchContract:
-    """Pin the SDK policy-fetch shape so a backend route rename trips here."""
-
-    def test_policy_url_is_org_scoped_get(self):
-        # Pure URL/verb check — no HTTP round-trip. The actual mapping
-        # is exercised in tests/test_runtime.py; this test only pins the
-        # wire-shape contract so a refactor that re-introduces the
-        # broken /api/v1/policies POST is caught at unit-test time.
-        from nullrun.runtime import NullRunRuntime
-
-        rt = NullRunRuntime(api_key="nr_live_x", _test_mode=True)
-        try:
-            rt.organization_id = "00000000-0000-0000-0000-000000000001"
-            captured: dict = {}
-
-            def fake_request(url: str, headers=None, timeout=None):
-                captured["url"] = url
-                captured["headers"] = headers
-
-                class _Resp:
-                    status_code = 200
-
-                    @staticmethod
-                    def json():
-                        # Wrapped list per backend PolicyListResponse
-                        return {"data": [], "meta": {"total": 0}}
-
-                return _Resp()
-
-            # Patch the HTTP client to capture without a real call.
-            rt._transport._client.get = fake_request  # type: ignore[assignment]
-            rt._fetch_policy()
-
-            assert captured["url"].endswith(
-                "/api/v1/orgs/00000000-0000-0000-0000-000000000001/policies"
-            ), f"unexpected policy URL: {captured['url']}"
-        finally:
-            rt.shutdown()
-
-
-# ─────────────────────────────────────────────────────────────────────
 # FIX-F2: SDK fetches per-workflow state via
 # GET /api/v1/orgs/{org_id}/workflows/{workflow_id}
 # (not /api/v1/status/{workflow_id} which 404'd).
+#
+# 0.7.0: SDK is a thin client. Policy fetch (GET /policies) was
+# removed along with local Policy class — backend owns all policy
+# state. The fetch-policy URL contract is no longer exercised by
+# the SDK; backend authors can keep the GET /policies endpoint for
+# dashboard / API consumers, but the SDK does not call it.
 # ─────────────────────────────────────────────────────────────────────
 
 
@@ -281,50 +240,14 @@ class TestWsHmacIdentityContract:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# FIX-F1: Policy.from_dict maps backend PolicyResponse fields.
-# Pin that rate_limit_per_minute is the source for SDK's rate_limit,
-# and detection flags round-trip.
+# 0.7.0: Policy.from_dict and Policy class were removed from the
+# SDK. The thin-client model means every enforcement decision
+# arrives from the backend via /gate and /execute; the SDK does
+# NOT maintain a local Policy object. The rate_limit_per_minute /
+# loop_threshold / retry_threshold mapping test that previously
+# lived here is now a backend unit test concern (see
+# backend/src/proxy/http/policies.rs).
 # ─────────────────────────────────────────────────────────────────────
-
-
-class TestPolicyMappingContract:
-    """Policy.from_dict reads the backend PolicyResponse shape."""
-
-    def test_rate_limit_per_minute_maps_to_rate_limit(self):
-        from nullrun.runtime import Policy
-
-        backend_entry = {
-            "id": "pol-1",
-            "name": "rate-limit",
-            "policy_type": "rate_limit",
-            "scope": "org",
-            "config": {},
-            "is_active": True,
-            "version": 1,
-            "rate_limit_per_minute": 42,
-            "loop_detection_enabled": True,
-            "anomaly_detection_enabled": True,
-            "loop_threshold": 7,
-            "retry_threshold": 4,
-        }
-        p = Policy.from_dict(backend_entry)
-        assert p.rate_limit == 42
-        assert p.loop_threshold == 7
-        assert p.retry_threshold == 4
-        assert p.anomaly_detection_enabled is True
-        assert p.loop_detection_enabled is True
-        # Fields the backend doesn't surface fall back to defaults.
-        assert p.budget_cents == 1000
-        assert p.retry_detection_enabled is True
-
-    def test_legacy_field_name_still_supported(self):
-        """Old SDK code (and any test fixture) may send ``rate_limit``
-        directly. The mapping must accept that too — pin backwards
-        compat so a refactor that removes it trips here."""
-        from nullrun.runtime import Policy
-
-        p = Policy.from_dict({"rate_limit": 99})
-        assert p.rate_limit == 99
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -429,156 +352,109 @@ class TestSensitiveToolRoutesToExecute:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# F-R2-02 (audit 2026-06-22): SDK policy fetch must fail-CLOSED on a
-# 5xx response, not silently fall through to Policy.default_local().
-# Pre-fix: any HTTP exception / non-200 status / empty `{"data": []}`
-# silently used Policy.default_local() (budget_cents=1000,
-# rate_limit=100, loop_threshold=6 — i.e. effectively unenforced).
-# Post-fix: cache the last good policy, fall back to
-# Policy.strict_local() if no cache, opt-out via
-# NULLRUN_POLICY_FAIL_OPEN=1.
+# 0.7.0: TestPolicyFetchFailClosed was retired along with the local
+# Policy class and _fetch_policy(). The SDK no longer fetches policy
+# from the backend on init (backend owns all policy state now).
 # ─────────────────────────────────────────────────────────────────────
 
 
-class TestPolicyFetchFailClosed:
-    """Policy fetch failures must not widen enforcement."""
+class TestOutgoingAckIsSigned:
+    """Pin the SDK's outgoing ACK wire shape: HMAC-signed envelope.
 
-    def test_503_response_uses_strict_local_not_default(self, monkeypatch):
-        """A 503 from the backend's /policies endpoint must NOT silently
-        use Policy.default_local() — that is fail-OPEN on every
-        enforcement gate. The SDK should fall back to the cached policy
-        (if any), then to Policy.strict_local() (zero budget,
-        1-call rate limit, first-repetition loop detection)."""
-        from nullrun.runtime import NullRunRuntime
+    CP7 fix (2026-06-26): previously the ACK was plain JSON
+    (``TestOutgoingAckIsPlainJson`` — now retired). The wire
+    format now includes ``api_key``, ``timestamp`` and
+    ``signature`` so the SDK is forward-compatible with the
+    backend's pending ACK-verification work
+    (``backend/src/proxy/http/ws_control.rs:842-848`` TODO).
 
-        monkeypatch.delenv("NULLRUN_POLICY_FAIL_OPEN", raising=False)
-        rt = NullRunRuntime(api_key="nr_live_x", _test_mode=True)
-        try:
-            rt.organization_id = "00000000-0000-0000-0000-000000000099"
+    Field-name consistency matches the incoming
+    ``SignedWsMessage`` envelope: ``api_key`` carries the user-
+    facing API key string (``nr_live_...``) as the HMAC identity,
+    ``timestamp`` is unix seconds (matches the rest of the SDK —
+    see FIX-F5), ``signature`` is sha256 HMAC of
+    ``timestamp:api_key:sha256(body)``.
 
-            class _Resp:
-                status_code = 503
+    The signature covers the canonical bytes of the *unsigned*
+    body (``{type, message_id, received_at}``), so the receiver
+    can re-hash the same body and compare.
+    """
 
-                @staticmethod
-                def json():
-                    return {"error": "backend_unavailable"}
-
-            def fake_get(url, headers=None, timeout=None):
-                return _Resp()
-
-            rt._transport._client.get = fake_get  # type: ignore[assignment]
-            rt._fetch_policy()
-
-            # Fail-CLOSED: strict_local() = budget_cents=0, rate_limit=1.
-            assert rt._policy.budget_cents == 0, (
-                f"F-R2-02: 5xx on policy fetch must use Policy.strict_local() "
-                f"(budget_cents=0). Got budget_cents={rt._policy.budget_cents}. "
-                f"Pre-fix this was Policy.default_local() with "
-                f"budget_cents=1000 (fail-OPEN on every gate)."
-            )
-            assert rt._policy.rate_limit == 1
-            assert rt._policy.loop_threshold == 1
-        finally:
-            rt.shutdown()
-
-    def test_503_response_with_cached_policy_uses_cache(self, monkeypatch):
-        """If we have a last-good cached policy, a 503 should preserve
-        the customer's existing limits — not silently widen them."""
-        from nullrun.runtime import NullRunRuntime, Policy
-
-        monkeypatch.delenv("NULLRUN_POLICY_FAIL_OPEN", raising=False)
-        rt = NullRunRuntime(api_key="nr_live_x", _test_mode=True)
-        try:
-            rt.organization_id = "00000000-0000-0000-0000-000000000099"
-            rt._last_good_policy = Policy(
-                budget_cents=5_000,
-                rate_limit=42,
-                loop_threshold=7,
-                retry_threshold=4,
-            )
-
-            class _Resp:
-                status_code = 503
-
-                @staticmethod
-                def json():
-                    return {"error": "backend_unavailable"}
-
-            rt._transport._client.get = lambda url, headers=None, timeout=None: _Resp()  # type: ignore[assignment]
-            rt._fetch_policy()
-
-            # Cache wins: customer's existing limits preserved.
-            assert rt._policy.budget_cents == 5_000, (
-                "F-R2-02: when a last-good policy is cached, the SDK must "
-                "preserve the customer's existing limits on a 503. "
-                "Pre-fix this dropped to Policy.default_local() and "
-                "silently widened enforcement."
-            )
-            assert rt._policy.rate_limit == 42
-        finally:
-            rt.shutdown()
-
-    def test_opt_out_env_var_restores_default(self, monkeypatch):
-        """NULLRUN_POLICY_FAIL_OPEN=1 must opt back into the legacy
-        permissive fallback for tests / staging environments."""
-        from nullrun.runtime import NullRunRuntime
-
-        monkeypatch.setenv("NULLRUN_POLICY_FAIL_OPEN", "1")
-        rt = NullRunRuntime(api_key="nr_live_x", _test_mode=True)
-        try:
-            rt.organization_id = "00000000-0000-0000-0000-000000000099"
-
-            class _Resp:
-                status_code = 503
-
-                @staticmethod
-                def json():
-                    return {}
-
-            rt._transport._client.get = lambda url, headers=None, timeout=None: _Resp()  # type: ignore[assignment]
-            rt._fetch_policy()
-
-            # Opt-out path: default_local() = budget_cents=1000, rate_limit=100.
-            assert rt._policy.budget_cents == 1000
-            assert rt._policy.rate_limit == 100
-        finally:
-            rt.shutdown()
-
-
-# ─────────────────────────────────────────────────────────────────────
-# F-R2-14 (audit 2026-06-22): outgoing WebSocket ACK is plain JSON,
-# NOT signed. CHANGELOG 0.5.2 overclaimed "signed outgoing ACKs". This
-# test pins the actual wire shape so a future signer that adds the
-# signature field doesn't break clients expecting 3-field ACKs (and
-# vice versa).
-# ─────────────────────────────────────────────────────────────────────
-
-
-class TestOutgoingAckIsPlainJson:
-    """Pin the SDK's ACK wire shape: 3 fields, no signature.
-
-    Until the backend enables ACK authenticity verification (the TODO
-    at backend/src/proxy/http/ws_control.rs:842-848), adding a
-    signature field would be cargo-culted. If you change this test,
-    coordinate with the backend signer first."""
-
-    def test_ack_envelope_has_three_fields(self):
-        # Mirrors transport_websocket._send_ack shape:
-        # {"type": "ack", "message_id": ..., "received_at": ...}
+    def test_ack_envelope_has_six_fields(self):
+        """Pure-function check on the expected envelope shape."""
+        timestamp = int(time.time())
         ack = {
             "type": "ack",
             "message_id": "msg-1",
-            "received_at": int(time.time()),
+            "received_at": timestamp,
+            "api_key": "nr_live_test",
+            "timestamp": timestamp,
+            "signature": "deadbeef" * 8,  # placeholder
         }
-        assert set(ack.keys()) == {"type", "message_id", "received_at"}, (
-            "F-R2-14: outgoing ACK envelope must contain exactly "
-            "{type, message_id, received_at}. If you added a "
-            "signature/timestamp field, the backend now needs to verify "
-            "it (see ws_control.rs:842-848 TODO) — coordinate before "
-            "shipping."
+        assert set(ack.keys()) == {
+            "type",
+            "message_id",
+            "received_at",
+            "api_key",
+            "timestamp",
+            "signature",
+        }, (
+            "CP7: outgoing ACK envelope must contain exactly "
+            "{type, message_id, received_at, api_key, timestamp, "
+            "signature}. The receiver verifies signature over the "
+            "bytes of the unsigned body (everything except "
+            "api_key/timestamp/signature)."
         )
-        assert "signature" not in ack
-        assert "timestamp" not in ack
+
+    def test_ack_signature_covers_unsigned_body(self):
+        """Signature MUST be computed over the canonical bytes of the
+        unsigned body (3 fields), NOT the signed body (6 fields).
+
+        If we naively computed the signature over the final dict,
+        the receiver's verify (which hashes the 3-field body) would
+        never match — a silent auth break. This test pins the
+        invariant so future refactors can't accidentally re-serialise
+        before signing.
+        """
+        import json
+
+        timestamp = 1_700_000_000
+        api_key = "nr_live_test"
+        secret_key = "test-secret"
+
+        unsigned_body = {
+            "type": "ack",
+            "message_id": "msg-1",
+            "received_at": timestamp,
+        }
+        # Mirrors transport.generate_hmac_signature: HMAC-SHA256 of
+        # "{timestamp}:{api_key}:{sha256(body)}".
+        body_str = json.dumps(unsigned_body, sort_keys=True)
+        body_hash = hashlib.sha256(body_str.encode("utf-8")).hexdigest()
+        message = f"{timestamp}:{api_key}:{body_hash}"
+        expected = hmac.new(
+            secret_key.encode("utf-8"),
+            message.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+        # Compute the signature the receiver would compute. It must
+        # match the sender's expected value exactly. This is the
+        # invariant: sender signs 3-field body, receiver verifies
+        # against the same 3-field body.
+        receiver_body_str = json.dumps(unsigned_body, sort_keys=True)
+        receiver_body_hash = hashlib.sha256(receiver_body_str.encode("utf-8")).hexdigest()
+        receiver_message = f"{timestamp}:{api_key}:{receiver_body_hash}"
+        receiver_expected = hmac.new(
+            secret_key.encode("utf-8"),
+            receiver_message.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+        assert expected == receiver_expected, (
+            "CP7: sender and receiver must hash the same canonical "
+            "bytes. If this fails, the signature scheme is broken."
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────

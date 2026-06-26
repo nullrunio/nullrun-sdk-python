@@ -12,6 +12,7 @@ weakref flush fires on GC, exceptions in the flush don't propagate to
 the atexit machinery, and the transport can be used as a context
 manager.
 """
+
 from __future__ import annotations
 
 import gc
@@ -87,8 +88,7 @@ class TestNoSignalHandlerInstalled:
 
                 src = inspect.getsource(handler)
                 assert "sys.exit" not in src, (
-                    f"SDK must not install a signal handler that "
-                    f"calls sys.exit: {handler!r}"
+                    f"SDK must not install a signal handler that calls sys.exit: {handler!r}"
                 )
             # And the original handler is preserved (the test
             # process had its own SIGTERM handler from pytest).
@@ -113,10 +113,7 @@ class TestAtexitViaWeakref:
             # The `__call__` method exists on the finalize object.
             # We can introspect by walking the weakref.finalize
             # instances attached to the object.
-            finalize_objs = [
-                r for r in gc.get_referrers(t)
-                if isinstance(r, weakref.finalize)
-            ]
+            finalize_objs = [r for r in gc.get_referrers(t) if isinstance(r, weakref.finalize)]
             # The weakref is registered as a referrer of t. We can
             # at minimum check that the atexit registry is not
             # pinned to t.
@@ -153,25 +150,179 @@ class TestAtexitViaWeakref:
             pytest.fail(f"Constructing after GC failed: {exc}")
 
     def test_atexit_flush_exception_is_swallowed(self):
-        """If the atexit flush raises, the exception must NOT
-        propagate to the interpreter's atexit machinery (which would
-        silently swallow the next atexit handler).
+        """The weakref finalizer must NEVER raise — exceptions
+        propagating into GC corrupt finalizer ordering and can
+        suppress subsequent finalizers.
 
-        Phase 0.4.0: ``_atexit_flush`` was removed in favour of
-        ``weakref.finalize`` -> ``_atexit_flush_safe``. We pin the
-        contract by patching ``_do_flush`` (the only side-effecting
-        call inside the safe wrapper) to raise.
+        0.7.0 contract: ``_atexit_flush_safe`` is a static no-op
+        that only emits a DEBUG log line. There is no buffer / WAL
+        / httpx-client reach inside the finalizer — by the time
+        ``weakref.finalize`` fires, ``self`` is already being
+        collected. Crash-safety lives in ``stop()`` (which calls
+        ``_persist_to_wal``) and the context-manager pattern, NOT
+        in the finalizer. We pin both:
+
+        1. Direct call (0 args, matching the weakref-finalize
+           contract): never raises regardless of upstream state.
+        2. Direct call with an unexpected positional arg (1 arg,
+           matching the original test signature intent): also
+           never raises — the method signature accepts the
+           optional positional arg defensively.
         """
         t = Transport(
             api_url="https://api.test.nullrun.io",
             api_key="test-key-12345678",
         )
         try:
-            with patch.object(t, "_do_flush", side_effect=RuntimeError("boom")):
-                # Calling the safe wrapper must not raise.
-                t._atexit_flush_safe(id(t))
+            # 1. The actual weakref-finalize call signature.
+            t._atexit_flush_safe()
+            # 2. Defensive: an extra positional arg (as
+            # weakref.finalize passes the id-of-self when atexit
+            # fires via the standard interpreter hook) must also
+            # not raise. The 0.7.0 signature is
+            # ``(_self_id: int | None = None)`` to accept this.
+            t._atexit_flush_safe(id(t))
         finally:
             t.stop()
+
+    def test_atexit_flush_does_not_persist_buffer(self):
+        """0.7.0 contract pin: the weakref finalizer is a no-op.
+        Buffered events that survived without ``stop()`` are
+        LOST — the SDK logs a DEBUG warning instead of writing
+        them to the WAL.
+
+        Rationale (per the 0.7.0 thin-client refactor): the
+        ``Transport._buffer`` is gone by the time the finalizer
+        fires (the instance is being GC'd; weakref.finalize
+        receives no ``self`` reference). Attempting to WAL-persist
+        from inside the finalizer would need a parallel registry
+        of live buffers, which contradicts the thin-client
+        architecture (the backend is authoritative for delivery,
+        not the local SDK).
+
+        Callers MUST use one of:
+          * ``with Transport(...) as t:`` — context manager
+            calls ``stop()`` on ``__exit__``.
+          * explicit ``t.start()`` / ``t.stop()`` pair.
+          * rely on the interpreter-level ``atexit`` runner, but
+            understand that buffered events that did not reach
+            ``_persist_to_wal`` BEFORE interpreter shutdown will
+            not be replayed.
+
+        The DEBUG log line emitted by the finalizer is the
+        user-visible signal that events were dropped.
+        """
+        import logging
+        import tempfile
+
+        # Use a per-test WAL path so we can verify the finalizer
+        # does NOT touch it.
+        wal_dir = tempfile.mkdtemp(prefix="nullrun_wal_test_")
+        wal_path = f"{wal_dir}/nullrun.wal"
+
+        t = Transport(
+            api_url="https://api.test.nullrun.io",
+            api_key="test-key-12345678",
+        )
+        try:
+            # Enqueue events that simulate the case where stop()
+            # was never called (e.g. user script just runs
+            # ``nullrun.init(...)`` and exits).
+            t.track({"event_id": "drop-1", "type": "cost", "amount": 42})
+            t.track({"event_id": "drop-2", "type": "cost", "amount": 17})
+            assert len(t._buffer) == 2
+
+            # Override the WAL path so we can assert the finalizer
+            # does NOT write to it.
+            t._wal_path = lambda: wal_path  # type: ignore[method-assign]
+
+            # Invoke the finalizer directly with the captured
+            # refs (simulating what weakref.finalize would do on
+            # GC).
+            with t._lock:
+                events_before = list(t._buffer)
+            t._atexit_flush_safe()
+
+            # The WAL file MUST NOT exist after the finalizer
+            # fired. The 0.7.0 contract is "no-op, log warning".
+            import os
+
+            assert not os.path.exists(wal_path), (
+                f"finalizer must NOT write WAL in 0.7.0, but {wal_path} exists"
+            )
+
+            # And the buffer must NOT be mutated by the finalizer.
+            with t._lock:
+                assert t._buffer == events_before, (
+                    "finalizer must NOT clear or mutate _buffer in 0.7.0"
+                )
+        finally:
+            t.stop()
+            import shutil
+
+            shutil.rmtree(wal_dir, ignore_errors=True)
+
+    def test_weakref_finalize_logs_warning_only(self, caplog):
+        """End-to-end: a Transport that is GC'd without an
+        explicit ``stop()`` MUST NOT silently drop /track events
+        on the floor — the SDK logs a DEBUG line so operators
+        can see the data-loss signal in their log pipeline.
+
+        0.7.0 contract change (vs 0.6.x): the finalizer no longer
+        writes the buffer to the WAL. It only emits a single
+        DEBUG-level log line via ``logger.debug``. To survive
+        a crash, callers must use the context manager or call
+        ``stop()`` explicitly — see ``test_atexit_flush_does_not_persist_buffer``
+        for the rationale.
+        """
+        import logging
+        import shutil
+        import tempfile
+
+        wal_dir = tempfile.mkdtemp(prefix="nullrun_wal_e2e_")
+        wal_path = f"{wal_dir}/nullrun.wal"
+        try:
+            # Step 1: build a Transport, enqueue events, GC it
+            # without calling stop(). This is what happens when
+            # a user script just does ``nullrun.init(...)`` and
+            # exits.
+            t = Transport(
+                api_url="https://api.test.nullrun.io",
+                api_key="test-key-12345678",
+            )
+            t._wal_path = lambda: wal_path  # type: ignore[method-assign]
+            t.track({"event_id": "e2e-1", "type": "cost"})
+            t.track({"event_id": "e2e-2", "type": "cost"})
+
+            # Detach the finalizer that stop() would detach, so
+            # the explicit-stop path doesn't suppress it. We're
+            # testing the no-stop path.
+            t._finalizer.detach()
+            # Capture DEBUG records emitted during the finalizer call.
+            caplog.set_level(logging.DEBUG, logger="nullrun.transport")
+            # Manually invoke what weakref.finalize would do on GC.
+            t._atexit_flush_safe()
+            del t
+
+            # Step 2: the WAL must NOT exist (no-op finalizer).
+            import os
+
+            assert not os.path.exists(wal_path), (
+                f"WAL must NOT be created in 0.7.0, but {wal_path} exists"
+            )
+
+            # Step 3: a DEBUG log line was emitted with the
+            # "may be lost" / "explicit stop" hint.
+            debug_msgs = [
+                rec.getMessage()
+                for rec in caplog.records
+                if rec.levelno == logging.DEBUG and rec.name == "nullrun.transport"
+            ]
+            assert any("may be lost" in m or "explicit stop" in m for m in debug_msgs), (
+                f"expected DEBUG log line about event loss, got: {debug_msgs!r}"
+            )
+        finally:
+            shutil.rmtree(wal_dir, ignore_errors=True)
 
 
 class TestContextManagerLifecycle:

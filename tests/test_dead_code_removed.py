@@ -19,6 +19,7 @@ Removed in 0.4.0:
 - Transport._atexit_flush (orphan from pre-weakref.finalize migration)
 - PoolConfig, AdaptivePool
 """
+
 from __future__ import annotations
 
 import pytest
@@ -27,51 +28,60 @@ import pytest
 # Runtime-level removals
 # ===========================================================================
 
+
 def test_bounded_dict_removed():
     """`BoundedDict` was deleted in 0.4.0."""
     from nullrun.runtime import NullRunRuntime
+
     assert getattr(NullRunRuntime, "BoundedDict", None) is None
 
 
 def test_wrap_tool_removed():
     """`runtime.wrap_tool` was deleted in 0.4.0."""
     from nullrun.runtime import NullRunRuntime
+
     assert getattr(NullRunRuntime, "wrap_tool", None) is None
 
 
 def test_wrap_removed():
     """`runtime.wrap` was deleted in 0.4.0 (and had a latent NameError)."""
     from nullrun.runtime import NullRunRuntime
+
     assert getattr(NullRunRuntime, "wrap", None) is None
 
 
 def test_check_before_tool_removed():
     """`runtime.check_before_tool` was deleted in 0.4.0."""
     from nullrun.runtime import NullRunRuntime
+
     assert getattr(NullRunRuntime, "check_before_tool", None) is None
 
 
 def test_enforce_check_before_llm_removed():
     """`runtime.enforce_check_before_llm` was deleted in 0.4.0."""
     from nullrun.runtime import NullRunRuntime
+
     assert getattr(NullRunRuntime, "enforce_check_before_llm", None) is None
 
 
 def test_check_before_llm_removed():
     """`runtime.check_before_llm` was deleted in 0.4.0 (along with its CheckDecision)."""
     from nullrun.runtime import NullRunRuntime
+
     assert getattr(NullRunRuntime, "check_before_llm", None) is None
 
 
 def test_evaluate_removed():
     """`runtime.evaluate` was deleted in 0.4.0 (also resolved silent fail-OPEN)."""
     from nullrun.runtime import NullRunRuntime
+
     assert getattr(NullRunRuntime, "evaluate", None) is None
 
 
 def test_check_decision_class_removed():
     """`CheckDecision` dataclass was deleted alongside `check_before_*`."""
     from nullrun import runtime as _runtime
+
     assert not hasattr(_runtime, "CheckDecision")
 
 
@@ -79,15 +89,18 @@ def test_check_decision_class_removed():
 # Actions-level removals
 # ===========================================================================
 
+
 def test_clear_pause_removed():
     """`ActionHandler.clear_pause` was deleted in 0.4.0."""
     from nullrun.actions import ActionHandler
+
     assert getattr(ActionHandler, "clear_pause", None) is None
 
 
 # ===========================================================================
 # Context-level removals
 # ===========================================================================
+
 
 def test_workflow_context_class_removed():
     """`WorkflowContext` class was deleted in 0.4.0."""
@@ -113,6 +126,7 @@ def test_workflow_contextmanager_still_works():
 # WebSocket removals
 # ===========================================================================
 
+
 def test_websocket_manager_removed():
     """`WebSocketManager` class was deleted in 0.4.0."""
     with pytest.raises(ImportError):
@@ -123,9 +137,11 @@ def test_websocket_manager_removed():
 # Transport removals
 # ===========================================================================
 
+
 def test_atexit_flush_removed():
     """`Transport._atexit_flush` was deleted in 0.4.0."""
     from nullrun.transport import Transport
+
     assert getattr(Transport, "_atexit_flush", None) is None
 
 
@@ -162,6 +178,7 @@ def test_decision_history_module_removed():
     and ``import nullrun.decision_history`` must now raise.
     """
     import importlib
+
     with pytest.raises(ModuleNotFoundError):
         importlib.import_module("nullrun.decision_history")
 
@@ -199,6 +216,7 @@ def test_zombie_exception_removed_from_breaker(name: str):
     have to maintain compatibility for.
     """
     from nullrun.breaker import exceptions  # noqa: F401
+
     assert not hasattr(exceptions, name), (
         f"{name} is still defined in nullrun.breaker.exceptions. "
         "It was marked as a zombie class in Sprint 2.2 — it has "
@@ -258,9 +276,11 @@ def test_get_api_key_id_removed():
     with pytest.raises(ImportError):
         from nullrun.context import get_api_key_id  # noqa: F401
 
+
 # ===========================================================================
 # Curated surface stays intact
 # ===========================================================================
+
 
 def test_dir_size_unchanged():
     """`dir(nullrun)` still shows exactly the curated surface.
@@ -284,6 +304,7 @@ def test_dir_size_unchanged():
         need the names visible in tab-completion.
     """
     import nullrun
+
     # Source of truth: ``__all__``. ``dir(nullrun)`` is rebuilt from
     # it via the PEP-562 ``__dir__`` override.
     assert set(dir(nullrun)) == set(nullrun.__all__)
@@ -343,6 +364,7 @@ def test_lazy_exports_dict_does_not_contain_patch_openai():
     Guards against a future regression that re-adds the dead entry.
     """
     import nullrun  # noqa: F401
+
     # `globals()` of the package is the lazy-export cache; we read it
     # via the module's __dict__ to avoid accessing the actual
     # (non-existent) attribute.
