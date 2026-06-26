@@ -16,6 +16,7 @@ We test by capturing the payload that ``runtime.execute`` received
 (the SDK's pre-execution policy check is the only thing that sees
 the args, so the audit-log PII risk lives at this single hop).
 """
+
 import inspect
 from unittest.mock import MagicMock
 
@@ -27,6 +28,7 @@ from nullrun.decorators import _safe_args, _safe_kwargs
 def test_safe_args_masks_known_sensitive_position():
     """``def charge(credit_card_number, amount)`` with a PAN at position 0
     must come out masked. ``credit_card_number`` is in SENSITIVE_ARG_KEYS."""
+
     def charge(credit_card_number, amount):
         return None
 
@@ -40,6 +42,7 @@ def test_safe_args_preserves_non_sensitive_position():
     """Non-sensitive positional args must pass through _safe_repr
     unchanged (modulo truncation), so dashboard debugging still has
     the value, not just ``***``."""
+
     def run(prompt, temperature):
         return None
 
@@ -52,6 +55,7 @@ def test_safe_args_masks_password_keyword_position():
     """The mask is case-insensitive (matches _safe_kwargs behaviour)
     and matches the full SENSITIVE_ARG_KEYS set: ``password``,
     ``api_key``, ``token``, etc."""
+
     def login(user, password):
         return None
 
@@ -64,6 +68,7 @@ def test_safe_args_handles_var_args():
     """When the function has ``*args``, the extra positional args have
     no parameter name to key on. They should still be ``_safe_repr``-ed
     so we don't ship an arbitrary ``repr(obj)`` to the audit log."""
+
     def variadic(*args):
         return None
 
@@ -105,8 +110,7 @@ def test_enforce_sensitive_tool_passes_masked_args_to_runtime_execute():
     # The /execute payload is the second positional arg to runtime.execute.
     payload = runtime.execute.call_args[0][1]
     assert payload["args"][0] == "***", (
-        "positional PAN leaked into /execute payload — "
-        f"got {payload['args'][0]!r}"
+        f"positional PAN leaked into /execute payload — got {payload['args'][0]!r}"
     )
     # Amount is non-sensitive — survives _safe_repr.
     assert payload["args"][1] == "50"
@@ -116,6 +120,7 @@ def test_safe_args_and_kwargs_consistency():
     """A sensitive param passed positionally OR as a kwarg must end up
     masked with the same ``"***"`` token. This keeps the audit log
     format uniform regardless of call style."""
+
     def login(user, password):
         return None
 

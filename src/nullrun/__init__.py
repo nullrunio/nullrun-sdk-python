@@ -247,15 +247,30 @@ def init(
     import nullrun.runtime as _rt_mod
     from nullrun.runtime import NullRunRuntime
 
-    # Phase 0.3.1: the three singleton slots (NullRunRuntime._instance,
-    # _rt_mod._runtime, _dec_mod._runtime) must all be assigned
-    # atomically. Without a lock, concurrent init() calls from
-    # multiple threads can leave the three slots pointing at two
-    # different runtimes. The failure mode is silent — the
-    # decorator's @protect wrapper reads _dec._runtime once and
-    # never re-resolves, so a missed assignment drops every
-    # span_start/span_end event for that runtime.
+    # C3 fix: shut down any existing runtime before constructing a new
+    # one. Without this, calling init() twice (or init() after a
+    # previous init() without an explicit shutdown()) leaves the prior
+    # daemon threads — transport flush, WS control plane, coverage
+    # reporter — running against the orphaned runtime. They keep
+    # burning CPU, hold sockets open, and can write to stale module
+    # slots that no longer reflect the active singleton.
+    #
+    # shutdown() is best-effort: if the previous runtime is mid-shutdown
+    # or in an unrecoverable state, we log and proceed so the new
+    # runtime can still come up.
     with _init_lock:
+        existing = NullRunRuntime._instance
+        if existing is not None:
+            logger.warning(
+                "nullrun.init() called while a previous runtime is "
+                "still alive; shutting down the old one to avoid "
+                "orphan threads (C3 fix)."
+            )
+            try:
+                existing.shutdown()
+            except Exception as e:  # noqa: BLE001 — best-effort
+                logger.warning("previous runtime shutdown raised during init(): %s", e)
+
         runtime = NullRunRuntime(
             api_key=api_key,
             api_url=api_url,

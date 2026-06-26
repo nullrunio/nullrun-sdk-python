@@ -6,6 +6,7 @@ the runtime sees LLM usage. These tests verify the wiring
 without requiring an actual LangChain/LangGraph runtime —
 we just need a duck-typed object with `.invoke` and `.stream`.
 """
+
 import pytest
 
 from nullrun.instrumentation.langgraph import NullRunCallback
@@ -94,6 +95,7 @@ def test_wrapper_handles_no_config_arg():
 def test_old_instrument_path_is_removed():
     """`nullrun.instrumentation.langgraph.instrument` no longer exists."""
     import nullrun.instrumentation.langgraph as mod
+
     assert not hasattr(mod, "instrument"), (
         "Phase 1 Commit 6: `instrument` should be removed; "
         "use `nullrun.toolbox.langgraph.wrapper` instead."

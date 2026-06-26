@@ -30,6 +30,7 @@ from nullrun.transport import (
 # Test fixture
 # ──────────────────────────────────────────────────────────────────────
 
+
 @pytest.fixture
 def transport_factory():
     """Factory that returns Transport with custom api_key/secret_key."""
@@ -45,9 +46,11 @@ def transport_factory():
 
     return _make
 
+
 # ──────────────────────────────────────────────────────────────────────
 # Pure-HMAC tests (no network)
 # ──────────────────────────────────────────────────────────────────────
+
 
 class TestGenerateHmacSignature:
     """The canonical signature formula matches the Rust backend."""
@@ -79,6 +82,7 @@ class TestGenerateHmacSignature:
         assert sig1 == sig2
         assert len(sig1) == 64  # SHA-256 hex
 
+
 class TestVerifyHmacSignature:
     """The verify function accepts canonical signatures and rejects tampered ones."""
 
@@ -100,9 +104,7 @@ class TestVerifyHmacSignature:
         ts = int(time.time()) - 1000  # 1000 seconds ago
         body = "body"
         sig = generate_hmac_signature(api_key, secret, ts, body)
-        assert not verify_hmac_signature(
-            api_key, secret, ts, body, sig, max_age_seconds=300
-        )
+        assert not verify_hmac_signature(api_key, secret, ts, body, sig, max_age_seconds=300)
 
     def test_fresh_timestamp_passes_verify(self):
         """A fresh timestamp is accepted (within the age window)."""
@@ -111,9 +113,7 @@ class TestVerifyHmacSignature:
         ts = int(time.time())
         body = "body"
         sig = generate_hmac_signature(api_key, secret, ts, body)
-        assert verify_hmac_signature(
-            api_key, secret, ts, body, sig, max_age_seconds=300
-        )
+        assert verify_hmac_signature(api_key, secret, ts, body, sig, max_age_seconds=300)
 
     def test_wrong_secret_fails_verify(self):
         """A signature produced with a different secret is rejected."""
@@ -137,9 +137,11 @@ class TestVerifyHmacSignature:
             "subtle::ConstantTimeEq check)."
         )
 
+
 # ──────────────────────────────────────────────────────────────────────
 # Header construction (Transport._build_signed_headers)
 # ──────────────────────────────────────────────────────────────────────
+
 
 class TestBuildSignedHeaders:
     """_build_signed_headers applies the canonical header set."""
@@ -157,9 +159,7 @@ class TestBuildSignedHeaders:
         # Signature is hex SHA-256 (64 chars)
         assert len(headers["X-Signature"]) == 64
         # Verify the signature is actually valid for the body
-        assert verify_hmac_signature(
-            t.api_key, t.secret_key, ts, body, headers["X-Signature"]
-        )
+        assert verify_hmac_signature(t.api_key, t.secret_key, ts, body, headers["X-Signature"])
 
     def test_without_secret_key_omits_signature_headers(self, transport_factory):
         """Without secret_key, no X-Signature / X-Signature-Timestamp is added."""
@@ -181,9 +181,7 @@ class TestBuildSignedHeaders:
         # Verify the body passed to _build_signed_headers matches
         # the bytes the signature is over.
         ts = int(headers["X-Signature-Timestamp"])
-        expected_sig = generate_hmac_signature(
-            t.api_key, t.secret_key, ts, body
-        )
+        expected_sig = generate_hmac_signature(t.api_key, t.secret_key, ts, body)
         assert headers["X-Signature"] == expected_sig
 
     def test_always_includes_x_api_key(self, transport_factory):
@@ -221,9 +219,11 @@ class TestBuildSignedHeaders:
         assert "X-API-Key" in headers
         assert "X-API-Version" in headers
 
+
 # ──────────────────────────────────────────────────────────────────────
 # Wire-level tests — every gateway endpoint goes through the signed path
 # ──────────────────────────────────────────────────────────────────────
+
 
 class TestSignedPostWirePath:
     """All four HTTP endpoints use the canonical signed header set."""

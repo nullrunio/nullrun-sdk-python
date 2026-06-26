@@ -20,6 +20,7 @@ bypassing the constructor's network calls (no auth, no policy
 fetch, no WS, no transport background thread) and exercise just
 the in-memory state machinery.
 """
+
 from __future__ import annotations
 
 import threading
@@ -98,13 +99,11 @@ class TestRemoteStateForAtomicity:
         def writer():
             barrier.wait()
             for v in range(2, 6):
-                runtime._set_remote_state(
-                    "wf-Y", {"version": v, "state": "Killed"}
-                )
+                runtime._set_remote_state("wf-Y", {"version": v, "state": "Killed"})
 
-        threads = [
-            threading.Thread(target=reader) for _ in range(n_readers)
-        ] + [threading.Thread(target=writer)]
+        threads = [threading.Thread(target=reader) for _ in range(n_readers)] + [
+            threading.Thread(target=writer)
+        ]
         for t in threads:
             t.start()
         for t in threads:
@@ -137,9 +136,7 @@ class TestPollCommandsDoesNotRaise:
         def writer(tid: int):
             barrier.wait()
             for i in range(n_iterations):
-                runtime._set_remote_state(
-                    f"wf-{tid}", {"version": i, "state": "Killed"}
-                )
+                runtime._set_remote_state(f"wf-{tid}", {"version": i, "state": "Killed"})
 
         def poller():
             barrier.wait()
@@ -155,9 +152,9 @@ class TestPollCommandsDoesNotRaise:
                     with errors_lock:
                         errors.append(e)
 
-        threads = [
-            threading.Thread(target=writer, args=(t,)) for t in range(n_writers)
-        ] + [threading.Thread(target=poller)]
+        threads = [threading.Thread(target=writer, args=(t,)) for t in range(n_writers)] + [
+            threading.Thread(target=poller)
+        ]
         for t in threads:
             t.start()
         for t in threads:
@@ -205,13 +202,11 @@ class TestTrackDoesNotClobberRemoteState:
                 # The state must remain "Killed" throughout.
                 with runtime._states_lock:
                     state = runtime._remote_states.get("wf-clobber", {})
-                assert state.get("state") == "Killed", (
-                    f"State was clobbered: {state}"
-                )
+                assert state.get("state") == "Killed", f"State was clobbered: {state}"
 
-        threads = [
-            threading.Thread(target=track_thread) for _ in range(n_threads)
-        ] + [threading.Thread(target=verify_thread)]
+        threads = [threading.Thread(target=track_thread) for _ in range(n_threads)] + [
+            threading.Thread(target=verify_thread)
+        ]
         for t in threads:
             t.start()
         for t in threads:

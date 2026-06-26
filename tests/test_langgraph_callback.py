@@ -12,6 +12,7 @@ Covers:
     track-event with normalised usage.
   - ``_extract_node_name`` — every branch (dict / list / str / missing).
 """
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -31,11 +32,13 @@ from nullrun.instrumentation.langgraph import (
 
 def test_extract_usage_metadata_dict_form():
     """OpenAI-via-LangChain style: ``response.usage_metadata`` as a dict."""
-    response = SimpleNamespace(usage_metadata={
-        "input_tokens": 12,
-        "output_tokens": 34,
-        "total_tokens": 46,
-    })
+    response = SimpleNamespace(
+        usage_metadata={
+            "input_tokens": 12,
+            "output_tokens": 34,
+            "total_tokens": 46,
+        }
+    )
     usage = extract_usage_from_response(response, provider="openai", model="x")
     assert usage["input_tokens"] == 12
     assert usage["output_tokens"] == 34
@@ -45,11 +48,13 @@ def test_extract_usage_metadata_dict_form():
 
 def test_extract_usage_metadata_object_form():
     """Object with .input_tokens / .output_tokens / .total_tokens attrs."""
-    response = SimpleNamespace(usage_metadata=SimpleNamespace(
-        input_tokens=7,
-        output_tokens=11,
-        total_tokens=18,
-    ))
+    response = SimpleNamespace(
+        usage_metadata=SimpleNamespace(
+            input_tokens=7,
+            output_tokens=11,
+            total_tokens=18,
+        )
+    )
     usage = extract_usage_from_response(response, provider="openai", model="x")
     assert usage["input_tokens"] == 7
     assert usage["output_tokens"] == 11
@@ -59,7 +64,9 @@ def test_extract_usage_metadata_object_form():
 
 def test_extract_usage_from_generations():
     """``response.generations[0][0].message.usage_metadata`` — dict."""
-    msg = SimpleNamespace(usage_metadata={"input_tokens": 5, "output_tokens": 6, "total_tokens": 11})
+    msg = SimpleNamespace(
+        usage_metadata={"input_tokens": 5, "output_tokens": 6, "total_tokens": 11}
+    )
     gen = SimpleNamespace(message=msg)
     response = SimpleNamespace(generations=[[gen]])
     usage = extract_usage_from_response(response, provider="openai", model="x")
@@ -80,7 +87,9 @@ def test_extract_usage_from_generations_object_form():
 
 def test_extract_usage_from_response_usage_dict():
     """Anthropic / standard OpenAI: ``response.usage`` as a dict."""
-    response = SimpleNamespace(usage={"input_tokens": 100, "output_tokens": 200, "total_tokens": 300})
+    response = SimpleNamespace(
+        usage={"input_tokens": 100, "output_tokens": 200, "total_tokens": 300}
+    )
     usage = extract_usage_from_response(response, provider="anthropic", model="x")
     assert usage["has_usage"] is True
     assert usage["total_tokens"] == 300
@@ -88,7 +97,9 @@ def test_extract_usage_from_response_usage_dict():
 
 def test_extract_usage_from_response_usage_object():
     """``response.usage`` as an object with .input_tokens / .total_tokens."""
-    response = SimpleNamespace(usage=SimpleNamespace(input_tokens=4, output_tokens=8, total_tokens=12))
+    response = SimpleNamespace(
+        usage=SimpleNamespace(input_tokens=4, output_tokens=8, total_tokens=12)
+    )
     usage = extract_usage_from_response(response, provider="anthropic", model="x")
     assert usage["has_usage"] is True
     assert usage["total_tokens"] == 12
@@ -96,11 +107,15 @@ def test_extract_usage_from_response_usage_object():
 
 def test_extract_usage_from_response_metadata_token_usage():
     """``response.response_metadata.token_usage`` — dict form (some providers)."""
-    response = SimpleNamespace(response_metadata={"token_usage": {
-        "prompt_tokens": 21,
-        "completion_tokens": 22,
-        "total_tokens": 43,
-    }})
+    response = SimpleNamespace(
+        response_metadata={
+            "token_usage": {
+                "prompt_tokens": 21,
+                "completion_tokens": 22,
+                "total_tokens": 43,
+            }
+        }
+    )
     usage = extract_usage_from_response(response, provider="openai", model="x")
     assert usage["has_usage"] is True
     assert usage["input_tokens"] == 21
@@ -109,10 +124,14 @@ def test_extract_usage_from_response_metadata_token_usage():
 
 def test_extract_usage_from_response_metadata_alternate_keys():
     """Some providers use ``input_tokens`` / ``output_tokens`` inside token_usage."""
-    response = SimpleNamespace(response_metadata={"token_usage": {
-        "input_tokens": 8,
-        "output_tokens": 9,
-    }})
+    response = SimpleNamespace(
+        response_metadata={
+            "token_usage": {
+                "input_tokens": 8,
+                "output_tokens": 9,
+            }
+        }
+    )
     usage = extract_usage_from_response(response, provider="anthropic", model="x")
     assert usage["has_usage"] is True
     assert usage["input_tokens"] == 8
@@ -120,11 +139,15 @@ def test_extract_usage_from_response_metadata_alternate_keys():
 
 def test_extract_usage_from_llm_output():
     """``response.llm_output.token_usage`` — ``LLMResult`` callback case."""
-    response = SimpleNamespace(llm_output={"token_usage": {
-        "prompt_tokens": 50,
-        "completion_tokens": 51,
-        "total_tokens": 101,
-    }})
+    response = SimpleNamespace(
+        llm_output={
+            "token_usage": {
+                "prompt_tokens": 50,
+                "completion_tokens": 51,
+                "total_tokens": 101,
+            }
+        }
+    )
     usage = extract_usage_from_response(response, provider="openai", model="x")
     assert usage["has_usage"] is True
     assert usage["total_tokens"] == 101
@@ -140,13 +163,16 @@ def test_extract_usage_no_usage_data_has_usage_false():
 
 def test_extract_usage_zero_values_has_usage_false():
     """All-zero usage dict → has_usage False."""
-    response = SimpleNamespace(usage_metadata={"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+    response = SimpleNamespace(
+        usage_metadata={"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    )
     usage = extract_usage_from_response(response, provider="openai", model="x")
     assert usage["has_usage"] is False
 
 
 def test_extract_usage_iterable_response_skipped():
     """Streaming-iterable response without usage → no-op branch hit."""
+
     class _Iter:
         def __iter__(self):
             return iter(["chunk1", "chunk2"])
@@ -257,7 +283,9 @@ def test_parent_run_id_falls_back_to_contextvar():
     token = set_span(parent)
 
     try:
-        cb.on_chain_start(serialized={"id": "x"}, inputs={}, run_id="child", parent_run_id="unknown-parent")
+        cb.on_chain_start(
+            serialized={"id": "x"}, inputs={}, run_id="child", parent_run_id="unknown-parent"
+        )
     finally:
         from nullrun.tracing import reset_span
 
@@ -341,11 +369,13 @@ def test_agent_finish_without_action_no_op():
 def test_on_llm_end_emits_llm_call():
     """``on_llm_end`` extracts usage and forwards to ``runtime.track``."""
     cb, _spans, llms = _make_cb_with_recorder()
-    response = SimpleNamespace(usage_metadata={
-        "input_tokens": 5,
-        "output_tokens": 10,
-        "total_tokens": 15,
-    })
+    response = SimpleNamespace(
+        usage_metadata={
+            "input_tokens": 5,
+            "output_tokens": 10,
+            "total_tokens": 15,
+        }
+    )
     cb.on_llm_end(response, invocation_params={"model_name": "gpt-4o", "model_provider": "openai"})
     assert len(llms) == 1
     ev = llms[0]
@@ -372,7 +402,9 @@ def test_on_llm_end_runtime_failure_is_swallowed():
     runtime.track.side_effect = RuntimeError("down")
     cb = NullRunCallback(runtime=runtime)
     # Must not raise.
-    cb.on_llm_end(SimpleNamespace(usage_metadata={"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}))
+    cb.on_llm_end(
+        SimpleNamespace(usage_metadata={"input_tokens": 1, "output_tokens": 2, "total_tokens": 3})
+    )
 
 
 def test_track_event_failure_is_swallowed():

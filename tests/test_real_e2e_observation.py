@@ -122,9 +122,9 @@ class _MockLLMServer:
                         parsed = {"_raw": raw.decode("utf-8", errors="replace")}
                     received_events.append(parsed)
                     track_event.set()
-                    response_body = json.dumps(
-                        {"ok": True, "accepted_event_ids": []}
-                    ).encode("utf-8")
+                    response_body = json.dumps({"ok": True, "accepted_event_ids": []}).encode(
+                        "utf-8"
+                    )
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
                     self.send_header("Content-Length", str(len(response_body)))
@@ -194,7 +194,6 @@ def mock_server():
 
 
 class TestRealE2EObservation:
-
     @pytest.mark.skip(
         reason=(
             "End-to-end stub-server test that exercises the real httpx "
@@ -205,9 +204,7 @@ class TestRealE2EObservation:
             "is restructured to set up the mock server before nullrun.init()."
         )
     )
-    def test_httpx_call_reaches_mock_llm_and_emits_track_event(
-        self, mock_server, monkeypatch
-    ):
+    def test_httpx_call_reaches_mock_llm_and_emits_track_event(self, mock_server, monkeypatch):
         """The real path: init() → auto-instrumented httpx → mock LLM
         response → auto-flushed track event arrives at the mock backend.
 

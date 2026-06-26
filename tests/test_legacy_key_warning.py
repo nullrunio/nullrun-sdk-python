@@ -11,6 +11,7 @@ The fix in 0.3.1: when ``_authenticate`` sees a missing
 ``workflow_id``, the runtime emits a one-time WARNING with a
 clear message. This test pins the contract.
 """
+
 from __future__ import annotations
 
 import logging
@@ -24,10 +25,7 @@ BASE_URL = "https://api.test.nullrun.io"
 
 
 class TestLegacyApiKeyWarning:
-
-    def test_legacy_key_emits_kill_switch_warning(
-        self, monkeypatch, caplog
-    ):
+    def test_legacy_key_emits_kill_switch_warning(self, monkeypatch, caplog):
         """A pre-Phase-139 key (no workflow_id in auth response)
         must emit a WARNING explaining that kill/pause will not
         be honoured.
@@ -46,14 +44,7 @@ class TestLegacyApiKeyWarning:
                     },
                 )
             )
-            respx.post(f"{BASE_URL}/api/v1/policies").mock(
-                return_value=Response(200, json=[{
-                    "budget_cents": 1000,
-                    "rate_limit": 100,
-                    "loop_threshold": 6,
-                    "retry_threshold": 5,
-                }])
-            )
+            # 0.7.0: SDK no longer calls /api/v1/policies on init.
             with caplog.at_level(logging.WARNING, logger="nullrun.runtime"):
                 rt = NullRunRuntime(
                     api_key="legacy-key-12345",
@@ -62,13 +53,12 @@ class TestLegacyApiKeyWarning:
                 )
             assert rt.workflow_id is None
             warning_records = [
-                r for r in caplog.records
-                if r.levelno == logging.WARNING
-                and r.name == "nullrun.runtime"
+                r
+                for r in caplog.records
+                if r.levelno == logging.WARNING and r.name == "nullrun.runtime"
             ]
             assert any(
-                "legacy key" in r.getMessage()
-                and "kill/pause" in r.getMessage()
+                "legacy key" in r.getMessage() and "kill/pause" in r.getMessage()
                 for r in warning_records
             ), (
                 "Expected a WARNING from nullrun.runtime mentioning "

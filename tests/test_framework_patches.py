@@ -10,6 +10,7 @@ Phase 7 of the production-readiness plan adds three new patches:
 Each test below is `pytest.importorskip` guarded so the suite stays
 green when the optional packages are not installed.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -18,16 +19,13 @@ import pytest
 # llama-index
 # ===========================================================================
 
-@pytest.mark.skipif(
-    True, reason="llama-index not installed in test environment"
-)
+
+@pytest.mark.skipif(True, reason="llama-index not installed in test environment")
 def test_llama_index_patch_idempotent():
     pass
 
 
-@pytest.mark.skipif(
-    True, reason="llama-index not installed in test environment"
-)
+@pytest.mark.skipif(True, reason="llama-index not installed in test environment")
 def test_llama_index_chat_end_emits_track():
     pass
 
@@ -36,16 +34,13 @@ def test_llama_index_chat_end_emits_track():
 # crewai
 # ===========================================================================
 
-@pytest.mark.skipif(
-    True, reason="crewai not installed in test environment"
-)
+
+@pytest.mark.skipif(True, reason="crewai not installed in test environment")
 def test_crewai_patch_idempotent():
     pass
 
 
-@pytest.mark.skipif(
-    True, reason="crewai not installed in test environment"
-)
+@pytest.mark.skipif(True, reason="crewai not installed in test environment")
 def test_crewai_kickoff_emits_usage_metrics():
     pass
 
@@ -54,16 +49,13 @@ def test_crewai_kickoff_emits_usage_metrics():
 # autogen
 # ===========================================================================
 
-@pytest.mark.skipif(
-    True, reason="autogen not installed in test environment"
-)
+
+@pytest.mark.skipif(True, reason="autogen not installed in test environment")
 def test_autogen_patch_idempotent():
     pass
 
 
-@pytest.mark.skipif(
-    True, reason="autogen not installed in test environment"
-)
+@pytest.mark.skipif(True, reason="autogen not installed in test environment")
 def test_autogen_on_messages_emits_span():
     pass
 
@@ -71,6 +63,7 @@ def test_autogen_on_messages_emits_span():
 # ===========================================================================
 # Common: graceful no-op when packages absent
 # ===========================================================================
+
 
 def test_patch_llama_index_returns_false_when_missing(monkeypatch):
     """patch_llama_index returns False (no-op) when llama-index not installed."""
@@ -87,6 +80,7 @@ def test_patch_llama_index_returns_false_when_missing(monkeypatch):
         importlib.reload(sys.modules["nullrun.instrumentation.llama_index"])
 
     from nullrun.instrumentation.llama_index import patch_llama_index
+
     assert patch_llama_index(None) is False
 
 
@@ -97,9 +91,11 @@ def test_patch_crewai_returns_false_when_missing(monkeypatch):
     monkeypatch.setitem(sys.modules, "crewai", None)
     if "nullrun.instrumentation.crewai" in sys.modules:
         import importlib
+
         importlib.reload(sys.modules["nullrun.instrumentation.crewai"])
 
     from nullrun.instrumentation.crewai import patch_crewai
+
     assert patch_crewai(None) is False
 
 
@@ -111,15 +107,18 @@ def test_patch_autogen_returns_false_when_missing(monkeypatch):
     monkeypatch.setitem(sys.modules, "autogen_agentchat.agents", None)
     if "nullrun.instrumentation.autogen" in sys.modules:
         import importlib
+
         importlib.reload(sys.modules["nullrun.instrumentation.autogen"])
 
     from nullrun.instrumentation.autogen import patch_autogen
+
     assert patch_autogen(None) is False
 
 
 # ===========================================================================
 # Common: modules importable + registered in auto_instrument
 # ===========================================================================
+
 
 def test_new_framework_modules_importable():
     """The three new patch modules are importable from `nullrun.instrumentation`."""

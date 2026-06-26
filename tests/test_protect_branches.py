@@ -4,6 +4,7 @@ Additional tests for ``nullrun.decorators`` — branch coverage for the
 helpers, the fail-CLOSED / fail-OPEN contract, the KILL→BlockedException
 unification (Round 3), and the ``@protect()`` paren-form.
 """
+
 from __future__ import annotations
 
 import os
@@ -105,6 +106,7 @@ def test_safe_kwargs_is_case_insensitive(test_runtime):
 
 def test_safe_args_masks_positional_sensitive_param(test_runtime):
     """Positional sensitive param (e.g. ``credit_card_number``) is masked."""
+
     def charge(credit_card_number, amount):
         return amount
 
@@ -116,6 +118,7 @@ def test_safe_args_masks_positional_sensitive_param(test_runtime):
 
 def test_safe_args_trailing_extra_args_uses_safe_repr():
     """``*args``-style callable: extra positional args use safe_repr."""
+
     def variadic(*args, **kwargs):
         return args
 
@@ -234,9 +237,7 @@ def test_enforce_sensitive_tool_real_block_propagates(test_runtime):
     """``decision=block`` from gateway → raises NullRunBlockedException."""
     rt = MagicMock()
     rt.is_sensitive_tool.return_value = True
-    rt.execute.side_effect = NullRunBlockedException(
-        workflow_id="wf-1", reason="denied"
-    )
+    rt.execute.side_effect = NullRunBlockedException(workflow_id="wf-1", reason="denied")
     with pytest.raises(NullRunBlockedException):
         _enforce_sensitive_tool(rt, lambda x: x, (1,), {})
 
@@ -491,6 +492,7 @@ def test_sensitive_runtime_init_failure_raises(test_runtime, monkeypatch):
         RuntimeError,
         match=r"@sensitive registration failed for 'f'",
     ) as excinfo:
+
         @sensitive
         def f():
             return 1

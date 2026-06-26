@@ -1,6 +1,7 @@
 """
 conftest.py - shared pytest fixtures and respx mocking
 """
+
 import pytest
 import respx
 from httpx import Response
@@ -49,49 +50,49 @@ def mock_api():
     with respx.mock:
         # Auth endpoint
         respx.post(f"{BASE_URL}/api/v1/auth/verify").mock(
-            return_value=Response(200, json={
-                "organization_id": "ws-test",
-                "workflow_id": "00000000-0000-0000-0000-000000000001",
-                "plan": "pro",
-                "features": [],
-                "limits": {"max_cost_cents": 10000},
-            })
+            return_value=Response(
+                200,
+                json={
+                    "organization_id": "ws-test",
+                    "workflow_id": "00000000-0000-0000-0000-000000000001",
+                    "plan": "pro",
+                    "features": [],
+                    "limits": {"max_cost_cents": 10000},
+                },
+            )
         )
         # Gate (execute) endpoint
         respx.post(f"{BASE_URL}/api/v1/gate").mock(
-            return_value=Response(200, json={
-                "decision": "allow",
-                "actions": [],
-                "local_cost_cents": 0,
-                "policy_id": "policy-test",
-                "decision_source": "gateway",
-            })
+            return_value=Response(
+                200,
+                json={
+                    "decision": "allow",
+                    "actions": [],
+                    "local_cost_cents": 0,
+                    "policy_id": "policy-test",
+                    "decision_source": "gateway",
+                },
+            )
         )
         # Check endpoint
         respx.post(f"{BASE_URL}/check").mock(
-            return_value=Response(200, json={
-                "allowed": True,
-                "actions": [],
-                "blocked_reason": None,
-            })
+            return_value=Response(
+                200,
+                json={
+                    "allowed": True,
+                    "actions": [],
+                    "blocked_reason": None,
+                },
+            )
         )
         # Track batch endpoint
         respx.post(f"{BASE_URL}/api/v1/track/batch").mock(
             return_value=Response(200, json={"ok": True, "accepted": 1})
         )
-        # Policies endpoint
-        respx.post(f"{BASE_URL}/api/v1/policies").mock(
-            return_value=Response(200, json=[{
-                "budget_cents": 1000,
-                "rate_limit": 100,
-                "loop_threshold": 6,
-                "retry_threshold": 5,
-            }])
-        )
+        # 0.7.0: SDK no longer fetches /policies on init (backend
+        # owns all policy state; SDK is a thin client).
         # Health endpoint
-        respx.get(f"{BASE_URL}/health").mock(
-            return_value=Response(200, json={"status": "ok"})
-        )
+        respx.get(f"{BASE_URL}/health").mock(return_value=Response(200, json={"status": "ok"}))
         yield
 
 

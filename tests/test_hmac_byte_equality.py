@@ -12,6 +12,7 @@ signed `/gate` and `/check` calls were rejected with 401 when
 Phase 4 introduces `_signed_request_body` (canonical JSON bytes) and
 moves all three signed POSTs to `content=body`.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -27,12 +28,14 @@ def test_signed_request_body_byte_exact():
     body = _signed_request_body(payload)
     assert body == json.dumps(payload, separators=(",", ":")).encode("utf-8")
 
+
 def test_signed_request_body_separators():
     """No spaces between keys/values."""
     from nullrun.transport import _signed_request_body
 
     body = _signed_request_body({"a": 1, "b": 2})
     assert b" " not in body
+
 
 def test_hmac_over_signed_bytes_matches():
     """HMAC computed over the exact bytes `_signed_request_body` produces
@@ -45,16 +48,16 @@ def test_hmac_over_signed_bytes_matches():
     body = _signed_request_body(payload)
     body_hash = hashlib.sha256(body).hexdigest()
     msg = f"1234567890:{api_key}:{body_hash}"
-    expected_sig = hmac.new(
-        secret.encode("utf-8"), msg.encode("utf-8"), hashlib.sha256
-    ).hexdigest()
+    expected_sig = hmac.new(secret.encode("utf-8"), msg.encode("utf-8"), hashlib.sha256).hexdigest()
     # Just sanity check the structure matches what server expects.
     assert len(expected_sig) == 64  # SHA-256 hex
     assert body_hash == hashlib.sha256(body).hexdigest()
 
+
 # ---------------------------------------------------------------------------
 # Canonical-bytes contract (audit 2026-06-22 #9)
 # ---------------------------------------------------------------------------
+
 
 def test_signed_request_body_matches_send_bytes():
     """Pre-compute guard (audit #9).
@@ -92,10 +95,9 @@ def test_signed_request_body_matches_send_bytes():
 
     expected_body_hash = hashlib.sha256(body).hexdigest()
     expected_msg = f"{headers['X-Signature-Timestamp']}:{api_key}:{expected_body_hash}".encode()
-    expected_sig = hmac.new(
-        secret.encode("utf-8"), expected_msg, hashlib.sha256
-    ).hexdigest()
+    expected_sig = hmac.new(secret.encode("utf-8"), expected_msg, hashlib.sha256).hexdigest()
     assert headers["X-Signature"] == expected_sig
+
 
 def test_signed_request_body_no_whitespace():
     """Canonical-byte invariant: no spaces between key/value/separator.

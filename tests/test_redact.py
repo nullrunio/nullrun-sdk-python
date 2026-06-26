@@ -23,6 +23,7 @@ if the redact marker lives past the truncation point, we still don't
 leak PII — we just don't get to see the redacted marker. That's
 strictly safer than the pre-fix behavior, where PII was leaking.
 """
+
 import pytest
 
 from nullrun.decorators import _safe_error_str, _safe_repr, _strip_details_balanced
@@ -43,13 +44,9 @@ class TestSafeReprRedactsBeforeTruncating:
         value = f"{prefix} details={{'secret': 'PII'}}"
         out = _safe_repr(value, max_len=50)
         # The SECRET value MUST NOT appear.
-        assert "PII" not in out, (
-            f"P0-6 regression: PII leaked through _safe_repr. "
-            f"Output: {out!r}"
-        )
+        assert "PII" not in out, f"P0-6 regression: PII leaked through _safe_repr. Output: {out!r}"
         assert "secret" not in out, (
-            f"P0-6 regression: secret key leaked through _safe_repr. "
-            f"Output: {out!r}"
+            f"P0-6 regression: secret key leaked through _safe_repr. Output: {out!r}"
         )
 
     def test_details_within_truncation_window_is_redacted(self):
@@ -90,16 +87,11 @@ class TestSafeReprRedactsBeforeTruncating:
         out = _safe_repr(exc_msg, max_len=50)
         # The card_number MUST NOT appear in the output.
         assert "4111" not in out, (
-            f"P0-6 regression: card_number leaked through _safe_repr. "
-            f"Output: {out!r}"
+            f"P0-6 regression: card_number leaked through _safe_repr. Output: {out!r}"
         )
-        assert "cvv" not in out, (
-            f"P0-6 regression: cvv leaked through _safe_repr. "
-            f"Output: {out!r}"
-        )
+        assert "cvv" not in out, f"P0-6 regression: cvv leaked through _safe_repr. Output: {out!r}"
         assert "123" not in out, (
-            f"P0-6 regression: cvv value leaked through _safe_repr. "
-            f"Output: {out!r}"
+            f"P0-6 regression: cvv value leaked through _safe_repr. Output: {out!r}"
         )
 
 
@@ -118,9 +110,7 @@ class TestSafeErrorStrPipeline:
         )
         out = _safe_error_str(Exception(exc_msg))
         assert out is not None
-        assert "4111" not in out, (
-            f"_safe_error_str leaked card_number. Output: {out!r}"
-        )
+        assert "4111" not in out, f"_safe_error_str leaked card_number. Output: {out!r}"
 
     def test_safe_error_str_none_returns_none(self):
         """Sanity: ``None`` in → ``None`` out, no redact call."""

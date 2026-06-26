@@ -14,6 +14,7 @@ agent was actually talking to.
 
 Post-fix both sync and async httpx ``_emit`` bump the counter.
 """
+
 import asyncio
 from unittest.mock import MagicMock
 
@@ -147,6 +148,4 @@ def test_sync_transport_no_bump_when_extractor_misses():
     request = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
     transport.handle_request(request)
 
-    assert runtime._coverage_seen == {}, (
-        f"no usage → no bump; got {runtime._coverage_seen}"
-    )
+    assert runtime._coverage_seen == {}, f"no usage → no bump; got {runtime._coverage_seen}"

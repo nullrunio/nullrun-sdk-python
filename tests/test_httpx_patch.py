@@ -131,9 +131,7 @@ def test_openai_response_emits_track_call(runtime):
 def test_non_llm_host_passes_through_without_track(runtime):
     patch_httpx(runtime)
     with respx.mock(base_url="https://api.example.com") as mock:
-        mock.post("/data").mock(
-            return_value=httpx.Response(200, content=b'{"ok": true}')
-        )
+        mock.post("/data").mock(return_value=httpx.Response(200, content=b'{"ok": true}'))
         with httpx.Client(base_url="https://api.example.com") as client:
             response = client.post("/data", json={"x": 1})
             assert response.status_code == 200
@@ -143,13 +141,9 @@ def test_non_llm_host_passes_through_without_track(runtime):
 
 def test_openai_4xx_does_not_emit_track(runtime):
     patch_httpx(runtime)
-    error_body = json.dumps(
-        {"error": {"message": "rate limit exceeded"}}
-    ).encode()
+    error_body = json.dumps({"error": {"message": "rate limit exceeded"}}).encode()
     with respx.mock(base_url="https://api.openai.com") as mock:
-        mock.post("/v1/chat/completions").mock(
-            return_value=httpx.Response(429, content=error_body)
-        )
+        mock.post("/v1/chat/completions").mock(return_value=httpx.Response(429, content=error_body))
         with httpx.Client(base_url="https://api.openai.com") as client:
             response = client.post(
                 "/v1/chat/completions",
@@ -171,9 +165,7 @@ def test_anthropic_response_emits_track(runtime):
         }
     ).encode()
     with respx.mock(base_url="https://api.anthropic.com") as mock:
-        mock.post("/v1/messages").mock(
-            return_value=httpx.Response(200, content=body)
-        )
+        mock.post("/v1/messages").mock(return_value=httpx.Response(200, content=body))
         with httpx.Client(base_url="https://api.anthropic.com") as client:
             response = client.post(
                 "/v1/messages",

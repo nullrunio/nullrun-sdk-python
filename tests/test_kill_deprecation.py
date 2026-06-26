@@ -13,6 +13,7 @@ calling ``BaseException.__init__`` directly instead of
 ``super().__init__()`` (which would re-emit the parent's warning).
 This test pins the contract.
 """
+
 from __future__ import annotations
 
 import warnings
@@ -26,7 +27,6 @@ from nullrun.breaker.exceptions import (
 
 
 class TestWorkflowKilledInterruptBypass:
-
     def test_interrupt_does_not_emit_deprecation_warning(self):
         """Constructing ``WorkflowKilledInterrupt`` must not emit
         the parent's ``DeprecationWarning``. If this test fails,
@@ -37,7 +37,8 @@ class TestWorkflowKilledInterruptBypass:
             warnings.simplefilter("always")
             exc = WorkflowKilledInterrupt(workflow_id="wf-1", reason="kill")
         deprecation = [
-            w for w in caught
+            w
+            for w in caught
             if issubclass(w.category, DeprecationWarning)
             and "WorkflowKilledException" in str(w.message)
         ]
@@ -58,7 +59,8 @@ class TestWorkflowKilledInterruptBypass:
             warnings.simplefilter("always")
             WorkflowKilledException(workflow_id="wf-2", reason="legacy")
         deprecation = [
-            w for w in caught
+            w
+            for w in caught
             if issubclass(w.category, DeprecationWarning)
             and "WorkflowKilledException" in str(w.message)
         ]

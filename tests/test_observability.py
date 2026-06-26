@@ -1,6 +1,7 @@
 """
 Tests for observability module — MetricsRegistry integration.
 """
+
 import httpx
 import pytest
 import respx
@@ -17,7 +18,6 @@ def reset_metrics():
 
 
 class TestMetricsRegistry:
-
     def test_to_dict_has_correct_structure(self):
         d = metrics.to_dict()
         assert "transport" in d
@@ -61,12 +61,15 @@ class TestMetricsRegistry:
     def test_execute_increments_allowed_counter(self, mock_api, make_runtime):
         """execute() when allowed=True updates execute_allowed."""
         respx.post(f"{BASE_URL}/api/v1/gate").mock(
-            return_value=httpx.Response(200, json={
-                "decision": "allow",
-                "decision_source": "gateway",
-                "explanation": "allowed",
-                "policy_version": 1,
-            })
+            return_value=httpx.Response(
+                200,
+                json={
+                    "decision": "allow",
+                    "decision_source": "gateway",
+                    "explanation": "allowed",
+                    "policy_version": 1,
+                },
+            )
         )
         rt = make_runtime()
         rt.execute(tool_name="gpt-4", input_data={}, mode="strict")
@@ -80,15 +83,19 @@ class TestMetricsRegistry:
         # /api/v1/execute (not /gate) so the backend checks the
         # `execute` scope. The mock needs to move with the contract.
         respx.post(f"{BASE_URL}/api/v1/execute").mock(
-            return_value=httpx.Response(200, json={
-                "decision": "block",
-                "explanation": "cost_limit_exceeded",
-                "decision_source": "gateway",
-                "policy_version": 1,
-            })
+            return_value=httpx.Response(
+                200,
+                json={
+                    "decision": "block",
+                    "explanation": "cost_limit_exceeded",
+                    "decision_source": "gateway",
+                    "policy_version": 1,
+                },
+            )
         )
         rt = make_runtime()
         from nullrun.breaker.exceptions import NullRunBlockedException
+
         try:
             rt.execute(tool_name="gpt-4", input_data={}, mode="strict")
         except NullRunBlockedException:
@@ -104,7 +111,6 @@ class TestMetricsRegistry:
 
 
 class TestThreadSafeMetrics:
-
     def test_inc_transport_increments_counter(self):
         """inc_transport increments transport metrics safely."""
         metrics.reset()
@@ -139,6 +145,7 @@ class TestThreadSafeMetrics:
         """set_transport works for timestamp fields."""
         metrics.reset()
         import time
+
         ts = time.monotonic()
         metrics.set_transport("last_flush_at", ts)
         assert metrics.transport.last_flush_at == ts
@@ -148,6 +155,7 @@ class TestThreadSafeMetrics:
         metrics.reset()
         # Start incrementing in a tight loop while reading to_dict
         import threading
+
         errors = []
 
         def incrementer():
@@ -207,6 +215,7 @@ class TestAllMetricsWired:
     def _reset_metrics(self):
         """Reset the global metrics singleton to a clean state."""
         from nullrun.observability import metrics
+
         metrics.reset()
         return metrics
 
@@ -260,8 +269,7 @@ class TestAllMetricsWired:
         # ``timeouts`` is incremented on EVERY timeout (not just
         # the final one), so it should equal 3 (3 attempts).
         assert metrics.transport.timeouts >= 2, (
-            f"timeouts did not increment on ReadTimeout; "
-            f"got {metrics.transport.timeouts}"
+            f"timeouts did not increment on ReadTimeout; got {metrics.transport.timeouts}"
         )
 
     def test_last_error_set_on_failure(self):

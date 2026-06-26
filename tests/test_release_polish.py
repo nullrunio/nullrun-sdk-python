@@ -7,6 +7,7 @@ Phase 8:
 - #8.6: RecordingSession does not persist _fingerprint.
 - Circuit-breaker sleep capped at 5s.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -14,6 +15,7 @@ import pytest
 # ===========================================================================
 # 8.1: get_org_status
 # ===========================================================================
+
 
 def test_get_org_status_requires_org_id():
     """get_org_status raises NullRunAuthenticationError when no org_id and runtime has none."""
@@ -40,8 +42,10 @@ def test_get_org_status_calls_endpoint(monkeypatch):
 
     class FakeResponse:
         status_code = 200
+
         def json(self):
             return {"usage_today_cents": 1234, "plan": "growth"}
+
         def raise_for_status(self):
             pass
 
@@ -60,6 +64,7 @@ def test_get_org_status_calls_endpoint(monkeypatch):
 # ===========================================================================
 # 8.4: env vars
 # ===========================================================================
+
 
 def test_batch_size_env_override(monkeypatch):
     """NULLRUN_BATCH_SIZE overrides FlushConfig.batch_size."""
@@ -114,14 +119,10 @@ def test_start_stop_recording_are_noop_stubs():
 
     runtime = NullRunRuntime(api_key="test", _test_mode=True)
     session_id = runtime.start_recording("wf-test")
-    assert session_id == "", (
-        f"start_recording() must return '' as a no-op stub; got {session_id!r}"
-    )
+    assert session_id == "", f"start_recording() must return '' as a no-op stub; got {session_id!r}"
 
     session = runtime.stop_recording()
-    assert session is None, (
-        f"stop_recording() must return None as a no-op stub; got {session!r}"
-    )
+    assert session is None, f"stop_recording() must return None as a no-op stub; got {session!r}"
 
 
 def test_decision_history_module_does_not_exist():
@@ -131,6 +132,7 @@ def test_decision_history_module_does_not_exist():
     must fail at import time, not silently get a different module.
     """
     import importlib
+
     with pytest.raises(ModuleNotFoundError):
         importlib.import_module("nullrun.decision_history")
 
@@ -138,6 +140,7 @@ def test_decision_history_module_does_not_exist():
 # ===========================================================================
 # Circuit-breaker sleep cap
 # ===========================================================================
+
 
 def test_open_to_halfopen_sleep_capped_at_5s():
     """The OPEN -> HALF_OPEN jitter sleep is bounded by 5.0s.

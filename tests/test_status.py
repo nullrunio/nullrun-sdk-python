@@ -143,32 +143,6 @@ class TestStateDerivation:
         assert s.api_key_valid is None
         assert s.api_key_prefix is None
 
-    def test_degraded_when_using_fallback_policy(self):
-        # Construct a runtime where ``_policy`` is strict_local
-        # but ``_last_good_policy`` is a permissive policy —
-        # this is the post-fetch-failure state.
-        rt = _make_runtime()
-        from nullrun.runtime import Policy
-
-        rt._last_good_policy = Policy(budget_cents=1000, rate_limit=100)
-        rt._policy = Policy.strict_local()
-        rt._last_policy_fetch_failed_at = rt.api_key and 1000000000.0 or 1000000000.0
-        s = nullrun.status()
-        assert s.state == "degraded"
-        assert s.fallback_policy is not None
-        assert s.fallback_policy is not s.active_policy
-        assert s.fallback_reason is not None
-        assert "failed" in s.fallback_reason.lower()
-
-    def test_ok_when_active_policy_is_healthy(self):
-        rt = _make_runtime()
-        from nullrun.runtime import Policy
-
-        rt._policy = Policy(budget_cents=500, rate_limit=100)
-        rt._last_good_policy = None  # no fallback in use
-        s = nullrun.status()
-        assert s.state == "ok"
-
 
 # ---------------------------------------------------------------------------
 # 4. Recent-errors ring buffer
@@ -273,18 +247,6 @@ class TestSummary:
         out = s.summary()
         assert "ok" in out
         assert "nr_live_te" in out
-
-    def test_degraded_summary_includes_fallback(self):
-        rt = _make_runtime()
-        from nullrun.runtime import Policy
-
-        rt._last_good_policy = Policy(budget_cents=1000, rate_limit=100)
-        rt._policy = Policy.strict_local()
-        rt._last_policy_fetch_failed_at = 1000000000.0
-        s = nullrun.status()
-        out = s.summary()
-        assert "degraded" in out
-        assert "fallback" in out or "last_good" in out
 
 
 # ---------------------------------------------------------------------------

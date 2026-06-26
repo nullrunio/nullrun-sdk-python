@@ -12,6 +12,7 @@ Also pins the singleton-state contract (plan item B3) and the
 unknown-kwarg rejection (the 7-symbol surface of the SDK is
 `init(api_key, api_url, debug)` — no `organization_id`).
 """
+
 from __future__ import annotations
 
 import threading
@@ -37,9 +38,7 @@ class TestInitRaisesWithoutApiKey:
         with pytest.raises(NullRunAuthenticationError, match="api_key"):
             nullrun.init()
 
-    def test_runtime_init_raises_when_api_key_missing(
-        self, monkeypatch, mock_api
-    ):
+    def test_runtime_init_raises_when_api_key_missing(self, monkeypatch, mock_api):
         """``NullRunRuntime(...)`` with no api_key and no env raises.
         This is the direct construction path used by tests and
         advanced callers; the public ``init()`` raises first with
@@ -130,9 +129,7 @@ class TestInitWritesAllSingletonSlots:
             )
             for _ in range(8)
         ]
-        threads = [
-            threading.Thread(target=worker, args=(rt,)) for rt in runtimes
-        ]
+        threads = [threading.Thread(target=worker, args=(rt,)) for rt in runtimes]
         for t in threads:
             t.start()
         for t in threads:

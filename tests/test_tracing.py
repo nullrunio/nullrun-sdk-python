@@ -9,6 +9,7 @@ invariants are:
   - set_span / reset_span are token-based (PEP 567 ContextVar semantics)
   - reset_span with the matching token restores the previous context
 """
+
 import pytest
 
 from nullrun.tracing import (

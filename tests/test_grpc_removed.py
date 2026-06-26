@@ -18,6 +18,7 @@ collection/import time (the symbol ``_grpc_transport`` is back)
 or at runtime (the import-time contract check on the package
 metadata breaks).
 """
+
 from __future__ import annotations
 
 import logging
@@ -27,7 +28,6 @@ BASE_URL = "https://api.test.nullrun.io"
 
 
 class TestGrpcRemoved:
-
     def test_runtime_has_no_grpc_transport_attr(self, make_runtime):
         """NullRunRuntime must not carry a _grpc_transport attribute.
 
@@ -49,6 +49,7 @@ class TestGrpcRemoved:
         After the fix, the symbol must not exist anywhere in the SDK.
         """
         import nullrun.runtime as rt_mod
+
         assert not hasattr(rt_mod, "create_grpc_transport"), (
             "create_grpc_transport must not exist in nullrun.runtime — "
             "gRPC transport is frozen at the platform side."
@@ -58,9 +59,7 @@ class TestGrpcRemoved:
             "gRPC transport is frozen at the platform side."
         )
 
-    def test_nullrun_use_grpc_does_not_crash_init(
-        self, make_runtime, monkeypatch, caplog
-    ):
+    def test_nullrun_use_grpc_does_not_crash_init(self, make_runtime, monkeypatch, caplog):
         """Setting NULLRUN_USE_GRPC=1 must NOT raise NameError.
 
         Pre-fix: NullRunRuntime.__init__ called ``create_grpc_transport(...)``
@@ -99,7 +98,7 @@ class TestGrpcRemoved:
         # ``dependencies = [`` section) must not contain ``grpcio``.
         deps_start = text.find("dependencies = [")
         next_section = text.find("\n\n", deps_start)
-        hard_block = text[deps_start:next_section if next_section > 0 else None]
+        hard_block = text[deps_start : next_section if next_section > 0 else None]
         assert "grpcio" not in hard_block, (
             "grpcio must not be a hard dependency of the SDK. "
             "If/when gRPC is unblocked at the platform, it should be "

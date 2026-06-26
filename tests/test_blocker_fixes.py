@@ -7,6 +7,7 @@ Phase 2 of the production-readiness plan:
 - #4 `auto_instrument()` did not call `patch_requests`.
 - #7 `wrap()` had a latent NameError (also deleted in 0.4.0).
 """
+
 from __future__ import annotations
 
 

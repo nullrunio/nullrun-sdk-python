@@ -5,6 +5,7 @@ Installs a synthetic ``requests.Session`` into ``sys.modules`` so the
 patcher can wrap ``Session.send`` end-to-end without requiring the
 real ``requests`` package in CI.
 """
+
 from __future__ import annotations
 
 import importlib
@@ -37,7 +38,10 @@ def _install_fake_requests(monkeypatch, *, streaming: bool = False, status: int 
         @staticmethod
         def send(self_or_cls, request, **kwargs):
             _FakeSession.send_count += 1
-            return _FakeResponse(b'{"usage":{"prompt_tokens":7,"completion_tokens":11,"total_tokens":18},"model":"gpt-4o"}', status)
+            return _FakeResponse(
+                b'{"usage":{"prompt_tokens":7,"completion_tokens":11,"total_tokens":18},"model":"gpt-4o"}',
+                status,
+            )
 
         # Track which attrs were set on the class for restore-in-place
         # assertions.
@@ -121,7 +125,9 @@ def test_session_send_emits_llm_call_for_openai(monkeypatch, fresh_patch_module)
     assert patch_requests(rt) is True
 
     # Build a fake PreparedRequest-like object.
-    req = SimpleNamespace(url="https://api.openai.com/v1/chat/completions", headers={}, _nullrun_tracked=False)
+    req = SimpleNamespace(
+        url="https://api.openai.com/v1/chat/completions", headers={}, _nullrun_tracked=False
+    )
     Session().send(req)
 
     assert len(recorder["track"]) == 1
@@ -180,7 +186,9 @@ def test_session_send_already_tracked_returns_unchanged(monkeypatch, fresh_patch
     from nullrun.instrumentation.auto_requests import patch_requests
 
     assert patch_requests(rt) is True
-    req = SimpleNamespace(url="https://api.openai.com/v1/chat/completions", headers={}, _nullrun_tracked=True)
+    req = SimpleNamespace(
+        url="https://api.openai.com/v1/chat/completions", headers={}, _nullrun_tracked=True
+    )
     Session().send(req)
     assert recorder["track"] == []
 
@@ -221,7 +229,9 @@ def test_session_send_accept_event_stream_header_skips_track(monkeypatch, fresh_
     from nullrun.instrumentation.auto_requests import patch_requests
 
     assert patch_requests(rt) is True
-    req = SimpleNamespace(url="https://api.openai.com/v1/chat/completions", headers={"Accept": "text/event-stream"})
+    req = SimpleNamespace(
+        url="https://api.openai.com/v1/chat/completions", headers={"Accept": "text/event-stream"}
+    )
     Session().send(req)
     assert recorder["track"] == []
 

@@ -13,6 +13,7 @@ Focuses on:
   - ``get_metrics()`` format
   - ``CircuitBreakerMetrics.__init__`` coverage
 """
+
 from __future__ import annotations
 
 import asyncio
