@@ -1149,7 +1149,7 @@ class NullRunRuntime:
         # running (not silently always-skipped).
         metrics.inc_runtime("check_calls")
 
-        from nullrun.context import get_workflow_id
+        from nullrun.context import get_call_model, get_call_tools, get_workflow_id
 
         # Phase 139+: prefer the user-set contextvar (explicit `with
         # workflow(...)` block), fall back to the API key's bound
@@ -1160,14 +1160,38 @@ class NullRunRuntime:
         if not workflow_id:
             return
 
+        # T4 (2026-06-27): use the real model name from the call
+        # context if the user set it via `set_call_context(model=...)`
+        # (or via a future `with workflow(..., model=...)` block).
+        # Pre-T4 this always sent the literal string "budget-precheck"
+        # — a fake sentinel that:
+        #   1. forced backend pricing lookup to fall through to the
+        #      default 3.0 rate, so projected_cost was always computed
+        #      against the wrong per-model rate;
+        #   2. blocked any future per-model budget tier (model-specific
+        #      caps) from being enforced correctly.
+        # Sending `None` is fine — backend `calculate_projected_cost`
+        # defaults to claude-sonnet-4 when model is unset, and tool_block
+        # enforcement on /gate is best-effort when no tools are sent.
+        call_model = get_call_model()
+        call_tools = get_call_tools()
+
         check_req = {
             "organization_id": self.organization_id or "local",
             "execution_id": workflow_id,
             "operation_id": str(uuid.uuid4()),
             "check_type": "llm",
-            "model": "budget-precheck",
+            "model": call_model,  # may be None if user didn't set it
             "estimated_tokens": 1,
         }
+
+        # Forward the tool list so backend (T3) can match each tool
+        # against the workflow's effective `blocked_tools` aggregate.
+        # Only included when the user actually set it — `[]` means
+        # "no tools will be called" which is different from "I didn't
+        # tell you what tools will be called" (None).
+        if call_tools:
+            check_req["tools"] = list(call_tools)
 
         try:
             response = self._transport.check(check_req)

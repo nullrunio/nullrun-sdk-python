@@ -331,6 +331,14 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "get_trace_id": ("nullrun.context", "get_trace_id"),
     "get_span_id": ("nullrun.context", "get_span_id"),
     "get_agent_id": ("nullrun.context", "get_agent_id"),
+    # T4 (2026-06-27): per-call context for /gate pre-flight. Users
+    # call `set_call_context(model=..., tools=[...])` inside
+    # `with workflow(...)` so the backend's budget + tool_block
+    # enforcement sees real values instead of the previous fake
+    # `"budget-precheck"` sentinel and empty tool list.
+    "set_call_context": ("nullrun.context", "set_call_context"),
+    "get_call_model": ("nullrun.context", "get_call_model"),
+    "get_call_tools": ("nullrun.context", "get_call_tools"),
     # Instrumentation
     "NullRunCallback": ("nullrun.instrumentation", "NullRunCallback"),
     # NOTE (Sprint 1.2 / B11-B12): `patch_openai` and `unpatch_openai`
