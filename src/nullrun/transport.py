@@ -1042,7 +1042,15 @@ class Transport:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
         # Add HMAC signature headers
-        body = json.dumps({"events": batch})
+        # 2026-06-27: route through _signed_request_body for canonical
+        # compact separators ((",", ":")) — matches the wire form used by
+        # /execute and /gate and the docstring invariant of
+        # _signed_request_body (which says "All three signed POST call
+        # sites MUST serialise via this helper"). HMAC itself is unaffected
+        # (it hashes the bytes either way), but consistent serialization
+        # means future audits / contract tests don't have to special-case
+        # this endpoint.
+        body = self._signed_request_body({"events": batch})
         self._add_hmac_headers(headers, body)
 
         # Inject trace context for distributed tracing (W3C Trace Context)
@@ -1122,16 +1130,41 @@ class Transport:
             response.raise_for_status()
         response.raise_for_status()
 
-        # Process actions_taken from server response
+        # Process actions from server response.
+        #
+        # 2026-06-27: Backend renamed BatchTrackResponse.actions_taken (Vec<String>
+        # of debug names) → BatchTrackResponse.actions (Vec<ActionTaken>) with
+        # human-readable strings moved to `messages`. Single /track still uses
+        # TrackResponse.actions_taken (Vec<ActionTaken>). We read both for forward
+        # compat, and per-element try/except so one malformed entry doesn't abort
+        # the whole loop.
         try:
             data = response.json()
-            actions = data.get("actions_taken", [])
+            actions = data.get("actions")
+            if actions is None:
+                actions = data.get("actions_taken", [])
             for action in actions:
-                action_type = action.get("type", "")
-                workflow_id = action.get("workflow_id", "unknown")
-                reason = action.get("reason", "")
-                if action_type:
-                    handle_action(action_type, workflow_id, reason)
+                try:
+                    if not isinstance(action, dict):
+                        # Backend sent a legacy string or unexpected shape —
+                        # log and skip, don't dispatch.
+                        logger.warning(
+                            "Skipping non-dict action from /track/batch: %r",
+                            action,
+                        )
+                        continue
+                    action_type = action.get("type", "")
+                    workflow_id = action.get("workflow_id", "unknown")
+                    reason = action.get("reason", "")
+                    if action_type:
+                        handle_action(action_type, workflow_id, reason)
+                except Exception as item_err:
+                    logger.warning(
+                        "Skipping malformed action %r: %s", action, item_err
+                    )
+            # Display-only backend messages (renamed from `actions_taken: Vec<String>`).
+            for msg in data.get("messages", []) or []:
+                logger.info("Backend message: %s", msg)
         except Exception as e:
             logger.warning(f"Failed to process actions_taken: {e}")
 

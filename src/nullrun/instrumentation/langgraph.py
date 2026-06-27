@@ -49,6 +49,104 @@ _ACTIVE_RUNS_MAX = 4096
 
 
 # =============================================================================
+# Helpers — read second-tier fields from every plausible source
+# =============================================================================
+# The token-extraction chain below is `elif` because merging token counts
+# from five different shapes would silently double-count. finish_reason
+# and tool_names are different: they're best-effort lookups, and a value
+# sitting on `response_metadata` must not be shadowed by an earlier
+# branch's empty raw_usage. These helpers walk every source independently.
+
+
+def _safe_get_gen_message(response: Any) -> Any:
+    """Return ``response.generations[0][0].message`` for LLMResult callback
+    responses, or ``None`` if any layer is missing / malformed.
+
+    The LLMResult shape nests the actual AI message inside a generations
+    list, so anything attached to the AIMessage (tool_calls, response
+    metadata, finish_reason) is unreachable via ``response.<attr>``.
+    """
+    try:
+        gens = getattr(response, "generations", None)
+        if not gens:
+            return None
+        first = gens[0]
+        if not first:
+            return None
+        msg = first[0]
+        return getattr(msg, "message", None)
+    except (AttributeError, IndexError, TypeError):
+        return None
+
+
+def _get_finish_reason(response: Any) -> str | None:
+    """Read finish_reason from every known location, returning the first
+    non-empty value found.
+
+    Different LangChain chat-model wrappers expose the same logical
+    field under different names on different objects. We walk the
+    candidate sources in priority order and return the first hit;
+    priority is "outermost first" so a top-level attribute wins over
+    a response_metadata hint, and a generation-message attribute is
+    consulted for the LLMResult callback path where the wrapper puts
+    metadata on the AIMessage rather than the LLMResult.
+
+    Sources checked, in order:
+
+    1. ``response.finish_reason`` / ``stop_reason`` / ``stopReason`` —
+       the chat-model wrapper's top-level attribute.
+    2. ``response.response_metadata[<key>]`` — OpenAI-via-LangChain
+       nests finish_reason inside the metadata dict.
+    3. ``response.generations[0][0].message.<attr>`` — LLMResult path
+       where the wrapper put the field on the AIMessage directly.
+    4. ``response.generations[0][0].message.response_metadata[<key>]``
+       — LLMResult where the metadata dict lives on the AIMessage.
+    5. ``response.llm_output.finish_reason`` / ``stop_reason`` — legacy
+       LLMResult where finish info sits on the LLMResult itself.
+    """
+    finish_keys = ("finish_reason", "stop_reason", "stopReason")
+    direct_attrs = ("finish_reason", "stop_reason", "stopReason")
+
+    # 1. Direct attributes on the response object.
+    for attr in direct_attrs:
+        val = getattr(response, attr, None)
+        if val:
+            return str(val)
+
+    # 2. response_metadata dict on the response.
+    resp_meta = getattr(response, "response_metadata", None)
+    if isinstance(resp_meta, dict):
+        for key in finish_keys:
+            val = resp_meta.get(key)
+            if val:
+                return str(val)
+
+    # 3 + 4. LLMResult callback path — look on the generation's message.
+    gen_msg = _safe_get_gen_message(response)
+    if gen_msg is not None:
+        for attr in direct_attrs:
+            val = getattr(gen_msg, attr, None)
+            if val:
+                return str(val)
+        gen_meta = getattr(gen_msg, "response_metadata", None)
+        if isinstance(gen_meta, dict):
+            for key in finish_keys:
+                val = gen_meta.get(key)
+                if val:
+                    return str(val)
+
+    # 5. llm_output dict (legacy LLMResult).
+    llm_out = getattr(response, "llm_output", None)
+    if isinstance(llm_out, dict):
+        for key in finish_keys:
+            val = llm_out.get(key)
+            if val:
+                return str(val)
+
+    return None
+
+
+# =============================================================================
 # Usage Normalization (SDK extracts, backend computes)
 # =============================================================================
 
@@ -59,6 +157,12 @@ def extract_usage_from_response(response: Any, provider: str, model: str) -> dic
     Returns raw usage dict - backend will normalize and compute cost.
     SDK does NOT compute cost - this is intentional (backend is source of truth).
 
+    Phase 4.1: also extracts cache_read_tokens, cache_write_tokens,
+    reasoning_tokens, finish_reason, and tool_names so the backend's
+    gate/budget/loop detection can see them as first-class columns.
+    Fields are best-effort — different LangChain providers expose
+    different sub-objects, so any field can be missing.
+
     Returns:
         Dict with keys:
             - input_tokens: int
@@ -66,6 +170,11 @@ def extract_usage_from_response(response: Any, provider: str, model: str) -> dic
             - total_tokens: int
             - has_usage: bool
             - raw_usage: original dict from provider
+            - cache_read_tokens: int
+            - cache_write_tokens: int
+            - reasoning_tokens: int
+            - finish_reason: str | None
+            - tool_names: list[str]
     """
     usage: dict[str, Any] = {
         "input_tokens": 0,
@@ -73,6 +182,11 @@ def extract_usage_from_response(response: Any, provider: str, model: str) -> dic
         "total_tokens": 0,
         "has_usage": False,
         "raw_usage": {},
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": 0,
+        "finish_reason": None,
+        "tool_names": [],
     }
 
     # Try LangChain's usage_metadata first (most common for OpenAI via LangChain)
@@ -176,6 +290,103 @@ def extract_usage_from_response(response: Any, provider: str, model: str) -> dic
         # Final response should have usage_metadata
         pass
 
+    # Phase 4.1: extract the second-tier fields the backend gate/budget
+    # loop detection now needs. We pull from the same response object
+    # LangChain already loaded — no extra HTTP, no schema surprise.
+    # All five fields are best-effort: any provider that doesn't expose
+    # them simply leaves the default value (0 / None / []).
+
+    # Cache tokens — Anthropic exposes these on the usage block.
+    # OpenAI exposes cached_tokens on a nested prompt_tokens_details.
+    raw = usage.get("raw_usage") or {}
+    if isinstance(raw, dict):
+        cache_read = raw.get("cache_read_input_tokens") or raw.get(
+            "cacheReadInputTokenCount"
+        )
+        if cache_read:
+            usage["cache_read_tokens"] = int(cache_read) or 0
+        cache_write = raw.get("cache_creation_input_tokens") or raw.get(
+            "cacheWriteInputTokenCount"
+        )
+        if cache_write:
+            usage["cache_write_tokens"] = int(cache_write) or 0
+        prompt_details = raw.get("prompt_tokens_details") or {}
+        if isinstance(prompt_details, dict) and prompt_details.get("cached_tokens"):
+            # OpenAI's prefix-cached prompt hits — best-effort merge.
+            usage["cache_read_tokens"] = int(
+                prompt_details.get("cached_tokens") or 0
+            )
+        completion_details = raw.get("completion_tokens_details") or {}
+        if isinstance(completion_details, dict) and completion_details.get(
+            "reasoning_tokens"
+        ):
+            usage["reasoning_tokens"] = int(
+                completion_details.get("reasoning_tokens") or 0
+            )
+
+    # Finish reason — read from every known source independently of the
+    # token branch. The `elif`-chain above means only one branch fills
+    # raw_usage, so finish_reason must NOT depend on which branch won;
+    # otherwise a finish_reason sitting on response_metadata gets lost
+    # whenever the tokens happened to live in usage_metadata.
+    usage["finish_reason"] = _get_finish_reason(response)
+
+    # Tool names — most LangChain chat models put tool calls on
+    # response.tool_calls or response.additional_kwargs.tool_calls.
+    # We only want the function name, not the arguments.
+    def _extract_tool_names(obj: Any) -> list[str]:
+        names: list[str] = []
+        if obj is None:
+            return names
+        # Dict-style tool_calls (OpenAI ChatCompletion)
+        if isinstance(obj, dict):
+            tcs = obj.get("tool_calls") or []
+            for tc in tcs:
+                if not isinstance(tc, dict):
+                    continue
+                func = tc.get("function") or {}
+                name = func.get("name") if isinstance(func, dict) else None
+                if not name:
+                    name = tc.get("name")
+                if name:
+                    names.append(str(name))
+            return names
+        # Object-style tool_calls (langchain_core.messages)
+        tcs = getattr(obj, "tool_calls", None) or []
+        for tc in tcs:
+            name = None
+            if isinstance(tc, dict):
+                func = tc.get("function") or {}
+                name = func.get("name") if isinstance(func, dict) else None
+                if not name:
+                    name = tc.get("name")
+            else:
+                func = getattr(tc, "function", None)
+                if func is not None:
+                    name = getattr(func, "name", None)
+                if not name:
+                    name = getattr(tc, "name", None)
+            if name:
+                names.append(str(name))
+        return names
+
+    collected: list[str] = []
+    for src in (
+        response,
+        getattr(response, "additional_kwargs", None),
+        getattr(response, "response_metadata", None),
+        # LLMResult callback path — tool_calls live on the generation's
+        # AIMessage, not on the response object itself. Without this,
+        # a callback-driven LLMResult emits an empty tool_names list
+        # even when the model produced several function calls.
+        _safe_get_gen_message(response),
+    ):
+        collected.extend(_extract_tool_names(src))
+    # De-duplicate while preserving first-seen order so a tool called
+    # multiple times in one response appears once in the wire shape.
+    seen: set[str] = set()
+    usage["tool_names"] = [n for n in collected if not (n in seen or seen.add(n))]
+
     # Determine if we got real usage data
     usage["has_usage"] = (
         usage["total_tokens"] > 0 or
@@ -270,6 +481,9 @@ class NullRunCallback(BaseCallbackHandler):
                       f"usage={usage}, has_usage={usage['has_usage']}")
 
             # Build event with RAW usage data (no cost computation in SDK!)
+            # Phase 4.1: lift cache / reasoning / finish / tool names out
+            # of raw_usage onto the event itself, mirroring the httpx
+            # transport shape so the dedup key space stays unified.
             event = {
                 "type": "llm_call",
                 "model": model,
@@ -277,8 +491,15 @@ class NullRunCallback(BaseCallbackHandler):
                 "tokens": usage["total_tokens"],
                 "input_tokens": usage["input_tokens"],
                 "output_tokens": usage["output_tokens"],
+                "cache_read_tokens": int(usage.get("cache_read_tokens", 0) or 0),
+                "cache_write_tokens": int(usage.get("cache_write_tokens", 0) or 0),
+                "reasoning_tokens": int(usage.get("reasoning_tokens", 0) or 0),
+                "finish_reason": usage.get("finish_reason"),
+                "tool_names": usage.get("tool_names") or [],
                 # Flag to backend: this is raw usage, compute cost yourself
                 "has_usage": usage["has_usage"],
+                # Stripped at the wire boundary by _WIRE_STRIP_FIELDS —
+                # kept here for in-process dedup + test introspection.
                 "raw_usage": usage["raw_usage"],
             }
 

@@ -89,6 +89,64 @@ class TestNullRunRuntimeTrack:
         # Не должно бросить исключение
         rt.track({"event_type": "test"})
 
+    def test_wire_payload_strips_sensitive_fields(self, make_runtime):
+        """Phase 4.1 privacy boundary: ``raw_usage``, ``_fingerprint``
+        and ``cost_cents`` MUST NOT appear in the dict that lands on
+        the transport buffer (i.e. what /api/v1/track/batch would
+        serialise). Normalised fields pass through unchanged.
+
+        We monkey-patch ``_transport.track`` to capture the wire
+        dict without spinning up the real httpx client.
+        """
+        rt = make_runtime()
+        captured: list[dict] = []
+        rt._transport.track = lambda event: captured.append(dict(event))
+
+        rt.track(
+            {
+                "type": "llm_call",
+                "provider": "openai",
+                "model": "gpt-4o",
+                "tokens": 15,
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "cache_read_tokens": 7,
+                "finish_reason": "stop",
+                "tool_names": ["search"],
+                "has_usage": True,
+                # These three MUST be stripped before the transport
+                # buffer sees the event.
+                "cost_cents": 0.001,
+                "_fingerprint": "abc123def456",
+                "raw_usage": {
+                    "prompt_tokens": 10,
+                    "secret_routing_info": "dc-us-east-1",
+                },
+            }
+        )
+
+        assert len(captured) == 1, "transport.track should be called exactly once"
+        sent = captured[0]
+
+        # Stripped at the wire boundary
+        assert "cost_cents" not in sent, "cost_cents leaked to wire"
+        assert "_fingerprint" not in sent, "_fingerprint leaked to wire"
+        assert "raw_usage" not in sent, "raw_usage leaked to wire"
+        # Sensitive nested field also gone (because raw_usage is gone)
+        assert "secret_routing_info" not in sent
+
+        # Normalised fields pass through unchanged
+        assert sent["type"] == "llm_call"
+        assert sent["input_tokens"] == 10
+        assert sent["cache_read_tokens"] == 7
+        assert sent["finish_reason"] == "stop"
+        assert sent["tool_names"] == ["search"]
+
+
+# ──────────────────────────────────────────────────────────────
+# NullRunRuntime — execute()
+# ──────────────────────────────────────────────────────────────
+
 
 # ──────────────────────────────────────────────────────────────
 # NullRunRuntime — execute()

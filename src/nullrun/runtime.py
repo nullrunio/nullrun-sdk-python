@@ -77,6 +77,35 @@ logger = logging.getLogger(__name__)
 # collision hazard). Wire compat: still a string.
 UNKNOWN_WORKFLOW_ID: str = "__nullrun_unknown__"
 
+# Phase 4.1: privacy boundary. Fields that MUST NOT leave the SDK on
+# the wire. The transport layer (POST /api/v1/track/batch) reads
+# whatever is in the event dict, so anything not allowlisted ends up
+# in the user's audit log on the backend side. We strip:
+#
+#   * ``cost_cents``  -- the SDK does not estimate cost; the backend
+#     recomputes it from tokens + the org's pricing policy. Sending
+#     a wrong number risks double-billing when the backend also
+#     persists its own computed cost.
+#   * ``_fingerprint`` -- the dedup key (sha256[:16] over the raw
+#     response body). Process-local; leaking it to audit logs
+#     would let an operator with audit-log read access fingerprint
+#     which prompts went through dedup, defeating the purpose.
+#   * ``raw_usage``   -- the vendor's full usage dict (OpenAI
+#     ``prompt_tokens_details``, Anthropic ``cache_*_input_tokens``,
+#     etc.) — Phase 4.1 moved every field we care about out of
+#     raw_usage onto the event itself, so the original dict is now
+#     just an opaque blob of provider-specific data. Carrying it on
+#     the wire is a privacy regression: provider response payloads
+#     can include user-supplied metadata, organization names, or
+#     other PII the backend has no business logging.
+#
+# Anything new added here MUST also be added to the in-process
+# callers that consume these fields (the dedup LRU at
+# ``_seen_track_fingerprints``, any local loggers).
+_WIRE_STRIP_FIELDS: frozenset[str] = frozenset(
+    {"cost_cents", "_fingerprint", "raw_usage"}
+)
+
 
 class NullRunRuntime:
     """
@@ -1165,7 +1194,20 @@ class NullRunRuntime:
             )
             return
         if decision == "block":
-            reasons = response.get("explanations") or ["block"]
+            # FIX-2026-06-27: backend /gate sets both `explanation` (a
+            # human-readable string, always populated on GateResponse::block)
+            # and `explanations` (an optional Vec<String> that the gate
+            # engine never populates today — `Some(vec![])` on the success
+            # path, `None` on the explicit-block path). Pre-fix the SDK only
+            # read `explanations`, so the user saw the useless fallback
+            # "block" with `details={}` even when the backend knew exactly
+            # why it blocked ("Budget exhausted: need 2 cents, 0 available").
+            # Fall back to `explanation` (singular String) when the list is
+            # empty so the real reason surfaces in the kill/pause reason.
+            reasons = (
+                response.get("explanations")
+                or ([response["explanation"]] if response.get("explanation") else ["block"])
+            )
             # Sprint 3 follow-up (B23): bump ``cost_limit_exceeded``
             # when the pre-flight blocks the workflow. The counter
             # is the operator's primary signal for "the budget
@@ -1177,7 +1219,10 @@ class NullRunRuntime:
                 reason="; ".join(reasons),
             )
         if decision == "throttle":
-            reasons = response.get("explanations") or ["throttle"]
+            reasons = (
+                response.get("explanations")
+                or ([response["explanation"]] if response.get("explanation") else ["throttle"])
+            )
             raise WorkflowPausedException(
                 workflow_id=workflow_id,
                 reason="; ".join(reasons),
@@ -1335,12 +1380,11 @@ class NullRunRuntime:
         self.check_control_plane(workflow_id)
 
         # Buffer for transport. The wire payload must NOT include
-        # cost_cents -- the SDK does not estimate cost; the backend
-        # recomputes it from tokens + the org's policy. The
-        # sink-only ``_fingerprint`` field is also stripped before
-        # the wire send so the dedup key shape is not leaked to
-        # anyone with audit-log access.
-        wire_event = {k: v for k, v in enriched.items() if k not in ("cost_cents", "_fingerprint")}
+        # any field in ``_WIRE_STRIP_FIELDS`` -- see that constant's
+        # docstring for the privacy rationale per field.
+        wire_event = {
+            k: v for k, v in enriched.items() if k not in _WIRE_STRIP_FIELDS
+        }
         self._transport.track(wire_event)
 
         # Update metrics (thread-safe)

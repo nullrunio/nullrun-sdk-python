@@ -57,6 +57,26 @@ class NullRunError(BreakerError):
     subclass populates at least ``error_code``; ``user_action`` is
     empty only when there is genuinely nothing to suggest (e.g. an
     internal sanity check).
+
+    Two intermediate marker subclasses split the public hierarchy by
+    category so host code can ``except`` on the category without
+    enumerating individual codes:
+
+    * :class:`NullRunDecision` — expected policy outcomes (budget
+      cap, tool block, rate limit, loop detection, workflow pause).
+      The enforcement layer is doing its job; the UX is "what
+      happened" + (where applicable) "how to proceed".
+    * :class:`NullRunInfrastructureError` — system failures (network,
+      backend 5xx, auth rejection, config error). The SDK could not
+      reach or query the policy engine; the UX is a generic
+      "service unavailable" with operator triage info.
+
+    Both inherit from :class:`NullRunError`, so existing
+    ``except NullRunError:`` clauses keep matching — the split is a
+    strict refinement, not a breaking change. ``WorkflowKilledInterrupt``
+    is **not** in either category: it remains a ``BaseException``
+    subclass so kill signals bypass any ``except Exception:`` that
+    might otherwise swallow them.
     """
 
     #: Default error code when a subclass does not override it.
@@ -121,6 +141,56 @@ class NullRunError(BreakerError):
 
 
 # ---------------------------------------------------------------------------
+# Category marker classes
+# ---------------------------------------------------------------------------
+# These two classes split the NullRunError hierarchy by what kind of
+# event the exception represents. They are pure markers — no new fields,
+# no constructor changes. Host code can use them as the catch-all for
+# a category without enumerating individual codes:
+#
+#     try:
+#         ...
+#     except NullRunDecision as d:
+#         # Budget, tool block, rate limit, loop, pause — expected
+#         return d.user_action_or_message()
+#     except NullRunInfrastructureError as e:
+#         # Network, 5xx, auth, config — system failure
+#         sentry.capture_exception(e)
+#         return "service unavailable"
+#
+# Both inherit from NullRunError so ``except NullRunError:`` keeps
+# matching existing handlers — the split is additive.
+class NullRunDecision(NullRunError):
+    """Marker for expected policy outcomes.
+
+    Includes budget caps, tool blocks, rate limits, loop detection,
+    workflow pause, and the generic block fallback. These are NOT
+    system failures — the enforcement layer reached a deliberate
+    decision. UX should explain the decision and (where applicable)
+    offer an upgrade or alternative action.
+
+    End-user messaging for these exceptions is stable per ``error_code``
+    (see :mod:`nullrun.messages`) and rarely needs to mention the
+    decision mechanism.
+    """
+
+
+class NullRunInfrastructureError(NullRunError):
+    """Marker for system failures (operator-facing).
+
+    Includes network errors reaching the policy engine, gateway 5xx,
+    authentication rejections, and configuration errors. End users see
+    a generic "service unavailable" message; operators see the
+    structured fields for triage (``error_code``, ``retryable``, and
+    for transport errors, ``source`` / ``endpoint``).
+
+    Host integrations (FastAPI middleware, Slack handler, etc.)
+    typically map these to HTTP 503 / 502 / 500 — NOT to 4xx, because
+    the failure is on our side, not the user's.
+    """
+
+
+# ---------------------------------------------------------------------------
 # Transport / network failures
 # ---------------------------------------------------------------------------
 class TransportErrorSource(str, Enum):
@@ -142,7 +212,7 @@ class TransportErrorSource(str, Enum):
     AUTH_ERROR = "AUTH_ERROR"  # 401 / 403 from the gateway
 
 
-class NullRunTransportError(NullRunError):
+class NullRunTransportError(NullRunInfrastructureError):
     """Raised by transport layer when the policy engine is unreachable.
 
     The exception carries a `source` (TransportErrorSource) and the
@@ -337,7 +407,7 @@ class InsecureTransportError(BreakerTransportError):
 # ---------------------------------------------------------------------------
 # Configuration / authentication
 # ---------------------------------------------------------------------------
-class NullRunConfigError(NullRunError):
+class NullRunConfigError(NullRunInfrastructureError):
     """Raised when the SDK is misconfigured: missing api_key, bad
     key format, workflow not registered, etc.
 
@@ -354,7 +424,7 @@ class NullRunConfigError(NullRunError):
     retryable = False
 
 
-class NullRunAuthenticationError(NullRunError):
+class NullRunAuthenticationError(NullRunInfrastructureError):
     """
     Raised when authentication fails and safe mode is required.
 
@@ -402,7 +472,7 @@ class NullRunAuthError(NullRunAuthenticationError):
 # ---------------------------------------------------------------------------
 # Block decisions (budget, loop, rate, tool-block)
 # ---------------------------------------------------------------------------
-class NullRunBlockedException(NullRunError):
+class NullRunBlockedException(NullRunDecision):
     """
     Raised when NullRun circuit breaker trips.
 
@@ -525,7 +595,7 @@ class NullRunToolBlockedError(NullRunBlockedException):
 #   - RateLimitExceededException
 
 
-class WorkflowPausedException(NullRunError):
+class WorkflowPausedException(NullRunDecision):
     """
     Raised when workflow is paused by NullRun.
 
