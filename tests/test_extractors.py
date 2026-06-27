@@ -311,3 +311,122 @@ def test_provider_table_covers_seven_hosts():
         "api.cohere.ai",
         "bedrock-runtime.amazonaws.com",
     }
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.1: new fields (cache / reasoning / finish / tool_names) and
+# the privacy boundary that strips them at the wire.
+# ---------------------------------------------------------------------------
+
+
+def test_openai_no_tool_calls_returns_empty_list():
+    """A response without tool_calls must not break the extractor — we
+    get an empty list and a normalized finish_reason. Pre-Phase-4.1
+    this would have KeyError'd on `tool_calls` because the loop
+    iterated over None."""
+    body = json.dumps(
+        {
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "hello"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 5,
+                "completion_tokens": 3,
+                "total_tokens": 8,
+            },
+            "model": "gpt-4o",
+        }
+    ).encode()
+    out = _openai_extractor(body, 200)
+    assert out is not None
+    assert out["tool_names"] == []
+    assert out["finish_reason"] == "stop"
+
+
+def test_openai_caches_and_reasoning_tokens():
+    """OpenAI 2024+ exposes prompt cache hits and o-series reasoning
+    tokens in nested detail blocks. Make sure both surface as
+    first-class fields, not buried in raw_usage."""
+    body = json.dumps(
+        {
+            "model": "o1-mini",
+            "choices": [{"finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": 1200,
+                "completion_tokens": 340,
+                "total_tokens": 1540,
+                "prompt_tokens_details": {"cached_tokens": 800},
+                "completion_tokens_details": {"reasoning_tokens": 200},
+            },
+        }
+    ).encode()
+    out = _openai_extractor(body, 200)
+    assert out["cache_read_tokens"] == 800
+    assert out["cache_write_tokens"] == 0
+    assert out["reasoning_tokens"] == 200
+
+
+def test_anthropic_tool_names_and_finish_normalization():
+    """Anthropic stop_reason uses 'end_turn' / 'tool_use' — these must
+    normalize to 'stop' / 'tool_calls' so the backend sees a single
+    canonical vocabulary."""
+    body = json.dumps(
+        {
+            "model": "claude-sonnet-4-6",
+            "stop_reason": "tool_use",
+            "content": [
+                {"type": "text", "text": "hi"},
+                {"type": "tool_use", "name": "search_web"},
+            ],
+            "usage": {"input_tokens": 100, "output_tokens": 50},
+        }
+    ).encode()
+    out = _anthropic_extractor(body, 200)
+    assert out["tool_names"] == ["search_web"]
+    assert out["finish_reason"] == "tool_calls"
+
+
+def test_bedrock_llama_tool_use_shape():
+    """Llama-3-on-Bedrock exposes tool_use blocks nested under
+    output.message.content, not under top-level content. Make sure
+    that third shape is recognized."""
+    body = json.dumps(
+        {
+            "modelId": "meta.llama3-70b-instruct-v1:0",
+            "stop_reason": "stop",
+            "output": {
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "thinking"},
+                        {"type": "tool_use", "name": "lookup_weather"},
+                    ]
+                }
+            },
+            "usage": {"inputTokens": 10, "outputTokens": 5},
+        }
+    ).encode()
+    out = _bedrock_extractor(body, 200)
+    assert out["tool_names"] == ["lookup_weather"]
+    assert out["finish_reason"] == "stop"
+
+
+def test_normalize_finish_reason_passthrough():
+    """Unknown strings must NOT be dropped — they pass through lowercased
+    so the backend still records them (e.g. a brand-new provider we
+    haven't seen yet)."""
+    from nullrun.instrumentation.auto import _normalize_finish_reason
+
+    assert _normalize_finish_reason(None) is None
+    assert _normalize_finish_reason("stop") == "stop"
+    assert _normalize_finish_reason("end_turn") == "stop"
+    assert _normalize_finish_reason("STOP") == "stop"
+    assert _normalize_finish_reason("max_tokens") == "length"
+    assert _normalize_finish_reason("MAX_TOKENS") == "length"
+    assert _normalize_finish_reason("SAFETY") == "blocked"
+    assert _normalize_finish_reason("SOME_NEW_REASON") == "some_new_reason"
+    # Empty string must not crash either — lowercased empty string
+    # becomes falsy and the helper returns None.
+    assert _normalize_finish_reason("") is None
