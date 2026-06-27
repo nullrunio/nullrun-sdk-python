@@ -390,6 +390,14 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "WorkflowPausedException": ("nullrun.breaker.exceptions", "WorkflowPausedException"),
     "WorkflowKilledException": ("nullrun.breaker.exceptions", "WorkflowKilledException"),
     "WorkflowKilledInterrupt": ("nullrun.breaker.exceptions", "WorkflowKilledInterrupt"),
+    # User-facing message catalog (NULLRUN owns the wording; see
+    # nullrun/messages.py for the design rationale). Eager in
+    # spirit — these are the "give the user a chance" surface that
+    # makes an SDK exception show up as a clean string instead of
+    # raw internal text.
+    "format_user_message": ("nullrun.messages", "format_user_message"),
+    "set_user_message": ("nullrun.messages", "set_user_message"),
+    "get_user_message": ("nullrun.messages", "get_user_message"),
 }
 
 
@@ -456,6 +464,12 @@ __all__ = [
     "NullRunBudgetError",
     "NullRunToolBlockedError",
     "WorkflowKilledInterrupt",
+    # User-facing message catalog — the single entry point for
+    # turning an SDK exception into a string safe to display to
+    # end users. ``set_user_message`` lets a deployment brand its
+    # own wording per error_code without rewriting the SDK.
+    "format_user_message",
+    "set_user_message",
 ]
 
 # Sprint 2.1: the SDK-side ``decision_history`` module was deleted.

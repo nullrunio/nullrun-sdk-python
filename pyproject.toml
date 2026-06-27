@@ -4,14 +4,27 @@ build-backend = "hatchling.build"
 
 [project]
 name = "nullrun"
-version = "0.7.0"
-description = "NullRun Python SDK — Enforcement gateway for AI agents."
+version = "0.7.6"
+# Long form used by PyPI page meta-description and search snippets.
+# Kept under the 200-char preview threshold so the full line is visible
+# without an "expand" click. Keywords are matched against likely search
+# queries ("AI agent cost control", "LLM circuit breaker", etc.).
+description = "NullRun Python SDK — enforcement gateway for AI agents. Circuit-breaker, policy enforcement and observability for OpenAI, Anthropic, LangGraph, LlamaIndex, CrewAI, AutoGen."
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
 
 authors = [
     { name = "nullrun.io", email = "support@nullrun.io" }
+]
+
+# Maintainer populates the PKG-INFO `Maintainer:` / `Maintainer-email:`
+# fields. PEP 621 maps the `authors` array to `Author-email:` but NOT
+# to the legacy `Author:` field, which leaves `pip show` displaying an
+# empty `Author:` line. Adding `maintainers` populates `Maintainer:`
+# instead so every metadata viewer shows non-empty contact info.
+maintainers = [
+    { name = "Anatolii Maltsev", email = "support@nullrun.io" }
 ]
 
 keywords = [
@@ -22,12 +35,25 @@ keywords = [
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
     "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: Implementation :: CPython",
     "Topic :: Software Development :: Libraries :: Python Modules",
+    # The SDK is positioned as a safety/cost-control layer for AI agents,
+    # so the Security and AI topics help PyPI search surface it for the
+    # queries developers actually run when shopping for these tools.
+    "Topic :: Security",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Internet :: WWW/HTTP",
     "Typing :: Typed",
 ]
 
@@ -66,6 +92,15 @@ autogen = [
     "autogen-agentchat>=0.4,<1.0",
     "autogen-ext[openai]>=0.4,<1.0",
 ]
+# Server-framework integrations. Each one pulls the framework so the
+# corresponding ``nullrun.integrations.<framework>`` module can be
+# imported. ``nullrun.integrations.__init__`` does NOT eager-import
+# these (the submodules are loaded lazily on first ``from
+# nullrun.integrations import <framework>``), so users who don't use
+# a given framework don't pay its install cost.
+fastapi = [
+    "fastapi>=0.100,<1.0",
+]
 all = [
     "openai>=1.0,<2.0",
     "anthropic>=0.20,<1.0",
@@ -98,14 +133,30 @@ dev = [
     # the import succeed; the `langgraph` and `langchain` extras pull
     # in heavier stacks that the unit tests don't need.
     "langchain-core>=0.3,<1.0",
+    # `tests/test_integrations_fastapi.py` does `from fastapi import ...`
+    # at module top-level, so pytest collection aborts the entire suite
+    # with ModuleNotFoundError if FastAPI isn't installed. Same import-
+    # time contract as `langchain-core` above; pin to the same lower
+    # bound as the `[fastapi]` extra so CI and end users agree on the
+    # minimum. `httpx` (already a core dep) covers `TestClient`.
+    "fastapi>=0.100,<1.0",
 ]
 
 [project.urls]
+# The homepage, docs and repository are the three links PyPI surfaces on
+# the project sidebar. The rest are convenience links that appear under
+# the "Project links" expander — they help users jump straight to the
+# issue tracker, release notes, or security policy without going through
+# the GitHub repo root first.
 Homepage = "https://nullrun.io"
 Documentation = "https://docs.nullrun.io"
 Repository = "https://github.com/nullrunio/nullrun-sdk-python"
-Changelog = "https://github.com/nullrunio/nullrun-sdk-python/blob/master/CHANGELOG.md"
 "Bug Tracker" = "https://github.com/nullrunio/nullrun-sdk-python/issues"
+Discussions = "https://github.com/nullrunio/nullrun-sdk-python/discussions"
+Changelog = "https://github.com/nullrunio/nullrun-sdk-python/blob/master/CHANGELOG.md"
+Releases = "https://github.com/nullrunio/nullrun-sdk-python/releases"
+"Source" = "https://github.com/nullrunio/nullrun-sdk-python"
+"Security Policy" = "https://github.com/nullrunio/nullrun-sdk-python/security/policy"
 Organization = "https://github.com/nullrunio"
 Examples = "https://github.com/nullrunio/nullrun-examples"
 

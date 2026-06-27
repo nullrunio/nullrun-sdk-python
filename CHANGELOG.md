@@ -7,6 +7,107 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [0.7.6] - 2026-06-27
+
+Additive patch on top of the 0.7.0 thin-client refactor. Brings a
+FastAPI integration, a default user-facing message catalog, and
+small transport consistency fixes. No breaking changes.
+
+### Added
+
+- **`nullrun.integrations.fastapi`** — one-line FastAPI integration
+  that turns every `NullRunDecision` / `NullRunInfrastructureError`
+  thrown by `@nullrun.protect` endpoints into a clean JSON
+  response with the right HTTP status code. No per-endpoint
+  `except` blocks required.
+  ```python
+  from fastapi import FastAPI
+  import nullrun
+  from nullrun.integrations.fastapi import install
+
+  nullrun.init(api_key="nr_live_...")
+  app = FastAPI()
+  install(app)
+
+  @app.post("/chat")
+  @nullrun.protect
+  def chat(message: str) -> str:
+      return agent.run(message)
+  ```
+  Response shape:
+  ```json
+  {
+    "error_code": "NR-B004",
+    "user_message": "You've reached the usage limit...",
+    "category": "decision"
+  }
+  ```
+  HTTP status mapping:
+  - `NR-B004` (budget), `NR-L001` (loop), `NR-R001` (rate) → **429**
+    with optional `Retry-After`.
+  - `NR-T001` (tool blocked), `NR-X001` (generic block) → **403**.
+  - `NR-W003` (paused) → **503** with `Retry-After`.
+  - `NR-W002` (killed) → **503**. `WorkflowKilledInterrupt` is a
+    `BaseException` subclass so Starlette's `add_exception_handler`
+    refuses it; the integration uses an ASGI middleware instead
+    (hybrid pattern documented in the module docstring).
+  - All `NullRunInfrastructureError` subclasses → **503**
+    (failure is on our side, not the user's).
+
+- **`nullrun.messages`** — default user-facing message catalog.
+  Every `NR-*` error code has an English default message owned by
+  NULLRUN, not by customer code, so a Customer Support Bot hitting
+  a budget cap shows the same wording across every NullRun-backed
+  application.
+  - `format_user_message(exc)` — render an exception as a
+    user-facing string.
+  - `set_user_message(code, text)` — per-process override for
+    branded variants in a single deployment.
+  - `get_user_message(code)` — raw lookup.
+  - `reset_overrides()` — clear all overrides (for tests).
+
+### Changed
+
+- **`Transport._send_batch` canonical JSON serialization** —
+  route the `/track/batch` body through `_signed_request_body` for
+  consistent compact-separator serialisation (`,`/`:`). HMAC itself
+  is unaffected (it hashes the bytes either way), but consistent
+  serialisation removes a special-case from the wire-format contract
+  tests. Docstring invariant: "All three signed POST call sites
+  MUST serialise via this helper."
+
+- **`Transport._send_batch` actions response handling** —
+  backend renamed `BatchTrackResponse.actions_taken` (debug names)
+  → `BatchTrackResponse.actions` (`ActionTaken` structs with
+  human-readable strings moved to `messages`). Single `/track`
+  still uses `TrackResponse.actions_taken`. We read both for
+  forward-compat; per-element `try/except` so one malformed
+  entry doesn't abort the whole loop.
+
+- **`pyproject.toml` metadata** — long-form description with
+  keyword coverage for search, `Maintainer:` populated via
+  `maintainers = [...]`, expanded classifiers
+  (`OS Independent` / Linux / Windows / macOS,
+  Python 3.13, `CPython`, `Security`, `AI`, `WWW/HTTP` topics),
+  project URL expander (Discussions / Releases / Source /
+  Security Policy).
+
+### Tests
+
+- `tests/test_messages.py` (new, 282 lines) — catalog completeness
+  (every NR-* code in `exceptions.py` has a default message),
+  override / reset behavior, render path.
+- `tests/test_integrations_fastapi.py` (new, 289 lines) — HTTP
+  status mapping per error code, response shape, ASGI
+  middleware path for `WorkflowKilledInterrupt`, hybrid
+  (exception handlers + middleware) composition.
+- `tests/test_decision_split.py` (new, 199 lines) — pins the
+  decision / infrastructure error split.
+- Updates to `tests/test_runtime.py`, `tests/test_extractors.py`
+  reflecting transport canonical-JSON + actions-renamed changes.
+
+---
+
 ## [0.7.0] - 2026-06-26
 
 ### BREAKING CHANGES

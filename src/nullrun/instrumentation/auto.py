@@ -62,11 +62,70 @@ logger = logging.getLogger(__name__)
 ExtractedUsage = dict[str, Any]
 
 
+# ---------------------------------------------------------------------------
+# D0: finish_reason normalizer
+# ---------------------------------------------------------------------------
+# Different LLM providers use different strings for the same logical
+# outcome ("stop" / "end_turn" / "STOP" all mean "model finished
+# normally"; "length" / "max_tokens" / "MAX_TOKENS" all mean "hit the
+# token cap"; etc.). The backend's policy engine, alerting, and
+# dashboard only see the normalized form so they don't have to know
+# about provider-specific vocabulary.
+#
+# Unknown values are passed through lowercased so a new provider we
+# haven't seen still lands as SOMETHING on the wire rather than
+# silently being treated as None. Unmappable strings (e.g.
+# FINISH_REASON_UNSPECIFIED from Gemini) become "unknown".
+
+_FINISH_REASON_MAP: dict[str, str] = {
+    # OpenAI / Mistral / Ollama / OpenAI-compat
+    "stop": "stop",
+    "length": "length",
+    "tool_calls": "tool_calls",
+    "content_filter": "blocked",
+    "function_call": "tool_calls",  # legacy OpenAI
+    # Anthropic
+    "end_turn": "stop",
+    "max_tokens": "length",
+    "tool_use": "tool_calls",
+    "stop_sequence": "stop",
+    # Gemini
+    "STOP": "stop",
+    "MAX_TOKENS": "length",
+    "SAFETY": "blocked",
+    "RECITATION": "blocked",
+    "FINISH_REASON_UNSPECIFIED": "unknown",
+    # Cohere (MAX_TOKENS already mapped under Gemini — same value)
+    "COMPLETE": "stop",
+    "ERROR_TOXIC": "blocked",
+    "ERROR": "blocked",
+    # Bedrock reuses Anthropic strings for Anthropic-on-Bedrock
+}
+
+
+def _normalize_finish_reason(raw: str | None) -> str | None:
+    """Map a provider-specific finish_reason string onto the canonical
+    ``{stop, length, tool_calls, blocked, unknown}`` vocabulary.
+
+    Returns ``None`` for ``None`` input. Unknown strings are passed
+    through lowercased so the backend still records them (rather than
+    silently dropping the signal).
+    """
+    if raw is None:
+        return None
+    if raw in _FINISH_REASON_MAP:
+        return _FINISH_REASON_MAP[raw]
+    return raw.lower() or None
+
+
 def _openai_extractor(body: bytes, status: int) -> ExtractedUsage | None:
     """OpenAI / Azure OpenAI / Mistral / Ollama (OpenAI-compat) response shape.
 
     Mistral and Ollama (when serving OpenAI-compat) follow the same schema:
     response.usage.{prompt_tokens, completion_tokens, total_tokens}.
+    Optional nested blocks: ``prompt_tokens_details.cached_tokens``
+    (cached prompt; o-series prefixed), and
+    ``completion_tokens_details.reasoning_tokens`` (o1/o3 reasoning).
     """
     if status >= 400 or not body:
         return None
@@ -84,11 +143,40 @@ def _openai_extractor(body: bytes, status: int) -> ExtractedUsage | None:
         total = prompt + completion
     if prompt == 0 and completion == 0 and total == 0:
         return None
+
+    # Optional nested usage detail blocks. OpenAI added these in 2024
+    # to expose cache hits (prompt caching) and reasoning tokens (o1).
+    prompt_details = usage.get("prompt_tokens_details") or {}
+    completion_details = usage.get("completion_tokens_details") or {}
+
+    # Tool names from choices[].message.tool_calls[].function.name.
+    # We deliberately do NOT extract tool arguments — the wire shape
+    # is allowlisted and arguments would leak user-supplied data.
+    tool_names: list[str] = []
+    for choice in payload.get("choices") or []:
+        msg = choice.get("message") or {}
+        for tc in msg.get("tool_calls") or []:
+            name = (tc.get("function") or {}).get("name")
+            if name:
+                tool_names.append(name)
+
+    choices = payload.get("choices") or []
+    raw_finish = (choices[0] if choices else {}).get("finish_reason")
+
     return {
         "prompt_tokens": prompt,
         "completion_tokens": completion,
         "total_tokens": total,
         "model": payload.get("model"),
+        # Phase 4.1: explicit cache / reasoning / finish / tool fields.
+        # Previously these were reachable only via raw_usage (now
+        # stripped at the wire boundary). Backend gate/budget/loop
+        # detection now sees them as first-class columns.
+        "cache_read_tokens": int(prompt_details.get("cached_tokens", 0) or 0),
+        "cache_write_tokens": 0,  # OpenAI does not expose cache creation
+        "reasoning_tokens": int(completion_details.get("reasoning_tokens", 0) or 0),
+        "finish_reason": _normalize_finish_reason(raw_finish),
+        "tool_names": tool_names,
     }
 
 
@@ -96,6 +184,10 @@ def _anthropic_extractor(body: bytes, status: int) -> ExtractedUsage | None:
     """Anthropic Messages API response shape.
 
     response.usage.{input_tokens, output_tokens}.
+    Anthropic is the only major provider that exposes BOTH cache read
+    AND cache write tokens: ``cache_read_input_tokens`` (cache hit,
+    cheaper) and ``cache_creation_input_tokens`` (cache miss that
+    writes a new cache entry, billed at a higher rate).
     """
     if status >= 400 or not body:
         return None
@@ -110,11 +202,31 @@ def _anthropic_extractor(body: bytes, status: int) -> ExtractedUsage | None:
     out = int(usage.get("output_tokens", 0) or 0)
     if inp == 0 and out == 0:
         return None
+
+    # Tool names from content blocks of type "tool_use". We extract
+    # only the function name — input arguments are deliberately
+    # excluded so they don't leak through raw_usage to the backend.
+    tool_names = [
+        block["name"]
+        for block in (payload.get("content") or [])
+        if isinstance(block, dict)
+        and block.get("type") == "tool_use"
+        and block.get("name")
+    ]
+
     return {
         "prompt_tokens": inp,
         "completion_tokens": out,
         "total_tokens": inp + out,
         "model": payload.get("model"),
+        "cache_read_tokens": int(usage.get("cache_read_input_tokens", 0) or 0),
+        "cache_write_tokens": int(usage.get("cache_creation_input_tokens", 0) or 0),
+        # Anthropic reasoning tokens are part of output_tokens (they're
+        # billed at the output rate). Surface 0 here so the backend
+        # can detect providers that report them separately.
+        "reasoning_tokens": 0,
+        "finish_reason": _normalize_finish_reason(payload.get("stop_reason")),
+        "tool_names": tool_names,
     }
 
 
@@ -122,6 +234,8 @@ def _gemini_extractor(body: bytes, status: int) -> ExtractedUsage | None:
     """Google Gemini (Generative Language API) response shape.
 
     response.usageMetadata.{promptTokenCount, candidatesTokenCount, totalTokenCount}.
+    Optional ``cachedContentTokenCount`` on the usageMetadata for
+    cached prompt hits.
     """
     if status >= 400 or not body:
         return None
@@ -137,11 +251,32 @@ def _gemini_extractor(body: bytes, status: int) -> ExtractedUsage | None:
     total = int(usage.get("totalTokenCount", 0) or 0)
     if prompt == 0 and completion == 0 and total == 0:
         return None
+
+    # Tool names from functionCall parts on each candidate.
+    tool_names: list[str] = []
+    for candidate in payload.get("candidates") or []:
+        content = candidate.get("content") or {}
+        for part in content.get("parts") or []:
+            if isinstance(part, dict) and "functionCall" in part:
+                fc = part["functionCall"]
+                if isinstance(fc, dict):
+                    name = fc.get("name")
+                    if name:
+                        tool_names.append(name)
+
+    candidates = payload.get("candidates") or []
+    raw_finish = (candidates[0] if candidates else {}).get("finishReason")
+
     return {
         "prompt_tokens": prompt,
         "completion_tokens": completion,
         "total_tokens": total or (prompt + completion),
         "model": payload.get("modelVersion"),
+        "cache_read_tokens": int(usage.get("cachedContentTokenCount", 0) or 0),
+        "cache_write_tokens": 0,
+        "reasoning_tokens": 0,
+        "finish_reason": _normalize_finish_reason(raw_finish),
+        "tool_names": tool_names,
     }
 
 
@@ -171,11 +306,30 @@ def _cohere_extractor(body: bytes, status: int) -> ExtractedUsage | None:
     total = int(usage.get("tokens", 0) or 0) or (inp + out)
     if total == 0 and inp == 0 and out == 0:
         return None
+
+    # Cohere tool_calls are top-level (not under choices[]). The
+    # schema varies: v2 uses {id, type: "function", function: {name,
+    # arguments}}; some adapters use {name, parameters}. We accept
+    # both shapes.
+    tool_names: list[str] = []
+    for tc in payload.get("tool_calls") or []:
+        if not isinstance(tc, dict):
+            continue
+        if isinstance(tc.get("function"), dict) and tc["function"].get("name"):
+            tool_names.append(tc["function"]["name"])
+        elif tc.get("name"):
+            tool_names.append(tc["name"])
+
     return {
         "prompt_tokens": inp,
         "completion_tokens": out,
         "total_tokens": total,
         "model": payload.get("model"),
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": 0,
+        "finish_reason": _normalize_finish_reason(payload.get("finish_reason")),
+        "tool_names": tool_names,
     }
 
 
@@ -185,6 +339,15 @@ def _bedrock_extractor(body: bytes, status: int) -> ExtractedUsage | None:
     Bedrock returns JSON whose usage is either top-level (`inputTokens` /
     `outputTokens` on Anthropic-on-Bedrock) or nested under `usage`. We
     handle both, since model adapter shapes vary.
+
+    Cache read: Anthropic-on-Bedrock exposes ``cacheReadInputTokenCount``
+    and ``cacheWriteInputTokenCount`` (camelCase, AWS-style). Other
+    Bedrock adapters (Mistral, Titan) don't have prompt caching.
+
+    Tool names: shape depends on the underlying model. Anthropic-on-
+    Bedrock reuses Anthropic's ``content[type=tool_use]`` shape;
+    Mistral-on-Bedrock reuses OpenAI's ``choices[].message.tool_calls``
+    shape. We attempt both and return whatever we find.
     """
     if status >= 400 or not body:
         return None
@@ -215,11 +378,89 @@ def _bedrock_extractor(body: bytes, status: int) -> ExtractedUsage | None:
     total = int(usage.get("totalTokens", 0) or 0) or (inp + out)
     if inp == 0 and out == 0 and total == 0:
         return None
+
+    # Tool names — model-adapter-dependent. Try shapes in order:
+    #   1. Anthropic-on-Bedrock / Anthropic-native: content[type=tool_use]
+    #   2. Mistral-on-Bedrock / OpenAI-compat: choices[].message.tool_calls
+    #   3. Llama-3-on-Bedrock: output.message.content[type=tool_use]
+    # Other Bedrock adapters (Titan, Cohere-on-Bedrock) don't expose
+    # a stable tool schema; we leave tool_names empty rather than
+    # guessing. If a future adapter adds a fourth shape, add it here
+    # and bump the fixture in tests/test_extractors.py::test_bedrock_*.
+    tool_names: list[str] = []
+    matched_shape: str | None = None
+    for block in payload.get("content") or []:
+        if (
+            isinstance(block, dict)
+            and block.get("type") == "tool_use"
+            and block.get("name")
+        ):
+            tool_names.append(block["name"])
+    if tool_names:
+        matched_shape = "anthropic_content"
+    if not tool_names:
+        for choice in payload.get("choices") or []:
+            msg = choice.get("message") or {}
+            for tc in msg.get("tool_calls") or []:
+                name = (tc.get("function") or {}).get("name")
+                if name:
+                    tool_names.append(name)
+        if tool_names:
+            matched_shape = "openai_choices"
+    if not tool_names:
+        # Llama-3-on-Bedrock path: tools nested under output.message.
+        output = payload.get("output") or {}
+        message = output.get("message") if isinstance(output, dict) else None
+        if isinstance(message, dict):
+            for block in message.get("content") or []:
+                if (
+                    isinstance(block, dict)
+                    and block.get("type") == "tool_use"
+                    and block.get("name")
+                ):
+                    tool_names.append(block["name"])
+            if tool_names:
+                matched_shape = "llama_output_message"
+    if not tool_names and (
+        payload.get("output")
+        or payload.get("content")
+        or payload.get("choices")
+    ):
+        # Body shape looks LLM-ish but we found no tool_calls. That's
+        # legitimate for plain text completions, but a noisy signal
+        # if we later find a host that advertises tool support and
+        # we still get an empty list. DEBUG-level so it stays out
+        # of default logs.
+        logger.debug(
+            "Bedrock extractor: response had LLM-shaped body "
+            "(host-shape=%s, keys=%s) but no tool calls recognized",
+            matched_shape or "unknown",
+            sorted(k for k in payload.keys() if isinstance(payload.get(k), (dict, list))),
+        )
+
+    # Cache fields — both Anthropic-on-Bedrock (camelCase) and any
+    # adapter that already sends snake_case.
+    cache_read = int(
+        usage.get("cacheReadInputTokenCount", 0)
+        or usage.get("cache_read_input_tokens", 0)
+        or 0
+    )
+    cache_write = int(
+        usage.get("cacheWriteInputTokenCount", 0)
+        or usage.get("cache_creation_input_tokens", 0)
+        or 0
+    )
+
     return {
         "prompt_tokens": inp,
         "completion_tokens": out,
         "total_tokens": total,
         "model": payload.get("modelId") or payload.get("model"),
+        "cache_read_tokens": cache_read,
+        "cache_write_tokens": cache_write,
+        "reasoning_tokens": 0,
+        "finish_reason": _normalize_finish_reason(payload.get("stopReason") or payload.get("stop_reason")),
+        "tool_names": tool_names,
     }
 
 
@@ -443,6 +684,12 @@ class NullRunSyncTransport(httpx.BaseTransport):
         # the majority of customers.
         _safe_bump_coverage(self._runtime, "_coverage_seen", host)
         try:
+            # Phase 4.1: lift cache / reasoning / finish / tool names
+            # out of raw_usage onto the event itself. The backend's
+            # gate/budget/loop detection needs them as first-class
+            # columns; raw_usage is no longer on the wire (stripped
+            # at the track() boundary — see _WIRE_STRIP_FIELDS in
+            # runtime.py).
             self._runtime.track(
                 {
                     "type": "llm_call",
@@ -452,7 +699,15 @@ class NullRunSyncTransport(httpx.BaseTransport):
                     "tokens": usage.get("total_tokens", 0),
                     "input_tokens": usage.get("prompt_tokens", 0),
                     "output_tokens": usage.get("completion_tokens", 0),
+                    "cache_read_tokens": int(usage.get("cache_read_tokens", 0) or 0),
+                    "cache_write_tokens": int(usage.get("cache_write_tokens", 0) or 0),
+                    "reasoning_tokens": int(usage.get("reasoning_tokens", 0) or 0),
+                    "finish_reason": usage.get("finish_reason"),
+                    "tool_names": usage.get("tool_names") or [],
                     "has_usage": True,
+                    # Stripped at the wire boundary by _WIRE_STRIP_FIELDS
+                    # in runtime.py — kept here only so the in-process
+                    # dedup layer can see the full vendor payload.
                     "raw_usage": usage,
                     # Fingerprint for dedup at the track() sink.
                     "_fingerprint": _fingerprint_for(host, body, status),
@@ -568,6 +823,9 @@ class NullRunAsyncTransport(httpx.AsyncBaseTransport):
         # httpx-path traffic (the dominant path).
         _safe_bump_coverage(self._runtime, "_coverage_seen", host)
         try:
+            # Phase 4.1: see sync _emit for rationale. Async path
+            # uses identical event shape so the dedup key space
+            # stays unified across sync + async transports.
             self._runtime.track(
                 {
                     "type": "llm_call",
@@ -577,6 +835,11 @@ class NullRunAsyncTransport(httpx.AsyncBaseTransport):
                     "tokens": usage.get("total_tokens", 0),
                     "input_tokens": usage.get("prompt_tokens", 0),
                     "output_tokens": usage.get("completion_tokens", 0),
+                    "cache_read_tokens": int(usage.get("cache_read_tokens", 0) or 0),
+                    "cache_write_tokens": int(usage.get("cache_write_tokens", 0) or 0),
+                    "reasoning_tokens": int(usage.get("reasoning_tokens", 0) or 0),
+                    "finish_reason": usage.get("finish_reason"),
+                    "tool_names": usage.get("tool_names") or [],
                     "has_usage": True,
                     "raw_usage": usage,
                     "_fingerprint": _fingerprint_for(host, body, status),
@@ -864,6 +1127,21 @@ def _emit_from_agents_result(runtime: Any, result: Any) -> None:
         if prompt == 0 and completion == 0 and total == 0:
             continue
         try:
+            # Phase 4.1: lift cache / reasoning / finish / tool fields
+            # from raw_usage onto the event itself, mirroring the
+            # sync/async httpx transport shape. The Agents SDK emits
+            # the OpenAI usage shape so the field names line up.
+            prompt_details = usage.get("prompt_tokens_details") or {}
+            completion_details = usage.get("completion_tokens_details") or {}
+            tool_names: list[str] = []
+            for choice in usage.get("choices") or []:
+                if not isinstance(choice, dict):
+                    continue
+                msg = choice.get("message") or {}
+                for tc in msg.get("tool_calls") or []:
+                    name = (tc.get("function") or {}).get("name")
+                    if name:
+                        tool_names.append(name)
             runtime.track(
                 {
                     "type": "llm_call",
@@ -872,6 +1150,14 @@ def _emit_from_agents_result(runtime: Any, result: Any) -> None:
                     "tokens": total,
                     "input_tokens": prompt,
                     "output_tokens": completion,
+                    "cache_read_tokens": int(prompt_details.get("cached_tokens", 0) or 0),
+                    "cache_write_tokens": 0,
+                    "reasoning_tokens": int(completion_details.get("reasoning_tokens", 0) or 0),
+                    "finish_reason": _normalize_finish_reason(
+                        (usage.get("choices") or [{}])[0].get("finish_reason")
+                        if usage.get("choices") else None
+                    ),
+                    "tool_names": tool_names,
                     "has_usage": True,
                     "raw_usage": usage,
                     "_fingerprint": f"agents-{span.get('id', id(span))}",
