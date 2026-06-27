@@ -248,6 +248,90 @@ class TestSummary:
         assert "ok" in out
         assert "nr_live_te" in out
 
+    def test_summary_with_organization_and_workflow(self):
+        # Covers the ``if self.organization_id`` and
+        # ``if self.workflow_id`` branches of summary().
+        rt = _make_runtime()
+        rt.organization_id = "org_abcdef1234567890"
+        rt.workflow_id = "wf_xyzzy1234567890"
+        s = nullrun.status()
+        out = s.summary()
+        assert "org=org_abcd" in out
+        assert "wf=wf_xyzzy" in out
+
+    def test_summary_includes_workflow_state_when_not_normal(self):
+        # Branch: ``self.workflow_state and .state != "Normal"``.
+        rt = _make_runtime()
+        rt.workflow_id = "wf-test-1"
+        rt._set_remote_state(
+            "wf-test-1",
+            {"state": "Killed", "version": 5, "reason": "manual kill"},
+        )
+        s = nullrun.status()
+        out = s.summary()
+        assert "wf_state=Killed" in out
+
+    def test_summary_omits_normal_workflow_state(self):
+        # Sanity: a Normal workflow state should NOT appear in summary.
+        rt = _make_runtime()
+        rt.workflow_id = "wf-test-1"
+        rt._set_remote_state(
+            "wf-test-1",
+            {"state": "Normal", "version": 1, "reason": None},
+        )
+        s = nullrun.status()
+        out = s.summary()
+        assert "wf_state=" not in out
+
+    def test_summary_includes_backend_unreachable(self):
+        # Branch: ``self.backend_reachable is False``.
+        # ``backend_reachable`` is a local in ``status()``, not a stored
+        # attribute on the runtime — construct the snapshot directly.
+        s = NullRunStatus(
+            state="degraded",
+            api_key_valid=True,
+            api_key_prefix="nr_live_te",
+            organization_id=None,
+            workflow_id=None,
+            api_url="https://api.nullrun.io",
+            backend_reachable=False,
+            ws_connected=None,
+            workflow_state=None,
+            recent_errors=[],
+        )
+        assert "backend=unreachable" in s.summary()
+
+    def test_summary_includes_ws_disconnected(self):
+        # Branch: ``self.ws_connected is False``. Same reasoning as above.
+        s = NullRunStatus(
+            state="degraded",
+            api_key_valid=True,
+            api_key_prefix="nr_live_te",
+            organization_id=None,
+            workflow_id=None,
+            api_url="https://api.nullrun.io",
+            backend_reachable=None,
+            ws_connected=False,
+            workflow_state=None,
+            recent_errors=[],
+        )
+        assert "ws=False" in s.summary()
+
+    def test_summary_includes_recent_errors_count(self):
+        # Branch: ``if self.recent_errors``.
+        rt = _make_runtime()
+        from nullrun.observability.error_hooks import ErrorContext
+        from nullrun.breaker.exceptions import NullRunError
+
+        for i in range(3):
+            rt._emit_sdk_error(
+                NullRunError(f"err-{i}", error_code="NR-X000"),
+                stage="init",
+            )
+        s = nullrun.status()
+        out = s.summary()
+        assert "errors=3" in out
+
 
 # ---------------------------------------------------------------------------
 # 7. Public API surface

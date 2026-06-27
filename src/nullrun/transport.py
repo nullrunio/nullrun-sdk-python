@@ -1050,7 +1050,13 @@ class Transport:
         # (it hashes the bytes either way), but consistent serialization
         # means future audits / contract tests don't have to special-case
         # this endpoint.
-        body = self._signed_request_body({"events": batch})
+        # NOTE: _signed_request_body is a MODULE-LEVEL helper, not a
+        # method on Transport. The two siblings in this file
+        # (``execute`` and ``check``) call it without ``self.``; calling
+        # ``self._signed_request_body`` here raised AttributeError on
+        # every batch flush and broke 15 tests across test_transport.py
+        # / test_track_batch_retry.py / test_integration_contract.py.
+        body = _signed_request_body({"events": batch})
         self._add_hmac_headers(headers, body)
 
         # Inject trace context for distributed tracing (W3C Trace Context)

@@ -92,6 +92,15 @@ autogen = [
     "autogen-agentchat>=0.4,<1.0",
     "autogen-ext[openai]>=0.4,<1.0",
 ]
+# Server-framework integrations. Each one pulls the framework so the
+# corresponding ``nullrun.integrations.<framework>`` module can be
+# imported. ``nullrun.integrations.__init__`` does NOT eager-import
+# these (the submodules are loaded lazily on first ``from
+# nullrun.integrations import <framework>``), so users who don't use
+# a given framework don't pay its install cost.
+fastapi = [
+    "fastapi>=0.100,<1.0",
+]
 all = [
     "openai>=1.0,<2.0",
     "anthropic>=0.20,<1.0",
@@ -124,6 +133,13 @@ dev = [
     # the import succeed; the `langgraph` and `langchain` extras pull
     # in heavier stacks that the unit tests don't need.
     "langchain-core>=0.3,<1.0",
+    # `tests/test_integrations_fastapi.py` does `from fastapi import ...`
+    # at module top-level, so pytest collection aborts the entire suite
+    # with ModuleNotFoundError if FastAPI isn't installed. Same import-
+    # time contract as `langchain-core` above; pin to the same lower
+    # bound as the `[fastapi]` extra so CI and end users agree on the
+    # minimum. `httpx` (already a core dep) covers `TestClient`.
+    "fastapi>=0.100,<1.0",
 ]
 
 [project.urls]

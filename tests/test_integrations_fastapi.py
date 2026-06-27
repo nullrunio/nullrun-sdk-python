@@ -10,6 +10,8 @@ is deterministic.
 """
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
@@ -287,3 +289,43 @@ def test_install_is_idempotent():
     # Single 429, not a double-handler crash.
     assert resp.status_code == 429
     assert resp.json()["error_code"] == "NR-B004"
+
+
+# ---------------------------------------------------------------------------
+# _build_headers edge cases — Retry-After handling
+# ---------------------------------------------------------------------------
+class _AttrBag:
+    """Minimal stand-in for a NullRun exception — only the attrs
+    that ``_build_headers`` reads (``retry_after`` / ``resume_after``)
+    matter."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+
+def test_build_headers_returns_empty_when_no_retry_hint():
+    """No ``retry_after`` / ``resume_after`` → no Retry-After header."""
+    assert nr_fastapi._build_headers(_AttrBag()) == {}
+
+
+def test_build_headers_returns_empty_when_retry_after_non_numeric():
+    """A non-numeric ``retry_after`` must NOT raise; it just yields
+    no header. The exception class is opaque to the renderer, so a
+    typo'd string field shouldn't break the response."""
+    assert nr_fastapi._build_headers(_AttrBag(retry_after="soon")) == {}
+
+
+def test_build_headers_returns_empty_when_retry_after_is_zero():
+    """Zero or negative ``retry_after`` is not meaningful for
+    Retry-After (RFC 9110 allows zero but a real client would
+    spin; the renderer drops it to avoid hot-looping)."""
+    assert nr_fastapi._build_headers(_AttrBag(retry_after=0)) == {}
+    assert nr_fastapi._build_headers(_AttrBag(retry_after=-5)) == {}
+
+
+def test_build_headers_falls_back_to_resume_after():
+    """``WorkflowPausedException`` uses ``resume_after`` instead of
+    ``retry_after`` — the renderer normalizes on the canonical
+    HTTP field name."""
+    assert nr_fastapi._build_headers(_AttrBag(resume_after=42)) == {"Retry-After": "42"}
