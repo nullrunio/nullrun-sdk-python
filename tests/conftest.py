@@ -17,6 +17,7 @@ def reset_runtime():
     import nullrun.actions as _act
     import nullrun.decorators as _dec
     import nullrun.runtime as _rt_mod
+    from nullrun.context import _call_model_var, _call_tools_var
     from nullrun.runtime import NullRunRuntime
 
     # Disable polling for all tests via the runtime's internal `polling` flag
@@ -33,6 +34,11 @@ def reset_runtime():
     # leaks across the suite (e.g. a test that did `nullrun.init(...)` with
     # the prod URL leaves that URL pinned for the next test).
     _rt_mod._runtime = None
+    # T4 (2026-06-27): reset the per-call context (model + tools) so a
+    # previous test's `set_call_context(...)` doesn't leak into the next
+    # test's wire payload.
+    _call_model_var.set(None)
+    _call_tools_var.set(())
 
     yield
 
@@ -42,6 +48,8 @@ def reset_runtime():
     _dec._runtime = None
     _act._action_handler = None
     _rt_mod._runtime = None
+    _call_model_var.set(None)
+    _call_tools_var.set(())
 
 
 @pytest.fixture

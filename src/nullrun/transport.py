@@ -1419,6 +1419,18 @@ class Transport:
             "model": check_request.get("model"),
             "estimated_tokens": check_request.get("estimated_tokens"),
             "operation_id": check_request.get("operation_id") or str(uuid.uuid4()),
+            # T4 (2026-06-27): forward the per-call `tools` list so the
+            # backend's `gate/internal.rs::check_tool_block` can match
+            # each tool against the workflow's effective `blocked_tools`
+            # aggregate. Pre-T4 this key was silently dropped here, so
+            # `set_call_context(tools=[...])` had no effect on /gate.
+            # When unset (None) we omit the key entirely — the backend
+            # distinguishes "no tools sent" from "explicit []".
+            **(
+                {"tools": check_request["tools"]}
+                if "tools" in check_request
+                else {}
+            ),
         }
 
         headers = {"Content-Type": "application/json"}

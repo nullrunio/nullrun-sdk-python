@@ -7,6 +7,97 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [0.7.7] - 2026-06-27
+
+Additive patch on top of 0.7.6. Fixes the `/gate` pre-flight so the
+backend can compute `projected_cost` and `tool_block` decisions from
+real per-call data instead of the previous fake `"budget-precheck"`
+sentinel and empty tool list. No breaking changes — new helpers
+default to `None` / empty so existing call sites keep working.
+
+### Added
+
+- **`nullrun.set_call_context(model=..., tools=[...])`** — per-call
+  context the SDK forwards to `/gate` so the backend can enforce
+  budget tiers and tool-block on real values.
+  ```python
+  import nullrun
+
+  with nullrun.workflow(name="support-bot"):
+      nullrun.set_call_context(
+          model="claude-sonnet-4-6",
+          tools=["shell.run", "code.eval"],
+      )
+
+      @nullrun.protect
+      def chat(message: str) -> str:
+          return agent.run(message)
+  ```
+  - `model` (optional) — LLM model name. Backend uses it to look up
+    the per-model rate from `tool_pricing` (Postgres) so
+    `projected_cost` matches what `/track` will compute from real
+    token counts. Defaults to `None` (backend falls back to
+    `claude-sonnet-4` default rate).
+  - `tools` (optional) — list of tool names the call intends to use.
+    Backend matches each against the workflow's effective
+    `blocked_tools` aggregate and returns `block` on any match.
+    `None` leaves whatever was previously set; `[]` clears.
+  - `nullrun.get_call_model()` and `nullrun.get_call_tools()` are
+    the read-side helpers (also reachable via
+    `nullrun.context.get_call_model` / `get_call_tools`).
+
+### Fixed
+
+- **`/gate` pre-flight no longer sends `model="budget-precheck"`.**
+  Pre-0.7.7 every SDK `/gate` call for any workflow with a budget
+  was hard-blocked because the runtime hard-coded the literal
+  string `"budget-precheck"` as the model. The backend's
+  `PolicyEvaluationGraph.evaluate()` stub treated any synthetic
+  `cost_limit` rule with score > 0.8 as `Block` (see
+  `backend/src/policy/graph.rs:448-462`,
+  `backend/src/proxy/http/gate/internal.rs:619-628`), so the
+  pricing lookup never landed on a real model and the rule fired
+  with the wrong score. Now the runtime forwards the model from
+  `set_call_context(model=...)` (or `None` when unset), and the
+  backend's `calculate_projected_cost` falls through to the
+  default rate cleanly.
+
+- **`/gate` pre-flight now forwards the per-call `tools` list.**
+  `Transport.check` previously dropped the `tools` key from the
+  wire payload, so even when the user called
+  `set_call_context(tools=[...])` the backend's
+  `gate/internal.rs::check_tool_block` had nothing to match
+  against. The transport now propagates `tools` when the runtime
+  sets it; `[]` vs missing-`None` are distinguished on the wire
+  (per `gate/internal.rs::check_tool_block` doc-comment —
+  "no tools will be called" is different from "I did not tell you
+  what tools").
+
+### Tests
+
+- **`tests/test_gate_real_path.py`** (new, 226 lines) — regression
+  test pinning the fix. Three classes:
+  - `TestGateRealPathRegression` — default request now returns
+    `allow` (not the old blanket block on the synthetic
+    `cost_limit` rule), wire payload contains no
+    `policy-N` residue from the old graph plumbing, and a real
+    `decision="block"` still raises `WorkflowKilledInterrupt`
+    (so the fix didn't accidentally remove the real-block path).
+  - `TestSetCallContext` — `set_call_context(model=...)` flows
+    into the wire body, `set_call_context(tools=[...])` flows
+    into the wire body, no-context means no `tools` key at all
+    (not `[]`), and `set_call_context(tools=[])` clears a
+    previously-set tool list.
+  - `TestPackageExports` — the new helpers are reachable from
+    `nullrun.*`.
+
+- `tests/conftest.py` — `reset_runtime` fixture now also clears
+  `_call_model_var` and `_call_tools_var` so a test's
+  `set_call_context(...)` doesn't leak into the next test's wire
+  payload.
+
+---
+
 ## [0.7.6] - 2026-06-27
 
 Additive patch on top of the 0.7.0 thin-client refactor. Brings a

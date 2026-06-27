@@ -31,6 +31,17 @@ _span_id_var: ContextVar[str | None] = ContextVar("span_id", default=None)
 _agent_id_var: ContextVar[str | None] = ContextVar("agent_id", default=None)
 _attempt_index_var: ContextVar[int] = ContextVar("attempt_index", default=0)
 
+# T4 (2026-06-27): per-call context that flows into the /gate pre-flight
+# request so the backend can compute projected_cost and tool_block
+# decisions from real data instead of the previous fake "budget-precheck"
+# sentinel. Both default to None/empty; users opt in by calling
+# ``set_call_context(model=..., tools=[...])`` inside a ``with workflow(...)``
+# block. When unset, the backend falls back to its default pricing and
+# skips tool-block enforcement on /gate (per-key tool_block is enforced
+# on /track only — see gate/internal.rs T3).
+_call_model_var: ContextVar[str | None] = ContextVar("call_model", default=None)
+_call_tools_var: ContextVar[tuple[str, ...]] = ContextVar("call_tools", default=())
+
 
 # =============================================================================
 # Workflow / trace getters
@@ -62,9 +73,60 @@ def get_attempt_index() -> int:
     return _attempt_index_var.get()
 
 
+def get_call_model() -> str | None:
+    """Get the LLM model name set via ``set_call_context``.
+
+    Used by ``check_workflow_budget`` to send the real model to the
+    backend's /gate endpoint instead of the previous fake
+    ``"budget-precheck"`` placeholder (which forced the backend's
+    pricing model to fall through to the default rate and broke any
+    future per-model budget tiers).
+    """
+    return _call_model_var.get()
+
+
+def get_call_tools() -> tuple[str, ...]:
+    """Get the tool names set via ``set_call_context``.
+
+    Used by ``check_workflow_budget`` so the backend's tool_block
+    enforcement (when added in T3) can match against the workflow's
+    configured ``blocked_tools`` aggregate.
+    """
+    return _call_tools_var.get()
+
+
 def set_attempt_index(index: int) -> None:
     """Set current attempt index for retry correlation."""
     _attempt_index_var.set(index)
+
+
+def set_call_context(
+    model: str | None = None,
+    tools: list[str] | tuple[str, ...] | None = None,
+) -> None:
+    """Set per-call context (model name, tool list) for the next /gate
+    pre-flight check.
+
+    T4 (2026-06-27): replaces the previous fake ``model="budget-precheck"``
+    and ``estimated_tokens=1`` always-default / always-empty pre-flight.
+    Call inside a ``with workflow(...)`` block before ``@protect`` to
+    give the backend real data.
+
+    Args:
+        model: LLM model name (e.g. ``"claude-sonnet-4-6"``). Backend
+            uses this to look up the per-model rate from
+            ``tool_pricing`` (Postgres) so projected_cost matches what
+            /track will compute from real token counts.
+        tools: List of tool names the call intends to use. Backend
+            matches each against the workflow's effective
+            ``blocked_tools`` aggregate (T3 in backend) and returns
+            block on any match. Pass ``None`` to leave whatever was
+            previously set, ``[]`` to clear.
+    """
+    if model is not None:
+        _call_model_var.set(model)
+    if tools is not None:
+        _call_tools_var.set(tuple(tools))
 
 
 def generate_trace_id() -> str:
