@@ -1142,27 +1142,46 @@ def _emit_from_agents_result(runtime: Any, result: Any) -> None:
                     name = (tc.get("function") or {}).get("name")
                     if name:
                         tool_names.append(name)
-            runtime.track(
-                {
-                    "type": "llm_call",
-                    "provider": "openai_agents",
-                    "model": span.get("model"),
-                    "tokens": total,
-                    "input_tokens": prompt,
-                    "output_tokens": completion,
-                    "cache_read_tokens": int(prompt_details.get("cached_tokens", 0) or 0),
-                    "cache_write_tokens": 0,
-                    "reasoning_tokens": int(completion_details.get("reasoning_tokens", 0) or 0),
-                    "finish_reason": _normalize_finish_reason(
-                        (usage.get("choices") or [{}])[0].get("finish_reason")
-                        if usage.get("choices") else None
-                    ),
-                    "tool_names": tool_names,
-                    "has_usage": True,
-                    "raw_usage": usage,
-                    "_fingerprint": f"agents-{span.get('id', id(span))}",
-                }
+            # Audit 2026-06-28 (SDK↔backend wire): ``span.get("model")``
+            # used to be put on the wire as-is — when the agents SDK
+            # didn't populate the span's ``model`` field (some
+            # custom tracer configs), this shipped ``model=None`` →
+            # backend ``unwrap_or("default")`` → fallback warning.
+            # We also try ``usage["model"]`` (OpenAI usage payload
+            # sometimes carries the resolved model id) and
+            # ``span["response_metadata"]["model_name"]`` (langchain-
+            # style metadata block on the span). Empty / None are
+            # dropped — only set ``model`` when we have a real value.
+            span_model = (
+                span.get("model")
+                or (usage.get("model") if isinstance(usage, dict) else None)
+                or (
+                    (span.get("response_metadata") or {}).get("model_name")
+                    if isinstance(span.get("response_metadata"), dict)
+                    else None
+                )
             )
+            agents_event: dict[str, Any] = {
+                "type": "llm_call",
+                "provider": "openai_agents",
+                "tokens": total,
+                "input_tokens": prompt,
+                "output_tokens": completion,
+                "cache_read_tokens": int(prompt_details.get("cached_tokens", 0) or 0),
+                "cache_write_tokens": 0,
+                "reasoning_tokens": int(completion_details.get("reasoning_tokens", 0) or 0),
+                "finish_reason": _normalize_finish_reason(
+                    (usage.get("choices") or [{}])[0].get("finish_reason")
+                    if usage.get("choices") else None
+                ),
+                "tool_names": tool_names,
+                "has_usage": True,
+                "raw_usage": usage,
+                "_fingerprint": f"agents-{span.get('id', id(span))}",
+            }
+            if span_model:
+                agents_event["model"] = span_model
+            runtime.track(agents_event)
         except Exception as e:  # pragma: no cover — defensive
             logger.debug("NullRun: agents track failed: %s", e)
 

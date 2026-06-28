@@ -101,22 +101,49 @@ def patch_autogen(runtime: Any) -> bool:
                         getattr(usage, "total_tokens", 0) or 0
                     ) or (prompt + completion)
                     if prompt or completion or total:
+                        # Audit 2026-06-28 (SDK↔backend wire): model
+                        # used to come only from ``self.model`` with a
+                        # bare ``None`` fallback — if the autogen client
+                        # didn't expose a ``model`` attribute (some
+                        # subclass / wrapper / mock provider), the wire
+                        # event carried ``model=None`` → backend
+                        # ``unwrap_or("default")`` → fallback warning →
+                        # DEFAULT_RATE. Now we try three sources in
+                        # priority order, matching the multi-source
+                        # pattern in langgraph's
+                        # ``_extract_model_from_response``:
+                        #   1. ``self.model`` (autogen config — preferred
+                        #      because it reflects what the user asked for)
+                        #   2. ``result.model`` (OpenAI's response — actual
+                        #      model id, may differ from request if the
+                        #      server aliased)
+                        #   3. None — let the runtime-level warning log
+                        #      (added 2026-06-28 in runtime.py:track())
+                        #      surface which path produced the gap.
+                        model = (
+                            getattr(self, "model", None)
+                            or getattr(result, "model", None)
+                        )
                         try:
-                            runtime.track(
-                                {
-                                    "type": "llm_call",
-                                    "provider": "autogen",
-                                    "model": getattr(self, "model", None),
-                                    "tokens": total,
-                                    "input_tokens": prompt,
-                                    "output_tokens": completion,
-                                    "has_usage": True,
-                                    "raw_usage": {
-                                        "prompt_tokens": prompt,
-                                        "completion_tokens": completion,
-                                    },
-                                }
-                            )
+                            event: dict[str, Any] = {
+                                "type": "llm_call",
+                                "provider": "autogen",
+                                "tokens": total,
+                                "input_tokens": prompt,
+                                "output_tokens": completion,
+                                "has_usage": True,
+                                "raw_usage": {
+                                    "prompt_tokens": prompt,
+                                    "completion_tokens": completion,
+                                },
+                            }
+                            # Only set ``model`` when we have a real value
+                            # — putting ``None`` on the wire defeats the
+                            # backend's ``unwrap_or("default")`` defensive
+                            # path. Empty string is treated as absent.
+                            if model:
+                                event["model"] = model
+                            runtime.track(event)
                         except Exception as e:  # pragma: no cover
                             logger.debug("autogen create emit failed: %s", e)
                 return result

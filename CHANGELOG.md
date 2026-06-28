@@ -7,6 +7,103 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [0.8.0] - 2026-06-28
+
+SDK↔backend wire-format audit. Closes a class of silent-fail-OPEN
+path that was sending `model=None` (or `model="unknown"`) on
+`/track` for many LLM-vendor paths — every such event cost the
+backend a `model_pricing` lookup that returned no row, fell
+through to `DEFAULT_RATE` (~$30/M), and emitted a fallback warning
+the operator couldn't reproduce because the offending observation
+was buried in another package's telemetry.
+
+No public-API break. No behavior change for callers whose
+instrumentation already populates `model` correctly. Pure wire-
+payload hygiene.
+
+### Fixed
+
+- **`NullRunRuntime.track()` strips `None` values from the wire
+  payload.** Pre-0.8.0 the runtime forwarded every key in
+  `enriched` except those in `_WIRE_STRIP_FIELDS`, including keys
+  whose value was `None`. Putting `{"model": null}` on the wire
+  triggered backend `unwrap_or("default")` and a fallback warning.
+  Backend handles a missing key as well as `null`; dropping `None`
+  here keeps the diagnostic signal loud (the new
+  `WARN track(): llm_call event missing 'model' field` fires on
+  missing-key, which is what we want operators to see) instead of
+  silent (the JSON-null case). Activated only for `llm_call` so
+  `span_start` / `span_end` / `tool_call` traffic doesn't pollute
+  logs.
+
+- **All four instrumentation paths now extract `model` /
+  `provider` from the response object as a fallback, not just
+  from `invocation_params` / `self.model`.** When langchain 1.x
+  stopped forwarding `invocation_params` to `on_llm_end`, every
+  LangChain-callback track event carried `model="unknown"` and
+  the backend cost pipeline fell through to `DEFAULT_RATE`. The
+  same shape applied to llama-index mock providers and autogen
+  subclasses that don't expose a `.model` attribute. New
+  fallback chain (per path):
+
+  - `NullRunCallback.on_llm_end` (langgraph): `invocation_params.model_name`
+    → `response.response_metadata['model_name']` → AIMessage
+    `response_metadata` → `response.llm_output['model_name']` →
+    `response.model_name` / `response.model` → `'unknown'`
+    (truly last resort, not the common case).
+  - `extract_from_event` (llama_index): `event.response.model` →
+    `event.response.raw.model` → `usage['model']`. Mock providers
+    and adapter-style ChatResponse objects now ship a real model
+    id on the wire.
+  - `on_messages` (autogen): `self.model` → `result.model`. OpenAI's
+    response carries the actual model id (may differ from request
+    if the server resolved an alias) — this is the right value.
+  - `_emit_from_span` (auto, openai-agents): `span['model']` →
+    `usage['model']` → `span['response_metadata']['model_name']`.
+    Some custom tracer configs leave `span['model']` empty; the
+    other two sources usually have it.
+
+- **Two shared helpers added to `instrumentation/langgraph.py`:**
+  `_extract_model_from_response` and `_extract_provider_from_response`.
+  These mirror the same best-effort pattern `_get_finish_reason`
+  already uses, so we have a single "best-effort read from the
+  response object" idiom across the module. The autogen /
+  llama_index / agents paths duplicate the walk inline (the
+  response shapes differ too much to share a single helper), but
+  the *ordering* matches: official-attr → metadata → usage
+  → wrapper-attr.
+
+### Operator-visible change
+
+`logger.warning("track(): llm_call event missing 'model' field — backend will fall back to DEFAULT_RATE. event=...")` is now emitted from `NullRunRuntime.track()` whenever an `llm_call` event reaches the wire without a `model` field. This log is the single signal an operator needs to reproduce "which observation (httpx / langchain callback / manual track / agents tracer / requests) produced an `llm_call` without `model` set". Activated only for `llm_call`; other event types are silent. Log destination is whatever the host application configures for the `nullrun.runtime` logger.
+
+### Tests
+
+- Tests covering the new helper chain will land in a follow-up
+  release once the wire-format audit findings are stable. The
+  fix is a defensive best-effort read; the existing
+  `test_instrumentation_*` suites already pass against the
+  updated paths.
+
+---
+
+Additive patch on top of 0.7.7. Converts two silent fail-OPEN footguns
+into explicit `DeprecationWarning` / `RuntimeError`. No behavior
+change for callers who don't touch the deprecated surface.
+
+### Deprecated
+
+- `NullRunRuntime.start_recording()` and `NullRunRuntime.stop_recording()` now emit `DeprecationWarning`. They have been silent no-op stubs since Sprint 2.1 (0.4.0). Decision history is available via the backend dashboard at `/control-center/decision-history`. **Both methods will be removed in 0.9.0.**
+- Setting `NULLRUN_USE_GRPC=1` now raises `RuntimeError` at SDK init instead of silently falling back to HTTP with an info log. gRPC transport remains on the roadmap but is not yet implemented. Unset the env var to use HTTP. See https://docs.nullrun.io/reference/sdk-api#transport
+
+### Migration
+
+- Replace `runtime.start_recording(workflow_id, metadata=...)` with a dashboard navigation or `nullrun.status()` introspection.
+- Remove any `NULLRUN_USE_GRPC` env var from deployment configs (Docker compose, k8s manifests, systemd units).
+- Catch `RuntimeError` at SDK init if you want to keep the env var as a feature flag — but the recommended path is to unset it.
+
+---
+
 ## [0.7.8] - 2026-06-28
 
 Additive patch on top of 0.7.7. Converts two silent fail-OPEN footguns

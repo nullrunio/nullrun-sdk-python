@@ -467,12 +467,35 @@ class NullRunCallback(BaseCallbackHandler):
 
         Extracts usage data and sends to backend for cost computation.
         Does NOT compute cost - backend is source of truth.
+
+        Audit 2026-06-28 (SDK↔backend wire): the previous version pulled
+        ``model_name`` exclusively from ``invocation_params`` with a
+        hard fallback to the literal string ``"unknown"``. When langchain
+        1.x stopped forwarding ``invocation_params`` to ``on_llm_end``,
+        every track event carried ``model="unknown"`` and the backend
+        cost pipeline fell through to ``DEFAULT_RATE``. Now we try
+        ``invocation_params.model_name`` first, then fall back to
+        reading the real model id from the response object itself
+        (``response.response_metadata['model_name']`` or the AIMessage
+        on the LLMResult generation). ``"unknown"`` is now a true last
+        resort, not the common case.
         """
         try:
-            # Extract provider/model from invocation params
-            invocation_params = kwargs.get('invocation_params', {})
-            model = invocation_params.get('model_name', 'unknown')
-            provider = invocation_params.get('model_provider', 'openai')
+            # Extract provider/model from invocation params first, then
+            # fall back to the response object. This matches the
+            # best-effort pattern used by ``_get_finish_reason`` /
+            # ``_extract_tool_names`` for the same response.
+            invocation_params = kwargs.get('invocation_params') or {}
+            model = (
+                invocation_params.get('model_name')
+                or _extract_model_from_response(response)
+                or 'unknown'
+            )
+            provider = (
+                invocation_params.get('model_provider')
+                or _extract_provider_from_response(response)
+                or 'openai'
+            )
 
             # Extract usage (normalized format)
             usage = extract_usage_from_response(response, provider, model)
@@ -669,4 +692,102 @@ def _extract_node_name(serialized: Any, default: str) -> str:
     if isinstance(name, str):
         return name
     return default
+
+
+# ---------------------------------------------------------------------------
+# Audit 2026-06-28 (SDK↔backend wire): model_name on the callback path
+# ---------------------------------------------------------------------------
+# Pre-fix: ``on_llm_end`` pulled ``model_name`` exclusively from
+# ``kwargs['invocation_params']`` with a hard fallback to the literal
+# string ``"unknown"``. When langchain 1.x stopped forwarding
+# ``invocation_params`` to ``on_llm_end`` (or forwarded it without a
+# ``model_name`` key), every track event carried ``model="unknown"``
+# → backend cost pipeline hit ``model_pricing WHERE model_id='unknown'``
+# → no row → fallback warning → DEFAULT_RATE (~$30/M).
+#
+# Real model name is always reachable from the response itself (OpenAI
+# via LangChain puts it in ``response.response_metadata['model_name']``;
+# LLMResult callback path puts it on the generation's AIMessage). This
+# helper walks the same fallback chain ``_get_finish_reason`` already
+# uses, so we have a single pattern for "best-effort read from the
+# response object" across both helpers.
+
+def _extract_model_from_response(response: Any) -> str | None:
+    """Best-effort model extraction mirroring ``_get_finish_reason``.
+
+    Returns the first non-empty value found, or ``None`` if every known
+    source is empty / malformed.
+
+    Sources checked, in order:
+
+    1. ``response.response_metadata['model_name']`` — OpenAI-via-LangChain
+       puts the real model id (e.g. ``"gpt-4.1-mini-2025-04-14"``) here.
+    2. ``response.generations[0][0].message.response_metadata['model_name']``
+       — LLMResult callback path where the metadata lives on the AIMessage
+       rather than the LLMResult itself.
+    3. ``response.llm_output['model_name']`` — legacy LLMResult where the
+       chat-model wrapper hoisted the field onto the LLMResult dict.
+    4. ``response.model`` / ``response.model_name`` — direct attributes
+       on the response object (rare but seen in some custom wrappers).
+    """
+    # 1. response_metadata on the response.
+    resp_meta = getattr(response, "response_metadata", None)
+    if isinstance(resp_meta, dict):
+        val = resp_meta.get("model_name") or resp_meta.get("model")
+        if val:
+            return str(val)
+
+    # 2. LLMResult callback path — look on the generation's AIMessage.
+    gen_msg = _safe_get_gen_message(response)
+    if gen_msg is not None:
+        gm = getattr(gen_msg, "response_metadata", None)
+        if isinstance(gm, dict):
+            val = gm.get("model_name") or gm.get("model")
+            if val:
+                return str(val)
+        # Some wrappers put the model name directly on the AIMessage.
+        for attr in ("model_name", "model"):
+            v = getattr(gen_msg, attr, None)
+            if v:
+                return str(v)
+
+    # 3. llm_output dict (legacy LLMResult).
+    llm_out = getattr(response, "llm_output", None)
+    if isinstance(llm_out, dict):
+        val = llm_out.get("model_name") or llm_out.get("model")
+        if val:
+            return str(val)
+
+    # 4. Direct attribute on response.
+    for attr in ("model_name", "model"):
+        v = getattr(response, attr, None)
+        if v:
+            return str(v)
+
+    return None
+
+
+def _extract_provider_from_response(response: Any) -> str | None:
+    """Best-effort provider extraction mirroring ``_extract_model_from_response``.
+
+    Same fallback chain — ``model_provider`` is what langchain passes
+    in ``invocation_params`` and what we want to read from response
+    metadata when invocation_params is absent. Returns ``None`` if
+    nothing is found so the caller keeps the default ('openai').
+    """
+    resp_meta = getattr(response, "response_metadata", None)
+    if isinstance(resp_meta, dict):
+        val = resp_meta.get("model_provider") or resp_meta.get("provider")
+        if val:
+            return str(val)
+
+    gen_msg = _safe_get_gen_message(response)
+    if gen_msg is not None:
+        gm = getattr(gen_msg, "response_metadata", None)
+        if isinstance(gm, dict):
+            val = gm.get("model_provider") or gm.get("provider")
+            if val:
+                return str(val)
+
+    return None
 

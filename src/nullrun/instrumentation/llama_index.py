@@ -50,17 +50,36 @@ def patch_llama_index(runtime: Any) -> bool:
             total = int(usage.get("total_tokens", 0) or 0) or (prompt + completion)
             if not (prompt or completion or total):
                 return
-            runtime.track(
-                {
-                    "type": "llm_call",
-                    "provider": "llama_index",
-                    "model": getattr(event.response, "model", None),
-                    "tokens": total,
-                    "input_tokens": prompt,
-                    "output_tokens": completion,
-                    "has_usage": True,
-                }
+            # Audit 2026-06-28 (SDK↔backend wire): model used to come
+            # only from ``event.response.model`` with a bare ``None``
+            # fallback — mock providers and some adapters don't
+            # populate ``.model`` on ChatResponse, which sent
+            # ``model=None`` to the backend → ``unwrap_or("default")``
+            # → fallback warning. Walk the same chain
+            # ``_extract_model_from_response`` uses in langgraph.py:
+            #   1. ``event.response.model`` — llama-index ChatResponse
+            #   2. ``event.response.raw.model`` — OpenAI-style nested
+            #      response object on the raw attribute
+            #   3. ``usage.model`` — provider dict sometimes carries it
+            # Empty / None values are dropped — only set ``model`` on
+            # the event when we have a real string.
+            response = event.response
+            model = (
+                getattr(response, "model", None)
+                or getattr(getattr(response, "raw", None), "model", None)
+                or (usage.get("model") if isinstance(usage, dict) else None)
             )
+            event_dict: dict[str, Any] = {
+                "type": "llm_call",
+                "provider": "llama_index",
+                "tokens": total,
+                "input_tokens": prompt,
+                "output_tokens": completion,
+                "has_usage": True,
+            }
+            if model:
+                event_dict["model"] = model
+            runtime.track(event_dict)
         except Exception as e:  # pragma: no cover - defensive
             logger.debug("llama_index on_chat_end: %s", e)
 
