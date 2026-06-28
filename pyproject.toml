@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "nullrun"
-version = "0.7.8"
+version = "0.8.0"
 # Long form used by PyPI page meta-description and search snippets.
 # Kept under the 200-char preview threshold so the full line is visible
 # without an "expand" click. Keywords are matched against likely search

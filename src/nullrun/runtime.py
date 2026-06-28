@@ -1416,10 +1416,38 @@ class NullRunRuntime:
 
         # Buffer for transport. The wire payload must NOT include
         # any field in ``_WIRE_STRIP_FIELDS`` -- see that constant's
-        # docstring for the privacy rationale per field.
+        # docstring for the privacy rationale per field. We also drop
+        # ``None`` values: putting ``{"model": null}`` on the wire
+        # triggers backend ``unwrap_or("default")`` and a fallback
+        # warning. Backend handles missing key as well as null, and
+        # dropping None here keeps the diagnostic signal loud (the
+        # warning below fires on missing-key, which is what we want
+        # to see in operator logs) instead of silent (the JSON null
+        # case).
         wire_event = {
-            k: v for k, v in enriched.items() if k not in _WIRE_STRIP_FIELDS
+            k: v
+            for k, v in enriched.items()
+            if k not in _WIRE_STRIP_FIELDS and v is not None
         }
+
+        # Audit 2026-06-28 (SDK↔backend wire): backend cost pipeline
+        # emits ``WARN model_id=default`` whenever an llm_call event
+        # reaches the wire without a ``model`` field
+        # (pipeline.rs:164 ``unwrap_or("default")``). This log lets
+        # operators reproduce the path: which observation (httpx /
+        # langchain callback / manual track / agents tracer / requests)
+        # produced an llm_call without ``model`` set, and whether
+        # the SDK explicitly passed ``model=None``, omitted the key,
+        # or had ``model=""`` (which the ``if model:`` guard in
+        # track_llm silently drops). Activated only for llm_call so
+        # span_start/span_end/tool_call traffic doesn't pollute logs.
+        if wire_event.get("type") == "llm_call" and not wire_event.get("model"):
+            logger.warning(
+                "track(): llm_call event missing 'model' field — "
+                "backend will fall back to DEFAULT_RATE. event=%s",
+                wire_event,
+            )
+
         self._transport.track(wire_event)
 
         # Update metrics (thread-safe)
