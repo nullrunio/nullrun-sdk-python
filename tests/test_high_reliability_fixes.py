@@ -103,7 +103,13 @@ def test_fetch_remote_state_uses_transport_client(monkeypatch):
     runtime._transport._client = FakeClient()
     runtime._fetch_remote_state("wf-1")
     assert len(called) == 1
-    assert "/api/v1/orgs/00000000-0000-0000-0000-000000000abc/workflows/wf-1" in called[0]
+    # Audit P1.1 (2026-06-28): swapped to /api/v1/status/{wf_id} so SDK
+    # auth (X-API-Key) is accepted. The org-scoped dashboard route
+    # requires Bearer session and 401'd SDK clients silently.
+    assert called[0].endswith("/api/v1/status/wf-1"), (
+        f"unexpected remote-state URL: {called[0]}"
+    )
+    assert "/orgs/" not in called[0]
 
 
 # ===========================================================================

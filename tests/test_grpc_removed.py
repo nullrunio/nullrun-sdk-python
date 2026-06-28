@@ -8,8 +8,10 @@ gRPC-related symbols at runtime.
 
 This test pins the post-deletion contract:
   1. ``NullRunRuntime`` does not carry a ``_grpc_transport`` attribute.
-  2. Setting ``NULLRUN_USE_GRPC=1`` does NOT crash init — it logs
-     an INFO line and silently falls back to HTTP.
+  2. Setting ``NULLRUN_USE_GRPC=1`` raises ``RuntimeError`` at SDK
+     init (was: silent no-op + INFO log in 0.3.1–0.7.7; fail-LOUD
+     as of 0.7.8 so customers can't silently ship a non-functional
+     SDK to prod).
   3. ``grpcio`` is NOT a hard dep — the ``pyproject.toml`` only
      lists ``httpx``.
 
@@ -21,8 +23,9 @@ metadata breaks).
 
 from __future__ import annotations
 
-import logging
 from pathlib import Path
+
+import pytest
 
 BASE_URL = "https://api.test.nullrun.io"
 
@@ -59,29 +62,34 @@ class TestGrpcRemoved:
             "gRPC transport is frozen at the platform side."
         )
 
-    def test_nullrun_use_grpc_does_not_crash_init(self, make_runtime, monkeypatch, caplog):
-        """Setting NULLRUN_USE_GRPC=1 must NOT raise NameError.
+    def test_nullrun_use_grpc_raises_runtime_error(self, make_runtime, monkeypatch):
+        """Setting NULLRUN_USE_GRPC=1 must raise RuntimeError at SDK init.
 
-        Pre-fix: NullRunRuntime.__init__ called ``create_grpc_transport(...)``
-        which did not exist, so init crashed with NameError before
-        reaching the warning log. The test now expects:
-          1. init succeeds,
-          2. an INFO line is logged about gRPC being a no-op,
-          3. the runtime is fully usable.
+        Contract evolution:
+          * 0.3.1: NullRunRuntime.__init__ called ``create_grpc_transport(...)``
+            which did not exist, so init crashed with NameError before
+            reaching any user code. Silent broken prod.
+          * 0.3.1 – 0.7.7: silent no-op + INFO log on nullrun.runtime.
+            Still broken, just harder to diagnose from a missing proto
+            trace in the dashboard.
+          * 0.7.8: explicit RuntimeError so the misconfiguration is
+            visible at startup. The CHANGELOG entry under "Deprecated"
+            tells the operator to unset the env var.
+
+        The test pins the 0.7.8 contract: setting the env var must
+        raise with a message that names the offending variable and
+        points the operator at the docs page.
         """
         monkeypatch.setenv("NULLRUN_USE_GRPC", "1")
-        with caplog.at_level(logging.INFO, logger="nullrun.runtime"):
-            rt = make_runtime()
-        assert rt is not None
-        # The no-op INFO log must be present so an operator who set
-        # the env var sees that nothing happened.
-        assert any(
-            "NULLRUN_USE_GRPC" in r.getMessage() and r.levelno == logging.INFO
-            for r in caplog.records
-        ), (
-            "Expected an INFO log on nullrun.runtime mentioning "
-            "NULLRUN_USE_GRPC. Got: "
-            f"{[(r.levelname, r.getMessage()) for r in caplog.records]}"
+        with pytest.raises(RuntimeError) as exc_info:
+            make_runtime()
+        msg = str(exc_info.value)
+        assert "NULLRUN_USE_GRPC" in msg, (
+            f"RuntimeError must name the offending env var. Got: {msg!r}"
+        )
+        assert "https://docs.nullrun.io" in msg, (
+            "RuntimeError must point operators at the docs page that "
+            "explains the migration. Got: " + repr(msg)
         )
 
     def test_pyproject_has_no_grpcio_hard_dep(self):

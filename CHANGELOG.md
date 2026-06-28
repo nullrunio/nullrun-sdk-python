@@ -7,6 +7,25 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [0.7.8] - 2026-06-28
+
+Additive patch on top of 0.7.7. Converts two silent fail-OPEN footguns
+into explicit `DeprecationWarning` / `RuntimeError`. No behavior
+change for callers who don't touch the deprecated surface.
+
+### Deprecated
+
+- `NullRunRuntime.start_recording()` and `NullRunRuntime.stop_recording()` now emit `DeprecationWarning`. They have been silent no-op stubs since Sprint 2.1 (0.4.0). Decision history is available via the backend dashboard at `/control-center/decision-history`. **Both methods will be removed in 0.9.0.**
+- Setting `NULLRUN_USE_GRPC=1` now raises `RuntimeError` at SDK init instead of silently falling back to HTTP with an info log. gRPC transport remains on the roadmap but is not yet implemented. Unset the env var to use HTTP. See https://docs.nullrun.io/reference/sdk-api#transport
+
+### Migration
+
+- Replace `runtime.start_recording(workflow_id, metadata=...)` with a dashboard navigation or `nullrun.status()` introspection.
+- Remove any `NULLRUN_USE_GRPC` env var from deployment configs (Docker compose, k8s manifests, systemd units).
+- Catch `RuntimeError` at SDK init if you want to keep the env var as a feature flag — but the recommended path is to unset it.
+
+---
+
 ## [0.7.7] - 2026-06-27
 
 Additive patch on top of 0.7.6. Fixes the `/gate` pre-flight so the
