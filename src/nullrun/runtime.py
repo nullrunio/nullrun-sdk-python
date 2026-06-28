@@ -34,10 +34,10 @@ for the full rules, including transport error classification
 import asyncio
 import logging
 import os
-import warnings
 import threading
 import time
 import uuid
+import warnings
 from collections.abc import Callable
 from typing import Any, Optional
 
