@@ -83,9 +83,16 @@ class TestAuthorizationHeaderOnPost:
 
 class TestRemoteStateFetchContract:
     """Pin the SDK remote-state URL so the legacy HTTP-poll fallback
-    hits a route that actually exists."""
+    hits a route that actually exists.
 
-    def test_remote_state_url_is_org_scoped(self):
+    2026-06-28 audit P1.1: swapped from
+    ``/api/v1/orgs/{org_id}/workflows/{wf_id}`` (the DASHBOARD route —
+    requires Bearer session, returned 401 to SDK clients that only
+    send X-API-Key) to ``/api/v1/status/{wf_id}`` (the SDK-polling
+    route at backend/src/proxy/handlers.rs:9758, accepts X-API-Key).
+    """
+
+    def test_remote_state_url_uses_status_endpoint(self):
         from nullrun.runtime import NullRunRuntime
 
         rt = NullRunRuntime(api_key="nr_live_x", _test_mode=True)
@@ -110,8 +117,12 @@ class TestRemoteStateFetchContract:
             rt._fetch_remote_state("wf-abc-123")
 
             assert captured["url"].endswith(
-                "/api/v1/orgs/00000000-0000-0000-0000-000000000002/workflows/wf-abc-123"
+                "/api/v1/status/wf-abc-123"
             ), f"unexpected remote-state URL: {captured['url']}"
+            # The SDK-polling route does NOT require org_id in the URL
+            # path. Setting it should still be a no-op for this endpoint.
+            assert "organization_id" not in captured["url"]
+            assert "/orgs/" not in captured["url"]
         finally:
             rt.shutdown()
 

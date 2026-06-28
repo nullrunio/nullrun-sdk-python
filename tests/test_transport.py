@@ -37,13 +37,16 @@ class TestTransport:
         assert route.called
 
     @respx.mock
-    def test_send_batch_includes_api_version_header(self, transport):
+    def test_send_batch_does_not_emit_x_api_version(self, transport):
+        """2026-06-27 audit P2.1: X-API-Version is dead — backend has
+        no reader. We stopped emitting it. See audit notes.
+        """
         route = respx.post("https://api.test.nullrun.io/api/v1/track/batch").mock(
             return_value=httpx.Response(200, json={})
         )
         transport._send_batch_with_retry_info([{"event": "test"}])
         request = route.calls.last.request
-        assert "X-API-Version" in request.headers
+        assert "X-API-Version" not in request.headers
 
     @respx.mock
     def test_send_batch_includes_auth_header(self, transport):

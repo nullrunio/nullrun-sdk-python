@@ -83,6 +83,92 @@ class TestGenerateHmacSignature:
         assert len(sig1) == 64  # SHA-256 hex
 
 
+class TestHmacBodyTypeParity:
+    """generate_hmac_signature accepts both ``str`` and ``bytes`` bodies
+    and produces identical signatures for equivalent payloads.
+
+    2026-06-27 regression guard: the /api/v1/track/batch flush path
+    passes the canonical wire bytes (from ``_signed_request_body``)
+    directly to the signer. A previous version of generate_hmac_signature
+    did ``body.encode("utf-8")`` unconditionally, which raised
+    ``AttributeError: 'bytes' object has no attribute 'encode'`` and
+    silently killed every analytics event -- the backend then logged
+    "missing signature headers" on the next batch retry because nothing
+    was ever sent.
+    """
+
+    def test_bytes_body_produces_same_signature_as_str_body(self):
+        """Signing the ``str`` form and the ``bytes`` form of the same
+        payload MUST produce identical HMAC signatures.
+
+        This is the load-bearing invariant: if these diverge, then
+        ``httpx.post(content=bytes_body)`` would put different bytes
+        on the wire than the signature was computed over, and the
+        Rust backend at ``backend/src/auth/hmac.rs:466-518`` would
+        reject the request with 401.
+        """
+        api_key = "nr_test_key_abc"
+        secret = "sk_test_secret_xyz"
+        timestamp = 1700000000
+        body_str = '{"events":[{"type":"parity","value":42}]}'
+        body_bytes = body_str.encode("utf-8")
+
+        sig_from_str = generate_hmac_signature(api_key, secret, timestamp, body_str)
+        sig_from_bytes = generate_hmac_signature(api_key, secret, timestamp, body_bytes)
+
+        assert sig_from_str == sig_from_bytes
+        assert len(sig_from_bytes) == 64  # SHA-256 hex digest
+
+    def test_bytes_body_does_not_raise_attribute_error(self):
+        """Regression guard for the 2026-06-27 /track/batch AttributeError.
+
+        Pre-fix code did ``body.encode("utf-8")`` on what was already
+        ``bytes`` -- this test would have raised ``AttributeError``.
+        """
+        api_key = "k"
+        secret = "s"
+        timestamp = 1700000000
+        body_bytes = b'{"events":[]}'
+
+        # Must not raise
+        sig = generate_hmac_signature(api_key, secret, timestamp, body_bytes)
+        assert isinstance(sig, str)
+        assert len(sig) == 64
+
+    def test_signature_from_bytes_verifies_against_str_body(self):
+        """End-to-end cross-form check: a signature computed over
+        ``bytes`` is verifiable against the ``str`` form of the same
+        body. This proves the two representations are fully
+        interchangeable -- the verify_hmac_signature path (which
+        still takes ``str``) keeps working with signatures produced
+        by the bytes path (which is what /track/batch uses).
+        """
+        api_key = "k"
+        secret = "s"
+        timestamp = int(time.time())
+        body_str = '{"events":[{"type":"cross","value":1}]}'
+        body_bytes = body_str.encode("utf-8")
+
+        # Sign over bytes (canonical /track/batch path)
+        sig = generate_hmac_signature(api_key, secret, timestamp, body_bytes)
+
+        # Verify using str (the verify_hmac_signature public API)
+        assert verify_hmac_signature(api_key, secret, timestamp, body_str, sig)
+
+    def test_str_and_bytes_produce_distinct_signatures_for_distinct_payloads(self):
+        """Sanity negative: if the body content differs, signatures
+        differ -- the parity above is not because both inputs are
+        being coerced to the same constant.
+        """
+        api_key = "k"
+        secret = "s"
+        timestamp = 1700000000
+
+        sig_a = generate_hmac_signature(api_key, secret, timestamp, "alpha")
+        sig_b = generate_hmac_signature(api_key, secret, timestamp, b"beta")
+        assert sig_a != sig_b
+
+
 class TestVerifyHmacSignature:
     """The verify function accepts canonical signatures and rejects tampered ones."""
 
@@ -190,14 +276,15 @@ class TestBuildSignedHeaders:
         headers = t._build_signed_headers("body")
         assert headers["X-API-Key"] == "nr_live_xyz"
 
-    def test_always_includes_x_api_version(self, transport_factory):
-        """X-API-Version is always set to the package version."""
+    def test_does_not_emit_x_api_version_header(self, transport_factory):
+        """2026-06-27 audit: backend has zero readers for X-API-Version
+        (not in CORS allowlist, not in any middleware). The header was
+        ~14 bytes/request wasted; we stopped emitting it. See audit
+        P2.1.
+        """
         t = transport_factory()
         headers = t._build_signed_headers("body")
-        assert "X-API-Version" in headers
-        from nullrun.transport import __api_version__
-
-        assert headers["X-API-Version"] == __api_version__
+        assert "X-API-Version" not in headers
 
     def test_extra_headers_override_defaults(self, transport_factory):
         """The extra_headers dict is merged ON TOP of the defaults."""
@@ -215,9 +302,9 @@ class TestBuildSignedHeaders:
         headers = t._build_signed_headers(None)
         assert "X-Signature" not in headers
         assert "X-Signature-Timestamp" not in headers
-        # But X-API-Key / X-API-Version still present
+        # But X-API-Key still present (X-API-Version removed 2026-06-27)
         assert "X-API-Key" in headers
-        assert "X-API-Version" in headers
+        assert "X-API-Version" not in headers
 
 
 # ──────────────────────────────────────────────────────────────────────

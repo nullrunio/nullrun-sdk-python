@@ -99,7 +99,7 @@ def generate_hmac_signature(
     api_key: str,
     secret_key: str,
     timestamp: int,
-    body: str,
+    body: str | bytes,
 ) -> str:
     """
     Generate HMAC-SHA256 signature for request authentication.
@@ -116,12 +116,24 @@ def generate_hmac_signature(
         api_key: Client's API key (identifier)
         secret_key: Client's secret key (used for HMAC)
         timestamp: Unix timestamp in seconds
-        body: Request body as JSON string
+        body: Request body as JSON string (``str``) or the already-encoded
+            wire bytes (``bytes``) returned by ``_signed_request_body``.
+            The bytes form is canonical: signing the exact bytes that go
+            on the wire eliminates any drift between ``json.dumps(...)``
+            output and what httpx actually sends via ``content=...``.
 
     Returns:
         Hex-encoded HMAC-SHA256 signature
     """
-    body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    # 2026-06-27: accept both ``str`` (legacy callers + verify_hmac_signature
+    # path which decodes the request body) and ``bytes`` (the four signed
+    # POST call sites that serialise via ``_signed_request_body`` and pass
+    # the wire bytes directly). Encoding twice (``.encode()`` on bytes)
+    # raised AttributeError on the /track/batch flush loop and silently
+    # killed every analytics event -- the backend then logged "missing
+    # signature headers" on the next batch retry because nothing was sent.
+    body_bytes = body.encode("utf-8") if isinstance(body, str) else body
+    body_hash = hashlib.sha256(body_bytes).hexdigest()
     message = f"{timestamp}:{api_key}:{body_hash}"
 
     signature = hmac.new(
@@ -180,9 +192,10 @@ def _signed_request_body(payload: dict[str, Any]) -> bytes:
     """Serialise a JSON payload to the canonical bytes the HMAC
     signature is computed over.
 
-    All three signed POST call sites (``_send_batch_with_retry_info``,
-    ``Transport.execute``, ``Transport.check``) MUST serialise via this
-    helper and pass the result with ``content=body`` to
+    All four signed POST call sites -- ``Transport.track`` (batched
+    via ``_send_batch_with_retry_info``), ``Transport.gate``,
+    ``Transport.check``, and ``Transport.execute`` -- MUST serialise
+    via this helper and pass the result with ``content=body`` to
     ``httpx.Client.post``. Sending via ``json=...`` lets httpx
     re-serialise with its default compact separators, which produces
     a body that does NOT match the body the HMAC signature was
@@ -897,13 +910,20 @@ class Transport:
         retry_after_ms: float | None = None
         is_policy_limit: bool = False
 
-    def _add_hmac_headers(self, headers: dict[str, str], body: str) -> None:
+    def _add_hmac_headers(self, headers: dict[str, str], body: str | bytes) -> None:
         """
         Add HMAC signing headers to request.
 
         Adds:
         - X-Signature-Timestamp: Unix timestamp for freshness
         - X-Signature: HMAC-SHA256(api_key, secret, timestamp, body_hash)
+
+        ``body`` is the canonical wire form returned by
+        ``_signed_request_body`` (``bytes``); passing it through
+        without an intermediate ``.decode("utf-8")`` is what makes
+        the signed payload match what httpx actually puts on the
+        wire via ``content=body``. ``str`` is still accepted so the
+        verify / legacy paths keep working.
 
         Only adds signature if secret_key is configured.
         """
@@ -934,7 +954,6 @@ class Transport:
 
         Always includes:
         - Content-Type: application/json
-        - X-API-Version: __api_version__
         - X-API-Key: when api_key is set
 
         Adds HMAC signature headers when secret_key is set and a
@@ -945,7 +964,6 @@ class Transport:
         """
         headers: dict[str, str] = {
             "Content-Type": "application/json",
-            "X-API-Version": __api_version__,
         }
         if self.api_key:
             headers["X-API-Key"] = self.api_key
@@ -968,9 +986,13 @@ class Transport:
             # cross-site requests, so this is not a CSRF regression.
             headers["Authorization"] = f"Bearer {self.api_key}"
         if body is not None and self.secret_key and self.api_key:
-            body_str = body if isinstance(body, str) else body.decode("utf-8")
             timestamp = int(time.time())
-            signature = generate_hmac_signature(self.api_key, self.secret_key, timestamp, body_str)
+            # 2026-06-27: generate_hmac_signature accepts ``str | bytes``
+            # natively, so we pass the wire form through without an
+            # intermediate ``.decode("utf-8")`` round-trip. Signing the
+            # exact bytes that go on the wire is the whole point of the
+            # canonical ``_signed_request_body`` helper.
+            signature = generate_hmac_signature(self.api_key, self.secret_key, timestamp, body)
             headers["X-Signature-Timestamp"] = str(timestamp)
             headers["X-Signature"] = signature
         if extra:
@@ -1035,7 +1057,7 @@ class Transport:
         audit_result.md §16.B (P0 #2).
         """
         logger.debug(f"Sending batch of {len(batch)} events to {self.api_url}/api/v1/track/batch")
-        headers = {"Content-Type": "application/json", "X-API-Version": __api_version__}
+        headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["X-API-Key"] = self.api_key
             # FIX-F3: Bearer header for CSRF bypass (see _build_signed_headers).
@@ -1146,9 +1168,13 @@ class Transport:
         # the whole loop.
         try:
             data = response.json()
-            actions = data.get("actions")
-            if actions is None:
-                actions = data.get("actions_taken", [])
+            # 2026-06-28 audit P2.4: backend renamed ``actions_taken``
+            # → ``messages`` on 2026-06-27 (see
+            # backend/src/proxy/handlers.rs:5375-5376 — the legacy field
+            # was misleadingly typed as Vec<String> and crashed SDK's
+            # action.get("type") dispatch). The legacy ``actions_taken``
+            # fallback below is therefore dead and was removed.
+            actions = data.get("actions") or []
             for action in actions:
                 try:
                     if not isinstance(action, dict):
@@ -1260,7 +1286,7 @@ class Transport:
             "operation_id": operation_id or str(uuid.uuid4()),
         }
 
-        headers = {"Content-Type": "application/json", "X-API-Version": __api_version__}
+        headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["X-API-Key"] = self.api_key
             # FIX-F3: Bearer header for CSRF bypass (see _build_signed_headers).
@@ -1270,7 +1296,7 @@ class Transport:
         # via content=body so the wire bytes match the signed bytes.
         # See ``_signed_request_body`` for the rationale.
         body = _signed_request_body(gate_request)
-        self._add_hmac_headers(headers, body.decode("utf-8"))
+        self._add_hmac_headers(headers, body)
 
         # Inject trace context for distributed tracing (W3C Trace Context)
         self._inject_trace_context(headers)
@@ -1438,12 +1464,11 @@ class Transport:
             headers["X-API-Key"] = self.api_key
             # FIX-F3: Bearer header for CSRF bypass (see _build_signed_headers).
             headers["Authorization"] = f"Bearer {self.api_key}"
-        headers["X-API-Version"] = __api_version__
 
         # HMAC fix: serialise via the canonical-bytes helper and send
         # via content=body so the wire bytes match the signed bytes.
         body = _signed_request_body(gate_request)
-        self._add_hmac_headers(headers, body.decode("utf-8"))
+        self._add_hmac_headers(headers, body)
 
         # Inject trace context for distributed tracing (W3C Trace Context)
         self._inject_trace_context(headers)
@@ -1621,7 +1646,7 @@ class Transport:
             }
             # Re-use the same HMAC headers as /gate and /track so
             # the server's auth-verify path is consistent.
-            self._add_hmac_headers(headers, body.decode("utf-8"))
+            self._add_hmac_headers(headers, body)
 
             response = self._client.post(
                 # P0 #5: contract drift — other auth-verify call sites
@@ -1647,29 +1672,32 @@ class Transport:
             logger.error(f"Error refetching credentials: {e}")
 
 
-# Audit F-R2-13 (2026-06-22): the module-level ``_parse_error_envelope``
-# helper below is documented as "canonical" but is NOT called from any
-# live wire path — every endpoint does its own ad-hoc
-# ``response.raise_for_status()`` or status-code branch.
+# ADR (2026-06-28, audit P2.2 close): ``_parse_error_envelope`` below
+# is INTENTIONALLY dead code — a frozen contract test for the canonical
+# envelope→exception mapping. Audit F-R2-13 (2026-06-22) flagged it as
+# drift; the resolution was to mark it stable rather than wire it up.
 #
-# The audit's recommendation was "either delete the helper (it's
-# misleading), OR wire it up everywhere". We chose "keep but mark
-# test-only" because:
-#
+# Rationale for keeping it as dead code instead of deleting:
 #   1. ``tests/test_error_envelope.py`` and
 #      ``tests/test_transport_branches.py`` import this helper as a
-#      pure-function reference for the canonical envelope→exception
-#      mapping (the test fixtures encode the contract that a future
-#      refactor will need to match).
-#   2. Tests are documentation. Deleting it forces the tests to
-#      duplicate the mapping table, which is exactly the kind of
-#      drift the helper exists to prevent.
+#      pure-function reference for the canonical mapping table the
+#      tests encode. Deleting the helper would force the tests to
+#      duplicate the mapping, which is exactly the kind of drift the
+#      helper exists to prevent.
+#   2. Live SDK endpoints each do their own ``raise_for_status()`` or
+#      status-code branch because the production error_code taxonomy
+#      (``NR-A003``, ``NR-B001``, …) is intentionally separate from
+#      the backend's SCREAMING_SNAKE envelope codes. Wiring the
+#      helper into the wire path would require picking one
+#      taxonomy, and neither is wrong — they serve different
+#      audiences (machine triage vs. end-user message).
 #
-# DO NOT add a new caller that uses this helper from the SDK wire
-# path until every endpoint is refactored to route through it. The
-# helper is currently a frozen contract test, not a live translator.
-# If you wire it up everywhere, delete this comment and rename to a
-# non-underscored name (it's no longer private).
+# DO NOT call this from a wire path without first deciding which
+# taxonomy wins. If you ever do wire it up, delete this ADR block
+# and rename to a non-underscored name (it's no longer private).
+#
+# Marked with a final ``__all__ = []`` exclusion in spirit (the
+# leading underscore); treat any new caller as a refactor signal.
 def _parse_error_envelope(
     response: httpx.Response,
     endpoint: str,

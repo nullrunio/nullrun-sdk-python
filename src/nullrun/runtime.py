@@ -37,6 +37,7 @@ import os
 import threading
 import time
 import uuid
+import warnings
 from collections.abc import Callable
 from typing import Any, Optional
 
@@ -317,11 +318,17 @@ class NullRunRuntime:
         # gRPC server at the platform is intentionally frozen until the
         # activation checklist (TLS, auth, proto extensions, cost pipeline
         # parity, tests) is complete. The SDK no longer attempts to construct
-        # a gRPC client. NULLRUN_USE_GRPC is a silent no-op.
+        # a gRPC client.
+        # FIX 2026-06-28: was a silent no-op (logger.info) — customers who
+        # set NULLRUN_USE_GRPC expecting gRPC silently fell back to HTTP with
+        # no signal. Now we raise loudly so the misconfiguration is visible
+        # at startup instead of being diagnosed from a missing proto trace.
         if os.getenv("NULLRUN_USE_GRPC"):
-            logger.info(
+            raise RuntimeError(
                 "NULLRUN_USE_GRPC is set but the gRPC transport is not "
-                "implemented in this SDK version; falling back to HTTP."
+                "yet implemented. This option is reserved for a future "
+                "release. Unset the env var to use the HTTP transport. "
+                "See https://docs.nullrun.io/reference/sdk-api#transport"
             )
 
         # Initialize
@@ -691,10 +698,18 @@ class NullRunRuntime:
 
         logger.debug(f"Authenticating with API at {self.api_url}/auth/verify")
         try:
-            # Use Transport's client for connection pooling, retry, and circuit breaker
-            response = self._transport._client.post(
+            # 2026-06-28 audit P2.3: retry transient 503/504 + network blips
+            # during init. Backend emits 503 + Retry-After: 5 on transient
+            # DB error (backend/src/proxy/handlers.rs:11346-11351). Pre-fix
+            # the first 503 surfaced as NR-A001 to the user as if their API
+            # key were bad. Three attempts, exponential backoff (0.5s → 1s
+            # → 2s), honor Retry-After when present. Auth-key failures (401)
+            # are NOT retried — the key is wrong on attempt 1 means it's
+            # wrong on attempt 3.
+            response = self._post_auth_with_retry(
                 f"{self.api_url}/api/v1/auth/verify",
-                json={"api_key": self.api_key},
+                json_body={"api_key": self.api_key},
+                max_attempts=3,
             )
 
             if response.status_code == 200:
@@ -1001,35 +1016,31 @@ class NullRunRuntime:
             self._remote_states[workflow_id] = dict(state)
 
     def _fetch_remote_state(self, workflow_id: str) -> None:
-        """Fetch remote state for a specific workflow via the org-scoped
-        workflow endpoint.
+        """Fetch remote state for a specific workflow.
 
-        Pre-FIX-F2 the SDK hit ``/api/v1/status/{workflow_id}``, which
-        is not a registered route on the backend (the backend exposes
-        per-workflow state via
-        ``GET /api/v1/orgs/{org_id}/workflows/{workflow_id}``). The
-        pre-fix code therefore 404'd every poll and silently fell back
-        to local state — meaning the legacy HTTP-poll path could never
-        observe a remote kill/pause. WS push (the default mode since
+        2026-06-27: target endpoint swapped from
+        ``GET /api/v1/orgs/{org_id}/workflows/{workflow_id}`` (the
+        DASHBOARD route — requires Bearer session cookie, returns 401
+        to SDK clients that only send X-API-Key) to
+        ``GET /api/v1/status/{workflow_id}`` (the SDK-polling route —
+        backend/src/proxy/handlers.rs:9758, accepts X-API-Key OR
+        Authorization: Bearer). Pre-swap the HTTP-poll path silently
+        401'd on every poll, so the legacy HTTP-poll fallback never
+        observed a remote kill/pause. WS push (the default mode since
         Phase 5) does NOT go through this code path, so the WS control
         plane is unaffected.
 
-        Backend ``WorkflowResponse`` (see
-        backend/src/proxy/http/workflows.rs:43) does not surface a
-        numeric ``version`` or ``reason`` for a workflow — those
-        fields are SDK-local only and remain at their cached values
-        when the remote response arrives. ``state`` is the only field
-        the kill/pause check (``check_control_plane``) actually reads,
-        so this is sufficient for correctness.
+        Backend ``StatusResponse`` (handlers.rs:9747-9756) returns
+        ``workflow_id, state, version, reason?, updated_at,
+        current_cost, rate_per_minute``. We only consume ``state`` —
+        ``version`` and ``reason`` are SDK-local fields and remain at
+        their cached values (mirroring the prior behaviour). This is
+        sufficient for ``check_control_plane`` which only reads
+        ``state``.
         """
-        if not self.organization_id:
-            # Legacy HTTP-poll was always org-bound; without org_id we
-            # cannot resolve the right route. Bail silently — the WS
-            # push path remains the authoritative source.
-            return
         try:
             response = self._transport._client.get(
-                f"{self.api_url}/api/v1/orgs/{self.organization_id}/workflows/{workflow_id}",
+                f"{self.api_url}/api/v1/status/{workflow_id}",
                 headers=self._auth_headers(),
                 timeout=5.0,
             )
@@ -1885,19 +1896,29 @@ class NullRunRuntime:
         """
         Start recording events for local decision history.
 
+        .. deprecated:: 0.8.0
+            Decision history moved to the backend dashboard. This method
+            is a no-op stub and will be removed in 0.9.0. Use
+            ``nullrun.status()`` for a per-runtime snapshot or visit
+            https://docs.nullrun.io/concepts/decision-history for the
+            dashboard workflow.
+
         Args:
             workflow_id: ID of the workflow to record
             metadata: Optional metadata about the session
 
         Returns:
-            session_id for this recording
+            session_id for this recording (always ``""`` since 0.4.0)
         """
-        # Sprint 2.1: local decision-history recorder was removed.
-        # This method is kept as a no-op stub for one minor
-        # version to avoid breaking callers that imported it. It
-        # will be deleted in the next release.
-        logger.debug(
-            "runtime.start_recording() is a no-op; decision history moved to the backend dashboard."
+        # FIX 2026-06-28: was a silent no-op with logger.debug. Now emits
+        # DeprecationWarning so customer code that still imports this
+        # surfaces a visible migration signal before deletion in 0.9.0.
+        warnings.warn(
+            "NullRunRuntime.start_recording() is deprecated and will be "
+            "removed in nullrun 0.9.0. Decision history is available via "
+            "the backend dashboard at /control-center/decision-history.",
+            DeprecationWarning,
+            stacklevel=2,
         )
         return ""
 
@@ -1905,10 +1926,19 @@ class NullRunRuntime:
         """
         Stop recording and return the session.
 
+        .. deprecated:: 0.8.0
+            See :meth:`start_recording`. Will be removed in 0.9.0.
+
         Returns:
             The recorded session, or None if not recording
         """
-        # Sprint 2.1: paired no-op stub for start_recording().
+        # FIX 2026-06-28: paired deprecation warning for start_recording().
+        warnings.warn(
+            "NullRunRuntime.stop_recording() is deprecated and will be "
+            "removed in nullrun 0.9.0.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return None
 
     def _enrich_event(self, event: dict[str, Any]) -> dict[str, Any]:
@@ -2105,6 +2135,77 @@ class NullRunRuntime:
 
             event["_fingerprint"] = _fingerprint_for_event_dict(event)
         return self.track(event)
+
+    def _post_auth_with_retry(
+        self,
+        url: str,
+        json_body: dict[str, Any],
+        max_attempts: int = 3,
+    ) -> httpx.Response:
+        """POST ``json_body`` to ``url`` with bounded retry on transient
+        failure.
+
+        2026-06-28 audit P2.3: the init path ``POST /api/v1/auth/verify``
+        previously did a single bare ``self._transport._client.post(...)``
+        call. Backend emits ``503 + Retry-After: 5`` on transient DB
+        errors (see ``backend/src/proxy/handlers.rs:11346-11351``), which
+        pre-fix surfaced to the user as ``NR-A001`` ("configuration
+        issue") even though the SDK was fine and the key was fine —
+        just a Postgres blip. This helper retries 5xx and network
+        errors up to ``max_attempts`` total tries, honors
+        ``Retry-After`` when the backend provides one, and propagates
+        ``httpx.RequestError`` unchanged on the LAST attempt so the
+        existing ``except`` arm below can turn it into ``NR-B001``.
+
+        Auth failures (401/403/422) are NOT retried — the API key is
+        wrong on attempt 1 means it's wrong on attempt 3.
+        """
+        import time as _time
+
+        last_exc: httpx.RequestError | None = None
+        for attempt in range(max_attempts):
+            try:
+                response = self._transport._client.post(url, json=json_body)
+            except httpx.RequestError as e:
+                last_exc = e
+                if attempt < max_attempts - 1:
+                    backoff_s = min(0.5 * (2 ** attempt), 5.0)
+                    logger.debug(
+                        f"/auth/verify network error "
+                        f"(attempt {attempt + 1}/{max_attempts}): "
+                        f"{e}; retrying in {backoff_s}s"
+                    )
+                    _time.sleep(backoff_s)
+                    continue
+                raise
+
+            # 5xx (transient) → retry. 4xx → return as-is so the
+            # caller's status-code branching can do its job.
+            if response.status_code >= 500 and attempt < max_attempts - 1:
+                retry_after_header = response.headers.get("retry-after")
+                if retry_after_header:
+                    try:
+                        backoff_s = float(retry_after_header)
+                    except ValueError:
+                        # HTTP-date or unparseable — fall back to exp backoff
+                        backoff_s = min(0.5 * (2 ** attempt), 5.0)
+                else:
+                    backoff_s = min(0.5 * (2 ** attempt), 5.0)
+                logger.debug(
+                    f"/auth/verify returned {response.status_code} "
+                    f"(attempt {attempt + 1}/{max_attempts}); "
+                    f"retrying in {backoff_s}s"
+                )
+                _time.sleep(backoff_s)
+                continue
+
+            return response
+
+        # Defensive: should be unreachable (loop either returns or
+        # raises). If a future refactor breaks that invariant, surface
+        # the last network error rather than silently returning None.
+        assert last_exc is not None
+        raise last_exc
 
 
 # Module-level convenience functions

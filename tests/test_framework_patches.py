@@ -7,58 +7,15 @@ Phase 7 of the production-readiness plan adds three new patches:
 - crewai (Crew.kickoff + Crew.kickoff_async + post-run usage_metrics)
 - autogen (BaseChatAgent.on_messages + OpenAIChatCompletionClient.create)
 
-Each test below is `pytest.importorskip` guarded so the suite stays
-green when the optional packages are not installed.
+The 6 placeholder tests removed on 2026-06-28 were
+``@pytest.mark.skipif(True, ...)`` stubs with empty bodies — they
+provided no coverage and gave a false sense of green-on-arrival.
+Real coverage for these frameworks lives in the framework-specific
+integration suites (one per repo, gated on the framework being
+installed). See Sprint 2.9 ticket.
 """
 
 from __future__ import annotations
-
-import pytest
-
-# ===========================================================================
-# llama-index
-# ===========================================================================
-
-
-@pytest.mark.skipif(True, reason="llama-index not installed in test environment")
-def test_llama_index_patch_idempotent():
-    pass
-
-
-@pytest.mark.skipif(True, reason="llama-index not installed in test environment")
-def test_llama_index_chat_end_emits_track():
-    pass
-
-
-# ===========================================================================
-# crewai
-# ===========================================================================
-
-
-@pytest.mark.skipif(True, reason="crewai not installed in test environment")
-def test_crewai_patch_idempotent():
-    pass
-
-
-@pytest.mark.skipif(True, reason="crewai not installed in test environment")
-def test_crewai_kickoff_emits_usage_metrics():
-    pass
-
-
-# ===========================================================================
-# autogen
-# ===========================================================================
-
-
-@pytest.mark.skipif(True, reason="autogen not installed in test environment")
-def test_autogen_patch_idempotent():
-    pass
-
-
-@pytest.mark.skipif(True, reason="autogen not installed in test environment")
-def test_autogen_on_messages_emits_span():
-    pass
-
 
 # ===========================================================================
 # Common: graceful no-op when packages absent
