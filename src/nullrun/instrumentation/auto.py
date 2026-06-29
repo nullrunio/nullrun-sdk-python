@@ -35,8 +35,8 @@ return a reconstructed Response — no buffering, no UX change.
 
 from __future__ import annotations
 
-import hashlib
 import gc
+import hashlib
 import json
 import logging
 import os
