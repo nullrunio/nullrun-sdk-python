@@ -7,6 +7,54 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [0.8.3] - 2026-06-29
+
+Additive patch on top of 0.8.2. Closes the same silent zero-billing
+class of bug 0.8.2 closed on the httpx path — but on the **langgraph
+callback path** and the **init-ordering hazard** that 0.8.2 didn't
+reach. Promotes the missing-model wire failure from WARN to fail-LOUD.
+
+### Fixed
+
+- **langgraph callback model extraction.** `_extract_model_from_response`
+  now consults `response.llm_output` FIRST. langchain-openai 1.x puts
+  the date-suffixed model id (e.g. `gpt-4.1-mini-2025-04-14`) on
+  `LLMResult.llm_output`, while the AIMessage inside
+  `generations[0][0].message` leaves `response_metadata` empty. The
+  previous chain led with `response_metadata`, so every
+  OpenAI-via-LangChain 1.x call silently zero-billed. Also adds an
+  "any key containing model" sweep inside `llm_output` for non-OpenAI
+  wrappers (proxies, custom chat models).
+- **Init-ordering hazard for `patch_httpx`.** The class-level
+  `__init__` wrap only catches Clients created AFTER it is installed.
+  Users that build `ChatOpenAI(...)` before `nullrun.init(api_key=...)`
+  end up with a pre-existing `httpx.Client` that the patch never sees.
+  `patch_httpx` now sweeps `gc.get_objects()` once at install and
+  wraps any pre-existing `Client`/`AsyncClient` whose transport isn't
+  already a `NullRun*Transport`. Idempotent via the existing
+  class-level marker.
+- **Fail-LOUD missing-model wire tag.** `runtime.track()` now
+  escalates the missing-model warning from `logger.warning` to
+  `logger.error`, bumps a `dropped_llm_call_no_model` runtime counter
+  for dashboards, and tags the wire event with `__missing_model: True`
+  so the backend's `into_track_request` gate can reject with HTTP 422
+  instead of silently recording a zero-cost call. The event is still
+  sent (not fail-CLOSED) so the backend can audit; the flag is
+  wire-private and stripped before persisting. Activated only for
+  `llm_call`; other event types are silent.
+
+### Tests
+
+- `tests/contract/test_llm_call_model_wire.py` pins all three
+  invariants: 7 unit tests for `_extract_model_from_response`
+  (every known langchain shape + non-OpenAI wrappers + empty-string
+  fallthrough), 3 tests for `track()`'s missing-model wire tagging
+  (ERROR + counter + `__missing_model` flag + non-llm_call silence),
+  and 2 tests for the eager-wrap sweep (pre-existing Client gets
+  wrapped, idempotent on re-patch).
+
+---
+
 ## [0.8.2] - 2026-06-29
 
 Additive patch on top of 0.8.0. No public-API break. Continues the
