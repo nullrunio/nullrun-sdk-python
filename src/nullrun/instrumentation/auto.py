@@ -476,6 +476,40 @@ PROVIDER_EXTRACTORS: dict[str, Callable[[bytes, int], ExtractedUsage | None]] = 
 }
 
 
+def _extract_model_from_request_body(request: httpx.Request) -> str | None:
+    """2026-06-28 (Issue 2 fix): fall back to the ``model`` field embedded
+    in the LLM request body when the response body extractor returned
+    ``None`` for ``model``.
+
+    The user typically passes ``ChatOpenAI(model="gpt-4.1-mini")`` and
+    that string appears in the request body's ``model`` field — even if
+    the response omits it (streaming edge cases, Responses API,
+    middleware that strips model from responses). Returning the
+    request-side model keeps the SDK's cost event attributable to the
+    real catalog entry (``gpt-4.1-mini`` substring → 400 microcents /
+    1M input in ``MODEL_RATES``) instead of falling through to
+    ``DEFAULT_RATE`` ($0 per call).
+
+    Returns ``None`` if the body is not JSON, has no ``model`` field,
+    or has an empty ``model``. Callers must treat the result as
+    optional and still surface the SDK's "missing model" warning when
+    both response and request lookups fail.
+    """
+    try:
+        body = request.content
+        if not body:
+            return None
+        payload = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    val = payload.get("model")
+    if isinstance(val, str) and val:
+        return val
+    return None
+
+
 def _match_extractor(host: str) -> Callable[[bytes, int], ExtractedUsage | None] | None:
     """Return the extractor for `host`, or None if the host is not a known
     LLM endpoint. We match exact host first, then any subdomain (e.g.
@@ -683,6 +717,26 @@ class NullRunSyncTransport(httpx.BaseTransport):
         # ``coverage_seen`` view in the dashboard would be empty for
         # the majority of customers.
         _safe_bump_coverage(self._runtime, "_coverage_seen", host)
+
+        # 2026-06-28 (Issue 2 fix): if the extractor returned ``None``
+        # for ``model`` (response body lacked the field — observed for
+        # some OpenAI Responses-API and Anthropic streaming edge cases),
+        # fall back to the model name embedded in the request body. The
+        # backend cost pipeline logs WARN and falls back to DEFAULT_RATE
+        # (≈$0 per call) whenever ``model`` is missing — see
+        # ``backend/src/cost/pipeline.rs:164`` ``unwrap_or("default")``
+        # and ``backend/src/cost/constants.rs::rate_for``. Without
+        # this fallback, every gpt-4.1-mini / claude-haiku-4 call where
+        # the response body omits ``model`` was being silently
+        # zero-billed. Request body is the next authoritative source:
+        # SDK users pass ``model="gpt-4.1-mini"`` in the ChatOpenAI
+        # constructor.
+        model_from_response = usage.get("model")
+        model_for_event = (
+            model_from_response
+            or _extract_model_from_request_body(request)
+        )
+
         try:
             # Phase 4.1: lift cache / reasoning / finish / tool names
             # out of raw_usage onto the event itself. The backend's
@@ -695,7 +749,7 @@ class NullRunSyncTransport(httpx.BaseTransport):
                     "type": "llm_call",
                     "provider": _provider_label(host),
                     "host": host,
-                    "model": usage.get("model"),
+                    "model": model_for_event,
                     "tokens": usage.get("total_tokens", 0),
                     "input_tokens": usage.get("prompt_tokens", 0),
                     "output_tokens": usage.get("completion_tokens", 0),

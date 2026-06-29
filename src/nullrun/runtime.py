@@ -1556,6 +1556,19 @@ class NullRunRuntime:
 
         Background emission is driven by ``start_coverage_reporter``;
         most callers don't invoke this method directly.
+
+        Wire shape (2026-06-28 fix):
+        The per-host counter dicts live under ``metadata`` so the
+        backend's batch handler (backend/src/proxy/handlers.rs:5909
+        -5923) reads them from ``sdk_event.metadata``. The handler
+        was wired to that location when the SDK moved from the
+        deprecated ``POST /api/v1/coverage`` endpoint onto the
+        shared ``/api/v1/track/batch`` pipeline — placing the
+        counters at the event top level silently dropped them (the
+        ``SdkTrackRequest`` struct uses explicit fields, no
+        ``#[serde(flatten)]`` catchall, so unknown top-level keys
+        are discarded by serde). Nesting under ``metadata`` matches
+        what the handler reads.
         """
         stats = self.coverage_report()
         seen_total = sum(stats["seen"].values())
@@ -1564,7 +1577,7 @@ class NullRunRuntime:
             return None
         return self.track_event(
             "coverage_report",
-            **{
+            metadata={
                 "seen": stats["seen"],
                 "tracked": stats["tracked"],
                 "streaming_skipped": stats["streaming_skipped"],

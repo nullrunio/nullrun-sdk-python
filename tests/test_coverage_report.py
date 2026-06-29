@@ -14,6 +14,11 @@ contract:
 * The emitted event carries ``type=coverage_report`` plus the
   three counter dicts and ``tokens=0`` so the backend's
   ``SdkTrackRequest`` deserializer accepts it.
+* The counter dicts live under ``metadata`` so the backend's batch
+  handler (backend/src/proxy/handlers.rs:5909-5923) reads them.
+  Placed at the event top level, serde deserialization would drop
+  them (``SdkTrackRequest`` has explicit fields, no flatten
+  catchall), which is exactly the bug this test guards against.
 * ``start_coverage_reporter`` is idempotent and stops cleanly.
 """
 
@@ -51,6 +56,69 @@ class TestTrackCoverage:
         # The transport queues the event; the runtime returns the
         # dedup/queue result from track_event.
         assert "deduped" in result or "accepted" in result or "queued" in result or True
+
+    def test_track_coverage_emits_wire_shape_with_metadata_nesting(self, runtime):
+        """Pin the wire shape so backend (handlers.rs:5909-5923) can
+        read the counters from ``event.metadata``.
+
+        Pre-fix this placed the three dicts at the top level of the
+        event, which serde silently dropped (the batch handler's
+        ``SdkTrackRequest`` uses explicit fields with no
+        ``#[serde(flatten)]`` catchall). Page rendered
+        ``last_coverage_pct = null`` permanently because every
+        report landed with empty ``seen`` / ``tracked`` /
+        ``streaming_skipped`` JSONB columns.
+        """
+        runtime.bump_coverage_counter("_coverage_seen", "api.openai.com")
+        runtime.bump_coverage_counter("_coverage_tracked", "api.openai.com")
+        runtime.bump_coverage_counter(
+            "_coverage_streaming_skipped", "api.openai.com"
+        )
+
+        # Drain anything left in the buffer from prior tests.
+        buf = runtime._transport._buffer
+        try:
+            buf.clear()
+        except Exception:
+            pass
+
+        result = runtime.track_coverage()
+        assert result is not None, "track_coverage must emit once counters exist"
+
+        # Find the coverage_report event in the buffered payload.
+        events = [e for e in list(buf) if e.get("type") == "coverage_report"]
+        assert len(events) >= 1, (
+            f"expected at least one coverage_report event in buffer, "
+            f"saw types={[e.get('type') for e in buf]}"
+        )
+        event = events[-1]
+
+        # Must NOT carry the counters at the top level — that was
+        # the bug shape (silently dropped by serde).
+        assert "seen" not in event, (
+            "top-level 'seen' silently dropped by SdkTrackRequest; "
+            "must live under metadata"
+        )
+        assert "tracked" not in event
+        assert "streaming_skipped" not in event
+
+        # MUST carry them under metadata so the batch handler reads
+        # them correctly.
+        metadata = event.get("metadata")
+        assert isinstance(metadata, dict), (
+            f"coverage_report event must have metadata dict, got {type(metadata).__name__}: {event!r}"
+        )
+        assert "seen" in metadata
+        assert "tracked" in metadata
+        assert "streaming_skipped" in metadata
+        assert metadata["seen"].get("api.openai.com") == 1
+        assert metadata["tracked"].get("api.openai.com") == 1
+        assert metadata["streaming_skipped"].get("api.openai.com") == 1
+
+        # Backend requires `tokens: u64` (non-Optional) on every
+        # event; track_event defaults it to 0 so the request
+        # deserializer accepts the coverage_report row.
+        assert event.get("tokens") == 0
 
     def test_coverage_reporter_emits_immediately(self, runtime):
         # Even with no traffic, start+stop should be safe.
