@@ -319,3 +319,163 @@ def test_patch_httpx_eager_wrap_is_idempotent():
     finally:
         auto.reset_for_tests()
         pre_existing.close()
+
+
+# ─── patch_chat_model_invoke: init-ordering regression ───────────────
+#
+# Audit 2026-06-29 (silent zero-billing): the LangGraph case the
+# production trace exposed is
+#
+#     llm = ChatOpenAI(model=...)  # before init
+#     nullrun.init(api_key=...)    # patch installed too late
+#     graph.invoke(input)          # llm.invoke() inside the node
+#
+# `patch_httpx` covers the eager-sweep path (pre-existing
+# ``httpx.Client`` instances are wrapped). For LangChain chat models,
+# the `BaseCallbackManager.__init__` patch is the original defence.
+# ``patch_chat_model_invoke`` is the new belt-and-suspenders layer
+# that wraps ``BaseChatModel.invoke`` / ``ainvoke`` directly so a
+# ``NullRunCallback`` is present in the per-call config even if the
+# callback manager constructor is somehow bypassed.
+#
+# This regression test pins the wrap so a future refactor can't
+# silently drop it.
+
+
+def test_patch_chat_model_invoke_injects_callback_when_llm_pre_exists():
+    """Create a fake BaseChatModel BEFORE ``nullrun.init``, then call
+    ``patch_chat_model_invoke``, then invoke. The wrapped invoke must
+    inject a ``NullRunCallback`` into the per-call config.
+    """
+    from langchain_core.language_models import BaseChatModel
+    from langchain_core.messages import AIMessage
+    from langchain_core.outputs import ChatGeneration, ChatResult
+
+    from nullrun.instrumentation import auto
+    from nullrun.instrumentation.langgraph import NullRunCallback
+
+    auto.reset_for_tests()
+    auto._chat_model_invoke_patched = False
+
+    class FakeChatModel(BaseChatModel):
+        """Minimal BaseChatModel that records the callbacks it saw."""
+
+        seen_callbacks: list = []
+
+        @property
+        def _llm_type(self) -> str:
+            return "fake"
+
+        def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+            # Record the callbacks the framework attached (or didn't)
+            # so the test can assert our wrapper injected one.
+            seen = getattr(run_manager, "handlers", None) or []
+            type(self).seen_callbacks.append(list(seen))
+            # Return a properly-shaped ChatResult with an AIMessage so
+            # the downstream on_llm_end extraction has a generations[0]
+            # to walk. The model_name is the same string we'd see from
+            # a real langchain-openai 1.x response.
+            return ChatResult(
+                generations=[
+                    ChatGeneration(
+                        message=AIMessage(
+                            content="ok",
+                            response_metadata={"model_name": "fake-model"},
+                        )
+                    )
+                ],
+                llm_output={"model_name": "fake-model"},
+            )
+
+    runtime = MagicMock()
+    try:
+        # The user's order: create the LLM before init.
+        llm = FakeChatModel()
+        type(llm).seen_callbacks = []
+
+        ok = auto.patch_chat_model_invoke(runtime)
+        assert ok is True
+
+        # Invoke the LLM through the wrapped method. The wrap must
+        # inject a NullRunCallback into config["callbacks"] so the
+        # internal _generate sees it.
+        llm.invoke("hello")
+
+        # Assert: at least one NullRunCallback was seen during _generate.
+        saw_nullrun = any(
+            any(isinstance(h, NullRunCallback) for h in seen)
+            for seen in type(llm).seen_callbacks
+        )
+        assert saw_nullrun, (
+            "patch_chat_model_invoke did not inject NullRunCallback into "
+            "the per-call config — the audit fix is broken or missing."
+        )
+    finally:
+        auto.reset_for_tests()
+
+
+def test_patch_chat_model_invoke_preserves_user_callbacks():
+    """If the user already supplied a callback in the config, the
+    wrap must NOT replace it — only add the NullRunCallback if absent.
+    """
+    from langchain_core.language_models import BaseChatModel
+    from langchain_core.messages import AIMessage
+    from langchain_core.outputs import ChatGeneration, ChatResult
+    from langchain_core.callbacks import BaseCallbackHandler
+
+    from nullrun.instrumentation import auto
+    from nullrun.instrumentation.langgraph import NullRunCallback
+
+    auto.reset_for_tests()
+    auto._chat_model_invoke_patched = False
+
+    class UserCallback(BaseCallbackHandler):
+        """Real BaseCallbackHandler so LangChain's manager doesn't
+        trip on missing attributes (``ignore_chat_model``,
+        ``raise_error``, etc.) when it tries to fire the callback."""
+        seen_callbacks: list = []
+
+        def on_chat_model_start(self, *args, **kwargs):
+            type(self).seen_callbacks.append(("start",))
+
+        def on_llm_end(self, *args, **kwargs):
+            type(self).seen_callbacks.append(("end",))
+
+    class FakeChatModel(BaseChatModel):
+        seen_callbacks: list = []
+
+        @property
+        def _llm_type(self) -> str:
+            return "fake"
+
+        def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+            seen = getattr(run_manager, "handlers", None) or []
+            type(self).seen_callbacks.append(list(seen))
+            return ChatResult(
+                generations=[
+                    ChatGeneration(message=AIMessage(content="ok"))
+                ],
+                llm_output={"model_name": "fake-model"},
+            )
+
+    runtime = MagicMock()
+    try:
+        llm = FakeChatModel()
+        type(llm).seen_callbacks = []
+        ok = auto.patch_chat_model_invoke(runtime)
+        assert ok is True
+
+        # User already has their own callback in config.
+        user_cb = UserCallback()
+        llm.invoke("hello", config={"callbacks": [user_cb]})
+
+        # The user's callback must still be there, alongside ours.
+        seen_lists = type(llm).seen_callbacks
+        assert any(user_cb in seen for seen in seen_lists), (
+            "user-supplied callback was lost"
+        )
+        assert any(
+            any(isinstance(h, NullRunCallback) for h in seen) for seen in seen_lists
+        ), "NullRunCallback was not injected alongside user callback"
+    finally:
+        auto.reset_for_tests()

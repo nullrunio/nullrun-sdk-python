@@ -507,6 +507,12 @@ class NullRunCallback(BaseCallbackHandler):
             # Phase 4.1: lift cache / reasoning / finish / tool names out
             # of raw_usage onto the event itself, mirroring the httpx
             # transport shape so the dedup key space stays unified.
+            # 0.9.0: tag metadata.tracked based on whether the model
+            # extraction produced a real value (not the literal
+            # "unknown" fallback). The backend's coverage query
+            # (backend/src/coverage/mod.rs) reads this flag to
+            # compute tracked_pct — see plan at
+            # `~/.claude/plans/async-swinging-hanrahan.md`.
             event = {
                 "type": "llm_call",
                 "model": model,
@@ -521,6 +527,13 @@ class NullRunCallback(BaseCallbackHandler):
                 "tool_names": usage.get("tool_names") or [],
                 # Flag to backend: this is raw usage, compute cost yourself
                 "has_usage": usage["has_usage"],
+                "metadata": {
+                    # Tracked iff we extracted a real model name — the
+                    # `usage["has_usage"]` flag is independent (a 4xx
+                    # response with empty body still yields has_usage
+                    # = False but we DID see the response).
+                    "tracked": model != "unknown",
+                },
                 # Stripped at the wire boundary by _WIRE_STRIP_FIELDS —
                 # kept here for in-process dedup + test introspection.
                 "raw_usage": usage["raw_usage"],
@@ -813,13 +826,68 @@ def _extract_model_from_response(response: Any) -> str | None:
     # event; this DEBUG line is for the per-call site so the
     # operator can correlate the wire warning back to a specific
     # response shape.
+    #
+    # Audit 2026-06-29 (silent zero-billing): the previous version
+    # emitted a single DEBUG line with only the response type. That
+    # was insufficient when the operator needed to see *which* of
+    # the four fallback steps almost-but-didn't match. We now dump
+    # the available keys on every relevant shape so a single
+    # logcat-level filter surfaces the root cause:
+    #   - `response.llm_output` keys
+    #   - `response.response_metadata` keys
+    #   - `gen_msg.response_metadata` keys (LLMResult callback path)
+    #   - direct attrs `response.model_name` / `response.model`
+    # All four dumps are guarded so a missing attribute is silent.
     try:
         response_type = type(response).__name__
     except Exception:
         response_type = "<unknown>"
+
+    llm_out_keys: list[str] = []
+    if isinstance(llm_out, dict):
+        try:
+            llm_out_keys = sorted(str(k) for k in llm_out.keys())
+        except Exception:
+            llm_out_keys = ["<unhashable-keys>"]
+    resp_meta_keys: list[str] = []
+    if isinstance(resp_meta, dict):
+        try:
+            resp_meta_keys = sorted(str(k) for k in resp_meta.keys())
+        except Exception:
+            resp_meta_keys = ["<unhashable-keys>"]
+    gen_msg_meta_keys: list[str] = []
+    direct_attrs: dict[str, str] = {}
+    if gen_msg is not None:
+        try:
+            gm = getattr(gen_msg, "response_metadata", None)
+            if isinstance(gm, dict):
+                gen_msg_meta_keys = sorted(str(k) for k in gm.keys())
+        except Exception:
+            pass
+        for attr in ("model_name", "model"):
+            try:
+                v = getattr(gen_msg, attr, None)
+                if v is not None:
+                    direct_attrs[attr] = repr(v)[:64]
+            except Exception:
+                pass
+    for attr in ("model_name", "model"):
+        try:
+            v = getattr(response, attr, None)
+            if v is not None:
+                direct_attrs[attr] = repr(v)[:64]
+        except Exception:
+            pass
+
     logger.debug(
-        "_extract_model_from_response returned None for response of type %s",
+        "_extract_model_from_response returned None for response of type %s — "
+        "llm_output_keys=%s response_metadata_keys=%s gen_msg_metadata_keys=%s "
+        "direct_attrs=%s",
         response_type,
+        llm_out_keys,
+        resp_meta_keys,
+        gen_msg_meta_keys,
+        direct_attrs,
     )
     return None
 

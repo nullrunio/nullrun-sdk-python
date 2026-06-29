@@ -14,15 +14,13 @@ Reuses from `auto.py`:
 - `_match_extractor(host)` — exact + subdomain match
 - `_provider_label(host)` — short label for the `provider` event field
 - `_fingerprint_for(host, body, status)` — dedup fingerprint
-- `_safe_bump_coverage(runtime, target_attr, host)` — bounded counter
-  bump that tolerates stub runtimes (MagicMock, custom test doubles)
 
 What this module owns:
 - `patch_requests(runtime)` — wraps `requests.Session.send` so every
   call routed through a session is observed. Idempotent.
 - Streaming handling: `requests.get(url, stream=True)` and
-  `Accept: text/event-stream` are skipped with a `streaming-skipped`
-  coverage marker. We do NOT buffer the response — that would break
+  `Accept: text/event-stream` emit a `metadata.streaming_skipped: true`
+  llm_call event. We do NOT buffer the response — that would break
   user-facing streaming (the caller reads `iter_content`/`iter_lines`
   chunk-by-chunk). The known limit is documented in
   `docs/known-limitations.md`.
@@ -30,6 +28,12 @@ What this module owns:
   the PreparedRequest after a successful track, so a future
   `urllib3` patch (which `requests` uses under the hood) can skip
   already-tracked requests. See plan section P2 / "requests ↔ urllib3".
+
+0.9.0: counter-bump helpers (`_safe_bump_coverage`,
+`_bump_streaming_skipped`) are gone — coverage is now derived from
+llm_call span metadata. Each emit site tags `metadata.tracked: bool`
+and `metadata.streaming_skipped: bool` so the backend can compute
+coverage_pct from `spans.metadata` directly.
 
 `aiohttp` is deliberately out of scope for this phase — see
 `docs/known-limitations.md` and the plan's open questions.
@@ -45,7 +49,6 @@ from nullrun.instrumentation.auto import (
     _fingerprint_for,
     _match_extractor,
     _provider_label,
-    _safe_bump_coverage,
 )
 
 logger = logging.getLogger(__name__)
@@ -77,24 +80,6 @@ def _is_streaming_request(request: Any, send_kwargs: dict[str, Any]) -> bool:
     return any(ct in accept for ct in _STREAMING_CONTENT_TYPES)
 
 
-def _bump_streaming_skipped(runtime: Any, host: str) -> None:
-    """Phase P2: bump a `streaming-skipped` counter so the dashboard
-    surfaces *known* untracked hosts (vs. just "seen but unknown
-    extractor"). Mirrors the structure of `_safe_bump_coverage` to
-    tolerate stub runtimes.
-    """
-    target = getattr(runtime, "_coverage_streaming_skipped", None)
-    if target is None:
-        return
-    bump = getattr(runtime, "_bump_coverage_counter", None)
-    if bump is None:
-        return
-    try:
-        bump(target, host)
-    except Exception as e:  # pragma: no cover — defensive
-        logger.debug("NullRun streaming-skipped bump failed: %s", e)
-
-
 def _emit_to_runtime(
     runtime: Any,
     request: Any,
@@ -107,8 +92,10 @@ def _emit_to_runtime(
     transport. Kept in this module (rather than re-exported from
     `auto.py`) so the requests path is self-contained and the
     `requests` dep is not pulled into `auto.py`'s import graph.
+
+    0.9.0: emits `metadata.tracked: True` — usage was extracted so
+    the SDK's `_match_extractor` identified a known provider.
     """
-    _safe_bump_coverage(runtime, "_coverage_tracked", host)
     try:
         runtime.track(
             {
@@ -120,12 +107,58 @@ def _emit_to_runtime(
                 "input_tokens": usage.get("prompt_tokens", 0),
                 "output_tokens": usage.get("completion_tokens", 0),
                 "has_usage": True,
+                "metadata": {
+                    "tracked": True,
+                },
                 "raw_usage": usage,
                 "_fingerprint": _fingerprint_for(host, body, status),
             }
         )
     except Exception as e:
         logger.debug("NullRun requests transport: track failed: %s", e)
+
+
+def _emit_streaming_skipped_to_runtime(
+    runtime: Any,
+    request: Any,
+    host: str,
+) -> None:
+    """0.9.0: emit an llm_call event for a streamed response that
+    we deliberately did NOT buffer (so the user keeps their chunked
+    read). Tags `metadata.streaming_skipped: True` and
+    `metadata.tracked: False` (extractor never ran because the body
+    was never read) — backend counts it toward `llm_call_count` but
+    not toward `tracked_call_count`.
+
+    Model is best-effort from the request body (sync path; mirrors
+    `auto._emit_streaming_skipped`).
+    """
+    try:
+        from nullrun.instrumentation.auto import (
+            _extract_model_from_request_body,
+        )
+        model = _extract_model_from_request_body(request)
+    except Exception:  # pragma: no cover — defensive
+        model = None
+    try:
+        runtime.track(
+            {
+                "type": "llm_call",
+                "provider": _provider_label(host),
+                "host": host,
+                "model": model,
+                "tokens": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "has_usage": False,
+                "metadata": {
+                    "tracked": False,
+                    "streaming_skipped": True,
+                },
+            }
+        )
+    except Exception as e:
+        logger.debug("NullRun requests transport: streaming-skipped track failed: %s", e)
 
 
 _requests_patched = False
@@ -179,17 +212,13 @@ def patch_requests(runtime: Any) -> bool:
 
             host = urllib.parse.urlparse(url).hostname or ""
 
-            # Phase 1.1: bump seen-counter for *every* host, including
-            # ones we don't have an extractor for. Same pattern as
-            # the httpx transport.
-            _safe_bump_coverage(runtime, "_coverage_seen", host)
-
             # Streaming skip: do NOT read `response.content` here —
             # that would buffer the entire stream and break the
-            # caller's chunked consumption. Mark as `streaming-skipped`
-            # so the dashboard can show "known but untracked".
+            # caller's chunked consumption. Emit an llm_call event
+            # tagged `metadata.streaming_skipped: true` so the
+            # backend can still see the call in coverage.
             if _is_streaming_request(request, kwargs):
-                _bump_streaming_skipped(runtime, host)
+                _emit_streaming_skipped_to_runtime(runtime, request, host)
                 return _orig_session_send(self, request, **kwargs)
 
             extractor = _match_extractor(host)

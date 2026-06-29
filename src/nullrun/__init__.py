@@ -41,6 +41,43 @@ from nullrun.decorators import protect  # the gate decorator
 from nullrun.runtime import track_event, track_llm, track_tool
 
 
+def shutdown(timeout: float = 2.0) -> None:
+    """Gracefully shut down the NullRun runtime.
+
+    Sends a clean WebSocket close frame, drains in-flight events, and
+    stops background threads (HTTP poller, WS push listener). After
+    this returns, any further ``nullrun.track(...)`` call or
+    ``@protect``-decorated call is a no-op.
+
+    Audit 2026-06-29 (WS graceful close on exit): a long-running
+    script that exits via ``sys.exit()`` lets the kernel RST the TCP
+    socket, which the backend logs as WARN "Connection reset
+    without closing handshake". Calling ``nullrun.shutdown()``
+    before exit (or registering it via ``atexit``) eliminates the
+    noisy log. No-op if ``init()`` was never called.
+
+    Args:
+        timeout: seconds to wait for the WS close handshake to
+            complete before giving up. The underlying
+            ``NullRunRuntime.shutdown()`` already caps WS join at
+            0.5s and the WS close at 2.0s — this parameter is
+            reserved for future expansion and is currently unused.
+
+    Example::
+
+        import atexit
+        import nullrun
+        atexit.register(nullrun.shutdown)
+    """
+    # Lazy import so the SDK module-import path stays light (mirrors
+    # the pattern in `init` and `status`).
+    from nullrun.runtime import NullRunRuntime
+    runtime = NullRunRuntime._instance  # type: ignore[attr-defined]
+    if runtime is None:
+        return
+    runtime.shutdown()
+
+
 def status():
     """Return the current runtime state as a Layer-3
     :class:`NullRunStatus` snapshot.
@@ -300,11 +337,10 @@ def init(
 
     auto_instrument(runtime)
 
-    # Start the coverage reporter so the backend gets a coverage_report
-    # event every 60s. Daemon thread; safe to leak across re-init.
-    # The coverage reporter is a no-op when no LLM traffic has been
-    # observed (see ``track_coverage``).
-    runtime.start_coverage_reporter()
+    # 0.9.0: coverage reporter removed. Coverage is now derived
+    # server-side from llm_call span metadata (host + tracked +
+    # streaming_skipped flags). No 60s daemon thread, no per-process
+    # counter dicts.
 
     return runtime
 
@@ -448,6 +484,15 @@ __all__ = [
     "track_llm",
     "track_tool",
     "track_event",
+    # Audit 2026-06-29 (WS graceful close on exit): the user-facing
+    # top-level ``shutdown()`` sends a clean WS close frame and
+    # drains in-flight events. Without it, a long-running script
+    # that exits via ``sys.exit()`` lets the kernel RST the TCP
+    # socket → backend logs WARN "Connection reset without closing
+    # handshake". Calling ``nullrun.shutdown()`` before
+    # ``sys.exit(0)`` (or in an ``atexit`` handler) eliminates the
+    # noisy log. No-op if init() was never called.
+    "shutdown",
     # Layer 2: global on_error hook. Eager because it is the
     # single most important "give the user a chance" API — the
     # user has to know it exists to call it.

@@ -10,18 +10,19 @@ OpenAI completion with ``max_tokens=8192`` the buffered body is
 in long-running services.
 
 Post-fix we use a bounded chunked read (``_read_body_with_cap`` /
-``_aread_body_with_cap``). When the body exceeds the cap we skip
-tracking and increment ``_coverage_streaming_skipped`` so the
-dashboard can see which hosts are producing oversized responses.
+``_aread_body_with_cap``). When the body exceeds the cap we now
+(0.9.0) emit an ``llm_call`` event tagged
+``metadata.streaming_skipped: True`` and ``metadata.tracked: False``
+so the backend's coverage query still counts the call toward
+``llm_call_count`` but not toward ``tracked_call_count``. The
+previous counter-bump on ``_coverage_streaming_skipped`` is gone.
 """
 
 import asyncio
 from unittest.mock import MagicMock
 
 import httpx
-import pytest
 
-from nullrun.instrumentation import auto as auto_mod
 from nullrun.instrumentation.auto import (
     MAX_RESPONSE_BYTES,
     NullRunAsyncTransport,
@@ -89,10 +90,12 @@ def test_aread_body_with_cap_short_circuits_on_content_length():
 # ===========================================================================
 
 
-def test_sync_transport_skips_tracking_on_oversized_response(monkeypatch):
+def test_sync_transport_emits_streaming_skipped_event(monkeypatch):
     """When the response body exceeds MAX_RESPONSE_BYTES, the sync
-    transport must NOT call ``runtime.track`` and MUST increment
-    ``_coverage_streaming_skipped``."""
+    transport must emit an llm_call event tagged
+    `metadata.streaming_skipped: True` and `metadata.tracked: False`.
+    The body is NOT buffered (so the caller can still consume it)
+    and usage data is not extracted (no tokens field)."""
     runtime = MagicMock()
     inner = MagicMock()
     body = b"x" * (MAX_RESPONSE_BYTES + 1)
@@ -104,19 +107,18 @@ def test_sync_transport_skips_tracking_on_oversized_response(monkeypatch):
 
     transport.handle_request(request)
 
-    # Body was oversized → no llm_call event was emitted.
-    runtime.track.assert_not_called()
-    # Coverage counter incremented (best-effort; the runtime mock
-    # accepts attribute reads). We verify the helper was called via
-    # the runtime attribute access path:
-    # ``_safe_bump_coverage(runtime, "_coverage_streaming_skipped", host)``
-    # should have read runtime._coverage_streaming_skipped.
-    # (We don't assert on the dict contents because the mock
-    # returns a fresh MagicMock for each attribute access; the
-    # important contract is that track() was NOT called.)
+    # Track WAS called with the streaming-skipped event.
+    runtime.track.assert_called_once()
+    event = runtime.track.call_args[0][0]
+    assert event["type"] == "llm_call"
+    assert event["host"] == "api.openai.com"
+    assert event["has_usage"] is False
+    assert event["tokens"] == 0
+    assert event["metadata"]["streaming_skipped"] is True
+    assert event["metadata"]["tracked"] is False
 
 
-def test_async_transport_skips_tracking_on_oversized_response():
+def test_async_transport_emits_streaming_skipped_event():
     """Async mirror of the sync test."""
     runtime = MagicMock()
     inner = MagicMock()
@@ -132,12 +134,16 @@ def test_async_transport_skips_tracking_on_oversized_response():
 
     asyncio.run(transport.handle_async_request(request))
 
-    runtime.track.assert_not_called()
+    runtime.track.assert_called_once()
+    event = runtime.track.call_args[0][0]
+    assert event["metadata"]["streaming_skipped"] is True
+    assert event["metadata"]["tracked"] is False
 
 
 def test_sync_transport_does_track_normal_sized_response():
     """Sanity: the cap doesn't break the happy path. A normal 200-byte
-    response with a usage block must still be tracked."""
+    response with a usage block must still be tracked and the event
+    must carry `metadata.tracked: True`."""
     runtime = MagicMock()
     inner = MagicMock()
     body = (
@@ -156,3 +162,6 @@ def test_sync_transport_does_track_normal_sized_response():
     event = runtime.track.call_args[0][0]
     assert event["type"] == "llm_call"
     assert event["tokens"] == 8
+    assert event["metadata"]["tracked"] is True
+    # streaming_skipped is not present (or False) on a normal tracked call.
+    assert not event["metadata"].get("streaming_skipped", False)
