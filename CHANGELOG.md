@@ -7,6 +7,49 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [0.9.0] - 2026-06-29
+
+Server-derived coverage replaces the in-process counter dicts.
+Counter-bump helpers are gone; every `llm_call` span now carries
+`metadata.tracked` and `metadata.streaming_skipped` flags so the
+backend's `coverage_pct` query can compute coverage from span
+metadata alone. Adds `nullrun.shutdown()` for clean WS close on
+script exit.
+
+### Breaking changes
+
+- `NullRunRuntime.coverage_report()` removed.
+- `NullRunRuntime._coverage_seen` / `_coverage_tracked` /
+  `_coverage_streaming_skipped` instance attributes removed.
+- `NullRunRuntime.start_coverage_reporter()` daemon thread removed
+  (no longer called from `init()`).
+- `_safe_bump_coverage` / `_bump_streaming_skipped` helpers removed
+  from `nullrun.instrumentation.auto`.
+- `llm_call` wire shape: `metadata.tracked: bool` and
+  `metadata.streaming_skipped: bool` are now authoritative; the
+  separate `coverage_report` event is dropped.
+
+### Added
+
+- `nullrun.shutdown(timeout=2.0)`: sends a clean WebSocket close
+  frame and drains in-flight events. Long-running scripts that
+  exit via `sys.exit()` previously let the kernel RST the TCP
+  socket, which the backend logged as WARN "Connection reset
+  without closing handshake". Registering `nullrun.shutdown` in an
+  `atexit` handler eliminates the noisy log. No-op if `init()`
+  was never called.
+
+### Tests
+
+- `tests/test_llm_call_metadata_flags.py` pins the new contract:
+  every `llm_call` span carries `metadata.tracked` or
+  `metadata.streaming_skipped`. Coverage is now an out-of-process
+  concern.
+- `tests/test_coverage_report.py` and `tests/test_coverage_seen_httpx.py`
+  removed — coverage is no longer an SDK-side concept.
+
+---
+
 ## [0.8.3] - 2026-06-29
 
 Additive patch on top of 0.8.2. Closes the same silent zero-billing
