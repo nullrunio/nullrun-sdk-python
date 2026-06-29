@@ -32,12 +32,29 @@ import httpx
 
 # Mirror the response builder from test_streaming_oom_cap.py to keep
 # these tests self-contained.
+def _make_request() -> httpx.Request:
+    """Audit 2026-06-29: in production the request body carries
+    ``{"model": "gpt-4.1-mini", ...}`` which is what
+    ``_extract_model_from_request_body`` reads when the response body
+    is too large to inspect. The streaming-skipped path now drops the
+    event if BOTH the response body AND the request body fail to
+    yield a model (a true double-consume artifact). Real
+    OpenAI/Anthropic/etc. requests always carry ``model``, so the
+    streaming-skipped path still fires for genuinely oversized
+    responses — it just refuses to emit a fully anonymous ghost event
+    with no model and no id."""
+    return httpx.Request(
+        "POST",
+        "https://api.openai.com/v1/chat/completions",
+        json={"model": "gpt-4.1-mini", "messages": []},
+    )
+
+
 def _make_response(content: bytes, content_length: int | None = None) -> httpx.Response:
-    request = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
     headers = {"content-type": "application/json"}
     if content_length is not None:
         headers["content-length"] = str(content_length)
-    return httpx.Response(200, headers=headers, content=content, request=request)
+    return httpx.Response(200, headers=headers, content=content, request=_make_request())
 
 
 def test_tracked_flag_true_on_normal_call():
@@ -56,9 +73,7 @@ def test_tracked_flag_true_on_normal_call():
     )
     inner.handle_request.return_value = _make_response(body, content_length=len(body))
     transport = NullRunSyncTransport(inner=inner, runtime=runtime)
-    transport.handle_request(
-        httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
-    )
+    transport.handle_request(_make_request())
 
     event = runtime.track.call_args[0][0]
     assert event["metadata"]["tracked"] is True
@@ -79,9 +94,7 @@ def test_streaming_skipped_flag_on_oversized_response():
     body = b"x" * (MAX_RESPONSE_BYTES + 1)
     inner.handle_request.return_value = _make_response(body, content_length=len(body))
     transport = NullRunSyncTransport(inner=inner, runtime=runtime)
-    transport.handle_request(
-        httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
-    )
+    transport.handle_request(_make_request())
 
     event = runtime.track.call_args[0][0]
     assert event["metadata"]["tracked"] is False
@@ -115,9 +128,7 @@ def test_track_does_not_strip_metadata_flags():
     body = b"x" * (MAX_RESPONSE_BYTES + 1)
     inner.handle_request.return_value = _make_response(body, content_length=len(body))
     transport = NullRunSyncTransport(inner=inner, runtime=runtime)
-    transport.handle_request(
-        httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
-    )
+    transport.handle_request(_make_request())
 
     wire = captured["event"]
     # `metadata` field is preserved on the wire — backend reads it.

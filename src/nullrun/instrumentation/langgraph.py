@@ -479,6 +479,21 @@ class NullRunCallback(BaseCallbackHandler):
         (``response.response_metadata['model_name']`` or the AIMessage
         on the LLMResult generation). ``"unknown"`` is now a true last
         resort, not the common case.
+
+        Audit 2026-06-29 (ghost-event dedup): the previous version of
+        this method did NOT attach a ``_fingerprint`` to the event
+        before forwarding it to ``runtime.track()``. Because the
+        dedup LRU only collapses events whose ``_fingerprint``
+        matches, the LangChain callback emission was never deduped
+        against the sibling emission from the httpx transport
+        (``NullRunSyncTransport._emit``), even though both observers
+        fire for the same LLM call. The net effect on a typical
+        ``app.invoke()`` with 6 LLM calls was 6-12 duplicate
+        ``llm_call`` events on the wire (instead of 6), plus extra
+        cost-pipeline ERROR noise from ``_emit_streaming_skipped``
+        for body-read failures. The fix derives a stable fingerprint
+        from the LangChain run_id + invocation_params + response id
+        so the dedup LRU can collapse these emissions.
         """
         try:
             # Extract provider/model from invocation params first, then
@@ -502,6 +517,59 @@ class NullRunCallback(BaseCallbackHandler):
 
             logger.info(f"NullRun callback: model={model}, provider={provider}, "
                       f"usage={usage}, has_usage={usage['has_usage']}")
+
+            # Audit 2026-06-29 (unified fingerprint): derive the same
+            # fingerprint the httpx transport computes for the same
+            # call, so the dedup LRU at runtime.track() collapses the
+            # two emissions to a single wire event. Both observers feed
+            # (model, provider, response_id) into
+            # ``_fingerprint_for_llm_call``; the helper is
+            # path-agnostic on purpose so the two schemes collide
+            # rather than diverge.
+            #
+            # The response_id has to be extracted from the same shape
+            # the upstream provider returned. For langchain-openai 1.x
+            # the chat-completion id lives in four places in priority
+            # order (first hit wins):
+            #   1. ``response.llm_output["id"]`` — LLMResult wrapper
+            #      where langchain-openai puts the upstream id.
+            #   2. ``response.id`` — direct attribute on the LLMResult
+            #      or AIMessage (some versions).
+            #   3. The AIMessage inside the first generation
+            #      (``response.generations[0][0].message.id``).
+            #   4. ``response.response_metadata["id"]`` — the dict
+            #      langchain-openai populates on the AIMessage.
+            # Any of these yields the same string (``"chatcmpl-..."``
+            # for OpenAI), so the fingerprint matches the httpx
+            # transport's reading of ``payload["id"]`` from the body.
+            from nullrun.instrumentation.auto import (
+                _fingerprint_for_llm_call,
+            )
+
+            response_id = None
+            try:
+                llm_out = getattr(response, "llm_output", None)
+                if isinstance(llm_out, dict):
+                    response_id = llm_out.get("id")
+            except Exception:  # pragma: no cover — defensive
+                pass
+            if not response_id:
+                response_id = getattr(response, "id", None)
+            if not response_id:
+                try:
+                    gens = getattr(response, "generations", None) or []
+                    if gens and gens[0]:
+                        msg = getattr(gens[0][0], "message", None)
+                        response_id = getattr(msg, "id", None)
+                except Exception:  # pragma: no cover — defensive
+                    pass
+            if not response_id:
+                try:
+                    resp_meta = getattr(response, "response_metadata", None)
+                    if isinstance(resp_meta, dict):
+                        response_id = resp_meta.get("id")
+                except Exception:  # pragma: no cover — defensive
+                    pass
 
             # Build event with RAW usage data (no cost computation in SDK!)
             # Phase 4.1: lift cache / reasoning / finish / tool names out
@@ -537,6 +605,19 @@ class NullRunCallback(BaseCallbackHandler):
                 # Stripped at the wire boundary by _WIRE_STRIP_FIELDS —
                 # kept here for in-process dedup + test introspection.
                 "raw_usage": usage["raw_usage"],
+                # Audit 2026-06-29 (unified fingerprint): use the
+                # same helper the httpx transport calls so the dedup
+                # LRU at runtime.track() collapses the sibling
+                # emission for the same real LLM call. Pre-fix this
+                # used ``_fingerprint_for_event_dict({path:
+                # "langchain_callback", ...})`` which produced a key
+                # the httpx fingerprint could never collide with —
+                # every LLM call produced two wire events.
+                "_fingerprint": _fingerprint_for_llm_call(
+                    model,
+                    provider,
+                    response_id,
+                ),
             }
 
             logger.info(f"NullRun track event: {event}")
