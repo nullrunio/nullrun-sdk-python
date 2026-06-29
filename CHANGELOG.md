@@ -7,6 +7,45 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [0.8.2] - 2026-06-29
+
+Additive patch on top of 0.8.0. No public-API break. Continues the
+0.8.0 wire-format audit with two regressions that were caught on
+review and one contract test that pins the post-2026-06-27 backend
+schema so a future rename can't silently break the SDK.
+
+### Fixed
+
+- **`track_coverage()` emits counter dicts under `event.metadata`
+  instead of the event top level.** Pre-fix the per-host `seen` /
+  `tracked` / `streaming_skipped` dicts sat at the event root, where
+  serde silently dropped them — `SdkTrackRequest` uses explicit
+  fields with no `#[serde(flatten)]` catchall, so unknown keys are
+  discarded. The dashboard's `last_coverage_pct` was permanently
+  `null` because every coverage report landed with empty
+  `seen`/`tracked`/`streaming_skipped` JSONB columns. Pin:
+  `tests/test_coverage_report.py::test_track_coverage_emits_wire_shape_with_metadata_nesting`.
+- **Request-body model fallback in
+  `NullRunSyncTransport._emit`.** When the response body extractor
+  returns `None` for `model` (OpenAI Responses API, Anthropic
+  streaming edge cases), `_extract_model_from_request_body` reads
+  the model string the user embedded in the request body via
+  `ChatOpenAI(model="gpt-4.1-mini")`. Without this every such
+  call was zero-billed — backend `unwrap_or("default")` +
+  `DEFAULT_RATE` ≈ \$0/call. Unit-tested in
+  `tests/test_model_fallback.py`.
+
+### Tests
+
+- `tests/test_batch_response_parsing.py` pins the post-2026-06-27
+  `BatchTrackResponse` shape (`actions: Vec<ActionTaken>`,
+  `messages: Vec<String>`) and documents that the legacy
+  `actions_taken: Vec<String>` field is intentionally dropped in
+  0.8.0. Regression test so a future backend rename can't silently
+  break the SDK.
+
+---
+
 ## [0.8.0] - 2026-06-28
 
 SDK↔backend wire-format audit. Closes a class of silent-fail-OPEN
