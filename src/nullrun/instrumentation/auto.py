@@ -2069,16 +2069,19 @@ def _emit_streaming_skipped(
     inspected), and attach a deterministic `_fingerprint` when we
     do emit so dedup collapses repeats from the same call site.
     """
+    # We always emit the streaming-skipped event regardless of
+    # whether ``_extract_model_from_request_body`` recovered a model.
+    # The test_streaming_oom_cap contract pins that the event fires
+    # whenever the cap is exceeded, so the backend's coverage
+    # denominator (``llm_call_count``) stays accurate. When ``model``
+    # is ``None`` the backend's into_track_request_v2 gate may log a
+    # ``cost_pipeline_missing_model_total`` warning, but that's the
+    # same noise a streaming-skipped response produced pre-0.9.1 and
+    # is preferable to silently dropping the event and skewing
+    # coverage_pct. The ``metadata.streaming_skipped: True`` flag
+    # tells the backend this is a known-skipped emission, not a
+    # real call to bill against.
     model = _extract_model_from_request_body(request)
-    if not model:
-        logger.debug(
-            "NullRun transport: dropping streaming_skipped event for host=%s "
-            "because model extraction also failed (likely double-consume "
-            "by langchain-openai upstream or empty request body); "
-            "the happy-path _emit() will handle attribution if available",
-            host,
-        )
-        return
     try:
         runtime.track(
             {
