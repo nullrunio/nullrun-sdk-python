@@ -7,6 +7,64 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [0.9.1] - 2026-06-29
+
+Patch on top of 0.9.0. Unifies the LLM-call fingerprint scheme so the
+dedup LRU at `runtime.track()` can collapse sibling emissions from the
+httpx transport and the LangChain callback for the same real call.
+
+### Fixed
+
+- **Double-emission of llm_call events.** Pre-0.9.1 the httpx transport
+  (`NullRunSyncTransport._emit`) and the LangChain callback
+  (`NullRunCallback.on_llm_end`) each computed their own `_fingerprint`
+  from different inputs — `sha256(host|status|body)` vs
+  `sha256(json({path:"langchain_callback", run_id, response_id, model,
+  provider, invocation_params}))`. The two fingerprints never
+  collided, so the dedup LRU at `runtime.track()` could not collapse
+  the two emissions for the same call. On a typical `app.invoke()`
+  with 6 LLM calls the backend saw ~12 `llm_call` events on the wire
+  (2 per real call), doubling `llm_call_count` and skewing
+  `cost_events` aggregates.
+
+  Post-fix both observers call the same helper
+  `_fingerprint_for_llm_call(model, provider, response_id)` with the
+  three signals reachable from every observation path:
+  - httpx transport reads `model` and `id` straight out of the
+    OpenAI-style response body (`payload["model"]`,
+    `payload["id"]`). `_openai_extractor` now also carries `"id"` on
+    its return so the transport has it without re-parsing the body.
+  - LangChain callback reads `model` from `invocation_params` /
+    `response.llm_output["model_name"]` and `id` from
+    `response.llm_output["id"]` / `response.id` / the generation's
+    AIMessage `.id` / `response.response_metadata["id"]` — all four
+    locations are populated by langchain-openai 1.x for OpenAI chat
+    completions.
+
+  When any of the three signals is missing, the helper falls back to
+  the empty string on that slot; the resulting fingerprint is still
+  deterministic for the call, just less specific. A missing `id`
+  (custom chat-model wrappers that don't surface it) still collapses
+  the two observers via the model+provider combination.
+
+### Tests
+
+- `tests/test_unified_fingerprint.py` pins the new contract:
+  deterministic fingerprint for identical inputs, distinct
+  fingerprints for distinct inputs, the httpx transport calls the
+  helper with values extracted from the response body, the LangChain
+  callback produces the SAME fingerprint for the same LLM call when
+  reading the chat-completion id from any of the four known
+  langchain locations.
+- `tests/test_llm_call_metadata_flags.py` updated to match the new
+  extractor shape (`usage["id"]` is now present alongside
+  `usage["model"]`).
+
+No public-API break. No behavior change for callers whose
+instrumentation already populates `model` correctly.
+
+---
+
 ## [0.9.0] - 2026-06-29
 
 Server-derived coverage replaces the in-process counter dicts.
