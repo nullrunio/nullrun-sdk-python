@@ -35,6 +35,7 @@ return a reconstructed Response — no buffering, no UX change.
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 import logging
@@ -1038,7 +1039,90 @@ def patch_httpx(runtime: Any) -> bool:
         httpx.AsyncClient._nullrun_patched = True  # type: ignore[attr-defined]
         _httpx_patched = True
         logger.info("httpx auto-instrumentation installed (sync + async)")
+
+        # Audit 2026-06-29 (init-ordering hazard): the class-level
+        # __init__ patch only wraps httpx.Clients created AFTER it is
+        # installed. If a user does
+        #
+        #     llm = ChatOpenAI(model="gpt-4.1-mini")  # before init()
+        #     nullrun.init(api_key=...)              # patch installed here
+        #
+        # ``ChatOpenAI`` already built its internal httpx.Client (or
+        # will on first .invoke()), but that client is reachable from
+        # the running process right now and is using the unpatched
+        # transport. Without the eager sweep below, the httpx path
+        # emits nothing for that LLM — every call silently zero-billed
+        # via the langchain callback fallback (or the bare-LLMResult
+        # path with no model).
+        #
+        # We sweep gc.get_objects() once and wrap any pre-existing
+        # httpx.Client/AsyncClient whose transport isn't already a
+        # NullRun*Transport. The class-level marker on ``__init__`` is
+        # set, so future constructions auto-wrap — this sweep is the
+        # back-fill for the instances that pre-date the patch.
+        try:
+            sync_wrapped, async_wrapped = _wrap_pre_existing_httpx_clients(runtime)
+            if sync_wrapped or async_wrapped:
+                logger.info(
+                    "httpx eager wrap: %d sync + %d async pre-existing "
+                    "client(s) now route through NullRun",
+                    sync_wrapped,
+                    async_wrapped,
+                )
+        except Exception as exc:  # noqa: BLE001 — defensive, never block init
+            logger.debug("httpx eager wrap sweep failed: %s", exc)
         return True
+
+
+def _wrap_pre_existing_httpx_clients(runtime: Any) -> tuple[int, int]:
+    """Find httpx clients created before ``patch_httpx`` ran and wrap their
+    transports in NullRun's transports.
+
+    Audit 2026-06-29 (init-ordering hazard): the typical sequence
+
+        llm = ChatOpenAI(model=...)  # builds internal httpx.Client
+        nullrun.init(api_key=...)    # installs the __init__ patch
+
+    leaves ``llm``'s internal client with the unpatched transport.
+    New ``httpx.Client()`` constructions are auto-wrapped by the
+    class-level patch; this sweep is the back-fill.
+
+    Returns ``(sync_count, async_count)`` for logging. Errors are
+    swallowed by the caller — this is a best-effort back-fill, never
+    a hard requirement.
+
+    We use ``gc.get_objects()`` because httpx does not maintain a
+    weakref registry of its Client instances. The sweep is O(heap);
+    on a typical agent process (hundreds of MB heap, mostly strings
+    and small dicts) this takes <50 ms. We bail early on
+    ``RuntimeError`` (raised by ``gc.get_objects()`` when the
+    interpreter is shutting down) and on any ``isinstance`` failure
+    (a class with a broken ``__class__``).
+    """
+    sync_count = 0
+    async_count = 0
+    try:
+        for obj in gc.get_objects():
+            try:
+                if isinstance(obj, httpx.Client) and not isinstance(
+                    obj._transport, NullRunSyncTransport
+                ):
+                    obj._transport = NullRunSyncTransport(obj._transport, runtime)
+                    sync_count += 1
+                elif isinstance(obj, httpx.AsyncClient) and not isinstance(
+                    obj._transport, NullRunAsyncTransport
+                ):
+                    obj._transport = NullRunAsyncTransport(obj._transport, runtime)
+                    async_count += 1
+            except (ReferenceError, TypeError, AttributeError):
+                # gc.get_objects can yield objects that are mid-GC or
+                # have a broken __class__; skip them rather than abort.
+                continue
+    except RuntimeError:
+        # gc.get_objects() raises RuntimeError during interpreter
+        # shutdown. Nothing to do.
+        pass
+    return sync_count, async_count
 
 
 # ---------------------------------------------------------------------------

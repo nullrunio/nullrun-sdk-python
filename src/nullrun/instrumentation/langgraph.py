@@ -718,26 +718,77 @@ def _extract_model_from_response(response: Any) -> str | None:
     Returns the first non-empty value found, or ``None`` if every known
     source is empty / malformed.
 
+    Audit 2026-06-29 (SDK↔backend wire: silent zero-billing): the chain
+    was checked top-to-bottom and silently returned ``None`` whenever
+    none of the four known locations carried the model. The backend
+    then ``unwrap_or("default")``'d to ``DEFAULT_RATE`` and every call
+    was recorded as ≈$0. We now:
+
+      - promote ``response.llm_output['model_name']`` (the location
+        langchain-openai 1.x uses for the date-suffixed model id
+        ``gpt-4.1-mini-2025-04-14``) to step 1, ahead of the
+        ``response_metadata`` step that langchain 0.x used;
+      - add ``response.llm_output['model']`` and a generic
+        "any key containing 'model'" sweep so non-OpenAI wrappers
+        (proxies, custom chat models) still get attributed;
+      - log a DEBUG line on the None path so an operator who sees
+        the wire warning in the backend can correlate it to the
+        observation site that produced the event.
+
     Sources checked, in order:
 
-    1. ``response.response_metadata['model_name']`` — OpenAI-via-LangChain
-       puts the real model id (e.g. ``"gpt-4.1-mini-2025-04-14"``) here.
-    2. ``response.generations[0][0].message.response_metadata['model_name']``
-       — LLMResult callback path where the metadata lives on the AIMessage
-       rather than the LLMResult itself.
-    3. ``response.llm_output['model_name']`` — legacy LLMResult where the
-       chat-model wrapper hoisted the field onto the LLMResult dict.
-    4. ``response.model`` / ``response.model_name`` — direct attributes
-       on the response object (rare but seen in some custom wrappers).
+    1. ``response.llm_output['model_name']`` / ``['model']`` /
+       any key containing "model" — langchain-openai 1.x puts the
+       date-suffixed id (e.g. ``"gpt-4.1-mini-2025-04-14"``) on
+       ``LLMResult.llm_output``. The backend's ``MODEL_RATES``
+       substring-match handles the date suffix.
+    2. ``response.response_metadata['model_name']`` — direct AIMessage
+       case (langchain 0.x chat-model wrappers expose metadata at
+       this level).
+    3. ``response.generations[0][0].message.response_metadata['model_name']``
+       — LLMResult callback path where the metadata lives on the
+       AIMessage rather than the LLMResult itself.
+    4. Direct ``response.model`` / ``response.model_name`` attributes
+       (rare, seen on some custom wrappers).
     """
-    # 1. response_metadata on the response.
+    # 1. llm_output dict (langchain-openai 1.x primary location).
+    #    Promote ahead of the response_metadata step: for OpenAI via
+    #    LangChain 1.x, the LLMResult carries the model on
+    #    ``llm_output['model_name']`` (date-suffixed) while the
+    #    AIMessage inside ``generations[0][0].message`` does NOT
+    #    carry ``response_metadata`` populated — step 3 would return
+    #    None. Without promoting step 1, every OpenAI call was
+    #    silently zero-billed.
+    llm_out = getattr(response, "llm_output", None)
+    if isinstance(llm_out, dict) and llm_out:
+        # Preferred: explicit "model_name" then "model" key.
+        for key in ("model_name", "model"):
+            val = llm_out.get(key)
+            if isinstance(val, str) and val:
+                return val
+        # Fallback: scan every key in llm_output for one that
+        # contains "model" and holds a non-empty string. Some
+        # custom chat-model wrappers / proxies put the model under
+        # less canonical keys (``"model_id"``, ``"modelName"``,
+        # ``"resolved_model"``).
+        for key, val in llm_out.items():
+            if (
+                isinstance(key, str)
+                and "model" in key.lower()
+                and isinstance(val, str)
+                and val
+            ):
+                return val
+
+    # 2. response_metadata on the response (langchain 0.x AIMessage
+    #    case, and any wrapper that hoists the metadata up).
     resp_meta = getattr(response, "response_metadata", None)
     if isinstance(resp_meta, dict):
         val = resp_meta.get("model_name") or resp_meta.get("model")
         if val:
             return str(val)
 
-    # 2. LLMResult callback path — look on the generation's AIMessage.
+    # 3. LLMResult callback path — look on the generation's AIMessage.
     gen_msg = _safe_get_gen_message(response)
     if gen_msg is not None:
         gm = getattr(gen_msg, "response_metadata", None)
@@ -751,19 +802,25 @@ def _extract_model_from_response(response: Any) -> str | None:
             if v:
                 return str(v)
 
-    # 3. llm_output dict (legacy LLMResult).
-    llm_out = getattr(response, "llm_output", None)
-    if isinstance(llm_out, dict):
-        val = llm_out.get("model_name") or llm_out.get("model")
-        if val:
-            return str(val)
-
     # 4. Direct attribute on response.
     for attr in ("model_name", "model"):
         v = getattr(response, attr, None)
         if v:
             return str(v)
 
+    # Diagnostic: every code path above returned None. The runtime
+    # layer will warn at ERROR when this happens for an llm_call
+    # event; this DEBUG line is for the per-call site so the
+    # operator can correlate the wire warning back to a specific
+    # response shape.
+    try:
+        response_type = type(response).__name__
+    except Exception:
+        response_type = "<unknown>"
+    logger.debug(
+        "_extract_model_from_response returned None for response of type %s",
+        response_type,
+    )
     return None
 
 
