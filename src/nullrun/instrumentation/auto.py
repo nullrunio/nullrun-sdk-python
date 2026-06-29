@@ -169,6 +169,15 @@ def _openai_extractor(body: bytes, status: int) -> ExtractedUsage | None:
         "completion_tokens": completion,
         "total_tokens": total,
         "model": payload.get("model"),
+        # Audit 2026-06-29 (unified fingerprint): the upstream
+        # chat-completion id (``payload["id"]``, e.g.
+        # ``"chatcmpl-Dw7288WJI4bBDFyQ4DnZvhPUKfaZo"`` for OpenAI) is
+        # the tightest discriminator for collapsing the sibling
+        # LangChain-callback emission via ``_fingerprint_for_llm_call``.
+        # Without this, the httpx path's fingerprint scheme (sha256 of
+        # body bytes) never collides with the callback's scheme and
+        # the dedup LRU cannot collapse duplicates.
+        "id": payload.get("id"),
         # Phase 4.1: explicit cache / reasoning / finish / tool fields.
         # Previously these were reachable only via raw_usage (now
         # stripped at the wire boundary). Backend gate/budget/loop
@@ -179,6 +188,76 @@ def _openai_extractor(body: bytes, status: int) -> ExtractedUsage | None:
         "finish_reason": _normalize_finish_reason(raw_finish),
         "tool_names": tool_names,
     }
+
+
+# ---------------------------------------------------------------------------
+# D2.5 (Audit 2026-06-29): unified LLM-call fingerprint
+# ---------------------------------------------------------------------------
+# The httpx transport and the LangChain callback both observe the same
+# real LLM call, but until this commit they computed fingerprints from
+# different inputs:
+#   - httpx transport:  sha256(host|status|body)
+#   - LangChain callback: sha256(json({path, run_id, response_id, ...}))
+# Because the inputs differ, the two fingerprints never collided and the
+# dedup LRU at runtime.track() could not collapse the two emissions for the
+# same call. On a typical `app.invoke()` with 6 LLM calls the backend
+# saw ~12 llm_call events on the wire (2 per real call), which doubled
+# the dashboard's `llm_call_count` and skewed `cost_events` aggregates.
+#
+# The fix: a single helper that both observers call with the same three
+# signals (model + provider + upstream chat-completion id). The three are
+# reachable from every observer:
+#   - httpx transport reads `model` and `id` straight out of the response
+#     body JSON (`payload["model"]`, `payload["id"]`).
+#   - LangChain callback reads `model` from `invocation_params` /
+#     `response.llm_output["model_name"]` and `id` from
+#     `response.llm_output["id"]` / `response.id` / the generation's
+#     AIMessage `.id` / `response.response_metadata["id"]` — all four
+#     locations are populated by langchain-openai 1.x for OpenAI chat
+#     completions.
+# When any of the three signals is missing, the helper falls back to the
+# empty string on that slot; the resulting fingerprint is still
+# deterministic for the call, just less specific. That's intentional —
+# a missing `id` (custom chat-model wrappers that don't surface it) still
+# collapses the two observers via the model+provider combination; the
+# narrower the key, the fewer collisions across distinct calls.
+
+def _fingerprint_for_llm_call(
+    model: str | None,
+    provider: str | None,
+    response_id: str | None,
+) -> str:
+    """Unified fingerprint for one real LLM call.
+
+    Both the httpx transport hook (``NullRunSyncTransport._emit`` /
+    ``NullRunAsyncTransport._emit``) and the LangChain callback
+    (``NullRunCallback.on_llm_end``) call this with the same three
+    signals so the dedup LRU at ``runtime.track()`` can collapse the
+    sibling emission for the same call to a single wire event.
+
+    Args:
+        model: provider-side model id as returned by the upstream
+            (``"gpt-4.1-mini-2025-04-14"`` for OpenAI, ``"claude-3-5-sonnet-..."``
+            for Anthropic, etc.). None is acceptable; the slot still
+            contributes to the fingerprint.
+        provider: short provider label (``"openai"``, ``"anthropic"``,
+            ``"gemini"``, etc.). Same fallback semantics as ``model``.
+        response_id: upstream chat-completion id (``"chatcmpl-..."`` for
+            OpenAI, ``"msg_..."`` for Anthropic, etc.). This is the
+            tightest discriminator — two LLM calls with the same model
+            and provider will still have distinct response_ids, so this
+            is the slot that prevents spurious collisions across
+            unrelated calls.
+
+    Returns:
+        A 16-char hex digest suitable for the ``_fingerprint`` event
+        field consumed by ``NullRunRuntime.track()``.
+    """
+    payload = f"{model or ''}|{provider or ''}|{response_id or ''}"
+    h = hashlib.sha256()
+    h.update(b"llm_call|")
+    h.update(payload.encode("utf-8"))
+    return h.hexdigest()[:16]
 
 
 def _anthropic_extractor(body: bytes, status: int) -> ExtractedUsage | None:
@@ -220,6 +299,9 @@ def _anthropic_extractor(body: bytes, status: int) -> ExtractedUsage | None:
         "completion_tokens": out,
         "total_tokens": inp + out,
         "model": payload.get("model"),
+        # Audit 2026-06-29 (unified fingerprint): Anthropic message id,
+        # e.g. ``"msg_01HXYZ..."``. See _openai_extractor comment.
+        "id": payload.get("id"),
         "cache_read_tokens": int(usage.get("cache_read_input_tokens", 0) or 0),
         "cache_write_tokens": int(usage.get("cache_creation_input_tokens", 0) or 0),
         # Anthropic reasoning tokens are part of output_tokens (they're
@@ -273,6 +355,11 @@ def _gemini_extractor(body: bytes, status: int) -> ExtractedUsage | None:
         "completion_tokens": completion,
         "total_tokens": total or (prompt + completion),
         "model": payload.get("modelVersion"),
+        # Audit 2026-06-29 (unified fingerprint): Gemini doesn't
+        # currently surface a stable response id at the top level;
+        # fall back to ``None`` and rely on model+provider to
+        # disambiguate. See _openai_extractor for the rationale.
+        "id": payload.get("responseId") or payload.get("id"),
         "cache_read_tokens": int(usage.get("cachedContentTokenCount", 0) or 0),
         "cache_write_tokens": 0,
         "reasoning_tokens": 0,
@@ -326,6 +413,10 @@ def _cohere_extractor(body: bytes, status: int) -> ExtractedUsage | None:
         "completion_tokens": out,
         "total_tokens": total,
         "model": payload.get("model"),
+        # Audit 2026-06-29 (unified fingerprint): Cohere v2 doesn't
+        # surface a stable response id at the top level; rely on
+        # model+provider for disambiguation. See _openai_extractor.
+        "id": payload.get("id") or payload.get("generation_id"),
         "cache_read_tokens": 0,
         "cache_write_tokens": 0,
         "reasoning_tokens": 0,
@@ -457,6 +548,13 @@ def _bedrock_extractor(body: bytes, status: int) -> ExtractedUsage | None:
         "completion_tokens": out,
         "total_tokens": total,
         "model": payload.get("modelId") or payload.get("model"),
+        # Audit 2026-06-29 (unified fingerprint): Bedrock InvokeModel
+        # response carries ``id`` at the top level (e.g.
+        # ``"msg_01ABC..."`` for Anthropic-on-Bedrock, ``"cmpl-..."``
+        # for Mistral-on-Bedrock). Falls back to ``None`` when the
+        # adapter doesn't surface one; model+provider still give us
+        # a fingerprint slot, just less specific.
+        "id": payload.get("id"),
         "cache_read_tokens": cache_read,
         "cache_write_tokens": cache_write,
         "reasoning_tokens": 0,
@@ -746,6 +844,15 @@ class NullRunSyncTransport(httpx.BaseTransport):
             # columns; raw_usage is no longer on the wire (stripped
             # at the track() boundary — see _WIRE_STRIP_FIELDS in
             # runtime.py).
+            #
+            # Audit 2026-06-29 (unified fingerprint): we use the
+            # ``_fingerprint_for_llm_call`` helper so this emission
+            # shares the same dedup key as the LangChain callback's
+            # emission for the same call. The previous per-transport
+            # ``_fingerprint_for(host, body, status)`` produced a key
+            # the callback could never collide with, doubling every
+            # real LLM call on the wire.
+            response_id = usage.get("id")
             self._runtime.track(
                 {
                     "type": "llm_call",
@@ -768,8 +875,15 @@ class NullRunSyncTransport(httpx.BaseTransport):
                     # in runtime.py — kept here only so the in-process
                     # dedup layer can see the full vendor payload.
                     "raw_usage": usage,
-                    # Fingerprint for dedup at the track() sink.
-                    "_fingerprint": _fingerprint_for(host, body, status),
+                    # Audit 2026-06-29 (unified fingerprint): see
+                    # ``_fingerprint_for_llm_call`` — same key the
+                    # LangChain callback computes, so the dedup LRU
+                    # collapses the two emissions for the same call.
+                    "_fingerprint": _fingerprint_for_llm_call(
+                        model_for_event,
+                        _provider_label(host),
+                        response_id,
+                    ),
                 }
             )
         except Exception as e:
@@ -889,6 +1003,12 @@ class NullRunAsyncTransport(httpx.AsyncBaseTransport):
             # Phase 4.1: see sync _emit for rationale. Async path
             # uses identical event shape so the dedup key space
             # stays unified across sync + async transports.
+            #
+            # Audit 2026-06-29 (unified fingerprint): see sync
+            # _emit for the rationale — async transport must use the
+            # same key the LangChain callback computes so the dedup
+            # LRU collapses duplicates.
+            response_id = usage.get("id")
             self._runtime.track(
                 {
                     "type": "llm_call",
@@ -908,7 +1028,11 @@ class NullRunAsyncTransport(httpx.AsyncBaseTransport):
                         "tracked": True,
                     },
                     "raw_usage": usage,
-                    "_fingerprint": _fingerprint_for(host, body, status),
+                    "_fingerprint": _fingerprint_for_llm_call(
+                        usage.get("model"),
+                        _provider_label(host),
+                        response_id,
+                    ),
                 }
             )
         except Exception as e:
@@ -1921,14 +2045,47 @@ def _emit_streaming_skipped(
     `model` falls back to the request body via
     `_extract_model_from_request_body` (sync-only, mirrors
     `_emit`'s pattern at lines 735-739).
+
+    Audit 2026-06-29 (ghost-event dedup): the previous version
+    emitted the event unconditionally and without a `_fingerprint`.
+    Two consequences:
+      1. When the body read fails for an external reason
+         (double-consume by langchain-openai, an upstream that
+         already drained the stream), the SDK produced an
+         `llm_call` with `tokens=0, model=None` — i.e. no useful
+         signal — that still reached the wire. The backend's
+         `into_track_request_v2` handler gate (handler.rs:2046)
+         rejected these with HTTP 422, but the cost-pipeline
+         belt-and-suspenders backstop still logged every one as
+         `cost_pipeline_missing_model_total` and stamped the 1-cent
+         surcharge. Operators saw 30+ ERROR lines per `app.invoke()`
+         for a workload that actually had 6 real LLM calls.
+      2. Because no `_fingerprint` was attached, the dedup LRU at
+         `runtime.track()` could not collapse this emission with
+         any sibling emission for the same call.
+    Fix: drop the event entirely when we cannot recover a usable
+    `model` (the request body has been consumed or doesn't carry
+    the field — same signature as a body that genuinely cannot be
+    inspected), and attach a deterministic `_fingerprint` when we
+    do emit so dedup collapses repeats from the same call site.
     """
+    model = _extract_model_from_request_body(request)
+    if not model:
+        logger.debug(
+            "NullRun transport: dropping streaming_skipped event for host=%s "
+            "because model extraction also failed (likely double-consume "
+            "by langchain-openai upstream or empty request body); "
+            "the happy-path _emit() will handle attribution if available",
+            host,
+        )
+        return
     try:
         runtime.track(
             {
                 "type": "llm_call",
                 "provider": _provider_label(host),
                 "host": host,
-                "model": _extract_model_from_request_body(request),
+                "model": model,
                 "tokens": 0,
                 "input_tokens": 0,
                 "output_tokens": 0,
@@ -1937,6 +2094,23 @@ def _emit_streaming_skipped(
                     "tracked": False,
                     "streaming_skipped": True,
                 },
+                # Audit 2026-06-29 (unified fingerprint): use the
+                # shared ``_fingerprint_for_llm_call`` helper so this
+                # ghost emission also collapses with any sibling
+                # emission the LangChain callback produces for the
+                # same call. The body was never read, so we don't
+                # have an upstream response id — but the model +
+                # provider pair still gives a deterministic key that
+                # matches the callback's emission for the same call
+                # when the callback has the model but not the id.
+                # (The pre-fix ``_fingerprint_for(host, b"<...>", 0)``
+                # sentinel produced a unique-per-path key that
+                # collided with NOTHING.)
+                "_fingerprint": _fingerprint_for_llm_call(
+                    model,
+                    _provider_label(host),
+                    None,
+                ),
             }
         )
     except Exception as e:  # pragma: no cover — defensive
