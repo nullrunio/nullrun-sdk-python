@@ -1430,23 +1430,38 @@ class NullRunRuntime:
             if k not in _WIRE_STRIP_FIELDS and v is not None
         }
 
-        # Audit 2026-06-28 (SDK↔backend wire): backend cost pipeline
-        # emits ``WARN model_id=default`` whenever an llm_call event
-        # reaches the wire without a ``model`` field
-        # (pipeline.rs:164 ``unwrap_or("default")``). This log lets
-        # operators reproduce the path: which observation (httpx /
-        # langchain callback / manual track / agents tracer / requests)
-        # produced an llm_call without ``model`` set, and whether
-        # the SDK explicitly passed ``model=None``, omitted the key,
-        # or had ``model=""`` (which the ``if model:`` guard in
-        # track_llm silently drops). Activated only for llm_call so
-        # span_start/span_end/tool_call traffic doesn't pollute logs.
+        # Audit 2026-06-29 (SDK↔backend wire: silent zero-billing):
+        # backend cost pipeline emits ``WARN model_id=default``
+        # whenever an llm_call event reaches the wire without a
+        # ``model`` field (pipeline.rs:176 ``unwrap_or("default")``).
+        # Pre-fix the SDK warned and continued — the backend then
+        # silently fell through to ``DEFAULT_RATE`` and every call
+        # was recorded as ≈$0, breaking budget enforcement.
+        #
+        # Post-fix the SDK is fail-LOUD (not fail-closed yet — the
+        # event is still sent so the backend can audit/reject):
+        #
+        #   1. ERROR log instead of WARN — operator sees the breakage
+        #      immediately, not buried in routine log noise.
+        #   2. Bump the ``dropped_llm_call_no_model`` runtime counter
+        #      so dashboards can surface the regression rate.
+        #   3. Tag the wire event with ``__missing_model: True`` so
+        #      the backend's into_track_request gate (fail-CLOSED
+        #      layer) can reject with HTTP 422 and a clear error
+        #      envelope instead of silently recording a zero-cost
+        #      call. The flag is treated as a wire-private signal —
+        #      the backend strips it before persisting.
+        #
+        # Activated only for llm_call so span_start/span_end/
+        # tool_call traffic doesn't pollute logs or the wire.
         if wire_event.get("type") == "llm_call" and not wire_event.get("model"):
-            logger.warning(
+            logger.error(
                 "track(): llm_call event missing 'model' field — "
-                "backend will fall back to DEFAULT_RATE. event=%s",
+                "tagging for backend rejection (HTTP 422). event=%s",
                 wire_event,
             )
+            metrics.inc_runtime("dropped_llm_call_no_model")
+            wire_event["__missing_model"] = True
 
         self._transport.track(wire_event)
 
