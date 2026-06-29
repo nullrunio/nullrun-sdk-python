@@ -43,11 +43,7 @@ for i in range(3):
     )
     print(f"call #{i + 1}: {resp.choices[0].message.content!r}")
 
-# 4. Optional: print a coverage snapshot from the runtime instance.
-#    The same counters are sent over the WS heartbeat and via the
-#    HTTP-fallback path when the WS connection is down.
-print("\nCoverage snapshot:")
-rt = nullrun.get_runtime()
-report = rt.coverage_report()
-for k, v in report.items():
-    print(f"  {k}: {v}")
+# 4. 0.9.0: per-process coverage snapshot removed. Coverage is now
+# derived server-side from llm_call span metadata (host + tracked +
+# streaming_skipped flags). Query the dashboard or use
+# `GET /api/v1/coverage/{org_id}` to inspect.

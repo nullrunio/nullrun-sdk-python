@@ -634,9 +634,12 @@ class NullRunSyncTransport(httpx.BaseTransport):
             # rebuild path only.
             body = _read_body_with_cap(response, MAX_RESPONSE_BYTES)
             if body is None:
-                # Body exceeded the cap. Drain it (so callers don't
-                # see a half-consumed response) but don't track.
-                _safe_bump_coverage(self._runtime, "_coverage_streaming_skipped", host)
+                # Body exceeded the cap. 0.9.0: still emit an
+                # llm_call event so the call counts toward coverage
+                # (host known, model best-effort, tracked: false
+                # because usage wasn't extractable). Drain the body
+                # so callers don't see a half-consumed response.
+                _emit_streaming_skipped(self._runtime, request, host)
                 logger.debug(
                     "NullRun transport: response from %s exceeded %d bytes; "
                     "skipping usage tracking",
@@ -709,16 +712,6 @@ class NullRunSyncTransport(httpx.BaseTransport):
         body: bytes,
         status: int,
     ) -> None:
-        # P2-1 (plan §10): bump the coverage counter so the dashboard
-        # can see which LLM hosts the agent is talking to. Pre-fix
-        # this counter was only incremented in the ``requests`` path
-        # (auto_requests.py:185). The httpx path is the dominant
-        # one (every OpenAI / Anthropic / Gemini / Mistral / Cohere
-        # call goes through httpx), so without this bump the
-        # ``coverage_seen`` view in the dashboard would be empty for
-        # the majority of customers.
-        _safe_bump_coverage(self._runtime, "_coverage_seen", host)
-
         # 2026-06-28 (Issue 2 fix): if the extractor returned ``None``
         # for ``model`` (response body lacked the field — observed for
         # some OpenAI Responses-API and Anthropic streaming edge cases),
@@ -738,6 +731,14 @@ class NullRunSyncTransport(httpx.BaseTransport):
             or _extract_model_from_request_body(request)
         )
 
+        # 0.9.0: every successful llm_call span carries
+        # `metadata.tracked: True`. The backend's coverage query
+        # (backend/src/coverage/mod.rs) computes tracked_pct from
+        # this flag — it replaces the old `_coverage_seen` /
+        # `_coverage_tracked` per-host dicts. Usage was extracted
+        # successfully, so the SDK's `_match_extractor` identified
+        # a known provider. See plan at
+        # `~/.claude/plans/async-swinging-hanrahan.md`.
         try:
             # Phase 4.1: lift cache / reasoning / finish / tool names
             # out of raw_usage onto the event itself. The backend's
@@ -760,6 +761,9 @@ class NullRunSyncTransport(httpx.BaseTransport):
                     "finish_reason": usage.get("finish_reason"),
                     "tool_names": usage.get("tool_names") or [],
                     "has_usage": True,
+                    "metadata": {
+                        "tracked": True,
+                    },
                     # Stripped at the wire boundary by _WIRE_STRIP_FIELDS
                     # in runtime.py — kept here only so the in-process
                     # dedup layer can see the full vendor payload.
@@ -805,7 +809,10 @@ class NullRunAsyncTransport(httpx.AsyncBaseTransport):
             # P0-3: bounded read (see sync path for full rationale).
             body = await _aread_body_with_cap(response, MAX_RESPONSE_BYTES)
             if body is None:
-                _safe_bump_coverage(self._runtime, "_coverage_streaming_skipped", host)
+                # 0.9.0: emit llm_call with metadata.streaming_skipped: true
+                # so the call counts toward coverage (host known,
+                # tracked: false because usage wasn't extractable).
+                _emit_streaming_skipped(self._runtime, request, host)
                 logger.debug(
                     "NullRun transport: async response from %s exceeded %d bytes; "
                     "skipping usage tracking",
@@ -873,10 +880,11 @@ class NullRunAsyncTransport(httpx.AsyncBaseTransport):
         body: bytes,
         status: int,
     ) -> None:
-        # P2-1 (plan §10): mirror the sync path — bump the coverage
-        # counter so the dashboard's ``coverage_seen`` view shows
-        # httpx-path traffic (the dominant path).
-        _safe_bump_coverage(self._runtime, "_coverage_seen", host)
+        # 0.9.0: emit llm_call with metadata.tracked: True (sync
+        # path is identical). Async path doesn't have the request-
+        # body model fallback yet (sync path's
+        # `_extract_model_from_request_body` is sync-only); leave
+        # model as the response-body value or None.
         try:
             # Phase 4.1: see sync _emit for rationale. Async path
             # uses identical event shape so the dedup key space
@@ -896,6 +904,9 @@ class NullRunAsyncTransport(httpx.AsyncBaseTransport):
                     "finish_reason": usage.get("finish_reason"),
                     "tool_names": usage.get("tool_names") or [],
                     "has_usage": True,
+                    "metadata": {
+                        "tracked": True,
+                    },
                     "raw_usage": usage,
                     "_fingerprint": _fingerprint_for(host, body, status),
                 }
@@ -992,6 +1003,14 @@ _langgraph_lock = threading.Lock()
 # first runtime — silently losing track() calls from later test runs.
 _orig_sync_init: Callable[..., Any] | None = None
 _orig_async_init: Callable[..., Any] | None = None
+# Audit 2026-06-29 (reset_for_tests gap): stash the originals of the
+# class methods we wrap so reset_for_tests can put them back. Without
+# this, a second test pass with `_langchain_patched = False` would
+# double-wrap `BaseCallbackManager.__init__`, and similarly for
+# `agents.Runner.run` / `Runner.run_sync`.
+_orig_base_callback_manager_init: Callable[..., Any] | None = None
+_orig_runner_run: Callable[..., Any] | None = None
+_orig_runner_run_sync: Callable[..., Any] | None = None
 
 
 def patch_httpx(runtime: Any) -> bool:
@@ -1165,6 +1184,12 @@ def patch_langchain_callback(runtime: Any) -> bool:
             return True
 
         _orig_init = BaseCallbackManager.__init__
+        # Audit 2026-06-29 (reset_for_tests gap): stash the original
+        # on a module-level so reset_for_tests can put it back.
+        # Without this, a second test pass with `_langchain_patched
+        # = False` would double-wrap.
+        global _orig_base_callback_manager_init
+        _orig_base_callback_manager_init = _orig_init
 
         def _wrap_init(self: Any, *args: Any, **kwargs: Any) -> None:
             _orig_init(self, *args, **kwargs)
@@ -1188,6 +1213,146 @@ def patch_langchain_callback(runtime: Any) -> bool:
         _langchain_patched = True
         logger.info("LangChain callback auto-instrumentation installed")
         return True
+
+
+# ---------------------------------------------------------------------------
+# D4b: patch_chat_model_invoke — defensive callback injection at the LLM
+# boundary.
+# ---------------------------------------------------------------------------
+# Audit 2026-06-29 (silent zero-billing): the previous
+# ``patch_langchain_callback`` only wrapped ``BaseCallbackManager.__init__``.
+# When the user instantiates ``ChatOpenAI(...)`` *before* ``nullrun.init``
+# (a common pattern — see SDK examples), the ``ChatOpenAI`` object keeps
+# no callback manager attached. The patched ``__init__`` runs only when
+# a *new* ``BaseCallbackManager`` is constructed inside
+# ``BaseChatModel.invoke`` / ``Runnable.invoke``. If the LangGraph path
+# goes through a different construction sequence (e.g. caching,
+# alternative transports, in-memory mock providers) the new manager
+# might be bypassed and ``on_llm_end`` never fires.
+#
+# To make the wiring robust we also wrap ``BaseChatModel.invoke`` /
+# ``BaseChatModel.ainvoke`` so a ``NullRunCallback`` is always present
+# in the per-call handlers list. This is belt-and-suspenders over the
+# ``BaseCallbackManager.__init__`` patch — if the manager constructor
+# runs, the handler is added; if the manager constructor is somehow
+# bypassed, the invoke wrapper still attaches it.
+#
+# Idempotent. Returns False if ``langchain-core`` is not installed.
+
+_chat_model_invoke_patched = False
+_orig_chat_model_invoke: Callable[..., Any] | None = None
+_orig_chat_model_ainvoke: Callable[..., Any] | None = None
+_orig_chat_model_stream: Callable[..., Any] | None = None
+_orig_chat_model_astream: Callable[..., Any] | None = None
+
+
+def patch_chat_model_invoke(runtime: Any) -> bool:
+    """Inject ``NullRunCallback`` at the ``BaseChatModel.invoke`` /
+    ``ainvoke`` boundary as a defensive complement to
+    ``patch_langchain_callback``.
+
+    See the audit block above for why both layers are needed. We never
+    *replace* user-supplied callbacks — the wrapped closure appends
+    our handler only when the user hasn't already supplied a
+    ``NullRunCallback``.
+    """
+    global _chat_model_invoke_patched
+    with _langchain_lock:
+        if _chat_model_invoke_patched:
+            return True
+        try:
+            from langchain_core.language_models import BaseChatModel
+        except ImportError:
+            logger.debug("langchain-core not installed; chat-model invoke patch skipped")
+            return False
+
+        if getattr(BaseChatModel, "_nullrun_invoke_patched", False):
+            _chat_model_invoke_patched = True
+            return True
+
+        def _ensure_cb(handlers: Any) -> list[Any]:
+            """Append a NullRunCallback to a handler list if absent."""
+            if handlers is None:
+                handlers = []
+            try:
+                if any(isinstance(h, NullRunCallback) for h in handlers):
+                    return list(handlers)
+            except TypeError:
+                return list(handlers) if handlers else []
+            return list(handlers) + [NullRunCallback(runtime=runtime)]
+
+        _orig_invoke = BaseChatModel.invoke
+        _orig_ainvoke = BaseChatModel.ainvoke
+        _orig_stream = BaseChatModel.stream
+        _orig_astream = BaseChatModel.astream
+
+        def _wrap_invoke(self: Any, input: Any, config: Any = None, **kwargs: Any) -> Any:
+            new_config = _inject_handler_into_config(config, _ensure_cb)
+            return _orig_invoke(self, input, new_config, **kwargs)
+
+        async def _wrap_ainvoke(
+            self: Any, input: Any, config: Any = None, **kwargs: Any
+        ) -> Any:
+            new_config = _inject_handler_into_config(config, _ensure_cb)
+            return await _orig_ainvoke(self, input, new_config, **kwargs)
+
+        def _wrap_stream(
+            self: Any, input: Any, config: Any = None, **kwargs: Any
+        ) -> Any:
+            new_config = _inject_handler_into_config(config, _ensure_cb)
+            return _orig_stream(self, input, new_config, **kwargs)
+
+        def _wrap_astream(
+            self: Any, input: Any, config: Any = None, **kwargs: Any
+        ) -> Any:
+            new_config = _inject_handler_into_config(config, _ensure_cb)
+            return _orig_astream(self, input, new_config, **kwargs)
+
+        global _orig_chat_model_invoke, _orig_chat_model_ainvoke
+        _orig_chat_model_invoke = _orig_invoke
+        _orig_chat_model_ainvoke = _orig_ainvoke
+        global _orig_chat_model_stream, _orig_chat_model_astream
+        _orig_chat_model_stream = _orig_stream
+        _orig_chat_model_astream = _orig_astream
+
+        BaseChatModel.invoke = _wrap_invoke  # type: ignore[method-assign]
+        BaseChatModel.ainvoke = _wrap_ainvoke  # type: ignore[method-assign]
+        BaseChatModel.stream = _wrap_stream  # type: ignore[method-assign]
+        BaseChatModel.astream = _wrap_astream  # type: ignore[method-assign]
+        BaseChatModel._nullrun_invoke_patched = True  # type: ignore[attr-defined]
+        _chat_model_invoke_patched = True
+        logger.info(
+            "LangChain BaseChatModel.invoke/ainvoke/stream/astream defensive callback injection installed"
+        )
+        return True
+
+
+def _inject_handler_into_config(config: Any, ensure: Callable[[Any], list[Any]]) -> Any:
+    """Helper: ensure ``config["callbacks"]`` (or the
+    ``configurable``/``callbacks`` kwarg) carries our handler. Returns
+    the original config untouched when we can't safely mutate it
+    (e.g. ``config`` is a frozen mapping).
+
+    The user may pass either:
+        - a dict like ``{"callbacks": [...]}``  (standard Runnable path)
+        - a RunnableConfig built from ``ConfigurableFieldSpec`` etc.
+        - ``None`` (we synthesise a fresh dict).
+    """
+    if config is None:
+        return {"callbacks": ensure(None)}
+    if not isinstance(config, dict):
+        return config
+    # `callbacks` is the canonical key on RunnableConfig. Some
+    # wrappers use `callback_manager` — we honour both. We never
+    # *replace* a user-supplied callback manager; we only ensure
+    # the handler list contains our NullRunCallback.
+    if "callbacks" in config:
+        config = dict(config)
+        config["callbacks"] = ensure(config["callbacks"])
+        return config
+    config = dict(config)
+    config["callbacks"] = ensure(None)
+    return config
 
 
 # ---------------------------------------------------------------------------
@@ -1219,6 +1384,13 @@ def patch_openai_agents(runtime: Any) -> bool:
 
     _orig_run = Runner.run
     _orig_run_sync = getattr(Runner, "run_sync", None)
+    # Audit 2026-06-29 (reset_for_tests gap): stash originals so
+    # reset_for_tests can restore them. Without this, a second
+    # test pass with `_agents_patched = False` would double-wrap
+    # Runner.run / Runner.run_sync.
+    global _orig_runner_run, _orig_runner_run_sync
+    _orig_runner_run = _orig_run
+    _orig_runner_run_sync = _orig_run_sync
 
     def _wrap_run(*args: Any, **kwargs: Any) -> Any:
         result = _orig_run(*args, **kwargs)
@@ -1472,10 +1644,10 @@ def auto_instrument(runtime: Any) -> bool:
     with _auto_lock:
         if _auto_installed:
             return True
-        # Lazy imports — auto_requests needs `_safe_bump_coverage` (now
-        # defined in this module) at module import time. The framework
-        # patches below are silent no-ops when their respective
-        # packages aren't installed.
+        # Lazy imports — auto_requests and the framework patches below
+        # are silent no-ops when their respective packages aren't
+        # installed. Each sub-importer handles its own missing-dep
+        # case.
         from nullrun.instrumentation._safe_patch import safe_patch
         from nullrun.instrumentation.auto_requests import patch_requests
         from nullrun.instrumentation.autogen import patch_autogen
@@ -1485,6 +1657,15 @@ def auto_instrument(runtime: Any) -> bool:
         paths = [
             safe_patch("httpx", lambda: patch_httpx(runtime)),
             safe_patch("langchain_callback", lambda: patch_langchain_callback(runtime)),
+            # D4b (2026-06-29): belt-and-suspenders callback injection at
+            # the BaseChatModel.invoke boundary. Ensures NullRunCallback
+            # fires even when the user creates the LLM BEFORE init() and
+            # the BaseCallbackManager.__init__ patch is somehow bypassed
+            # (LangGraph node-internal calls, cached config paths, etc.).
+            safe_patch(
+                "chat_model_invoke",
+                lambda: patch_chat_model_invoke(runtime),
+            ),
             safe_patch("openai_agents", lambda: patch_openai_agents(runtime)),
             safe_patch("langgraph_compiled", lambda: patch_langgraph_compiled(runtime)),
             safe_patch("requests", lambda: patch_requests(runtime)),
@@ -1529,6 +1710,10 @@ def reset_for_tests() -> None:
     global _orig_sync_init, _orig_async_init
     global _orig_pregel_invoke, _orig_pregel_stream
     global _orig_pregel_ainvoke, _orig_pregel_astream
+    global _orig_chat_model_invoke, _orig_chat_model_ainvoke
+    global _orig_chat_model_stream, _orig_chat_model_astream
+    global _orig_base_callback_manager_init
+    global _orig_runner_run, _orig_runner_run_sync
     _auto_installed = False
     _httpx_patched = False
     _langchain_patched = False
@@ -1562,6 +1747,50 @@ def reset_for_tests() -> None:
     _orig_pregel_stream = None
     _orig_pregel_ainvoke = None
     _orig_pregel_astream = None
+    # D4b (2026-06-29): restore BaseChatModel.invoke/ainvoke/stream/astream
+    # if we patched them, otherwise the next test pass would double-wrap.
+    if _orig_chat_model_invoke is not None:
+        try:
+            from langchain_core.language_models import BaseChatModel
+            BaseChatModel.invoke = _orig_chat_model_invoke  # type: ignore[method-assign]
+            BaseChatModel.ainvoke = _orig_chat_model_ainvoke  # type: ignore[method-assign]
+            BaseChatModel.stream = _orig_chat_model_stream  # type: ignore[method-assign]
+            BaseChatModel.astream = _orig_chat_model_astream  # type: ignore[method-assign]
+            BaseChatModel._nullrun_invoke_patched = False  # type: ignore[attr-defined]
+        except Exception as e:  # pragma: no cover — defensive
+            logger.debug("reset_for_tests: failed to restore BaseChatModel: %s", e)
+    _orig_chat_model_invoke = None
+    _orig_chat_model_ainvoke = None
+    _orig_chat_model_stream = None
+    _orig_chat_model_astream = None
+    global _chat_model_invoke_patched
+    _chat_model_invoke_patched = False
+    # Audit 2026-06-29 (reset_for_tests gap): pre-fix the function
+    # reset the *_patched flag for langchain_callback and openai_agents
+    # but did NOT restore the wrapped class methods. A second test
+    # pass with `auto._langchain_patched = False; auto_instrument(r)`
+    # would then double-wrap BaseCallbackManager.__init__ /
+    # Runner.run / Runner.run_sync. Fix: restore them here so a
+    # repeat pass gets a clean wrap.
+    if _orig_base_callback_manager_init is not None:
+        try:
+            from langchain_core.callbacks import BaseCallbackManager
+            BaseCallbackManager.__init__ = _orig_base_callback_manager_init  # type: ignore[method-assign]
+            BaseCallbackManager._nullrun_patched = False  # type: ignore[attr-defined]
+        except Exception as e:  # pragma: no cover — defensive
+            logger.debug("reset_for_tests: failed to restore BaseCallbackManager: %s", e)
+    _orig_base_callback_manager_init = None
+    if _orig_runner_run is not None:
+        try:
+            from agents import Runner
+            Runner.run = _orig_runner_run  # type: ignore[method-assign]
+            if _orig_runner_run_sync is not None:
+                Runner.run_sync = _orig_runner_run_sync  # type: ignore[method-assign]
+            Runner._nullrun_patched = False  # type: ignore[attr-defined]
+        except Exception as e:  # pragma: no cover — defensive
+            logger.debug("reset_for_tests: failed to restore Runner: %s", e)
+    _orig_runner_run = None
+    _orig_runner_run_sync = None
 
 
 # ---------------------------------------------------------------------------
@@ -1674,27 +1903,41 @@ def _fingerprint_is_seen(state: OrderedDict[str, None], fp: str) -> bool:
     return False
 
 
-def _safe_bump_coverage(runtime: Any, target_attr: str, host: str) -> None:
-    """Bump a per-host counter on the runtime, tolerating stub runtimes
-    (MagicMock, custom test doubles) that don't carry the attribute.
+def _emit_streaming_skipped(
+    runtime: Any,
+    request: httpx.Request,
+    host: str,
+) -> None:
+    """Emit an llm_call event for a response where the body exceeded
+    the tracking cap and usage data could not be extracted.
 
-    ``target_attr`` is one of ``_coverage_seen``,
-    ``_coverage_streaming_skipped``. Mirrors the structure of
-    ``_fingerprint_is_seen`` — never raises.
+    0.9.0: replaces the old `_safe_bump_coverage(...,
+    "_coverage_streaming_skipped", host)` counter bump. The event
+    carries `metadata.streaming_skipped: True` and `metadata.tracked:
+    False` (extractor did not run because the body was never read)
+    so the backend's coverage query still counts it toward the
+    `llm_call_count` denominator while flagging it as not-tracked.
 
-    Background: ``nullrun.instrumentation.auto_requests`` imports this
-    helper but the original 0.3.0 release never defined it, so the
-    entire ``requests`` auto-instrumentation path was unimportable.
-    Adding the helper here unblocks the module and the dashboard's
-    coverage tab.
+    `model` falls back to the request body via
+    `_extract_model_from_request_body` (sync-only, mirrors
+    `_emit`'s pattern at lines 735-739).
     """
-    target = getattr(runtime, target_attr, None)
-    if target is None:
-        return
-    if isinstance(target, dict):
-        target[host] = int(target.get(host, 0)) + 1
-    else:
-        try:
-            target[host] = int(target[host]) + 1
-        except Exception as e:  # pragma: no cover — defensive
-            logger.debug("_safe_bump_coverage: %s bump failed: %s", target_attr, e)
+    try:
+        runtime.track(
+            {
+                "type": "llm_call",
+                "provider": _provider_label(host),
+                "host": host,
+                "model": _extract_model_from_request_body(request),
+                "tokens": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "has_usage": False,
+                "metadata": {
+                    "tracked": False,
+                    "streaming_skipped": True,
+                },
+            }
+        )
+    except Exception as e:  # pragma: no cover — defensive
+        logger.debug("NullRun transport: streaming-skipped track failed: %s", e)
