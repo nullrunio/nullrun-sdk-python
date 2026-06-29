@@ -220,62 +220,14 @@ def test_register_sensitive_tools_bulk():
     assert "stripe.charge" in tools
 
 
-# ─── coverage_report / bump_coverage_counter ─────────────────────────
-
-
-def test_coverage_report_returns_independent_copies():
-    rt = _make_test_runtime()
-    rt._coverage_seen["a"] = 1
-    snap = rt.coverage_report()
-    snap["seen"]["b"] = 99  # mutate the snapshot
-    # Internal state should not observe the mutation.
-    assert "b" not in rt._coverage_seen
-
-
-def test_bump_coverage_counter_missing_attr_no_op():
-    """Stub runtime (duck type) without the attribute → no-op."""
-    import threading
-
-    class _Stub:
-        _tools_lock = threading.Lock()
-
-    stub = _Stub()
-    NullRunRuntime.bump_coverage_counter(stub, "_coverage_seen", "x")  # no raise
-
-
-def test_bump_coverage_counter_non_dict_logs_and_skips():
-    """If the target is not a dict, log DEBUG and skip without raising."""
-    rt = _make_test_runtime()
-    rt.__dict__["_coverage_seen"] = "string-not-dict"  # bypass dict guard
-    NullRunRuntime.bump_coverage_counter(rt, "_coverage_seen", "x")  # no raise
-
-
-def test_bump_coverage_counter_existing_key_increments():
-    rt = _make_test_runtime()
-    rt._coverage_seen["a"] = 5
-    rt.bump_coverage_counter("_coverage_seen", "a")
-    assert rt._coverage_seen["a"] == 6
-
-
-def test_bump_coverage_counter_new_key_inserts():
-    rt = _make_test_runtime()
-    rt.bump_coverage_counter("_coverage_seen", "new")
-    assert rt._coverage_seen["new"] == 1
-
-
-def test_bump_coverage_counter_evicts_at_cap(caplog):
-    """When the cap is hit, the OLDEST host is evicted (FIFO)."""
-    import logging
-
-    rt = _make_test_runtime()
-    rt._COVERAGE_CAP = 3
-    rt._coverage_seen["a"] = 1
-    rt._coverage_seen["b"] = 1
-    rt._coverage_seen["c"] = 1
-    with caplog.at_level(logging.WARNING, logger="nullrun.runtime"):
-        rt.bump_coverage_counter("_coverage_seen", "d")
-    assert "a" not in rt._coverage_seen  # evicted
-    assert "d" in rt._coverage_seen
+# 0.9.0: removed six `coverage_report` / `bump_coverage_counter`
+# tests at lines 223-278. The `_coverage_seen` /
+# `_coverage_tracked` / `_coverage_streaming_skipped` dicts,
+# `coverage_report()`, `track_coverage()`,
+# `start_coverage_reporter()`, `_coverage_reporter_loop()`, and
+# `bump_coverage_counter()` method are all gone — coverage is now
+# derived server-side from llm_call span metadata. See plan at
+# `~/.claude/plans/async-swinging-hanrahan.md`.
 
 
 # ─── execute() mode resolution ──────────────────────────────────────

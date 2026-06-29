@@ -50,30 +50,11 @@ def test_auto_requests_module_importable():
     import nullrun.instrumentation.auto_requests  # noqa: F401
 
 
-def test_safe_bump_coverage_exported():
-    """`_safe_bump_coverage` is importable and increments the runtime counter."""
-    from nullrun.instrumentation.auto import _safe_bump_coverage
-    from nullrun.runtime import NullRunRuntime
-
-    runtime = NullRunRuntime(api_key="test", _test_mode=True)
-    assert runtime._coverage_seen == {}
-    _safe_bump_coverage(runtime, "_coverage_seen", "api.openai.com")
-    assert runtime._coverage_seen == {"api.openai.com": 1}
-    _safe_bump_coverage(runtime, "_coverage_seen", "api.openai.com")
-    assert runtime._coverage_seen == {"api.openai.com": 2}
-    _safe_bump_coverage(runtime, "_coverage_seen", "api.anthropic.com")
-    assert runtime._coverage_seen == {"api.openai.com": 2, "api.anthropic.com": 1}
-
-
-def test_safe_bump_coverage_tolerates_missing_attribute():
-    """Stub runtimes (MagicMock, custom doubles) without the attribute don't crash."""
-    from nullrun.instrumentation.auto import _safe_bump_coverage
-
-    class StubRuntime:
-        pass
-
-    # Should not raise.
-    _safe_bump_coverage(StubRuntime(), "_coverage_seen", "api.openai.com")
+# 0.9.0: removed `test_safe_bump_coverage_exported` and
+# `test_safe_bump_coverage_tolerates_missing_attribute`. The
+# `_safe_bump_coverage` helper is gone — coverage is derived from
+# llm_call span metadata. See plan at
+# `~/.claude/plans/async-swinging-hanrahan.md`.
 
 
 def test_auto_instrument_patches_requests():

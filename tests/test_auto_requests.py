@@ -194,16 +194,17 @@ def test_session_send_already_tracked_returns_unchanged(monkeypatch, fresh_patch
 
 
 def test_session_send_streaming_skips_track(monkeypatch, fresh_patch_module):
-    """``stream=True`` kwarg triggers the streaming skip branch."""
+    """0.9.0: ``stream=True`` triggers the streaming branch which
+    emits an llm_call event tagged `metadata.streaming_skipped: True`
+    and `metadata.tracked: False`. The call still counts toward
+    coverage `llm_call_count` (backend's denominator) but not toward
+    `tracked_call_count`.
+    """
     _install_fake_requests(monkeypatch, streaming=True)
     recorder = {"track": [], "track_event": []}
     rt = MagicMock()
     rt.track.side_effect = lambda ev: recorder["track"].append(ev)
     rt.track_event.side_effect = lambda **kw: recorder["track_event"].append(kw)
-    # Pretend the runtime has a coverage counters dict so we can
-    # observe the streaming-skipped bump.
-    rt._coverage_streaming_skipped = {}
-    rt._bump_coverage_counter = MagicMock()
 
     from requests import Session
 
@@ -212,14 +213,22 @@ def test_session_send_streaming_skips_track(monkeypatch, fresh_patch_module):
     assert patch_requests(rt) is True
     req = SimpleNamespace(url="https://api.openai.com/v1/chat/completions", headers={})
     Session().send(req, stream=True)
-    # Track was NOT called (streaming skip).
-    assert recorder["track"] == []
-    # Streaming-skipped counter was bumped.
-    assert rt._bump_coverage_counter.called
+    # Track WAS called (with the streaming-skipped flag) — the new
+    # behavior replaces the old counter-bump.
+    assert len(recorder["track"]) == 1
+    ev = recorder["track"][0]
+    assert ev["type"] == "llm_call"
+    assert ev["host"] == "api.openai.com"
+    assert ev["has_usage"] is False
+    assert ev["metadata"]["streaming_skipped"] is True
+    assert ev["metadata"]["tracked"] is False
 
 
 def test_session_send_accept_event_stream_header_skips_track(monkeypatch, fresh_patch_module):
-    """``Accept: text/event-stream`` header triggers the streaming skip branch."""
+    """0.9.0: ``Accept: text/event-stream`` header triggers the same
+    streaming branch — emit llm_call tagged
+    `metadata.streaming_skipped: True`.
+    """
     _install_fake_requests(monkeypatch)
     recorder = {"track": [], "track_event": []}
     rt = _fake_runtime(recorder)
@@ -233,7 +242,8 @@ def test_session_send_accept_event_stream_header_skips_track(monkeypatch, fresh_
         url="https://api.openai.com/v1/chat/completions", headers={"Accept": "text/event-stream"}
     )
     Session().send(req)
-    assert recorder["track"] == []
+    assert len(recorder["track"]) == 1
+    assert recorder["track"][0]["metadata"]["streaming_skipped"] is True
 
 
 def test_session_send_no_extractor_for_host_returns_response(monkeypatch, fresh_patch_module):
@@ -323,29 +333,10 @@ def test_session_send_track_failure_is_swallowed(monkeypatch, fresh_patch_module
     assert resp.status_code == 200
 
 
-def test_session_send_seen_counter_bumped(monkeypatch, fresh_patch_module):
-    """Every host bumps the ``_coverage_seen`` counter, including
-    unknown ones (so the dashboard shows visibility into all
-    outbound traffic, not just tracked vendors). The bump happens
-    via ``_safe_bump_coverage`` which mutates the dict directly.
-    """
-    _install_fake_requests(monkeypatch)
-    rt = MagicMock()
-    rt.track.side_effect = lambda ev: None
-    rt.track_event.side_effect = lambda **kw: None
-    rt._coverage_seen = {}
-    rt._bump_coverage_counter = MagicMock()
-
-    from requests import Session
-
-    from nullrun.instrumentation.auto_requests import patch_requests
-
-    assert patch_requests(rt) is True
-    req = SimpleNamespace(url="https://example.com/api", headers={})
-    Session().send(req)
-    # Direct dict mutation: host is now present with count 1.
-    assert rt._coverage_seen.get("example.com") == 1
-
+# 0.9.0: removed `test_session_send_seen_counter_bumped`. The
+# `_coverage_seen` per-host counter dict is gone — coverage is
+# derived from llm_call span metadata.host. See plan at
+# `~/.claude/plans/async-swinging-hanrahan.md`.
 
 # ─── reset_for_tests ─────────────────────────────────────────────────
 
@@ -424,36 +415,9 @@ def test_is_streaming_request_headers_get_raises():
     assert _is_streaming_request(req, {}) is False
 
 
-def test_bump_streaming_skipped_no_attr():
-    """Runtime missing the attribute → silent no-op."""
-    from nullrun.instrumentation.auto_requests import _bump_streaming_skipped
-
-    # MagicMock auto-creates attributes, so build a plain object.
-    class _Runtime:
-        pass
-
-    rt = _Runtime()  # no _coverage_streaming_skipped
-    _bump_streaming_skipped(rt, "x")  # must not raise
-
-
-def test_bump_streaming_skipped_no_bump_method():
-    """Runtime missing the bump method → silent no-op."""
-    from nullrun.instrumentation.auto_requests import _bump_streaming_skipped
-
-    class _Runtime:
-        _coverage_streaming_skipped = {}
-
-    rt = _Runtime()  # no _bump_coverage_counter
-    _bump_streaming_skipped(rt, "x")  # must not raise
-
-
-def test_bump_streaming_skipped_calls_bump():
-    """Happy path: bump is invoked with the target dict and host."""
-    from nullrun.instrumentation.auto_requests import _bump_streaming_skipped
-
-    target: dict = {}
-    rt = MagicMock()
-    rt._coverage_streaming_skipped = target
-    rt._bump_coverage_counter = MagicMock()
-    _bump_streaming_skipped(rt, "api.openai.com")
-    rt._bump_coverage_counter.assert_called_once_with(target, "api.openai.com")
+# 0.9.0: removed three `_bump_streaming_skipped` helper tests.
+# The helper is gone — streaming-skipped calls now emit an
+# llm_call event tagged `metadata.streaming_skipped: True`. See
+# `test_session_send_streaming_skips_track` and
+# `test_session_send_accept_event_stream_header_skips_track` above
+# for the new behavior assertions.

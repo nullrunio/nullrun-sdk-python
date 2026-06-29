@@ -262,18 +262,10 @@ class NullRunRuntime:
         # first call.
         self._local_cost_cents_estimate: int = 0
 
-        # Coverage counters (Phase 3 of the production-readiness plan).
-        # The instrumentation layer in `nullrun.instrumentation.auto`
-        # calls ``_safe_bump_coverage(runtime, "_coverage_seen" /
-        # "_coverage_tracked" / "_coverage_streaming_skipped", host)``
-        # so the dashboard can show "which LLM hosts the SDK is
-        # seeing vs. successfully tracking". Previous versions
-        # relied on ``_safe_bump_coverage`` to no-op when these
-        # attributes were missing -- the dashboard's coverage tab
-        # was always empty.
-        self._coverage_seen: dict[str, int] = {}
-        self._coverage_tracked: dict[str, int] = {}
-        self._coverage_streaming_skipped: dict[str, int] = {}
+        # 0.9.0: coverage counters removed. Coverage is now derived
+        # server-side from the llm_call span metadata (`tracked` and
+        # `streaming_skipped` flags set by the instrumentation layer).
+        # The previous per-host dicts and 60s daemon thread are gone.
 
         # Remote control plane state (per-workflow, pushed from server via WS).
         # Unified model: effective_state = max(local_state, remote_state).
@@ -399,21 +391,7 @@ class NullRunRuntime:
         # a concurrent ``add`` if both interleave on a free-threaded
         # build). The lock is uncontended on the read path so the
         # cost is one acquire per call.
-        #
-        # We also reuse this lock to guard the coverage-counter
-        # dicts (§7.2 #33) because the bump + prune sequence must
-        # be atomic — otherwise two threads could both observe the
-        # dict at length 4095, both bump their counter, and both
-        # evict a different entry, growing the dict to 4097
-        # before either prune lands. One lock, one source of
-        # truth, cheaper than two fine-grained ones.
         self._tools_lock = threading.Lock()
-        # §7.2 #33: cap the per-host coverage counters. Without
-        # this, a long-running process that sees thousands of
-        # custom LLM endpoints over its lifetime would grow these
-        # dicts without bound — same hazard as
-        # ``NullRunCallback._active_runs`` (now capped at 4096).
-        self._COVERAGE_CAP: int = 4096
 
         logger.info("NullRun Runtime initialized: mode=cloud")
 
@@ -1528,186 +1506,6 @@ class NullRunRuntime:
             return needle in {t.lower() for t in self._sensitive_tools} or needle in {
                 t.lower() for t in self._strict_mode_tools
             }
-
-    def coverage_report(self) -> dict[str, dict[str, int]]:
-        """
-        Snapshot of the LLM-host coverage counters that the auto-
-        instrumentation layer maintains. The SDK tracks three
-        counters per host:
-
-          - ``seen`` -- every LLM host the SDK observed a request to.
-          - ``tracked`` -- hosts whose response was successfully
-            extracted and emitted as an ``llm_call`` event.
-          - ``streaming_skipped`` -- hosts whose response was a
-            streaming SSE / ``stream=True`` and was deliberately
-            NOT buffered (so the user keeps their chunked read).
-
-        The same payload is sent over the WebSocket heartbeat every
-        60s and via the HTTP-fallback path when the WS connection
-        is down. The dashboard's coverage tab uses these counters
-        to surface "we know about this host but cannot track it" --
-        the leading indicator that an SDK upgrade is needed.
-
-        Returns:
-            ``{"seen": {...}, "tracked": {...},
-            "streaming_skipped": {...}}``. Each value is a fresh
-            ``dict`` so callers can mutate the result without
-            affecting the runtime's internal state.
-        """
-        return {
-            "seen": dict(self._coverage_seen),
-            "tracked": dict(self._coverage_tracked),
-            "streaming_skipped": dict(self._coverage_streaming_skipped),
-        }
-
-    def track_coverage(self) -> dict[str, Any] | None:
-        """Emit a `coverage_report` event with the current per-host counters.
-
-        Returned from ``track_event`` so the caller can observe the
-        transport-side outcome (queued, deduped, breaker open, etc.).
-        Returns ``None`` when there are no counters to report yet
-        (cold start, no LLM traffic) — the backend doesn't need an
-        empty row per minute per process.
-
-        Background emission is driven by ``start_coverage_reporter``;
-        most callers don't invoke this method directly.
-
-        Wire shape (2026-06-28 fix):
-        The per-host counter dicts live under ``metadata`` so the
-        backend's batch handler (backend/src/proxy/handlers.rs:5909
-        -5923) reads them from ``sdk_event.metadata``. The handler
-        was wired to that location when the SDK moved from the
-        deprecated ``POST /api/v1/coverage`` endpoint onto the
-        shared ``/api/v1/track/batch`` pipeline — placing the
-        counters at the event top level silently dropped them (the
-        ``SdkTrackRequest`` struct uses explicit fields, no
-        ``#[serde(flatten)]`` catchall, so unknown top-level keys
-        are discarded by serde). Nesting under ``metadata`` matches
-        what the handler reads.
-        """
-        stats = self.coverage_report()
-        seen_total = sum(stats["seen"].values())
-        if seen_total == 0:
-            # Nothing to report — avoid empty rows.
-            return None
-        return self.track_event(
-            "coverage_report",
-            metadata={
-                "seen": stats["seen"],
-                "tracked": stats["tracked"],
-                "streaming_skipped": stats["streaming_skipped"],
-            },
-        )
-
-    _COVERAGE_REPORT_INTERVAL_SECONDS = 60.0
-
-    def start_coverage_reporter(self) -> None:
-        """Start a background thread that emits ``coverage_report`` events
-        every ``_COVERAGE_REPORT_INTERVAL_SECONDS``.
-
-        Idempotent — second call is a no-op. Caller is responsible
-        for calling :meth:`stop_coverage_reporter` on shutdown, but
-        the thread is a daemon so a missed stop does not block exit.
-        """
-        if getattr(self, "_coverage_reporter_thread", None) is not None:
-            return
-        thread = threading.Thread(
-            target=self._coverage_reporter_loop,
-            name="nullrun-coverage-reporter",
-            daemon=True,
-        )
-        self._coverage_reporter_thread = thread
-        thread.start()
-
-    def stop_coverage_reporter(self, timeout: float = 2.0) -> None:
-        """Signal the coverage reporter to exit and join its thread."""
-        self._coverage_reporter_stop = True
-        thread = getattr(self, "_coverage_reporter_thread", None)
-        if thread is not None:
-            thread.join(timeout=timeout)
-
-    def _coverage_reporter_loop(self) -> None:
-        """Loop body for the coverage reporter thread.
-
-        Emits a coverage report on entry (so the dashboard has data
-        within ~1s of process start), then every interval until
-        ``stop_coverage_reporter`` is called.
-        """
-        self._coverage_reporter_stop = False
-        # Emit once on entry — gives the backend a row even if the
-        # process is short-lived (CI, batch jobs).
-        try:
-            self.track_coverage()
-        except Exception as e:  # noqa: BLE001 — background loop
-            logger.debug(f"coverage_reporter: initial emit failed: {e}")
-        while not getattr(self, "_coverage_reporter_stop", False):
-            # Sleep in short slices so shutdown is responsive.
-            slept = 0.0
-            while slept < self._COVERAGE_REPORT_INTERVAL_SECONDS and not getattr(
-                self, "_coverage_reporter_stop", False
-            ):
-                time.sleep(min(0.5, self._COVERAGE_REPORT_INTERVAL_SECONDS - slept))
-                slept += 0.5
-            if getattr(self, "_coverage_reporter_stop", False):
-                break
-            try:
-                self.track_coverage()
-            except Exception as e:  # noqa: BLE001 — background loop
-                logger.debug(f"coverage_reporter: emit failed: {e}")
-
-    def bump_coverage_counter(self, target_attr: str, host: str) -> None:
-        """Bump a per-host coverage counter with FIFO eviction at the cap.
-
-        §7.2 #33: replaces the previous direct-dict-mutation path
-        used by ``nullrun.instrumentation.auto._safe_bump_coverage``.
-        The pre-fix code just did ``target[host] = target.get(host,
-        0) + 1``, which let a process with many custom LLM
-        endpoints grow the dict without bound. We now:
-
-          1. Take ``_tools_lock`` so concurrent bumps from
-             multiple threads (sync httpx + async httpx + the
-             requests transport) can't both pass the cap check
-             and evict different entries.
-          2. If the dict already has the key, increment (LRU
-             bump via dict insertion order).
-          3. If the key is new and we're at the cap, evict the
-             oldest entry before inserting.
-
-        Tolerates a missing attribute (stub runtimes in tests):
-        no-op when ``getattr(self, target_attr, None)`` returns
-        ``None``. Tolerates a non-dict target (also a test-only
-        scenario): logs DEBUG and moves on.
-        """
-        with self._tools_lock:
-            target = getattr(self, target_attr, None)
-            if target is None:
-                return
-            if not isinstance(target, dict):
-                logger.debug(
-                    "bump_coverage_counter: %s is not a dict (%s); skipping",
-                    target_attr,
-                    type(target).__name__,
-                )
-                return
-            if host in target:
-                # Insertion-order LRU bump: re-insert so this
-                # host moves to the end of the dict.
-                target[host] = int(target.get(host, 0)) + 1
-                # Re-set to refresh insertion order (Python dicts
-                # don't auto-promote on value update).
-                value = target.pop(host)
-                target[host] = value
-            else:
-                if len(target) >= self._COVERAGE_CAP:
-                    evicted_host, _ = next(iter(target.items()))
-                    del target[evicted_host]
-                    logger.warning(
-                        "coverage counter %s hit cap %d; evicting oldest host=%s",
-                        target_attr,
-                        self._COVERAGE_CAP,
-                        evicted_host,
-                    )
-                target[host] = 1
 
     def get_org_status(self, org_id: str | None = None) -> dict[str, Any]:
         """Public helper for reading ``/api/v1/orgs/{org_id}/status``.
