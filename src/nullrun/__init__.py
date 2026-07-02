@@ -442,6 +442,22 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "format_user_message": ("nullrun.messages", "format_user_message"),
     "set_user_message": ("nullrun.messages", "set_user_message"),
     "get_user_message": ("nullrun.messages", "get_user_message"),
+    # Minimal-boilerplate error handling for scripts (see
+    # nullrun/_handle.py for the rationale). Pair with @nullrun.protect
+    # so a typical ``run an agent and print a friendly message on
+    # failure`` script needs no explicit try/except around
+    # NullRunError. WorkflowKilledInterrupt (BaseException) still
+    # propagates — kill is never swallowed.
+    #
+    # The module is named ``_handle.py`` (private, leading underscore)
+    # so it does not collide with the public ``nullrun.handle``
+    # context manager. With a non-underscored name, pytest's test
+    # discovery would pre-import ``nullrun.handle`` as a submodule,
+    # which shadows the lazy export and breaks ``from nullrun import
+    # handle``.
+    "handle": ("nullrun._handle", "handle"),
+    "guarded": ("nullrun._handle", "guarded"),
+    "init_or_die": ("nullrun._handle", "init_or_die"),
 }
 
 
@@ -523,6 +539,18 @@ __all__ = [
     # own wording per error_code without rewriting the SDK.
     "format_user_message",
     "set_user_message",
+    # Minimal-boilerplate error handling for scripts. ``handle`` is
+    # the context manager (``with nullrun.handle():``), ``guarded``
+    # is the decorator (``@nullrun.guarded``). Both translate any
+    # ``NullRunError`` into ``print(format_user_message(exc))`` +
+    # ``sys.exit(1)``; ``WorkflowKilledInterrupt`` propagates.
+    # ``init_or_die`` is the convenience wrapper around ``init``
+    # that catches NR-C001 "no api_key" at startup and exits
+    # cleanly — without it the user sees a raw traceback before
+    # any ``with handle():`` block is in scope.
+    "handle",
+    "guarded",
+    "init_or_die",
 ]
 
 # Sprint 2.1: the SDK-side ``decision_history`` module was deleted.
