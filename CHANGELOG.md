@@ -8,7 +8,29 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 ---
 
 
+## [0.12.0] - 2026-07-03
+
+Server-minted execution_id default ON. Per CLAUDE.md section 24, every /check now mints a server-side uuidv7 execution_id. The SDK no longer needs to generate its own; the response carries the server-minted id which propagates to /track. This is the SDK_MIN_VERSION for the v3 rollout - older SDKs still work for v1/v2 endpoints but should upgrade.
+
+### Added
+
+- `nullrun.uuid7` module - RFC 9562 section 5.7 time-ordered ID generator. Used internally for trace_id and span IDs.
+- `nullrun.capabilities` module - probe_capabilities(), parse_capabilities(), validate_sdk_version(). Wired into nullrun.init().
+
+### Changed
+
+- __version__ bumped from 0.11.0 to 0.12.0.
+
 ## [0.9.1] - 2026-06-29
+
+### Added
+
+- `nullrun.uuid7` module - RFC 9562 section 5.7 time-ordered ID generator. Used internally for trace_id and span IDs.
+- `nullrun.capabilities` module - probe_capabilities(), parse_capabilities(), validate_sdk_version(). Wired into nullrun.init().
+
+### Changed
+
+- __version__ bumped from 0.11.0 to 0.12.0.
 
 Patch on top of 0.9.0. Unifies the LLM-call fingerprint scheme so the
 dedup LRU at `runtime.track()` can collapse sibling emissions from the

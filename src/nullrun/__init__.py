@@ -329,6 +329,38 @@ def init(
         # drops span_start/span_end events.
         _dec_mod._runtime = runtime
 
+    # v3.12 / 0.12.0 — server-minted execution_id default ON. Probe
+    # the backend's /health endpoint and log any version mismatch
+    # so the operator sees the gap at startup rather than on the
+    # first failed /check. We do NOT fail init() — the gate still
+    # rejects with 400 PROTOCOL_TOO_OLD, and the SDK's role is
+    # advisory here.
+    try:
+        from nullrun.capabilities import (
+            probe_capabilities,
+            validate_sdk_version,
+        )
+        from nullrun.__version__ import __version__
+
+        caps = probe_capabilities(runtime.api_url)
+        if caps is not None:
+            warnings = validate_sdk_version(__version__, caps)
+            for w in warnings:
+                logger.warning("nullrun.init: %s", w)
+        else:
+            # /health unreachable — most likely the operator
+            # hasn't pointed the SDK at the right host. We don't
+            # fail init() (the user might intentionally init()
+            # before network is ready) but we log at INFO so the
+            # operator sees it.
+            logger.info(
+                "nullrun.init: could not probe %s/health — "
+                "v3 capability negotiation skipped",
+                runtime.api_url,
+            )
+    except Exception as e:  # noqa: BLE001 — best-effort probe
+        logger.debug("nullrun.init: capability probe raised %s", e)
+
     # Phase D6: wire auto-instrumentation AFTER the runtime is fully
     # constructed. In 0.3.0 api_key is required, so this branch is
     # unconditional — we always have a remote LLM traffic source if
