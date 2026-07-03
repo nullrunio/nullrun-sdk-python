@@ -4,7 +4,14 @@ build-backend = "hatchling.build"
 
 [project]
 name = "nullrun"
-version = "0.11.0"
+# Version bump: 0.11.0 → 0.12.0 in `feat(sdk)` (server-minted
+# execution_id default + capability probe). The previous commit
+# updated `src/nullrun/__version__.py` but missed this field, so
+# `python -m build` was producing a wheel named `nullrun-0.11.0-*`
+# that collided with the 0.11.0 artifact already on TestPyPI
+# (causing the publish-test workflow to fail with HTTP 400
+# "File already exists").
+version = "0.12.0"
 # Long form used by PyPI page meta-description and search snippets.
 # Kept under the 200-char preview threshold so the full line is visible
 # without an "expand" click. Keywords are matched against likely search
