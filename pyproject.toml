@@ -14,18 +14,22 @@ readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
 
-authors = [
-    { name = "nullrun.io", email = "support@nullrun.io" }
-]
-
-# Maintainer populates the PKG-INFO `Maintainer:` / `Maintainer-email:`
-# fields. PEP 621 maps the `authors` array to `Author-email:` but NOT
-# to the legacy `Author:` field, which leaves `pip show` displaying an
-# empty `Author:` line. Adding `maintainers` populates `Maintainer:`
-# instead so every metadata viewer shows non-empty contact info.
-maintainers = [
-    { name = "Anatolii Maltsev", email = "support@nullrun.io" }
-]
+# Authors and maintainers are populated dynamically by the custom
+# metadata hook in ``hatch_build.py``. Declaring ``authors`` here as a
+# dynamic field is what triggers hatchling to call
+# ``MetadataHookInterface.update()`` at all — without at least one
+# field in ``dynamic``, the hook is configured but never invoked.
+#
+# Why dynamic in the first place: PEP 621 maps the ``authors`` array to
+# PKG-INFO's ``Author-email:`` line but NOT to the legacy single
+# ``Author:`` line that ``pip show`` renders. Worse, hatchling's
+# authors parser (core.py, ``authors`` property) only populates the
+# legacy ``Author:`` field when an inline-table has a ``name`` and NO
+# ``email``; if both are present the name is folded into the email's
+# display_name and ``Author:`` is suppressed. The hook splits the
+# author into two inline-tables (name-only + email-only) so both lines
+# appear in the wheel METADATA.
+dynamic = ["authors", "maintainers"]
 
 keywords = [
     "circuit-breaker", "agent", "llm", "observability",
@@ -165,6 +169,15 @@ packages = ["src/nullrun"]
 include = [
     "src/nullrun/py.typed",
 ]
+
+# Custom metadata hook: rewrites ``project.authors`` into name-only +
+# email-only inline tables so hatchling's authors parser populates both
+# the legacy ``Author:`` field and the ``Author-email:`` field. See
+# ``hatch_build.py`` for the full rationale. The hook lives at the repo
+# root because hatchling discovers it by import path, not via the wheel
+# ``packages`` list above (which only covers the runtime package).
+[tool.hatch.metadata.hooks.custom]
+path = "hatch_build.py"
 
 [tool.hatch.build.targets.sdist]
 exclude = [
