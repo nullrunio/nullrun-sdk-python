@@ -7,6 +7,7 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+
 ## [0.9.1] - 2026-06-29
 
 Patch on top of 0.9.0. Unifies the LLM-call fingerprint scheme so the
@@ -62,6 +63,200 @@ httpx transport and the LangChain callback for the same real call.
 
 No public-API break. No behavior change for callers whose
 instrumentation already populates `model` correctly.
+
+## [0.11.0] - 2026-07-02
+
+Wire-protocol v3 alignment with the backend's Sprint 6 v1 cut
+(CLAUDE.md v3.4). The previous SDK shipped pre-v3 endpoints
+(`/api/v1/gate`, `/api/v1/execute`, `/api/v1/track/batch`) without
+the `X-NULLRUN-PROTOCOL` header that the v3 backend requires as a
+fail-CLOSED pre-check — every signed POST was rejected with HTTP 400
+`PROTOCOL_HEADER_REQUIRED`. This release aligns the SDK with the v3
+wire contract and adds the missing soft-mode / chain / heartbeat /
+cancel / budget-estimate surface.
+
+### BREAKING (wire-contract)
+
+- **`X-NULLRUN-PROTOCOL: 3` is now mandatory on every signed POST.**
+  The backend's `proxy/http/gate/protocol.rs` middleware rejects
+  requests without the header with HTTP 400 + error_code
+  `PROTOCOL_HEADER_REQUIRED` BEFORE the gate pipeline runs. Pre-v3
+  SDKs that don't send it will get 400 on every request, including
+  `/auth/verify` (which is unsigned but goes through the same
+  protocol guard via the `_post_auth_with_retry` path).
+  - Routed through the new centralised helper in
+    `nullrun.transport._protocol_header_value()` so a future bump
+    is a one-line change.
+  - The header is set in `_build_signed_headers()` (covers
+    `/gate`, `/execute`, `/track/batch`, `_refetch_credentials`)
+    AND inlined in the four call sites that build their own
+    headers dict (track/batch, gate, execute, WS handshake,
+    auth/verify refresh). The `runtime._auth_headers()` helper was
+    extended to include the header for the three direct
+    `self._client.get/post` call sites (`_post_auth_with_retry`,
+    `_fetch_remote_state`, `get_org_status`).
+
+### Added
+
+- **`Transport.check_v3(request)` — POST /api/v1/check.** The v3
+  replacement for `/gate`. Adds three optional wire fields
+  (CLAUDE.md §16):
+  - `chain_id` (UUID v4) — pairs with `chain_op` for soft-mode
+    budget enforcement (CLAUDE.md §5, §6).
+  - `chain_op` (`"start"` / `"continue"` / `"end"` / `"auto"`)
+    — state-machine transitions; absent defaults to auto-register.
+  - `idempotency_key` — replays return the original decision.
+  - `stream: bool` — hints the backend whether streaming is
+    expected (no wire-enforced behaviour change yet).
+  - The response carries a server-minted `execution_id` (§24);
+    callers MUST NOT treat the request's `execution_id` as
+    authoritative.
+
+- **`Transport.track_single(request)` — POST /api/v1/track.**
+  Single-event consume path with the CONSUME_SCRIPT invariant
+  (`actual_cost <= reserved_cents + epsilon_cents`, CLAUDE.md §25).
+  Returns 422 CONSUME_OVERBUDGET when the call's actual cost
+  exceeds the reservation by more than epsilon. The reservation is
+  NOT silently re-reserved (ADR-005).
+
+- **`Transport.cancel(execution_id, reason=None)` — POST
+  /api/v1/cancel.** Idempotent via `cancel:{execution_id}` SETNX
+  (CLAUDE.md §23). Repeated calls return 200 OK without side
+  effects. Surfaced as `NullRunRuntime.cancel_execution()` for the
+  ergonomic wrapper.
+
+- **`Transport.heartbeat(chain_id)` — POST /api/v1/heartbeat.**
+  Atomic `EXPIRE chain:{org}:{chain_id} 300` with SETNX-based
+  dedup via `heartbeat:{chain_id}:{ts_floor_30s}` (CLAUDE.md §26).
+  Cadence: wall-clock 30s (configurable 10-120s). Skew tolerance
+  ±5s.
+
+- **`Transport.chain_end(chain_id)` — POST /api/v1/chain/end.**
+  Explicit chain close (CLAUDE.md §6). Idempotent — unknown
+  chain_id is a no-op 200. Surfaced as
+  `NullRunRuntime.chain_end()`.
+
+- **`Transport.approximate_budget(organization_id=None)` — GET
+  /api/v1/budget/approximate.** UI-only budget estimation
+  (CLAUDE.md §17). Returns 503 `BUDGET_DATA_UNAVAILABLE` when
+  ALL sources fail — NEVER returns 0 (the dashboard must not
+  display "≈ $0 spent" when data is missing). Surfaced as
+  `NullRunRuntime.approximate_budget()`.
+
+- **`Transport._parse_v3_error_envelope(response, endpoint)`**
+  — ACTIVE error envelope parser. Maps the backend's
+  `error_code` field to typed SDK exception subclasses
+  (PROTOCOL_TOO_OLD → `NullRunProtocolError`, CONSUME_OVERBUDGET
+  → `NullRunConsumeOverbudgetError`, CHAIN_CROSS_ORG →
+  `NullRunChainError`, WORKFLOW_INACTIVE →
+  `NullRunWorkflowInactiveError`, etc.). Coexists with the
+  frozen `_parse_error_envelope` from 0.6.0 — the frozen
+  helper remains for the audit/contract test surface.
+
+- **Chain context (`nullrun.context`).** New contextvars
+  `_chain_id_var` + `_chain_op_var` plus the public API:
+  - `chain(chain_id, op="start")` — contextmanager (mirrors
+    `workflow()`).
+  - `get_chain_id()` / `set_chain_id()` — manual setters.
+  - `get_chain_op()` / `set_chain_op()` — chain-op enum setter.
+  - Reachable from the top-level `nullrun` namespace via
+    `_LAZY_EXPORTS` (consistent with `workflow` /
+    `set_call_context`).
+
+- **`NullRunRuntime.ping_chain(chain_id, interval=30.0)` —
+  time-based heartbeat scheduler (CLAUDE.md §26).** Returns a
+  `stop()` callable. The daemon thread emits POST /heartbeat on
+  a wall-clock schedule (`time.monotonic`), not on chunk-count.
+  Pre-fix chunk-based heuristic (every 50 chunks) had two
+  pathological cases — slow chunk rates left chains idle,
+  bursty traffic wasted heartbeat budget on a fresh chain.
+  Cadence clamped to the 10-120s policy range per §26.
+
+- **`NullRunRuntime.cancel_execution(execution_id, reason=None)`
+  + `chain_end(chain_id)` + `approximate_budget()`** — ergonomic
+  wrappers around the new `Transport` methods.
+
+### Added (exceptions)
+
+- `NullRunProtocolError` (NR-P001) — PROTOCOL_TOO_OLD /
+  PROTOCOL_TOO_NEW.
+- `NullRunChainError` (NR-CH001) — CHAIN_MAX_DURATION_EXCEEDED /
+  CHAIN_CROSS_ORG / CHAIN_ORG_MISMATCH / CHAIN_NOT_FOUND /
+  CHAIN_EXPIRED. Carries `chain_id` and `backend_code` for
+  diagnostic clarity.
+- `NullRunConsumeOverbudgetError` (NR-O001) — CONSUME_OVERBUDGET.
+  Carries `reserved_cents`, `max_allowed_cents`, `actual_cost_cents`,
+  `epsilon_cents` so callers can reconcile manually without
+  re-parsing the message string.
+- `NullRunWorkflowInactiveError` (NR-W004) — WORKFLOW_INACTIVE
+  (CLAUDE.md §4 fail-CLOSED on soft-deleted workflow + active key,
+  wired in Sprint 6 v1 12.2).
+- `NullRunRateLimitRedisError` (NR-R002) —
+  RATE_LIMIT_REDIS_UNAVAILABLE. Fail-CLOSED per §4 enforcement
+  table (aggregate rate limit = authoritative gate).
+
+All five are subclasses of either `NullRunInfrastructureError`
+(protocol / rate-limit-redis) or `NullRunDecision` (chain /
+overbudget / workflow-inactive) so existing `except
+NullRunError:` clauses keep matching.
+
+### Changed
+
+- **`check_workflow_budget()` forwards chain context.** When the
+  caller has wrapped the gate in `with chain(chain_id, op="start")`,
+  the SDK now includes `chain_id` + `chain_op` + `idempotency_key`
+  in the /gate (or /check) payload so the backend's Lua
+  RESERVE_SCRIPT can run the soft-mode branch (CLAUDE.md §5).
+  Absent chain context, behaviour is identical to 0.10.0 (single-
+  shot Hard). Wire-shape is additive — legacy callers see no
+  payload change.
+- **`Transport.check()` (legacy /gate) forwards chain_id /
+  chain_op / idempotency_key / stream when present.** Same
+  additive contract — missing keys are omitted, not nulled.
+- **`_auth_headers()` includes `X-NULLRUN-PROTOCOL`.** Affects
+  `_post_auth_with_retry`, `_fetch_remote_state`, `get_org_status`.
+- **`runtime._post_auth_with_retry` now passes headers.** Pre-fix
+  the helper did `self._client.post(url, json=json_body)` with no
+  headers — the wire had no `X-API-Key`, no Authorization, and no
+  protocol header, which the backend's protocol + CSRF middlewares
+  reject. Now it passes `self._auth_headers()`.
+
+### Backwards compatibility
+
+- All five new `Transport` methods are additive. Existing
+  `check()` / `execute()` / batch `_send_batch_with_retry_info`
+  paths keep their previous signatures.
+- The five new exception classes are subclasses of the existing
+  public hierarchy (`NullRunError` ← `NullRunDecision` /
+  `NullRunInfrastructureError`); existing `except NullRunError:`
+  clauses keep matching.
+- The wire-protocol header is mandatory ONLY when connecting to
+  a v3-or-later backend. Older pre-v3 backends ignore the header
+  — no payload-level break.
+
+### Notes
+
+- The v3 `gate_reserve_v3` Lua script (CLAUDE.md §33) is on
+  blue-green deployment per §19 — the SDK must work against
+  BOTH the legacy `cost/reservation.rs::reserve_budget_atomic`
+  (v1/v2 default) AND the v3 Lua path. The new `check_v3` /
+  `track_single` helpers are the v3 path; the legacy `check` /
+  batch `track` continue to hit the v1/v2 default. Operators
+  flip the backend flag `NULLRUN_RESERVE_V3_ENABLED=1` to
+  migrate; SDKs on 0.11.0 work in both modes.
+- Soft-mode budget enforcement requires the backend's
+  `NULLRUN_SOFT_LIMIT_ENABLED=1` flag (CLAUDE.md §0 G3). Without
+  it, chain_id is forwarded but the backend still treats soft
+  passes as hard blocks. This is the controlled migration
+  state noted in §0.
+
+---
+
+## [0.10.0] - 2026-06-29
+
+(Unreleased — work-in-progress; will be backfilled once 0.11.0
+ships.)
+
 
 ---
 

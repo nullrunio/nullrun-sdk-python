@@ -50,6 +50,39 @@ logger = logging.getLogger(__name__)
 
 __api_version__ = "1.0"
 
+# 2026-07-02 (v0.11.0): wire-protocol version handshake.
+#
+# CLAUDE.md §32 (v3) — the backend's `proxy/http/gate/protocol.rs`
+# middleware rejects every signed POST that does not carry
+# `X-NULLRUN-PROTOCOL: <n>` with HTTP 400 + `error_code:
+# PROTOCOL_HEADER_REQUIRED` (or `PROTOCOL_TOO_OLD` / `PROTOCOL_TOO_NEW`
+# for incompatible versions). The check fires BEFORE step 1 of the
+# gate-order pipeline (`tool_block`), so an SDK that doesn't send
+# the header gets 400 on every request — even `/track/batch` and
+# `/auth/verify` (the latter only via the bounded `_post_auth_with_retry`
+# path; `/auth/verify` itself is unsigned and goes through
+# `self._transport._client.post(...)` directly).
+#
+# Bumping `NULLRUN_PROTOCOL_VERSION` here must be coordinated with
+# the backend's `proxy::http::gate::protocol` constant and the
+# `/health` endpoint's `current_protocol_version`. /health also
+# publishes `min_protocol_version` (the floor — older SDKs get
+# `PROTOCOL_TOO_OLD`) and `max_protocol_version` (the ceiling —
+# newer SDKs get `PROTOCOL_TOO_NEW`).
+NULLRUN_PROTOCOL_VERSION: int = 3
+HEADER_PROTOCOL: str = "X-NULLRUN-PROTOCOL"
+
+
+def _protocol_header_value() -> str:
+    """Return the current wire-protocol version as the wire-format string.
+
+    The backend stores it as u32, so we serialise the integer directly
+    (``"3"``, not ``"v3"``). Centralising the value here means a future
+    bump is a one-line change — every call site reads from this helper
+    rather than hardcoding ``"3"``.
+    """
+    return str(NULLRUN_PROTOCOL_VERSION)
+
 
 def _emit_for_transport_error(
     err: BaseException,
@@ -997,6 +1030,15 @@ class Transport:
             headers["X-Signature"] = signature
         if extra:
             headers.update(extra)
+        # CLAUDE.md §32 (v3): wire-protocol handshake. The backend
+        # rejects every signed POST without `X-NULLRUN-PROTOCOL: 3`
+        # with 400 PROTOCOL_HEADER_REQUIRED before the gate pipeline
+        # even starts. Setting it inside the canonical
+        # `_build_signed_headers` helper means every existing signed
+        # POST (`/gate`, `/execute`, `/track/batch`,
+        # `_refetch_credentials`) automatically gets the header
+        # without each call site having to remember to add it.
+        headers[HEADER_PROTOCOL] = _protocol_header_value()
         # Inject trace context (W3C) as well — matches the
         # end-to-end behaviour of every signed POST.
         self._inject_trace_context(headers)
@@ -1057,32 +1099,17 @@ class Transport:
         audit_result.md §16.B (P0 #2).
         """
         logger.debug(f"Sending batch of {len(batch)} events to {self.api_url}/api/v1/track/batch")
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["X-API-Key"] = self.api_key
-            # FIX-F3: Bearer header for CSRF bypass (see _build_signed_headers).
-            headers["Authorization"] = f"Bearer {self.api_key}"
-
-        # Add HMAC signature headers
-        # 2026-06-27: route through _signed_request_body for canonical
-        # compact separators ((",", ":")) — matches the wire form used by
-        # /execute and /gate and the docstring invariant of
-        # _signed_request_body (which says "All three signed POST call
-        # sites MUST serialise via this helper"). HMAC itself is unaffected
-        # (it hashes the bytes either way), but consistent serialization
-        # means future audits / contract tests don't have to special-case
-        # this endpoint.
-        # NOTE: _signed_request_body is a MODULE-LEVEL helper, not a
-        # method on Transport. The two siblings in this file
-        # (``execute`` and ``check``) call it without ``self.``; calling
-        # ``self._signed_request_body`` here raised AttributeError on
-        # every batch flush and broke 15 tests across test_transport.py
-        # / test_track_batch_retry.py / test_integration_contract.py.
+        # 2026-07-02 (v0.11.0 refactor): route through the canonical
+        # signed-headers helper instead of building the dict inline.
+        # The helper produces exactly the headers we used to set here
+        # (X-API-Key + Authorization + X-NULLRUN-PROTOCOL + HMAC +
+        # trace context) so the wire shape is identical — see the
+        # ``tests/test_v3_wire_contract.py::TestSignedPostIncludesProtocolHeader``
+        # pinning. Building it inline was a 2026-06-27 holdover for
+        # HMAC byte-equality that has since been solved by routing
+        # through ``_signed_request_body`` + ``content=body``.
         body = _signed_request_body({"events": batch})
-        self._add_hmac_headers(headers, body)
-
-        # Inject trace context for distributed tracing (W3C Trace Context)
-        self._inject_trace_context(headers)
+        headers = self._build_signed_headers(body=body)
 
         # Use batch endpoint for efficiency - single request for all events.
         # We send ``content=body`` (the exact bytes that were HMAC-signed
@@ -1286,20 +1313,15 @@ class Transport:
             "operation_id": operation_id or str(uuid.uuid4()),
         }
 
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["X-API-Key"] = self.api_key
-            # FIX-F3: Bearer header for CSRF bypass (see _build_signed_headers).
-            headers["Authorization"] = f"Bearer {self.api_key}"
-
-        # HMAC fix: serialise via the canonical-bytes helper and send
-        # via content=body so the wire bytes match the signed bytes.
-        # See ``_signed_request_body`` for the rationale.
+        # 2026-07-02 (v0.11.0 refactor): route through the canonical
+        # signed-headers helper — produces Content-Type + X-API-Key +
+        # Authorization + X-NULLRUN-PROTOCOL + HMAC + trace context.
+        # Building the dict inline (the previous shape) duplicated
+        # the same logic across batch / execute / check / refresh /
+        # WS endpoints and was the root cause of the 2026-06-22
+        # CSRF-bypass audit finding (FIX-F3). Now centralised.
         body = _signed_request_body(gate_request)
-        self._add_hmac_headers(headers, body)
-
-        # Inject trace context for distributed tracing (W3C Trace Context)
-        self._inject_trace_context(headers)
+        headers = self._build_signed_headers(body=body)
 
         def do_execute_request() -> httpx.Response:
             return self._client.post(
@@ -1459,19 +1481,27 @@ class Transport:
             ),
         }
 
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["X-API-Key"] = self.api_key
-            # FIX-F3: Bearer header for CSRF bypass (see _build_signed_headers).
-            headers["Authorization"] = f"Bearer {self.api_key}"
+        # 2026-07-02 (v0.11.0): wire-protocol v3 fields (CLAUDE.md
+        # §16). Forwarded only when present so legacy /gate callers
+        # (which never set chain_id) keep their previous payload
+        # shape. The backend treats missing as "single-shot Hard".
+        if check_request.get("chain_id") is not None:
+            gate_request["chain_id"] = check_request["chain_id"]
+        if check_request.get("chain_op") is not None:
+            gate_request["chain_op"] = check_request["chain_op"]
+        if check_request.get("idempotency_key") is not None:
+            gate_request["idempotency_key"] = check_request["idempotency_key"]
+        if "stream" in check_request:
+            gate_request["stream"] = bool(check_request["stream"])
 
-        # HMAC fix: serialise via the canonical-bytes helper and send
-        # via content=body so the wire bytes match the signed bytes.
+        # 2026-07-02 (v0.11.0 refactor): route through the canonical
+        # signed-headers helper — produces Content-Type + X-API-Key +
+        # Authorization + X-NULLRUN-PROTOCOL + HMAC + trace context.
+        # Building the dict inline (the previous shape) duplicated
+        # the same logic across batch / execute / check / refresh /
+        # WS endpoints.
         body = _signed_request_body(gate_request)
-        self._add_hmac_headers(headers, body)
-
-        # Inject trace context for distributed tracing (W3C Trace Context)
-        self._inject_trace_context(headers)
+        headers = self._build_signed_headers(body=body)
 
         try:
             response = self._client.post(
@@ -1579,11 +1609,14 @@ class Transport:
             )
         )
 
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["X-API-Key"] = self.api_key
-            # FIX-F3: Bearer header for CSRF bypass (see _build_signed_headers).
-            headers["Authorization"] = f"Bearer {self.api_key}"
+        # 2026-07-02 (v0.11.0 refactor): WS upgrade is a GET-with-no-body,
+        # so the signed-headers helper (which adds HMAC headers for
+        # the body) does not fit. We use the GET helper instead —
+        # same Content-Type + X-API-Key + Authorization +
+        # X-NULLRUN-PROTOCOL + trace context shape, no HMAC.
+        # The backend's protocol middleware (CLAUDE.md §32) runs on
+        # the WS upgrade path too, so the header is mandatory here.
+        headers = self._auth_headers_for_get()
 
         # Policy invalidation: 0.7.0 thin client. There is no local
         # policy cache to clear -- the next /gate or /execute call
@@ -1638,15 +1671,14 @@ class Transport:
         try:
             payload = {"api_key": self.api_key}
             body = _signed_request_body(payload)
-            headers: dict[str, str] = {
-                "Content-Type": "application/json",
-                "X-API-Key": self.api_key or "",
-                # FIX-F3: Bearer header for CSRF bypass (see _build_signed_headers).
-                "Authorization": f"Bearer {self.api_key}" if self.api_key else "",
-            }
-            # Re-use the same HMAC headers as /gate and /track so
-            # the server's auth-verify path is consistent.
-            self._add_hmac_headers(headers, body)
+            # 2026-07-02 (v0.11.0 refactor): route through the canonical
+            # signed-headers helper. ``self.api_key`` may be None on
+            # unauthenticated init paths; the helper handles that
+            # gracefully (omits X-API-Key + Authorization when no
+            # key is set, which is fine for /auth/verify — the
+            # backend doesn't require a signed key on the initial
+            # bootstrap, only on the rotation refetch).
+            headers = self._build_signed_headers(body=body)
 
             response = self._client.post(
                 # P0 #5: contract drift — other auth-verify call sites
@@ -1670,6 +1702,630 @@ class Transport:
                 logger.warning(f"Failed to refetch credentials: {response.status_code}")
         except Exception as e:
             logger.error(f"Error refetching credentials: {e}")
+
+    # =============================================================================
+    # Wire-protocol v3 endpoints (CLAUDE.md §3, §13, §16, §17, §22-§26, §29)
+    # =============================================================================
+    #
+    # The v3 wire contract adds six endpoints that the legacy /gate +
+    # /execute + /track/batch surface does not cover. Each new method
+    # follows the same shape as the existing `check` method:
+    #
+    #   1. Build headers via ``_build_signed_headers`` (gets X-API-Key +
+    #      Authorization + X-NULLRUN-PROTOCOL + HMAC + trace context).
+    #   2. Serialise the body via ``_signed_request_body`` so the wire
+    #      bytes match the HMAC-signed bytes.
+    #   3. POST through the shared ``self._client`` (mTLS, connection
+    #      pool, circuit breaker all apply).
+    #   4. Map non-2xx responses through ``_parse_v3_error_envelope``
+    #      so callers can ``except NullRunBudgetError`` / ``except
+    #      NullRunConsumeOverbudgetError`` / etc. without parsing the
+    #      raw error_code string.
+
+    def check_v3(
+        self,
+        request: dict[str, Any],
+        on_transport_error: Callable[[Exception], dict[str, Any]] | str | None = None,
+    ) -> dict[str, Any]:
+        """POST /api/v1/check — wire-protocol v3 pre-execution gate.
+
+        CLAUDE.md §3, §16, §22-§24. The v3 replacement for ``check()``
+        (/api/v1/gate). Adds three new optional fields on top of the
+        v2 wire shape:
+
+        * ``chain_id`` (UUID v4, optional) — pairs with ``chain_op``
+          (``"start"`` / ``"continue"`` / ``"end"``). Enables the
+          backend's soft-mode gate (§5) which only allows budget
+          overdrafts when a chain is active.
+        * ``chain_op`` (string, optional) — ``"start"`` creates a
+          chain in REGISTERED state, ``"continue"`` extends the TTL,
+          ``"end"`` closes the chain. Absent means auto-register.
+        * ``idempotency_key`` (UUID v4, optional) — replays return
+          the original decision instead of re-running the gate.
+
+        The response carries a server-minted ``execution_id`` (§24) —
+        callers MUST NOT treat the request's ``execution_id`` field
+        as authoritative; the backend overwrites it on the response.
+
+        Args:
+            request: Gate request body. Must include ``organization_id``,
+                ``execution_id`` (for backward compat — server mints its
+                own), ``operation_id``, and ``check_type``.
+            on_transport_error: Mirrors the ``check()`` flag.
+
+        Returns:
+            Parsed JSON dict, augmented with ``decision_source =
+            DecisionSource.GATEWAY`` so callers distinguish it from a
+            fallback synthetic response.
+
+        Raises:
+            NullRunAuthenticationError: 401/403 (PROTOCOL_TOO_OLD,
+                PROTOCOL_TOO_NEW, API_KEY_REVOKED, CHAIN_CROSS_ORG).
+            NullRunConsumeOverbudgetError: 422 (placeholder for /track;
+                not raised on /check).
+            NullRunBudgetError: 402 BUDGET_HARD_BLOCKED /
+                BUDGET_SOFT_BLOCKED / BUDGET_OVERDRAFT_EXCEEDED.
+            NullRunChainError: 402 CHAIN_MAX_DURATION_EXCEEDED /
+                403 CHAIN_ORG_MISMATCH.
+            NullRunWorkflowInactiveError: 403 WORKFLOW_INACTIVE.
+            NullRunBackendError: 5xx / BUDGET_DATA_UNAVAILABLE /
+                RATE_LIMIT_REDIS_UNAVAILABLE.
+        """
+        gate_request = dict(request)
+        headers = self._build_signed_headers()
+        body = _signed_request_body(gate_request)
+
+        try:
+            response = self._client.post(
+                f"{self.api_url}/api/v1/check",
+                content=body,
+                headers=headers,
+                timeout=5.0,
+            )
+        except httpx.RequestError as e:
+            if on_transport_error == "raise":
+                raise NullRunTransportError(
+                    f"Network error on /check: {e}",
+                    source=TransportErrorSource.NETWORK_ERROR,
+                    endpoint="check",
+                ) from e
+            logger.warning(f"/check request failed: {e}")
+            return {
+                "decision": "block",
+                "decision_source": DecisionSource.FALLBACK,
+                "execution_id": None,
+                "remaining_budget_cents": 0,
+                "projected_cost_cents": 0,
+                "explanations": [f"/check request failed: {e}"],
+                "suggestions": ["Check API availability"],
+            }
+
+        if response.status_code == 200:
+            data = response.json()
+            data.setdefault("decision_source", DecisionSource.GATEWAY)
+            return data  # type: ignore[no-any-return]
+
+        # Non-2xx — map through the v3 error envelope parser.
+        raise _parse_v3_error_envelope(response, "check")
+
+    def track_single(
+        self,
+        request: dict[str, Any],
+    ) -> dict[str, Any]:
+        """POST /api/v1/track — wire-protocol v3 single-event consume.
+
+        CLAUDE.md §5, §22-§25. The single-event path is the v3
+        replacement for the legacy `/api/v1/track/batch` POST body.
+        It runs the CONSUME_SCRIPT invariant
+        ``actual_cost <= reserved_cents + epsilon_cents`` (§25,
+        ADR-005) and rejects with 422 CONSUME_OVERBUDGET on
+        violation. The reserved binding is the one created by the
+        matching ``/check`` call (same ``execution_id``).
+
+        Args:
+            request: Consume request body. Must include
+                ``execution_id``, ``actual_cost_cents``,
+                ``api_key_id``. Optional ``cost_source``
+                (``"provisional"`` / ``"authoritative"``) — see §22.
+
+        Returns:
+            Parsed JSON dict with at least
+            ``{"status": "ok"|"idempotent_replay", ...}``.
+
+        Raises:
+            NullRunConsumeOverbudgetError: 422 CONSUME_OVERBUDGET —
+                ``actual_cost > reserved + epsilon_cents``. The
+                reservation is NOT silently re-reserved (§25).
+            NullRunBackendError: 503 RESERVATION_NOT_FOUND /
+                EXECUTION_NOT_BOUND.
+            NullRunAuthenticationError: 401/403.
+        """
+        headers = self._build_signed_headers()
+        body = _signed_request_body(request)
+
+        try:
+            response = self._client.post(
+                f"{self.api_url}/api/v1/track",
+                content=body,
+                headers=headers,
+                timeout=5.0,
+            )
+        except httpx.RequestError as e:
+            raise NullRunTransportError(
+                f"Network error on /track: {e}",
+                source=TransportErrorSource.NETWORK_ERROR,
+                endpoint="track",
+            ) from e
+
+        if response.status_code == 200:
+            return response.json()  # type: ignore[no-any-return]
+
+        raise _parse_v3_error_envelope(response, "track")
+
+    def cancel(
+        self,
+        execution_id: str,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        """POST /api/v1/cancel — cancel an in-flight execution.
+
+        CLAUDE.md §23 (idempotency contract). The server uses
+        ``cancel:{execution_id}`` SETNX to deduplicate repeated
+        cancellations: a 200 OK response is idempotent. A
+        non-existent ``execution_id`` returns 404 — we surface it
+        as ``NullRunBackendError`` because retrying with the same
+        id is not a valid recovery path (the execution already
+        terminated).
+
+        Args:
+            execution_id: Server-minted id from the matching /check
+                response.
+            reason: Optional human-readable reason for the
+                cancellation (audit trail).
+
+        Returns:
+            Parsed JSON dict (typically ``{"status": "ok",
+            "execution_id": ..., "cancelled_at": ts}``).
+        """
+        request: dict[str, Any] = {"execution_id": execution_id}
+        if reason:
+            request["reason"] = reason
+
+        headers = self._build_signed_headers()
+        body = _signed_request_body(request)
+
+        try:
+            response = self._client.post(
+                f"{self.api_url}/api/v1/cancel",
+                content=body,
+                headers=headers,
+                timeout=5.0,
+            )
+        except httpx.RequestError as e:
+            raise NullRunTransportError(
+                f"Network error on /cancel: {e}",
+                source=TransportErrorSource.NETWORK_ERROR,
+                endpoint="cancel",
+            ) from e
+
+        if response.status_code == 200:
+            return response.json()  # type: ignore[no-any-return]
+
+        raise _parse_v3_error_envelope(response, "cancel")
+
+    def heartbeat(
+        self,
+        chain_id: str,
+    ) -> dict[str, Any]:
+        """POST /api/v1/heartbeat — extend a chain's idle TTL.
+
+        CLAUDE.md §26. The server runs
+        ``EXPIRE chain:{org}:{chain_id} 300`` atomically and
+        deduplicates repeated heartbeats via
+        ``heartbeat:{chain_id}:{ts_floor_30s}`` SETNX
+        (TTL = 35s — the 5s tail absorbs ±5s skew per §26).
+
+        Recommended cadence: every 30s of wall-clock time (the
+        SDK's ``ping_chain`` helper wraps this method with the
+        time-based scheduler). Bursting heartbeats more often than
+        once per 30s is wasted bandwidth — the SETNX dedups them.
+
+        Args:
+            chain_id: Active chain_id.
+
+        Returns:
+            Parsed JSON dict (typically ``{"status": "ok",
+            "chain_id": ..., "last_active": ts}``).
+        """
+        request = {"chain_id": chain_id}
+        headers = self._build_signed_headers()
+        body = _signed_request_body(request)
+
+        try:
+            response = self._client.post(
+                f"{self.api_url}/api/v1/heartbeat",
+                content=body,
+                headers=headers,
+                timeout=5.0,
+            )
+        except httpx.RequestError as e:
+            raise NullRunTransportError(
+                f"Network error on /heartbeat: {e}",
+                source=TransportErrorSource.NETWORK_ERROR,
+                endpoint="heartbeat",
+            ) from e
+
+        if response.status_code == 200:
+            return response.json()  # type: ignore[no-any-return]
+
+        raise _parse_v3_error_envelope(response, "heartbeat")
+
+    def chain_end(
+        self,
+        chain_id: str,
+    ) -> dict[str, Any]:
+        """POST /api/v1/chain/end — close a chain explicitly.
+
+        CLAUDE.md §6 (chain state machine). The handler is already
+        idempotent — a no-op 200 OK for an unknown chain_id is the
+        documented success path. The SDK still raises through the
+        envelope parser on a true non-2xx so unexpected backend
+        regressions surface.
+
+        Args:
+            chain_id: Chain to close.
+
+        Returns:
+            Parsed JSON dict (typically ``{"status": "ok",
+            "chain_id": ...}``).
+        """
+        request = {"chain_id": chain_id}
+        headers = self._build_signed_headers()
+        body = _signed_request_body(request)
+
+        try:
+            response = self._client.post(
+                f"{self.api_url}/api/v1/chain/end",
+                content=body,
+                headers=headers,
+                timeout=5.0,
+            )
+        except httpx.RequestError as e:
+            raise NullRunTransportError(
+                f"Network error on /chain/end: {e}",
+                source=TransportErrorSource.NETWORK_ERROR,
+                endpoint="chain_end",
+            ) from e
+
+        if response.status_code == 200:
+            return response.json()  # type: ignore[no-any-return]
+
+        raise _parse_v3_error_envelope(response, "chain_end")
+
+    def approximate_budget(
+        self,
+        organization_id: str | None = None,
+    ) -> dict[str, Any]:
+        """GET /api/v1/budget/approximate — UI-only budget estimation.
+
+        CLAUDE.md §17. NEVER for enforcement — the backend stamps
+        ``is_approximate: true`` on every response. The endpoint
+        returns 503 ``BUDGET_DATA_UNAVAILABLE`` if all three sources
+        (Redis period counter → Postgres cost_events → last-known
+        cache) fail — NEVER returns 0, because a UI that displays
+        "≈ $0 spent" when no data is available misleads the user.
+
+        Used by ``nullrun.cost_dashboard()`` / ``examples/cost_dashboard.py``
+        and the dashboard rollup panel.
+
+        Args:
+            organization_id: Optional org override; defaults to the
+                transport's bound org via the auth/verify result.
+
+        Returns:
+            Parsed JSON dict with ``current_spend_cents_estimate``,
+            ``is_approximate: True``, ``source`` (BudgetSource enum
+            string), ``confidence`` (High/Medium/Low), and
+            ``last_updated_at``.
+
+        Raises:
+            NullRunBackendError: 503 BUDGET_DATA_UNAVAILABLE (all
+                sources failed) — caller should display "Data
+                unavailable" + retry button, NOT "$0 spent".
+            NullRunAuthenticationError: 401/403.
+        """
+        # ApproximateBudget uses GET (not POST) per the wire contract;
+        # no signed body, so we use _auth_headers() directly instead
+        # of _build_signed_headers().
+        headers = self._auth_headers_for_get()
+        url = f"{self.api_url}/api/v1/budget/approximate"
+        if organization_id:
+            url += f"?organization_id={organization_id}"
+
+        try:
+            response = self._client.get(url, headers=headers, timeout=5.0)
+        except httpx.RequestError as e:
+            raise NullRunTransportError(
+                f"Network error on /budget/approximate: {e}",
+                source=TransportErrorSource.NETWORK_ERROR,
+                endpoint="approximate_budget",
+            ) from e
+
+        if response.status_code == 200:
+            return response.json()  # type: ignore[no-any-return]
+
+        raise _parse_v3_error_envelope(response, "approximate_budget")
+
+    def _auth_headers_for_get(self) -> dict[str, str]:
+        """Headers for an unsigned GET (no HMAC body).
+
+        Same shape as ``_build_signed_headers`` minus the HMAC
+        headers. Used by ``approximate_budget`` which is a GET with
+        no body, so there's nothing to sign. Keeps the protocol +
+        CSRF-bypass + trace-context headers consistent with the
+        signed-POST path.
+        """
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["X-API-Key"] = self.api_key
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        headers[HEADER_PROTOCOL] = _protocol_header_value()
+        self._inject_trace_context(headers)
+        return headers
+
+
+# 2026-07-02 (v0.11.0): ACTIVE v3 error envelope parser.
+#
+# This is the live wire path. It supersedes the frozen
+# ``_parse_error_envelope`` helper below (which the test suite still
+# references as a frozen contract test). The v3 parser exists because
+# the new endpoints (/check, /track, /cancel, /heartbeat, /chain/end,
+# /budget/approximate) return machine-readable error envelopes with
+# codes from CLAUDE.md §13 — PROTOCOL_TOO_OLD, CONSUME_OVERBUDGET,
+# CHAIN_CROSS_ORG, WORKFLOW_INACTIVE, REDIS_UNAVAILABLE, etc.
+#
+# The mapping table lives at the bottom of the file so the wire-shape
+# contracts are visible in one place. Adding a new error_code is a
+# one-line change here.
+def _parse_v3_error_envelope(
+    response: httpx.Response,
+    endpoint: str,
+) -> Exception:
+    """Translate a non-2xx ``httpx.Response`` into the right v3
+    SDK exception.
+
+    The backend returns errors as a JSON envelope of the shape
+    ``{"error_code": "BUDGET_HARD_BLOCKED", "error_message": "...",
+    "details": {...}, "retry_after_ms": N}`` (CLAUDE.md §13). The
+    parser maps the backend's ``error_code`` string to the closest
+    SDK exception class, attaching the structured envelope fields
+    as instance attributes so callers can introspect them.
+
+    Mapping table lives at ``_V3_ERROR_CODE_MAP`` below — keep the
+    helper as a thin dispatcher.
+    """
+    # Lazy imports: the exception classes import the transport
+    # types (TransportErrorSource), so a top-level import here
+    # would create a cycle. The price is one extra import per
+    # non-2xx response — irrelevant for the failure path.
+    from nullrun.breaker.exceptions import (
+        NullRunBackendError,
+        NullRunBudgetError,
+        NullRunChainError,
+        NullRunConsumeOverbudgetError,
+        NullRunProtocolError,
+        NullRunRateLimitRedisError,
+        NullRunWorkflowInactiveError,
+        RateLimitError,
+    )
+
+    status = response.status_code
+    try:
+        body = response.json()
+    except Exception:
+        body = None
+    if not isinstance(body, dict):
+        body = {}
+
+    backend_code: str = body.get("error_code", "") or ""
+    message: str = (
+        body.get("error_message") or response.text or f"HTTP {status}"
+    )
+    details: dict[str, Any] = body.get("details") or {}
+    retry_after_ms: float | None = body.get("retry_after_ms")
+
+    # Retry-After header takes precedence over the JSON field when
+    # both are present (server-side convention — header is canonical
+    # per RFC 7231, JSON is a NullRun-specific fallback).
+    retry_after_header = response.headers.get("Retry-After")
+    if retry_after_header:
+        try:
+            retry_after_ms = float(retry_after_header) * 1000.0
+        except ValueError:
+            # HTTP-date form is non-numeric — leave JSON value intact.
+            pass
+
+    # Per-class dispatcher. Each exception has its own constructor
+    # signature (RateLimitError requires source+endpoint,
+    # NullRunBackendError requires endpoint+status_code, etc.) so a
+    # uniform ``error_cls(**kwargs)`` does not work. The switches
+    # below mirror the exact field mapping from CLAUDE.md §13.
+    full_message = f"{endpoint}: {message}"
+
+    if backend_code == "PROTOCOL_TOO_OLD" or backend_code == "PROTOCOL_TOO_NEW":
+            # NullRunProtocolError → NullRunInfrastructureError →
+            # NullRunError base. Base constructor does NOT accept
+            # a generic ``details=`` kwarg. Pass message only — the
+            # catalog value already encodes error_code + retryable.
+            return NullRunProtocolError(full_message)
+
+    if backend_code == "CONSUME_OVERBUDGET":
+        return NullRunConsumeOverbudgetError(
+            full_message,
+            execution_id=details.get("execution_id"),
+            reserved_cents=details.get("reserved_cents"),
+            max_allowed_cents=details.get("max_allowed_cents"),
+            actual_cost_cents=details.get("actual_cost_cents"),
+            epsilon_cents=details.get("epsilon_cents"),
+        )
+
+    if backend_code == "CHAIN_MAX_DURATION_EXCEEDED" or backend_code == "CHAIN_CROSS_ORG" or backend_code == "CHAIN_ORG_MISMATCH":
+        return NullRunChainError(
+            full_message,
+            chain_id=details.get("chain_id"),
+            backend_code=backend_code,
+            details=details,
+        )
+
+    if backend_code == "WORKFLOW_INACTIVE":
+        return NullRunWorkflowInactiveError(
+            full_message,
+            workflow_id=details.get("workflow_id"),
+        )
+
+    if backend_code == "RATE_LIMIT_REDIS_UNAVAILABLE":
+            # NullRunRateLimitRedisError → NullRunInfrastructureError
+            # → NullRunError base. Base constructor accepts only
+            # message + (error_code, user_action, retryable, docs_url,
+            # cause) — NOT a generic ``details=``. The catalog value
+            # already encodes error_code + retryable, so we just pass
+            # the message.
+            return NullRunRateLimitRedisError(full_message)
+
+    if backend_code == "RATE_LIMIT_EXCEEDED":
+        retry_after = retry_after_ms / 1000.0 if retry_after_ms else None
+        return RateLimitError(
+            full_message,
+            source=TransportErrorSource.GATEWAY_ERROR,
+            endpoint=endpoint,
+            retry_after=retry_after,
+            body=body,
+        )
+
+    # Catalog codes that map to NullRunBudgetError / NullRunBackendError
+    # via the fallback shape (no special signature).
+    catalog = _V3_ERROR_CODE_MAP.get(backend_code)
+    if catalog is not None:
+        # Special-case each constructor signature — the NullRun
+        # hierarchy has heterogeneous constructors (workflow_id +
+        # reason for NullRunBlockedException, endpoint + status_code
+        # for NullRunBackendError, error_code/user_action for
+        # NullRunError base). Universal ``catalog(message, details=)``
+        # would trip one of them every time.
+        if catalog is NullRunBackendError:
+            return NullRunBackendError(
+                full_message,
+                endpoint=endpoint,
+                status_code=status,
+            )
+        if catalog is NullRunBudgetError:
+            # NullRunBudgetError → NullRunBlockedException → requires
+            # workflow_id (str) + reason (str) positional args. Use
+            # the workflow_id / reason from the envelope details if
+            # present, otherwise synthesise from the endpoint label.
+            return NullRunBudgetError(
+                workflow_id=str(details.get("workflow_id") or "unknown"),
+                reason=full_message,
+            )
+        if catalog is NullRunRateLimitRedisError:
+            # NullRunError base takes (message, error_code=, user_action=,
+            # retryable=, docs_url=, cause=). The catalog value here
+            # already encodes error_code + retryable, so we pass
+            # the message only.
+            return catalog(full_message)
+        if catalog is NullRunProtocolError:
+            return catalog(full_message)
+        # Final fallback for catalog classes with a generic
+        # (message, **details) signature (NullRunAuthError).
+        return catalog(full_message, details=details)
+
+    # Fallback — use HTTP status. The catalog may not yet cover
+    # every backend code, so we surface a typed backend error
+    # that exposes status_code + error_code for the caller.
+    if status in (401, 403):
+        return NullRunAuthenticationError(
+            f"Auth failed on {endpoint} (status {status}, error_code="
+            f"{backend_code!r}): {message}"
+        )
+    if status == 429:
+        retry_after = retry_after_ms / 1000.0 if retry_after_ms else None
+        return RateLimitError(
+            f"Rate limited on {endpoint} (status 429, error_code="
+            f"{backend_code!r}): {message}",
+            source=TransportErrorSource.GATEWAY_ERROR,
+            endpoint=endpoint,
+            retry_after=retry_after,
+            body=body,
+        )
+    if 500 <= status < 600:
+        return NullRunBackendError(
+            f"{endpoint}: {message} (status {status}, error_code="
+            f"{backend_code!r})",
+            endpoint=endpoint,
+            status_code=status,
+        )
+    return NullRunBackendError(
+        f"{endpoint}: {message} (status {status}, error_code="
+        f"{backend_code!r})",
+        endpoint=endpoint,
+        status_code=status,
+    )
+
+
+# Lazy import to avoid a hard dependency at module import time.
+# `_parse_v3_error_envelope` is a module-level helper; the exception
+# classes live in `nullrun.breaker.exceptions`. Importing here
+# (rather than at the top of transport.py) keeps the legacy import
+# graph identical and avoids breaking the frozen
+# ``_parse_error_envelope`` test contract.
+def _build_v3_error_code_map() -> dict[str, type[BaseException]]:
+    """Construct the v3 error_code → exception class mapping.
+
+    Imported lazily because the exception classes import the
+    transport types (TransportErrorSource), which would create a
+    circular import if loaded eagerly at the top of transport.py.
+    """
+    from nullrun.breaker.exceptions import (
+        NullRunAuthError,
+        NullRunBackendError,
+        NullRunBudgetError,
+        NullRunChainError,
+        NullRunConsumeOverbudgetError,
+        NullRunProtocolError,
+        NullRunRateLimitRedisError,
+        NullRunWorkflowInactiveError,
+        RateLimitError,
+    )
+
+    return {
+        # 400 — protocol mismatch (CLAUDE.md §32)
+        "PROTOCOL_TOO_OLD": NullRunProtocolError,
+        "PROTOCOL_TOO_NEW": NullRunProtocolError,
+        # 402 — budget family
+        "BUDGET_HARD_BLOCKED": NullRunBudgetError,
+        "BUDGET_SOFT_BLOCKED": NullRunBudgetError,
+        "BUDGET_OVERDRAFT_EXCEEDED": NullRunBudgetError,
+        "BUDGET_PERIOD_NOT_STARTED": NullRunBudgetError,
+        "REDIS_UNAVAILABLE": NullRunBudgetError,
+        # 402 — chain family (separate class for diagnostic clarity)
+        "CHAIN_MAX_DURATION_EXCEEDED": NullRunChainError,
+        # 403 — chain security + workflow state
+        "CHAIN_CROSS_ORG": NullRunChainError,
+        "CHAIN_ORG_MISMATCH": NullRunChainError,
+        "WORKFLOW_INACTIVE": NullRunWorkflowInactiveError,
+        # 401/403 — auth
+        "API_KEY_REVOKED": NullRunAuthError,
+        # 422 — consume invariant violation (CLAUDE.md §25)
+        "CONSUME_OVERBUDGET": NullRunConsumeOverbudgetError,
+        # 429 — rate limit
+        "RATE_LIMIT_EXCEEDED": RateLimitError,
+        # 503 — backend availability
+        "RATE_LIMIT_REDIS_UNAVAILABLE": NullRunRateLimitRedisError,
+        "BUDGET_DATA_UNAVAILABLE": NullRunBackendError,
+    }
+
+
+_V3_ERROR_CODE_MAP: dict[str, type[BaseException]] = _build_v3_error_code_map()
 
 
 # ADR (2026-06-28, audit P2.2 close): ``_parse_error_envelope`` below
