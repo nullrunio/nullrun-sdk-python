@@ -338,11 +338,11 @@ def init(
     # rejects with 400 PROTOCOL_TOO_OLD, and the SDK's role is
     # advisory here.
     try:
+        from nullrun.__version__ import __version__
         from nullrun.capabilities import (
             probe_capabilities,
             validate_sdk_version,
         )
-        from nullrun.__version__ import __version__
 
         caps = probe_capabilities(runtime.api_url)
         if caps is not None:
