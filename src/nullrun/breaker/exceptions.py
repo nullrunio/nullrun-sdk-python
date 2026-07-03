@@ -360,6 +360,188 @@ class RateLimitError(NullRunTransportError):
         super().__init__(message, source, endpoint, **details)
 
 
+# ---------------------------------------------------------------------------
+# v3 wire-protocol error codes (CLAUDE.md §13, §25, §32)
+# ---------------------------------------------------------------------------
+# 2026-07-02 (v0.11.0): five new error subclasses covering the v3
+# envelope codes. Each one carries a stable ``error_code`` so callers
+# can branch on the catalog value rather than parsing the
+# ``error_message`` string. All are retryable = False — these are
+# client-actionable problems (upgrade SDK, fix api_key, stop sending
+# the request) that retrying without changing something will just hit
+# the same wall.
+
+
+class NullRunProtocolError(NullRunInfrastructureError):
+    """Wire-protocol version mismatch (CLAUDE.md §32).
+
+    Raised when the backend rejects the SDK's ``X-NULLRUN-PROTOCOL``
+    header as either too old (``PROTOCOL_TOO_OLD`` — server is newer
+    than the SDK) or too new (``PROTOCOL_TOO_NEW`` — SDK is newer
+    than the server). The actionable fix is to upgrade the SDK
+    (too old) or wait for the backend to roll out the new wire
+    version (too new).
+    """
+
+    error_code = "NR-P001"
+    user_action = (
+        "The NullRun backend rejected the SDK's wire-protocol version. "
+        "Upgrade the SDK to a version that supports protocol "
+        "X-NULLRUN-PROTOCOL: 3 — see "
+        "https://docs.nullrun.io/reference/wire-protocol for the "
+        "current compatibility matrix."
+    )
+    retryable = False
+
+
+class NullRunChainError(NullRunDecision):
+    """Chain-related failure (CLAUDE.md §6, §13).
+
+    Covers four backend codes: ``CHAIN_MAX_DURATION_EXCEEDED`` (402),
+    ``CHAIN_CROSS_ORG`` (403), ``CHAIN_ORG_MISMATCH`` (403), and
+    ``CHAIN_NOT_FOUND`` / ``CHAIN_EXPIRED`` (404). Splitting the
+    chain codes into their own class (rather than reusing
+    NullRunBlockedException) gives cookbook code a clean way to
+    distinguish "you forgot to start a chain" from "your tool is
+    blocked" without string-matching the message.
+
+    Attributes:
+        chain_id: Chain that triggered the error (may be None on a
+            cross-org collision).
+    """
+
+    error_code = "NR-CH001"
+    user_action = (
+        "The chain context is invalid. Verify chain_id is a UUID v4 "
+        "you started with chain_op='start', that it belongs to the "
+        "same org as the API key, and that it has not exceeded its "
+        "max_duration. See https://docs.nullrun.io/concepts/chains."
+    )
+    retryable = False
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        chain_id: str | None = None,
+        backend_code: str | None = None,
+        details: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        self.chain_id = chain_id
+        self.backend_code = backend_code or self.error_code
+        self.details = details or {}
+        super().__init__(message, **kwargs)
+
+
+class NullRunConsumeOverbudgetError(NullRunDecision):
+    """``actual_cost > reserved + epsilon_cents`` (CLAUDE.md §25).
+
+    The CONSUME_SCRIPT v3 invariant fires when the per-call actual
+    cost exceeds the per-execution reservation by more than the
+    configured ``epsilon_cents`` (default 1 cent). The reservation
+    is NOT silently re-reserved — the caller MUST reconcile the
+    delta manually before retrying. This is the §25 fix to a class
+    of "implicit re-reserve = bypass enforcement" attacks where a
+    malicious SDK would reserve 1 cent, then report 1000 cents on
+    the consume path.
+
+    Attributes:
+        execution_id: Server-minted id from the matching /check.
+        reserved_cents: What the gate reserved (the binding ceiling).
+        max_allowed_cents: ``reserved + epsilon_cents`` — the actual
+            hard ceiling that was violated.
+        actual_cost_cents: What the caller tried to consume (the
+            rejected value).
+        epsilon_cents: The configured tolerance (default 1).
+    """
+
+    error_code = "NR-O001"
+    user_action = (
+        "The actual cost exceeded the reservation by more than the "
+        "epsilon_cents tolerance. The reservation was NOT silently "
+        "re-reserved (CLAUDE.md §25). Either reduce the call's "
+        "expected cost before /check (model downgrade, fewer tokens) "
+        "or increase the per-policy ``epsilon_cents`` after manual "
+        "review — never bypass the invariant by retrying."
+    )
+    retryable = False
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        execution_id: str | None = None,
+        reserved_cents: int | None = None,
+        max_allowed_cents: int | None = None,
+        actual_cost_cents: int | None = None,
+        epsilon_cents: int | None = None,
+        **kwargs: Any,
+    ) -> None:
+        self.execution_id = execution_id
+        self.reserved_cents = reserved_cents
+        self.max_allowed_cents = max_allowed_cents
+        self.actual_cost_cents = actual_cost_cents
+        self.epsilon_cents = epsilon_cents
+        super().__init__(message, **kwargs)
+
+
+class NullRunWorkflowInactiveError(NullRunDecision):
+    """Workflow soft-deleted; gate blocks per-key traffic (CLAUDE.md §4,
+    §12 — Sprint 6 v1 12.2 hot-path wiring).
+
+    Raised when the workflow's ``is_active`` flag is false (soft
+    delete + ``killed_at`` not null) AND an active API key still
+    tries to drive traffic against it. Per the fail-CLOSED contract
+    in CLAUDE.md §4, the SDK must not let the agent body run in
+    this state — a soft-deleted workflow implies the operator
+    intentionally revoked it.
+    """
+
+    error_code = "NR-W004"
+    user_action = (
+        "The workflow is soft-deleted or killed on the server. "
+        "Stop sending traffic against this workflow — restore it "
+        "via the dashboard at https://app.nullrun.io/workflows/ "
+        "before retrying. Existing reservations are returned to "
+        "the org's available budget via the /cancel path or by "
+        "the per-execution reservation TTL (300s)."
+    )
+    retryable = False
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        workflow_id: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        self.workflow_id = workflow_id
+        super().__init__(message, **kwargs)
+
+
+class NullRunRateLimitRedisError(NullRunInfrastructureError):
+    """Redis unavailable for the aggregate per-org rate limit
+    (CLAUDE.md §4, §13).
+
+    Fail-CLOSED per the §4 enforcement table — aggregate rate
+    limiting is the authoritative gate, so a Redis outage maps to
+    503, not to a silent allow. Per-key rate limits stay
+    fail-OPEN because budget enforcement is the authoritative
+    backstop there.
+    """
+
+    error_code = "NR-R002"
+    user_action = (
+        "The NullRun backend cannot reach Redis for the aggregate "
+        "rate limit. The request was rejected (fail-CLOSED per "
+        "CLAUDE.md §4) because the rate limit is the authoritative "
+        "gate, not a soft advisory. Retry after the operator "
+        "confirms Redis is healthy — check status.nullrun.io."
+    )
+    retryable = True
+
+
 class BreakerTransportError(BreakerError):
     """
     Raised when transport layer fails and events cannot be delivered.

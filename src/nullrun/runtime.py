@@ -62,11 +62,14 @@ from nullrun.context import (
 )
 from nullrun.observability import metrics
 from nullrun.transport import (
+    HEADER_PROTOCOL,
+    NULLRUN_PROTOCOL_VERSION,
     DecisionSource,
     FallbackMode,
     FlushConfig,
     Transport,
     TransportErrorSource,
+    _protocol_header_value,
 )
 
 logger = logging.getLogger(__name__)
@@ -1138,7 +1141,13 @@ class NullRunRuntime:
         # running (not silently always-skipped).
         metrics.inc_runtime("check_calls")
 
-        from nullrun.context import get_call_model, get_call_tools, get_workflow_id
+        from nullrun.context import (
+            get_call_model,
+            get_call_tools,
+            get_chain_id,
+            get_chain_op,
+            get_workflow_id,
+        )
 
         # Phase 139+: prefer the user-set contextvar (explicit `with
         # workflow(...)` block), fall back to the API key's bound
@@ -1165,6 +1174,16 @@ class NullRunRuntime:
         call_model = get_call_model()
         call_tools = get_call_tools()
 
+        # 2026-07-02 (v0.11.0): forward chain context for soft-mode
+        # budget enforcement (CLAUDE.md §5, §6, §16). When the user
+        # has wrapped the call in `with chain(chain_id, op="start")`,
+        # the backend's Lua RESERVE_SCRIPT uses the chain to decide
+        # whether to allow soft-mode overdrafts. Absent chain_id, the
+        # gate falls back to single-shot Hard mode (binary budget
+        # or no) — the previous behaviour.
+        chain_id = get_chain_id()
+        chain_op = get_chain_op()
+
         check_req = {
             "organization_id": self.organization_id or "local",
             "execution_id": workflow_id,
@@ -1172,6 +1191,7 @@ class NullRunRuntime:
             "check_type": "llm",
             "model": call_model,  # may be None if user didn't set it
             "estimated_tokens": 1,
+            "stream": False,
         }
 
         # Forward the tool list so backend (T3) can match each tool
@@ -1181,6 +1201,22 @@ class NullRunRuntime:
         # tell you what tools will be called" (None).
         if call_tools:
             check_req["tools"] = list(call_tools)
+
+        # Chain context — only included when the user has set it.
+        # None vs missing chain_id is significant on the backend:
+        # missing means "I'm a single-shot Hard call", None
+        # explicitly would mean the same. Both safe to omit.
+        if chain_id is not None:
+            check_req["chain_id"] = chain_id
+            check_req["chain_op"] = chain_op if chain_op != "auto" else None
+
+        # 2026-07-02 (v0.11.0): idempotency key (CLAUDE.md §23).
+        # Replays of the same idempotency_key return the original
+        # decision instead of re-running the gate. We use the
+        # operation_id as the idempotency anchor — operation_id is
+        # already a UUID v4 generated per call, so it doubles as
+        # an idempotency_key without an extra round-trip.
+        check_req["idempotency_key"] = check_req["operation_id"]
 
         try:
             response = self._transport.check(check_req)
@@ -1241,11 +1277,179 @@ class NullRunRuntime:
                 reason="; ".join(reasons),
             )
 
+    # =============================================================================
+    # v3 wire-protocol helpers (CLAUDE.md §5, §6, §16, §17, §23, §26, §29)
+    # =============================================================================
+
+    def ping_chain(
+        self,
+        chain_id: str,
+        interval: float = 30.0,
+    ) -> Callable[[], None]:
+        """Schedule time-based heartbeats for an active chain
+        (CLAUDE.md §26).
+
+        Returns a ``stop()`` callable that cancels the scheduler
+        thread. The heartbeat runs on a dedicated daemon thread so
+        the agent loop stays unblocked.
+
+        Replaces the previous chunk-based heuristic (every N chunks)
+        with a wall-clock scheduler. Chunks do not correlate with
+        time — one chunk per minute still leaves the chain idle for
+        long stretches between heartbeat emissions, while bursty
+        1000-chunk-per-second traffic wastes heartbeat budget on an
+        already-fresh chain. ``time.monotonic()`` ties the cadence
+        to wall-clock time as recommended.
+
+        Args:
+            chain_id: Active chain_id (UUID v4). Must match a chain
+                registered via ``with chain(chain_id, op="start")``.
+            interval: Seconds between heartbeats. Default 30s, per
+                the §26 spec (configurable per policy in the
+                10-120s range). ±5s skew is tolerated server-side.
+
+        Returns:
+            ``stop()`` — call to cancel the scheduler. Idempotent.
+
+        Notes:
+            - The heartbeat POST is non-blocking and best-effort.
+              A failed heartbeat is logged at DEBUG and the chain
+              will simply expire via the server-side idle TTL.
+            - The thread is a daemon so an interpreter shutdown
+              without explicit ``stop()`` does not hang.
+            - Cadence is wall-clock (``time.monotonic``), not
+              chunk-count. Bursting the agent loop 100x/sec does
+              not change the heartbeat rate.
+        """
+        import threading as _threading
+
+        if interval < 10.0 or interval > 120.0:
+            raise ValueError(
+                f"ping_chain interval must be in [10, 120] seconds per "
+                f"CLAUDE.md §26, got {interval}"
+            )
+
+        stop_event = _threading.Event()
+        thread_done = _threading.Event()
+
+        def _heartbeat_loop() -> None:
+            try:
+                while not stop_event.is_set():
+                    # Wait in small slices so ``stop()`` returns
+                    # promptly. ``Event.wait`` returns True if the
+                    # event is set during the wait, so we break on
+                    # shutdown without a long sleep.
+                    if stop_event.wait(timeout=interval):
+                        break
+                    if stop_event.is_set():
+                        break
+                    try:
+                        self._transport.heartbeat(chain_id)
+                    except Exception as exc:  # noqa: BLE001 — best-effort
+                        logger.debug(
+                            "ping_chain: heartbeat for %s failed: %s",
+                            chain_id,
+                            exc,
+                        )
+            finally:
+                thread_done.set()
+
+        thread = _threading.Thread(
+            target=_heartbeat_loop,
+            daemon=True,
+            name=f"nullrun-ping-chain-{chain_id[:8]}",
+        )
+        thread.start()
+
+        def stop() -> None:
+            """Cancel the heartbeat scheduler. Idempotent."""
+            if stop_event.is_set():
+                return
+            stop_event.set()
+            # Bounded wait so a stuck network call cannot keep the
+            # interpreter alive past shutdown. The thread exits via
+            # the ``stop_event.wait`` slice on the next iteration.
+            thread_done.wait(timeout=interval + 1.0)
+
+        return stop
+
+    def cancel_execution(self, execution_id: str, reason: str | None = None) -> dict[str, Any]:
+        """Cancel an in-flight execution via /api/v1/cancel
+        (CLAUDE.md §23).
+
+        Idempotent: repeated calls with the same ``execution_id``
+        return 200 OK without side effects. A non-existent id
+        surfaces as ``NullRunBackendError`` — the user should not
+        retry in that case (the execution already terminated).
+
+        Args:
+            execution_id: Server-minted id from the matching /check
+                response. Client-supplied execution_ids from pre-v3
+                SDKs are NOT accepted.
+            reason: Optional audit-trail reason.
+
+        Returns:
+            Parsed JSON dict.
+        """
+        return self._transport.cancel(execution_id, reason=reason)
+
+    def chain_end(self, chain_id: str) -> dict[str, Any]:
+        """Close a chain explicitly via /api/v1/chain/end
+        (CLAUDE.md §6).
+
+        Idempotent on the server — a no-op 200 for unknown
+        chain_ids is the documented success path. Prefer using the
+        ``with chain(...)`` contextmanager for normal flows; this
+        helper is for the case where the chain was opened in a
+        prior request and you need to close it from a different
+        one.
+
+        Args:
+            chain_id: Chain to close.
+
+        Returns:
+            Parsed JSON dict.
+        """
+        return self._transport.chain_end(chain_id)
+
+    def approximate_budget(self) -> dict[str, Any]:
+        """UI-only budget estimate via GET /api/v1/budget/approximate
+        (CLAUDE.md §17).
+
+        NEVER use this value for enforcement — the response carries
+        ``is_approximate: True`` and the estimate lags the
+        authoritative budget counter by the outbox flush interval.
+        Dashboards should display "Data unavailable" + retry button
+        on the 503 path, NEVER "≈ $0 spent".
+
+        Returns:
+            Parsed JSON dict with ``current_spend_cents_estimate``,
+            ``is_approximate: True``, ``source``, ``confidence``,
+            ``last_updated_at``.
+
+        Raises:
+            NullRunBackendError: 503 BUDGET_DATA_UNAVAILABLE when
+                all three sources (Redis period counter → Postgres
+                cost_events → last-known cache) failed.
+        """
+        return self._transport.approximate_budget(
+            organization_id=self.organization_id,
+        )
+
     def _auth_headers(self) -> dict[str, str]:
-        """Get authentication headers."""
+        """Get authentication headers.
+
+        CLAUDE.md §32 (v3): the wire-protocol handshake header is
+        required on every signed POST. The three direct callers of
+        this helper — ``_post_auth_with_retry``, ``_fetch_remote_state``,
+        and ``get_org_status`` — all go through the backend's protocol
+        middleware, so the header has to be present here rather than
+        at every call site.
+        """
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["X-API-Key"] = self.api_key
+        headers[HEADER_PROTOCOL] = _protocol_header_value()
         return headers
 
     def shutdown(self) -> None:
@@ -2019,7 +2223,11 @@ class NullRunRuntime:
         last_exc: httpx.RequestError | None = None
         for attempt in range(max_attempts):
             try:
-                response = self._transport._client.post(url, json=json_body)
+                response = self._transport._client.post(
+                    url,
+                    json=json_body,
+                    headers=self._auth_headers(),
+                )
             except httpx.RequestError as e:
                 last_exc = e
                 if attempt < max_attempts - 1:

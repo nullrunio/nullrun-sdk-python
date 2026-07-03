@@ -42,6 +42,22 @@ _attempt_index_var: ContextVar[int] = ContextVar("attempt_index", default=0)
 _call_model_var: ContextVar[str | None] = ContextVar("call_model", default=None)
 _call_tools_var: ContextVar[tuple[str, ...]] = ContextVar("call_tools", default=())
 
+# 2026-07-02 (v0.11.0): chain_id contextvar for soft-mode gate
+# (CLAUDE.md §5, §6, §16).
+#
+# Soft-mode budget enforcement ONLY allows overdrafts when an
+# active chain is registered against the org. The SDK must forward
+# the active chain_id on every /check request so the backend can
+# find the chain in Redis. Storing the chain_id as a contextvar
+# (rather than threading it through every @protect call) means
+# user code does not have to manage the chain lifecycle explicitly
+# — the ``with chain("agent-loop")`` contextmanager below handles
+# set + reset.
+_chain_id_var: ContextVar[str | None] = ContextVar("chain_id", default=None)
+_chain_op_var: ContextVar[str] = ContextVar(
+    "chain_op", default="auto"
+)  # "auto" | "start" | "continue" | "end"
+
 
 # =============================================================================
 # Workflow / trace getters
@@ -93,6 +109,55 @@ def get_call_tools() -> tuple[str, ...]:
     configured ``blocked_tools`` aggregate.
     """
     return _call_tools_var.get()
+
+
+# ---------------------------------------------------------------------------
+# Chain context (v0.11.0 — CLAUDE.md §5, §6, §16)
+# ---------------------------------------------------------------------------
+def get_chain_id() -> str | None:
+    """Return the active chain_id, or ``None`` when no chain is in
+    scope.
+
+    Read by ``Transport.check_v3`` (and the legacy ``check`` /
+    ``check_workflow_budget`` paths) so the backend can decide
+    whether to allow soft-mode budget overdrafts. ``None`` means
+    single-shot Hard mode — the gate is binary (budget or no).
+    """
+    return _chain_id_var.get()
+
+
+def get_chain_op() -> str:
+    """Return the chain operation for the next /check call.
+
+    One of ``"auto"`` (default — auto-register if chain_id present,
+    else no-op), ``"start"``, ``"continue"``, ``"end"``. Maps to the
+    backend's ``chain_op`` field on ``/api/v1/check`` (CLAUDE.md §16).
+    """
+    return _chain_op_var.get()
+
+
+def set_chain_id(chain_id: str | None) -> None:
+    """Manually set the active chain_id (advanced; prefer ``with chain(...)``).
+
+    Setting ``None`` clears the chain context — subsequent /check
+    calls become single-shot Hard. The setter does NOT issue a
+    /chain/end — call ``nullrun.chain_end(chain_id)`` explicitly
+    when you want to close the chain on the server.
+    """
+    _chain_id_var.set(chain_id)
+
+
+def set_chain_op(op: str) -> None:
+    """Manually set the chain_op for the next /check call.
+
+    Valid values: ``"auto"`` (default), ``"start"``, ``"continue"``,
+    ``"end"``. Mirrors the wire-contract enum in CLAUDE.md §6
+    decision matrix. Use ``"start"`` to force REGISTERED-state
+    semantics on the next call (no auto-register); use ``"end"``
+    on a /check to close the chain in the same atomic operation
+    as the gate (avoids the extra round-trip).
+    """
+    _chain_op_var.set(op)
 
 
 def set_attempt_index(index: int) -> None:
@@ -288,3 +353,58 @@ def attempt(attempt_index: int) -> Generator[int, None, None]:
         yield attempt_index
     finally:
         _attempt_index_var.reset(token)
+
+
+# 2026-07-02 (v0.11.0): chain context manager for soft-mode budget
+# enforcement (CLAUDE.md §5, §6, §16).
+#
+# Usage:
+#
+#     import nullrun
+#     import uuid
+#
+#     chain_id = str(uuid.uuid4())
+#     with nullrun.chain(chain_id, op="start"):
+#         # First @protect call inside this block issues
+#         # /api/v1/check with chain_id + chain_op="start".
+#         # Subsequent calls extend the chain's TTL on the server.
+#         agent.run_long_loop()
+#     # On exit, the SDK does NOT issue /chain/end automatically —
+#     # the server's idle TTL (300s) cleans up if no /check lands.
+#     # To close explicitly: nullrun.chain_end(chain_id).
+#
+# Pair with ``runtime.ping_chain(chain_id, interval=30.0)`` for
+# long-running streams where you want to extend the TTL faster than
+# the natural /check cadence.
+@contextmanager
+def chain(
+    chain_id: str,
+    op: str = "start",
+) -> Generator[str, None, None]:
+    """Context manager for chain scope (CLAUDE.md §6, §16).
+
+    Args:
+        chain_id: UUID v4 (or any unique string) identifying this
+            chain. Persists in Redis with idle TTL 300s; auto-extended
+            by every /check inside the block.
+        op: Chain operation for the FIRST /check call inside the
+            block. ``"start"`` creates REGISTERED-state, ``"continue"``
+            extends TTL (auto-recover if the chain was lost),
+            ``"end"`` closes the chain on the same call. Subsequent
+            calls inside the block always send ``op="continue"``.
+
+    Yields:
+        The chain_id (so callers can ``as cid`` for symmetry with
+        ``workflow()``).
+    """
+    if op not in ("start", "continue", "end", "auto"):
+        raise ValueError(
+            f"chain() op must be one of start/continue/end/auto, got {op!r}"
+        )
+    chain_token = _chain_id_var.set(chain_id)
+    op_token = _chain_op_var.set(op)
+    try:
+        yield chain_id
+    finally:
+        _chain_id_var.reset(chain_token)
+        _chain_op_var.reset(op_token)

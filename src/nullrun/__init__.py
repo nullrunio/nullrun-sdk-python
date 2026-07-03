@@ -375,6 +375,14 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "set_call_context": ("nullrun.context", "set_call_context"),
     "get_call_model": ("nullrun.context", "get_call_model"),
     "get_call_tools": ("nullrun.context", "get_call_tools"),
+    # 2026-07-02 (v0.11.0): chain context for soft-mode budget gate
+    # (CLAUDE.md §5, §6, §16). ``chain`` is the contextmanager,
+    # ``get_chain_id`` / ``set_chain_id`` are the manual setters.
+    "chain": ("nullrun.context", "chain"),
+    "get_chain_id": ("nullrun.context", "get_chain_id"),
+    "set_chain_id": ("nullrun.context", "set_chain_id"),
+    "get_chain_op": ("nullrun.context", "get_chain_op"),
+    "set_chain_op": ("nullrun.context", "set_chain_op"),
     # Instrumentation
     "NullRunCallback": ("nullrun.instrumentation", "NullRunCallback"),
     # NOTE (Sprint 1.2 / B11-B12): `patch_openai` and `unpatch_openai`
