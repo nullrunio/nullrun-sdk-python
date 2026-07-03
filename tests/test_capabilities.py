@@ -4,18 +4,24 @@ These tests cover:
 - parse_capabilities: tolerant parsing with default-false fallbacks
 - validate_sdk_version: returns warnings for version mismatch
 - is_v3_ready: True only when ALL three v3 capabilities are set
+- probe_capabilities: /health fetch with respx (network failure paths)
 """
 
 from __future__ import annotations
 
+import httpx
 import pytest
+import respx
 
 from nullrun.capabilities import (
     SDK_MIN_VERSION_FOR_V3,
     ServerCapabilities,
     parse_capabilities,
+    probe_capabilities,
     validate_sdk_version,
 )
+
+BASE_URL = "https://api.test.nullrun.io"
 
 
 def test_parse_capabilities_v3_ready_backend():
@@ -151,6 +157,77 @@ def test_sdk_min_version_constant():
     """
     # Sanity: current value matches the v3.12 release.
     assert SDK_MIN_VERSION_FOR_V3 == "0.12.0"
+
+
+# ---------------------------------------------------------------------------
+# probe_capabilities — /health fetch (network failure paths)
+# ---------------------------------------------------------------------------
+# These cover the ``logger.debug`` branches in probe_capabilities that the
+# pure-data tests above cannot reach: non-2xx responses and transport
+# errors. We use respx (already a dev dep) to intercept the call without
+# touching the real network.
+
+
+def test_probe_capabilities_returns_caps_on_2xx():
+    """A successful /health response parses into a ServerCapabilities."""
+    payload = {
+        "min_protocol_version": 3,
+        "max_protocol_version": 3,
+        "server_minted_execution_id": True,
+        "per_execution_reservations": True,
+        "enforcement_modes_soft": False,
+        "heartbeat_time_based": True,
+    }
+    with respx.mock:
+        respx.get(f"{BASE_URL}/health").mock(
+            return_value=httpx.Response(200, json=payload)
+        )
+        caps = probe_capabilities(BASE_URL)
+    assert caps is not None
+    assert caps.is_v3_ready()
+    assert caps.min_protocol_version == 3
+
+
+def test_probe_capabilities_returns_none_on_non_2xx():
+    """A non-2xx /health response returns None (advisory, not fatal).
+
+    Pins the ``logger.debug("... returned %d", ...)` branch in
+    probe_capabilities so a future refactor can't silently swallow
+    the response code without a test catching it.
+    """
+    with respx.mock:
+        respx.get(f"{BASE_URL}/health").mock(
+            return_value=httpx.Response(503, text="service unavailable")
+        )
+        caps = probe_capabilities(BASE_URL)
+    assert caps is None
+
+
+def test_probe_capabilities_returns_none_on_network_error():
+    """Connection failures return None — the caller should treat
+    ``None`` as 'best-effort probe failed, proceed without it'.
+
+    Pins the ``logger.debug("... probe failed for %s: %s", ...)``
+    branch (transport-level exception path).
+    """
+    with respx.mock:
+        respx.get(f"{BASE_URL}/health").mock(
+            side_effect=httpx.ConnectError("connection refused")
+        )
+        caps = probe_capabilities(BASE_URL)
+    assert caps is None
+
+
+def test_probe_capabilities_returns_none_on_malformed_json():
+    """Malformed JSON (ValueError on json()) returns None — same
+    contract as a transport error: best-effort, not fatal.
+    """
+    with respx.mock:
+        respx.get(f"{BASE_URL}/health").mock(
+            return_value=httpx.Response(200, text="not-json{")
+        )
+        caps = probe_capabilities(BASE_URL)
+    assert caps is None
 
 
 if __name__ == "__main__":

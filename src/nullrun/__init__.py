@@ -228,8 +228,10 @@ def init(
     import logging
     import os
 
+    logger = logging.getLogger("nullrun")
+
     if debug:
-        logging.getLogger("nullrun").setLevel(logging.DEBUG)
+        logger.setLevel(logging.DEBUG)
 
     # T3-S2 (0.3.0): api_key is now required. Previous versions fell back
     # to a NullRunNoop stub in `local_mode`, which silently bypassed every
