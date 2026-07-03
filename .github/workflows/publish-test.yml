@@ -57,3 +57,9 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           repository-url: https://test.pypi.org/legacy/
+          # TestPyPI rejects re-uploads of the same wheel hash with
+          # HTTP 400 "File already exists". `skip-existing` makes
+          # re-runs of the same SHA a no-op (matching twine's
+          # --skip-existing behaviour). Production PyPI cannot
+          # overwrite anyway, so this flag is harmless there too.
+          skip-existing: true
