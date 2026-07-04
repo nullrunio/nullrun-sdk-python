@@ -8,6 +8,24 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 ---
 
 
+## [0.12.2] - 2026-07-04
+
+Bug-fix release. Two related correctness fixes layered on top of 0.12.1; no wire-format change.
+
+### Fixed
+
+- **BUG #4 — `/check` execution_id**: `check_workflow_budget()` now sends a fresh `uuidv7` as the `execution_id` field on every call, instead of reusing `workflow_id`. The backend's `gate_reserve_v3` overwrites the field with its own server-minted value on the response, but the previous behaviour could confuse the v3 reservation binding on `/track` when `track_single()` reached the backend — the same root cause as the four gaps 0.12.1 closed, from the client-side placeholder angle. (CLAUDE.md §29 §24 ownership.)
+- **BUG #5 — chain-mode gate thrash**: new `nullrun.runtime._GATE_CACHE` (5s TTL, keyed on `(workflow_id, chain_id, model)`) collapses consecutive `/gate` calls from inside `with chain(...)` to a single roundtrip, avoiding 100 /gate calls per 100-step agent loop. Single-shot (Hard mode) callers bypass the cache — the gate legitimately flips allow→block between consecutive calls there, and a stale "allow" would leak a budget-exhausted call through. Opt-out via `NULLRUN_GATE_CACHE_DISABLE=1` for callers that want the legacy always-roundtrip behaviour (e.g. live smoke tests per `docs/runbooks/budget-blue-green-smoke.sh`).
+
+### Added
+
+- 158 lines of contract tests in `tests/test_v3_wire_contract.py`: `TestGateExecutionId` (per-call uniqueness + uuidv7 format validation) and `TestGateCache` (5 cache invariant + opt-out cases).
+
+### Changed
+
+- `__version__` bumped from 0.12.1 to 0.12.2.
+
+
 ## [0.12.1] - 2026-07-04
 
 Bug-fix release. The v0.12.0 changelog claimed the SDK propagates the server-minted `execution_id` from /check to /track but the wiring was never shipped — the SDK still sent client-supplied ids on /track/batch and ignored `reservation_id` on /check responses (audit fix per memory `sdk-v3-migration-gaps`).
