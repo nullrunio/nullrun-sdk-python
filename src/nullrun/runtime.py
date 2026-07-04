@@ -2592,8 +2592,8 @@ def _capture_server_minted_execution_id(response: dict[str, Any]) -> str | None:
     from nullrun.context import (
         clear_server_minted_execution_id,
         set_server_minted_execution_id,
-        set_server_minted_reservation_at,
         set_server_minted_idempotency_key,
+        set_server_minted_reservation_at,
     )
 
     raw = response.get("reservation_id") if isinstance(response, dict) else None
