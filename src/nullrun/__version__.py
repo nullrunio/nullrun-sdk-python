@@ -81,7 +81,8 @@ No wire-format change. Pure client-side fix — backends on
 1.0.0 keep working unchanged. Pinning unchanged:
 SDK_MIN_VERSION_FOR_V3 = "0.12.0". Recommended upgrade
 path: 0.12.1 -> 0.12.2.
-"""
+
+---
 
 v3.13 / 0.13.0 (2026-07-04) — drift-fixes release: closes the SDK-side
 items left over from the docs-vs-code audit captured in
