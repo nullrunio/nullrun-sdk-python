@@ -83,5 +83,63 @@ SDK_MIN_VERSION_FOR_V3 = "0.12.0". Recommended upgrade
 path: 0.12.1 -> 0.12.2.
 """
 
-__version__ = "0.12.2"
+v3.13 / 0.13.0 (2026-07-04) — drift-fixes release: closes the SDK-side
+items left over from the docs-vs-code audit captured in
+`docs/drift.md`.
+
+  1. ``idempotency_key`` wired onto the v3 /track single-event
+     payload. New contextvar
+     ``nullrun.context._server_minted_idempotency_key_var`` +
+     ``get_/set_/reset_/clear_server_minted_idempotency_key``;
+     ``_capture_server_minted_execution_id`` now also captures
+     ``response["operation_id"]`` (which equals the /check
+     idempotency_key, runtime.py:1260); ``_enrich_event`` stamps
+     the value onto the ``wire_event`` for ``llm_call``;
+     ``_build_v3_track_payload`` propagates it onto the v3 /track
+     body with a contextvar fallback for tests + direct callers.
+     Without this, transport-level retry on the same event either
+     503'd with ``RESERVATION_NOT_FOUND`` (reservation key DEL'd
+     after the first consume per CLAUDE.md §25) or double-billed
+     the underlying budget.
+
+  2. Wire ``status_code`` preserved through every decision
+     exception class. ``NullRunBlockedException``,
+     ``NullRunBudgetError``, ``NullRunChainError``,
+     ``NullRunWorkflowInactiveError``,
+     ``NullRunConsumeOverbudgetError`` now all accept
+     ``status_code: int | None = None``; ``_parse_v3_error_envelope``
+     sets it from ``response.status_code`` for every branch —
+     402 budget, 403 workflow/chain cross-org, 422
+     ``CONSUME_OVERBUDGET``, 503 ``RATE_LIMIT_REDIS_UNAVAILABLE``,
+     etc. FastAPI exception handlers reading ``exc.status_code``
+     previously got ``None`` / 500 for budget blocks (the backend's
+     402 was lost in the constructor chain).
+
+  3. The runtime.py module docstring now distinguishes
+     SDK-side transport failure (network/5xx/breaker open →
+     fail-OPEN on /check) from wire 4xx/5xx that names an
+     enforcement failure (``BUDGET_REDIS_UNAVAILABLE`` → 402
+     fail-CLOSED; ``RATE_LIMIT_REDIS_UNAVAILABLE`` → 503
+     fail-CLOSED). The README had conflated the two with a single
+     "fail-OPEN on infra failures" claim.
+
+Tests:
+  * ``tests/test_drift_fixes_2026_07_04.py`` — 15 tests (5 idempotency,
+    8 status_code on every decision exception, 2 fail-CLOSED on
+    wire 503 RATE_LIMIT_REDIS_UNAVAILABLE).
+  * ``tests/test_v3_wire_contract.py::TestGateCacheRuntimeFlow`` — 3
+    runtime-level chain-mode cache tests that close the 0.12.2
+    patch-coverage gap (dragged codecov/patch below the 70% floor
+    on PR #52). Drives ``NullRunRuntime.check_workflow_budget``
+    inside ``with workflow(...) + with chain(...)`` to exercise
+    cache_enabled / cache-hit / cache-miss /
+    cache-bypass-via-env branches (runtime.py:1287-1310).
+
+Backends on 1.0.0 keep working unchanged. Pinning unchanged:
+SDK_MIN_VERSION_FOR_V3 = "0.12.0". Recommended upgrade
+path: 0.12.2 -> 0.13.0 (no on-wire breaking change; the SDK
+will pick up the new idempotency_key stamping automatically).
+"""
+
+__version__ = "0.13.0"
 __platform_version__ = "1.0.0"
