@@ -60,7 +60,6 @@ from nullrun.context import (
     get_trace_id,
     get_workflow_id,
 )
-from nullrun.uuid7 import uuid7_str  # 2026-07-04 BUG #4 (CLAUDE.md §24)
 from nullrun.observability import metrics
 from nullrun.transport import (
     HEADER_PROTOCOL,
@@ -73,6 +72,7 @@ from nullrun.transport import (
     _emit_for_transport_error,
     _protocol_header_value,
 )
+from nullrun.uuid7 import uuid7_str  # 2026-07-04 BUG #4 (CLAUDE.md §24)
 
 logger = logging.getLogger(__name__)
 

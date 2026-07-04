@@ -48,13 +48,12 @@ from nullrun.context import (
     set_chain_id,
 )
 from nullrun.transport import (
+    _V3_ERROR_CODE_MAP,
     HEADER_PROTOCOL,
     NULLRUN_PROTOCOL_VERSION,
     Transport,
     _parse_v3_error_envelope,
-    _V3_ERROR_CODE_MAP,
 )
-
 
 BASE_URL = "https://api.test.nullrun.io"
 
@@ -804,6 +803,7 @@ class TestGateExecutionId:
         """Two consecutive /check calls produce DIFFERENT
         execution_id values, both != workflow_id."""
         import json as _json
+
         from nullrun.uuid7 import uuid7_str
 
         t = Transport(api_url=BASE_URL, api_key="nr_live_abc123")
@@ -845,6 +845,7 @@ class TestGateExecutionId:
     def test_execution_id_is_uuidv7_format(self):
         """The execution_id must be a valid uuid7 (version nibble == 7)."""
         import json as _json
+
         from nullrun.uuid7 import uuid7_str
 
         t = Transport(api_url=BASE_URL, api_key="nr_live_abc123")
@@ -902,6 +903,7 @@ class TestGateCache:
 
     def test_store_and_retrieve_within_ttl(self):
         import time as _time
+
         from nullrun import runtime
         k = ("wf-x", "chain-y", "model-z")
         runtime._GATE_CACHE[k] = (_time.monotonic(), {"decision": "allow"})
@@ -911,6 +913,7 @@ class TestGateCache:
 
     def test_per_chain_cache_key_isolation(self):
         import time as _time
+
         from nullrun import runtime
         k1 = ("wf-x", "chain-A", "model-z")
         k2 = ("wf-x", "chain-B", "model-z")
