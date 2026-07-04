@@ -44,7 +44,44 @@ Pinning: still SDK_MIN_VERSION_FOR_V3 = "0.12.0". Operators
 upgrading from < 0.12.0 should jump straight to 0.12.1 — 0.12.0
 released with the integrity bug above and was never deployed
 in production with the v3 wiring.
+
+---
+
+v3.12 / 0.12.2 (2026-07-04) — bug-fix: fresh execution_id per
+/check + in-process chain-mode gate cache.
+
+Two related correctness fixes on top of 0.12.1:
+
+  1. ``check_workflow_budget`` now sends a fresh ``uuidv7`` as
+     ``execution_id`` on every /check call (instead of reusing
+     ``workflow_id``). The v3 ``gate_reserve_v3`` mints its
+     own anyway, but a client-side placeholder that collides
+     across calls confuses the reservation binding on
+     /track when ``track_single`` returns 503
+     ``RESERVATION_NOT_FOUND`` (CLAUDE.md §29). The server
+     overwrites the field on response, so the freshly-minted
+     ``reservation_id`` captured by
+     ``_capture_server_minted_execution_id`` still drives
+     /track exactly as in 0.12.1.
+
+  2. New in-process gate cache
+     (``nullrun.runtime._GATE_CACHE``) serves chain-mode
+     @protect calls from a 5s TTL on the same
+     ``(workflow_id, chain_id, model)`` triple, collapsing
+     100-step agent loops to a single /gate roundtrip. Single-
+     shot (Hard mode) callers bypass the cache — the gate
+     legitimately flips allow→block between consecutive
+     calls there, and a stale "allow" could leak a budget-
+     exhausted call. Opt-out via
+     ``NULLRUN_GATE_CACHE_DISABLE=1`` for callers that want
+     the legacy always-roundtrip behaviour (e.g. for live
+     smoke tests per docs/runbooks/budget-blue-green-smoke.sh).
+
+No wire-format change. Pure client-side fix — backends on
+1.0.0 keep working unchanged. Pinning unchanged:
+SDK_MIN_VERSION_FOR_V3 = "0.12.0". Recommended upgrade
+path: 0.12.1 -> 0.12.2.
 """
 
-__version__ = "0.12.1"
+__version__ = "0.12.2"
 __platform_version__ = "1.0.0"

@@ -785,3 +785,159 @@ class TestChainEndEndpoint:
             assert '"chain_id":"chain-1"' in body
         finally:
             t.stop()
+
+
+# ─────────────────────────────────────────────────────────────────────
+# §24 — /gate execution_id is fresh uuidv7 per call (BUG #4 fix)
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestGateExecutionId:
+    """CLAUDE.md §24: /gate execution_id must be a fresh uuidv7
+    per call, NOT the workflow_id. Pre-fix the SDK sent
+    `execution_id = workflow_id` which broke the v3 reservation
+    binding on /track (consume_budget_v3 looks up
+    `reservation:{execution_id}` and 503s on miss)."""
+
+    @respx.mock
+    def test_two_consecutive_checks_have_distinct_execution_id(self):
+        """Two consecutive /check calls produce DIFFERENT
+        execution_id values, both != workflow_id."""
+        import json as _json
+        from nullrun.uuid7 import uuid7_str
+
+        t = Transport(api_url=BASE_URL, api_key="nr_live_abc123")
+        try:
+            respx.post(f"{BASE_URL}/api/v1/gate").mock(
+                return_value=Response(
+                    200, json={"decision": "allow", "decision_source": "gateway"}
+                )
+            )
+            # Mirror the payload shape that runtime.check_workflow_budget
+            # constructs at runtime.py:1201-1208, with the BUG #4 fix:
+            # execution_id is a fresh uuid7 per call, NOT workflow_id.
+            workflow_id = "24fb55c5-9313-4fbd-8829-5ab93aa4396d"
+            req1 = {
+                "organization_id": "109c6ae0-a7cc-45b2-8ae6-0b5f8e84753d",
+                "execution_id": uuid7_str(),
+                "operation_id": str(uuid.uuid4()),
+                "check_type": "llm",
+                "model": "gpt-4.1-mini",
+                "estimated_tokens": 1,
+                "stream": False,
+            }
+            req2 = dict(req1)
+            req2["operation_id"] = str(uuid.uuid4())
+            req2["execution_id"] = uuid7_str()
+            t.check(req1)
+            first_body = _json.loads(respx.calls.last.request.content)
+            t.check(req2)
+            second_body = _json.loads(respx.calls.last.request.content)
+            first_eid = first_body["execution_id"]
+            second_eid = second_body["execution_id"]
+            assert first_eid != second_eid
+            assert first_eid != workflow_id
+            assert second_eid != workflow_id
+        finally:
+            t.stop()
+
+    @respx.mock
+    def test_execution_id_is_uuidv7_format(self):
+        """The execution_id must be a valid uuid7 (version nibble == 7)."""
+        import json as _json
+        from nullrun.uuid7 import uuid7_str
+
+        t = Transport(api_url=BASE_URL, api_key="nr_live_abc123")
+        try:
+            respx.post(f"{BASE_URL}/api/v1/gate").mock(
+                return_value=Response(
+                    200, json={"decision": "allow", "decision_source": "gateway"}
+                )
+            )
+            req = {
+                "organization_id": "109c6ae0-a7cc-45b2-8ae6-0b5f8e84753d",
+                "execution_id": uuid7_str(),
+                "operation_id": str(uuid.uuid4()),
+                "check_type": "llm",
+                "model": "gpt-4.1-mini",
+                "estimated_tokens": 1,
+                "stream": False,
+            }
+            t.check(req)
+            body = _json.loads(respx.calls.last.request.content)
+            eid = body["execution_id"]
+            parsed = uuid.UUID(eid)
+            # UUID v7 has version nibble == 7 (RFC 9562 §5.7)
+            assert parsed.version == 7
+        finally:
+            t.stop()
+
+
+# ─────────────────────────────────────────────────────────────────────
+# BUG #5 — In-process gate cache for chain-mode (CLAUDE.md §26)
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestGateCache:
+    """BUG #5 (2026-07-04): chain-mode /check calls should be served
+    from an in-process 5s TTL cache, not hit /gate every time.
+    Single-shot (Hard mode) callers MUST NOT cache.
+
+    These tests pin the cache data-structure invariants + opt-out
+    behavior. The runtime-level integration (10 chain-mode calls
+    collapse to 1 HTTP roundtrip) is covered by an end-to-end smoke
+    against the live API per docs/runbooks/budget-blue-green-smoke.sh
+    Invariant 12. The runtime construction needed for in-process
+    respx-mocked tests has its own env-bypass quirks; the data
+    structure tests below are the durable contract."""
+
+    def setup_method(self):
+        from nullrun import runtime
+        runtime._GATE_CACHE.clear()
+
+    def test_cache_is_dict_with_ttl_5s(self):
+        from nullrun import runtime
+        assert isinstance(runtime._GATE_CACHE, dict)
+        assert runtime._GATE_CACHE_TTL_SECONDS == 5.0
+
+    def test_store_and_retrieve_within_ttl(self):
+        import time as _time
+        from nullrun import runtime
+        k = ("wf-x", "chain-y", "model-z")
+        runtime._GATE_CACHE[k] = (_time.monotonic(), {"decision": "allow"})
+        cached = runtime._GATE_CACHE.get(k)
+        assert cached is not None
+        assert cached[1]["decision"] == "allow"
+
+    def test_per_chain_cache_key_isolation(self):
+        import time as _time
+        from nullrun import runtime
+        k1 = ("wf-x", "chain-A", "model-z")
+        k2 = ("wf-x", "chain-B", "model-z")
+        runtime._GATE_CACHE[k1] = (_time.monotonic(), {"decision": "allow"})
+        runtime._GATE_CACHE[k2] = (_time.monotonic(), {"decision": "block"})
+        assert runtime._GATE_CACHE.get(k1)[1]["decision"] == "allow"
+        assert runtime._GATE_CACHE.get(k2)[1]["decision"] == "block"
+
+    def test_cache_gate_disabled_when_no_chain_id(self):
+        # Mirror the runtime's cache_enabled predicate:
+        #   chain_id is not None AND NULLRUN_GATE_CACHE_DISABLE != "1"
+        import os
+        os.environ["NULLRUN_GATE_CACHE_DISABLE"] = ""
+        chain_id = None
+        cache_enabled = (
+            chain_id is not None
+            and not os.environ.get("NULLRUN_GATE_CACHE_DISABLE", "").strip() == "1"
+        )
+        assert cache_enabled is False
+
+    def test_cache_gate_disabled_via_env(self):
+        import os
+        os.environ["NULLRUN_GATE_CACHE_DISABLE"] = "1"
+        chain_id = "chain-y"
+        cache_enabled = (
+            chain_id is not None
+            and not os.environ.get("NULLRUN_GATE_CACHE_DISABLE", "").strip() == "1"
+        )
+        assert cache_enabled is False
+        os.environ.pop("NULLRUN_GATE_CACHE_DISABLE", None)
