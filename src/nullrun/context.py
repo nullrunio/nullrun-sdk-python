@@ -22,7 +22,7 @@ from the ``_authenticate`` response.
 import uuid
 from collections.abc import Generator
 from contextlib import contextmanager
-from contextvars import ContextVar
+from contextvars import ContextVar, Token
 
 # Context variables for workflow/trace propagation.
 _workflow_id_var: ContextVar[str | None] = ContextVar("workflow_id", default=None)
@@ -158,6 +158,145 @@ def set_chain_op(op: str) -> None:
     as the gate (avoids the extra round-trip).
     """
     _chain_op_var.set(op)
+
+
+# ---------------------------------------------------------------------------
+# Server-minted execution_id (2026-07-04 — CLAUDE.md §24, §29)
+# ---------------------------------------------------------------------------
+#
+# Pre-0.12.0 the SDK sent a client-supplied ``execution_id`` (usually
+# ``workflow_id``) in /check requests and IGNORED the server's response.
+# This left two problems:
+#
+#   1. CLAUDE.md §24 ownership — the backend's `gate_reserve_v3`
+#      generates a uuidv7 internally, persists
+#      ``execution:{execution_id}`` (24h TTL) and creates
+#      ``reservation:{execution_id}`` (300s TTL). The client-minted
+#      id never matched, so on the v3 path the gate rejected /track
+#      with 503 RESERVATION_NOT_FOUND (§29 — fail-CLOSED).
+#
+#   2. CLAUDE.md §23 idempotency — /track's ``idempotency_key``
+#      contract depends on the server-minted UUID being reused
+#      on retry. Without picking it up at /check the SDK has no
+#      way to compute a stable key.
+#
+# Fix: capture the ``reservation_id`` field from the /check
+# response into this contextvar. The runtime sets it on every
+# successful /check; the runtime's ``_enrich_event`` reads it on
+# the way out and tags the /track payload with ``execution_id``.
+#
+# Lifetime: scoped automatically by ``with workflow(...)`` /
+# ``with chain(...)`` — the runtime resets the contextvar on
+# block exit so a /check in one block never leaks into a /track
+# in a sibling block. Tests can drive it manually with
+# ``set_/reset_server_minted_execution_id`` (Token-based API
+# mirrors the user-facing audit spec; ``clear_`` is a
+# no-token convenience for the runtime's ``_enrich_event``
+# after a /track has been issued).
+#
+# The reservation TTL (300s) is shorter than the chain id's 24h
+# binding TTL, so we also record the capture timestamp —
+# ``get_server_minted_reservation_at`` returns ``time.monotonic()``
+# at the moment /check returned 200. The runtime ignores the
+# contextvar when the age exceeds 295s (5s margin below the
+# 300s backend reservation TTL) so an exceptionally long LLM
+# call never ships a doomed ``execution_id``.
+_server_minted_execution_id_var: ContextVar[str | None] = ContextVar(
+    "server_minted_execution_id", default=None
+)
+_server_minted_reservation_at_var: ContextVar[float] = ContextVar(
+    "server_minted_reservation_at", default=0.0
+)
+
+
+def get_server_minted_execution_id() -> str | None:
+    """Return the server-minted execution_id from the last /check, or
+    ``None`` if none captured in scope.
+
+    Read by ``NullRunRuntime._enrich_event`` to tag the /track
+    payload. ``None`` is the legacy / v1-v2 path — the wire spec
+    allows the field to be omitted when the backend has not
+    minted one (capability ``server_minted_execution_id=False``).
+    """
+    return _server_minted_execution_id_var.get()
+
+
+def get_server_minted_reservation_at() -> float:
+    """Return ``time.monotonic()`` at the moment of /check capture,
+    or ``0.0`` if no capture in scope.
+
+    Used by ``NullRunRuntime._enrich_event`` to refuse a /track
+    whose /check has aged past the v3 reservation TTL (300s —
+    CLAUDE.md §29). The runtime captures the timestamp at the
+    same instant the id is captured, so the two values always
+    refer to the same /check.
+    """
+    return _server_minted_reservation_at_var.get()
+
+
+def set_server_minted_execution_id(value: str | None) -> Token[str | None]:
+    """Capture the server-minted execution_id returned by /check.
+
+    Returns the ``Token`` so the caller can restore the previous
+    value via :func:`reset_server_minted_execution_id`. The
+    runtime drives the lifetime explicitly (it owns the
+    capture/reset cycle around the user-function call) — user
+    code does not need to call this directly.
+
+    Args:
+        value: UUID v7 string returned on ``GateResponse.
+            reservation_id`` (server-minted per §24). Pass
+            ``None`` to clear (e.g. on a hard block response
+            which carries no reservation_id).
+    """
+    return _server_minted_execution_id_var.set(value)
+
+
+def set_server_minted_reservation_at(value: float) -> Token[float]:
+    """Capture the ``time.monotonic()`` instant corresponding to
+    ``set_server_minted_execution_id``.
+
+    Called by the runtime immediately after :func:`set_server_minted_execution_id`
+    so the two timestamps stay in lockstep. Returns the matching
+    Token for symmetric :func:`reset_server_minted_reservation_at`.
+    """
+    return _server_minted_reservation_at_var.set(value)
+
+
+def reset_server_minted_execution_id(token: Token[str | None]) -> None:
+    """Restore the previous server-minted execution_id value.
+
+    Pair with :func:`set_server_minted_execution_id`. The runtime
+    stores the token at capture time and resets it on the matching
+    /track emission (or at workflow/chain block exit, whichever
+    comes first).
+    """
+    _server_minted_execution_id_var.reset(token)
+
+
+def reset_server_minted_reservation_at(token: Token[float]) -> None:
+    """Restore the previous reservation capture timestamp.
+
+    Pair with :func:`set_server_minted_reservation_at`.
+    """
+    _server_minted_reservation_at_var.reset(token)
+
+
+def clear_server_minted_execution_id() -> None:
+    """Erase the captured server-minted execution_id + timestamp.
+
+    No-token convenience for the runtime's "block exited, drop the
+    capture" code path. Equivalent to::
+
+        _server_minted_execution_id_var.set(None)
+        _server_minted_reservation_at_var.set(0.0)
+
+    Use :func:`reset_server_minted_execution_id` instead when you
+    have a Token to consume — that path restores the previous
+    scope's value, ``clear_`` strictly forgets it.
+    """
+    _server_minted_execution_id_var.set(None)
+    _server_minted_reservation_at_var.set(0.0)
 
 
 def set_attempt_index(index: int) -> None:

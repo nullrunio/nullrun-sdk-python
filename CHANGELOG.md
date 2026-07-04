@@ -8,9 +8,40 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 ---
 
 
+## [0.12.1] - 2026-07-04
+
+Bug-fix release. The v0.12.0 changelog claimed the SDK propagates the server-minted `execution_id` from /check to /track but the wiring was never shipped — the SDK still sent client-supplied ids on /track/batch and ignored `reservation_id` on /check responses (audit fix per memory `sdk-v3-migration-gaps`).
+
+This release closes the four gaps documented in `docs/sdk-v3-migration-gaps.md`:
+
+- `check_workflow_budget()` now reads `response["reservation_id"]` and stores it on a contextvar (`nullrun.context._server_minted_execution_id_var`).
+- New helpers `set_server_minted_execution_id` / `get_server_minted_execution_id` / `reset_server_minted_execution_id` + a paired `_server_minted_reservation_at` timestamp for the 295s TTL guard.
+- `_enrich_event` stamps `execution_id` onto the /track payload when the captured reservation is fresh, and drops it (clearing the capture) once past the safety window — prevents forwarding a doomed id that would 503 on /track per CLAUDE.md section 33.
+- `_route_track` routes `llm_call` events to the v3 `/api/v1/track` single-event endpoint via `Transport.track_single()` so backend `gate_consume_v3` validates the consume-vs-reserve + epsilon invariant (CLAUDE.md section 25). Span / tool events keep using the legacy `/api/v1/track/batch`.
+- `NULLRUN_V3_TRACK_DISABLE=1` opt-out forces everything through the legacy batch path (backends still on v1/v2).
+
+### Added
+
+- `nullrun.context._server_minted_execution_id_var` + `nullrun.context._server_minted_reservation_at_var` + 6 helpers (`get_/set_/reset_/clear_`).
+- `nullrun.runtime._capture_server_minted_execution_id(response)` — defensive UUID parse + warn-on-malformed.
+- `nullrun.runtime._route_track(wire_event)` — dispatches to single-event /track or batch /track/batch.
+- `nullrun.runtime._build_v3_track_payload(event, reservation_id)` — maps an enriched event onto the v3 /track wire schema.
+- 27 contract tests in `tests/test_v3_server_minted.py` covering contextvar hygiene, capture defence-in-depth, _enrich_event age threshold, _route_track dispatch, and end-to-end /gate -> /track round trip.
+
+### Changed
+
+- `__version__` bumped from 0.12.0 to 0.12.1 (post-release integrity fix — the v0.12.0 wiring never shipped before this).
+
+### Fixed
+
+- SDK no longer treats the /check `reservation_id` field as decorative. Each LLM-call track event now carries the server-minted uuidv7 the backend minted, so v3 `gate_consume_v3` can find the matching `reservation:{execution_id}` Redis key (300s TTL).
+- LLM-call events now POST to `/api/v1/track` (v3 single-event) instead of `/api/v1/track/batch`. This exercises the consume-vs-reserve invariant that the batch path silently skipped (regression of the v1/v2 `monthly_cost` counter — see CLAUDE.md section 0 G1).
+
 ## [0.12.0] - 2026-07-03
 
 Server-minted execution_id default ON. Per CLAUDE.md section 24, every /check now mints a server-side uuidv7 execution_id. The SDK no longer needs to generate its own; the response carries the server-minted id which propagates to /track. This is the SDK_MIN_VERSION for the v3 rollout - older SDKs still work for v1/v2 endpoints but should upgrade.
+
+> **Integrity note (2026-07-04):** the propagation claim in this entry was correct in intent but the actual wiring was not shipped in 0.12.0. See 0.12.1 above for the closing fix.
 
 ### Added
 

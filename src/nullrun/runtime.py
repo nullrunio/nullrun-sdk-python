@@ -69,6 +69,7 @@ from nullrun.transport import (
     FlushConfig,
     Transport,
     TransportErrorSource,
+    _emit_for_transport_error,
     _protocol_header_value,
 )
 
@@ -80,6 +81,18 @@ logger = logging.getLogger(__name__)
 # to be named ``<unknown>`` (the previous literal was a
 # collision hazard). Wire compat: still a string.
 UNKNOWN_WORKFLOW_ID: str = "__nullrun_unknown__"
+
+# 2026-07-04 (v0.12.0 wiring fix — CLAUDE.md §24, §29):
+# the maximum age (seconds) for a captured ``reservation_id``
+# to be eligible for forwarding onto a /track payload. Past
+# this age the underlying ``reservation:{execution_id}`` Redis
+# key has expired (300s TTL per §29) — forwarding would
+# guarantee a 503 ``RESERVATION_NOT_FOUND`` on /track. The
+# 5s margin below the 300s TTL absorbs clock-skew between
+# the SDK's ``time.monotonic()`` and the Redis cluster's own
+# TTL decay (sub-second typically, but the safety budget is
+# worth the simplicity of a hard-coded threshold).
+SERVER_MINTED_RESERVATION_MAX_AGE_SECONDS: float = 295.0
 
 # Phase 4.1: privacy boundary. Fields that MUST NOT leave the SDK on
 # the wire. The transport layer (POST /api/v1/track/batch) reads
@@ -1224,6 +1237,33 @@ class NullRunRuntime:
             logger.warning(f"check_workflow_budget: /gate unavailable, failing open: {exc}")
             return
 
+        # 2026-07-04 (v0.12.0 wiring fix — CLAUDE.md §24, §29):
+        # capture the server-minted ``reservation_id`` returned by
+        # the backend's v3 ``gate_reserve_v3`` Lua path. Per §24
+        # the server is the source-of-truth for execution_id
+        # ownership; the value in ``GateResponse.reservation_id``
+        # is a freshly-minted uuidv7 that maps to the
+        # ``reservation:{execution_id}`` Redis key (TTL 300s).
+        #
+        # The /track handler v3 ``consume_budget_v3`` rejects with
+        # 503 ``RESERVATION_NOT_FOUND`` when ``execution_id`` in
+        # the request body does NOT match a live reservation key
+        # (§33 — fail-CLOSED). Storing the id on a contextvar
+        # means downstream ``track_llm`` / ``track_tool`` /
+        # ``track_event`` calls can fill in the field without
+        # threading it through the user-facing call sites.
+        #
+        # On legacy backends (``server_minted_execution_id=False``
+        # capability) the field is omitted — ``get_...`` returns
+        # ``None`` and the SDK falls back to the previous
+        # (un-minted) wire flow. Capture happens regardless of
+        # ``decision``: a "throttle" pass still produces a
+        # reservation_id; only "block" + transport-failed clear it.
+        # We capture BEFORE the decision checks so a future
+        # bugfix that reorders them can't desync capture from
+        # response.
+        _capture_server_minted_execution_id(response)
+
         decision = response.get("decision", "allow")
         decision_source = response.get("decision_source", DecisionSource.GATEWAY)
         # Round 3 (Phase 0.4.0): only fail-OPEN on EXPLICIT synthetic
@@ -1645,7 +1685,7 @@ class NullRunRuntime:
             metrics.inc_runtime("dropped_llm_call_no_model")
             wire_event["__missing_model"] = True
 
-        self._transport.track(wire_event)
+        self._route_track(wire_event)
 
         # Update metrics (thread-safe)
         metrics.inc_runtime("track_calls")
@@ -2033,6 +2073,55 @@ class NullRunRuntime:
             if attempt_index > 0:  # Only add if not default (first attempt)
                 enriched["attempt_index"] = attempt_index
 
+        # 2026-07-04 (v0.12.0 wiring fix — CLAUDE.md §24, §29):
+        # include the server-minted execution_id on the /track
+        # payload when one is in scope (captured by
+        # ``check_workflow_budget`` via
+        # ``_capture_server_minted_execution_id``).
+        #
+        # Wire field: ``execution_id`` — matches the backend's
+        # ``consume_budget_v3`` consume-request body schema
+        # (``backend/src/cost/reservation.rs::consume_budget_v3``).
+        #
+        # Skip when:
+        # * the user / caller already supplied ``execution_id``
+        #   (explicit takes precedence),
+        # * no reservation was captured yet (legacy path or this
+        #   is the very first event before the first /check),
+        # * the captured reservation has aged past
+        #   ``SERVER_MINTED_RESERVATION_MAX_AGE_SECONDS`` (295s
+        #   by default — 5s safety margin below the 300s Redis
+        #   reservation TTL per §29). Forwards of a stale id
+        #   would 503 ``RESERVATION_NOT_FOUND`` on /track and
+        #   we'd rather drop the field than trip the gate.
+        if "execution_id" not in enriched:
+            import time as _time
+
+            from nullrun.context import (
+                get_server_minted_execution_id,
+                get_server_minted_reservation_at,
+            )
+
+            smid = get_server_minted_execution_id()
+            if smid:
+                age = _time.monotonic() - get_server_minted_reservation_at()
+                if age >= SERVER_MINTED_RESERVATION_MAX_AGE_SECONDS:
+                    # Drop the stale capture. The user (or the
+                    # next @protect invocation) will mint a fresh
+                    # id on the next /check.
+                    from nullrun.context import (
+                        clear_server_minted_execution_id,
+                    )
+                    clear_server_minted_execution_id()
+                    logger.debug(
+                        "_enrich_event: dropping stale server-minted "
+                        "execution_id (age=%.1fs >= %ds)",
+                        age,
+                        SERVER_MINTED_RESERVATION_MAX_AGE_SECONDS,
+                    )
+                else:
+                    enriched["execution_id"] = smid
+
         # Add type if not present
         if "type" not in enriched:
             enriched["type"] = "event"
@@ -2045,6 +2134,94 @@ class NullRunRuntime:
             enriched["operation_name"] = None
 
         return enriched
+
+    def _route_track(self, wire_event: dict[str, Any]) -> None:
+        """Route a tracked event to v3 single-event /track or
+        legacy batch /track/batch (CLAUDE.md §24, §29).
+
+        Why this exists
+        ---------------
+        Pre-0.12.0 wiring the SDK always called
+        ``self._transport.track(wire_event)`` which posts to the
+        legacy ``/api/v1/track/batch`` (the ``process_span_event``
+        pipeline). That pipeline reads the org's lifetime
+        ``monthly_cost`` counter — drift with the dashboard's
+        period-bound ``bp:{ts}:cost_cents`` per CLAUDE.md §0 G1,
+        and never exercises v3 ``consume_budget_v3`` so the
+        consume ≤ reserve + ε invariant (§25) is never validated.
+
+        The fix: route events that have a paired ``/check``
+        reservation (currently: ``llm_call``) to
+        ``track_single`` which posts to ``/api/v1/track``. The
+        backend's consume takes the server-minted execution_id
+        from the request, looks up
+        ``reservation:{execution_id}`` and runs the invariant.
+        Span events still ride /track/batch — they have no
+        reservation to release.
+
+        Opt-out
+        -------
+        ``NULLRUN_V3_TRACK_DISABLE=1`` forces every event
+        through the legacy batch path. Use it on backends that
+        haven't flipped ``NULLRUN_CONSUME_V3_ENABLED=1`` yet.
+
+        Failure mode
+        ------------
+        ``track_single`` raises on 422 / 503 / 5xx (see
+        ``nullrun.breaker.exceptions``). We catch and log at
+        WARNING level; the event is dropped (NOT retried via
+        the batch path — that would risk double-billing per
+        §23 idempotency contract).
+        """
+        from nullrun.context import get_server_minted_execution_id
+
+        event_type = wire_event.get("type")
+        v3_disabled = (
+            os.environ.get("NULLRUN_V3_TRACK_DISABLE", "").strip() == "1"
+        )
+
+        if event_type != "llm_call" or v3_disabled:
+            # Span / heartbeat / tool events have no reservation;
+            # the legacy batch path is the right endpoint.
+            self._transport.track(wire_event)
+            return
+
+        smid = get_server_minted_execution_id()
+        if not smid:
+            # Either no /check landed in this scope (legacy v1/v2
+            # path) or the capture expired past the 295s safety
+            # window. Don't make up an id — fall back to batch
+            # which uses the no-reservation v1/v2 consume path.
+            self._transport.track(wire_event)
+            logger.debug(
+                "_route_track: llm_call without server-minted "
+                "execution_id in scope — routing via /track/batch"
+            )
+            return
+
+        single_payload = _build_v3_track_payload(wire_event, smid)
+        if single_payload is None:
+            # Mapper refused (missing required field). Fall back.
+            self._transport.track(wire_event)
+            return
+
+        try:
+            self._transport.track_single(single_payload)
+            metrics.inc_runtime("v3_track_single_ok")
+        except Exception as exc:  # noqa: BLE001 — transport-level
+            metrics.inc_runtime("v3_track_single_failed")
+            _emit_for_transport_error(
+                exc,
+                stage="track_v3_single",
+                correlation_id=smid,
+                status_code=getattr(exc, "status_code", None),
+            )
+            logger.warning(
+                "_route_track: track_single failed for "
+                "execution_id=%s (%s) — event dropped",
+                smid,
+                exc,
+            )
 
     def track_llm(
         self,
@@ -2272,6 +2449,188 @@ class NullRunRuntime:
 
 # Module-level convenience functions
 _runtime: NullRunRuntime | None = None
+
+
+# 2026-07-04 (v0.12.0 wiring fix — CLAUDE.md §24, §29):
+# helper used by ``check_workflow_budget`` to capture the server-minted
+# execution_id from the /check response into a contextvar. Lives at
+# module scope so any /check path (``check_workflow_budget``,
+# ``check_v3``, future ``preflight_v3``) can call it without taking
+# a dependency on the runtime singleton.
+#
+# Behaviour:
+# * On a real ``reservation_id`` field: store it on the
+#   ``_server_minted_execution_id_var`` contextvar + record
+#   ``time.monotonic()`` on ``_server_minted_reservation_at_var``
+#   so ``_enrich_event`` can refuse to forward a stale capture
+#   past the 300s reservation TTL (§29).
+# * On missing/None/empty value: clear both contextvars so
+#   downstream /track ships without ``execution_id`` (the legacy
+#   / v1-v2 wire shape — backend is tolerant per the
+#   ``server_minted_execution_id=False`` capability gating).
+# * On an invalid UUID string (defence-in-depth — backend is the
+#   source-of-truth and only mints uuidv7, but a buggy proxy
+#   could echo a malformed field): drop it with a warning log.
+def _capture_server_minted_execution_id(response: dict[str, Any]) -> str | None:
+    """Capture ``response["reservation_id"]`` into the server-minted
+    execution_id contextvar.
+
+    Returns the captured id (or ``None`` on miss / malformed) so the
+    caller can log it on debug paths. The contextvar itself is the
+    authoritative side-effect — readers consult
+    ``get_server_minted_execution_id`` from ``nullrun.context``.
+
+    Import is lazy (inside the function) to keep
+    ``nullrun.runtime`` import order stable: ``context`` itself
+    imports nothing from ``runtime``, but ``_enrich_event`` lives
+    in this module and depends on the context getters.
+    """
+    import time as _time
+
+    from nullrun.context import (
+        clear_server_minted_execution_id,
+        set_server_minted_execution_id,
+        set_server_minted_reservation_at,
+    )
+
+    raw = response.get("reservation_id") if isinstance(response, dict) else None
+    if not raw:
+        # Legacy / v1-v2 backend, or a block response with no
+        # reservation. Clear any prior capture so the next /track
+        # doesn't ship a stale id from a previous /check.
+        clear_server_minted_execution_id()
+        return None
+
+    if not isinstance(raw, str):
+        clear_server_minted_execution_id()
+        logger.warning(
+            "_capture_server_minted_execution_id: response.reservation_id "
+            "is %s, expected str — dropping",
+            type(raw).__name__,
+        )
+        return None
+
+    # Defence-in-depth UUID parse — backend's mint_execution_id
+    # emits RFC-4122 uuidv7 but a buggy proxy could echo garbage.
+    # Drop without raising (fail-OPEN on capture; the backend will
+    # still reject malformed ids with 400 on /track).
+    import uuid as _uuid
+
+    try:
+        _uuid.UUID(raw)
+    except (ValueError, AttributeError):
+        clear_server_minted_execution_id()
+        logger.warning(
+            "_capture_server_minted_execution_id: response.reservation_id=%r "
+            "is not a valid UUID — dropping",
+            raw,
+        )
+        return None
+
+    set_server_minted_execution_id(raw)
+    set_server_minted_reservation_at(_time.monotonic())
+    logger.debug(
+        "_capture_server_minted_execution_id: captured %s",
+        raw,
+    )
+    return raw
+
+
+# 2026-07-04 (v0.12.0 wiring fix — CLAUDE.md §24, §29): build the
+# v3 /track single-event payload from an enriched llm_call event.
+# Lives at module scope so ``_route_track`` (a method) can call it
+# without taking a runtime dependency beyond the contextvar getters.
+#
+# Wire shape (``/api/v1/track`` schema per
+# ``backend/src/proxy/handlers.rs::TrackRequest``):
+#
+#     {
+#       "reservation_id": "<server-minted uuidv7 from /check>",
+#       "workflow_id":    "<bound workflow uuid>",
+#       "tokens":         <int>,    # input + output
+#       "input_tokens":   <int>,
+#       "output_tokens":  <int>,
+#       "cost_cents":     <int>,    # 0 — backend computes from tokens
+#       "model":          "<model name>",  # used for rate lookup
+#       "metadata":       {...},    # optional, free-form
+#       "cost_source":    "provisional",   # per §22 trust model
+#     }
+#
+# The backend's ``gate_consume_v3`` reads ``reservation_id`` and
+# runs CONSUME_SCRIPT v3 (server-minted execution_id owner check +
+# consume ≤ reserve + epsilon invariant). If a required field is
+# missing OR the runtime cannot construct the payload, returns
+# ``None`` and the caller falls back to ``/track/batch``.
+def _build_v3_track_payload(
+    wire_event: dict[str, Any],
+    reservation_id: str,
+) -> dict[str, Any] | None:
+    """Map an enriched llm_call event onto the v3 /track schema.
+
+    Returns ``None`` when the event cannot be mapped (caller
+    falls back to legacy batch path). Required ``tokens`` /
+    ``workflow_id`` absence is the only failure mode today.
+    """
+    wf_id = wire_event.get("workflow_id")
+    if not wf_id:
+        # The backend's consume_budget_v3 needs a workflow_id to
+        # attribute the consume to a key+workflow counter (§24
+        # ownership binding). A missing workflow_id means the
+        # SDK never bound the API key to a workflow (legacy
+        # legacy-no-binding). Fall back.
+        logger.debug(
+            "_build_v3_track_payload: missing workflow_id — "
+            "cannot shape v3 /track payload"
+        )
+        return None
+
+    tokens = wire_event.get("tokens")
+    if tokens is None:
+        # Same as llm_call missing required fields — the backend
+        # would 422 anyway. Fall back to batch.
+        logger.debug(
+            "_build_v3_track_payload: missing tokens — cannot "
+            "shape v3 /track payload"
+        )
+        return None
+
+    payload: dict[str, Any] = {
+        "reservation_id": reservation_id,
+        "workflow_id": wf_id,
+        "tokens": int(tokens),
+        "cost_cents": 0,
+        "cost_source": "provisional",  # CLAUDE.md §22
+    }
+    if "input_tokens" in wire_event and wire_event["input_tokens"] is not None:
+        payload["input_tokens"] = int(wire_event["input_tokens"])
+    if "output_tokens" in wire_event and wire_event["output_tokens"] is not None:
+        payload["output_tokens"] = int(wire_event["output_tokens"])
+    if "model" in wire_event and wire_event["model"]:
+        payload["model"] = wire_event["model"]
+    if "latency_ms" in wire_event and wire_event["latency_ms"] is not None:
+        payload["latency_ms"] = int(wire_event["latency_ms"])
+    if "metadata" in wire_event and wire_event["metadata"]:
+        payload["metadata"] = wire_event["metadata"]
+    if "trace_id" in wire_event and wire_event["trace_id"]:
+        payload["trace_id"] = wire_event["trace_id"]
+    if "span_id" in wire_event and wire_event["span_id"]:
+        payload["span_id"] = wire_event["span_id"]
+
+    # Optional downstream fields preserved verbatim (workflow-level
+    # cost attribution, agent_id, etc.). Backend ignores unknown
+    # fields, so unknown keys are safe — we just surface the ones
+    # the SDK actually emits.
+    for k in (
+        "agent_id",
+        "environment",
+        "agent_type",
+        "attempt_index",
+        "is_retry",
+    ):
+        if k in wire_event and wire_event[k] is not None:
+            payload[k] = wire_event[k]
+
+    return payload
 
 
 def get_runtime() -> NullRunRuntime:
