@@ -72,6 +72,7 @@ from nullrun.transport import (
     _emit_for_transport_error,
     _protocol_header_value,
 )
+from nullrun.uuid7 import uuid7_str  # 2026-07-04 BUG #4 (CLAUDE.md §24)
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +82,25 @@ logger = logging.getLogger(__name__)
 # to be named ``<unknown>`` (the previous literal was a
 # collision hazard). Wire compat: still a string.
 UNKNOWN_WORKFLOW_ID: str = "__nullrun_unknown__"
+
+# 2026-07-04 (BUG #5): in-process gate cache for chain-mode
+# invocations. Without this, every @protect inside `with chain(...)`
+# issues a /gate HTTP roundtrip + Redis reserve. For a 100-step
+# agent loop that's 100 roundtrips. The gate decision is
+# deterministic for a given (workflow_id, chain_id, model) over a
+# short window (chain status only changes on `chain_end`), so
+# caching the LAST decision for 5s is safe.
+#
+# Scope: ONLY when chain_id is set. Single-shot (Hard) callers
+# must NOT cache — the gate legitimately returns "allow" once and
+# "block" on the next call (Hard mode binary), and a stale "allow"
+# could let through a budget-exhausted call. Chain-mode callers
+# share a budget envelope, so caching "allow" is consistent with
+# the chain's semantics.
+#
+# Opt-out: NULLRUN_GATE_CACHE_DISABLE=1
+_GATE_CACHE: dict[tuple[str, str | None, str | None], tuple[float, dict[str, Any]]] = {}
+_GATE_CACHE_TTL_SECONDS: float = 5.0
 
 # 2026-07-04 (v0.12.0 wiring fix — CLAUDE.md §24, §29):
 # the maximum age (seconds) for a captured ``reservation_id``
@@ -1199,7 +1219,15 @@ class NullRunRuntime:
 
         check_req = {
             "organization_id": self.organization_id or "local",
-            "execution_id": workflow_id,
+            # 2026-07-04 (BUG #4): CLAUDE.md §24 requires server-minted
+            # execution_id. Sending `workflow_id` here would re-use the
+            # same execution_id for every /check in the workflow, breaking
+            # the v3 reservation binding. We send a fresh uuidv7 per call
+            # as a placeholder; the server's `gate_reserve_v3` overwrites
+            # the field on the response, and `_capture_server_minted_execution_id`
+            # (called below) picks up the server-minted `reservation_id`
+            # for the downstream /track path.
+            "execution_id": uuid7_str(),
             "operation_id": str(uuid.uuid4()),
             "check_type": "llm",
             "model": call_model,  # may be None if user didn't set it
@@ -1231,11 +1259,40 @@ class NullRunRuntime:
         # an idempotency_key without an extra round-trip.
         check_req["idempotency_key"] = check_req["operation_id"]
 
-        try:
-            response = self._transport.check(check_req)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(f"check_workflow_budget: /gate unavailable, failing open: {exc}")
-            return
+        # 2026-07-04 (BUG #5): in-process gate cache for chain-mode.
+        # See module-top comment on _GATE_CACHE for full rationale.
+        response: dict[str, Any]
+        cache_key: tuple[str, str | None, str | None] | None = None
+        cache_enabled = (
+            chain_id is not None
+            and not os.environ.get("NULLRUN_GATE_CACHE_DISABLE", "").strip() == "1"
+        )
+        if cache_enabled:
+            cache_key = (str(workflow_id), chain_id, call_model)
+            cached = _GATE_CACHE.get(cache_key)
+            if cached is not None and (time.monotonic() - cached[0]) < _GATE_CACHE_TTL_SECONDS:
+                # Cache hit within TTL — reuse the response without a
+                # network roundtrip. The server's cumulative-spend
+                # tracking is the source of truth; this is a debounce.
+                response = cached[1]
+            else:
+                # Cache miss or expired — go to the server, then store.
+                try:
+                    response = self._transport.check(check_req)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        f"check_workflow_budget: /gate unavailable, failing open: {exc}"
+                    )
+                    return
+                _GATE_CACHE[cache_key] = (time.monotonic(), response)
+        else:
+            try:
+                response = self._transport.check(check_req)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    f"check_workflow_budget: /gate unavailable, failing open: {exc}"
+                )
+                return
 
         # 2026-07-04 (v0.12.0 wiring fix — CLAUDE.md §24, §29):
         # capture the server-minted ``reservation_id`` returned by
