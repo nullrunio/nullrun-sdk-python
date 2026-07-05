@@ -68,13 +68,11 @@ from typing import Any, Optional
 
 import httpx
 
-from nullrun._registry import get_active_runtime
 from nullrun.actions import ActionHandler, ActionType
 from nullrun.breaker.exceptions import (
     BreakerError,
     NullRunAuthenticationError,
     NullRunBlockedException,
-    NullRunError,
     WorkflowKilledInterrupt,
     WorkflowPausedException,
 )
@@ -171,19 +169,7 @@ _WIRE_STRIP_FIELDS: frozenset[str] = frozenset(
 )
 
 
-# Phase 3 (2026-07-05): metaclass is what routes the legacy
-# NullRunRuntime._instance class-attribute access through the
-# registry (see :class:`nullrun._singleton._NullRunRuntimeMeta`).
-# The descriptor protocol only fires on class-level access if the
-# descriptor lives on the metaclass — defining _instance on
-# the class body would route reads through type.__getattribute__
-# and never call our __get__. Keeping the metaclass minimal
-# (it only owns _instance) means every other attribute behaves
-# exactly as before.
-from nullrun._singleton import _NullRunRuntimeMeta
-
-
-class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
+class NullRunRuntime:
     """
     Central runtime for NullRun SDK.
 
@@ -208,21 +194,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         rt.track({"type": "llm_call", "tokens": 100})
     """
 
-    # Backwards-compat proxy: reads/writes through
-    # NullRunRuntime._instance route to the registry. External test
-    # fixtures and third-party code that still inspects the class
-    # attribute see the same instance that @protect / track_*
-    # consume. A write of None clears the registry (matching the
-    # legacy cls._instance = None semantics from reset_instance /
-    # shutdown).
-    #
-    # Implementation note: _instance is a class-level descriptor
-    # defined below as :class:`_InstanceProxy`. The descriptor
-    # protocol means accessing cls._instance (or
-    # instance._instance for backwards compatibility with
-    # subclasses) routes through __get__ / __set__, so the registry
-    # is the single source of truth and this attribute never holds
-    # a stale reference.
+    _instance: Optional["NullRunRuntime"] = None
     _lock = threading.Lock()
 
     def __init__(
@@ -366,35 +338,6 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         self._remote_states: dict[str, dict[str, Any]] = {}
         self._states_lock = threading.RLock()
 
-        # Drift section 7 (2026-07-06): human-approval pending registry.
-        # When a /gate response carries decision="require_approval",
-        # the SDK stores the (approval_id, workflow_id, execution_id)
-        # tuple here and blocks until either:
-        #   - the WS push arrives with outcome="approved" (release
-        #     the gate, resume from the same execution_id), or
-        #   - the WS push arrives with outcome="denied" (surface
-        #     WorkflowKilledInterrupt), or
-        #   - the per-approval timeout elapses (fall back to the
-        #     /status poll path; emit a warning so the operator
-        #     knows WS push is silent).
-        #
-        # Keyed by approval_id because the WS push carries the
-        # approval id, not the execution id. The execution_id
-        # lets the SDK distinguish "approval for THIS gate call"
-        # from a stale pending approval for a different execution
-        # in the same workflow.
-        self._approval_pending: dict[str, dict[str, Any]] = {}
-        self._approval_lock = threading.RLock()
-        # Default timeout for WS approval push. Set to None to
-        # block indefinitely (the legacy poll path is still
-        # active as a backstop, so the SDK cannot hang forever).
-        # Override with NULLRUN_APPROVAL_TIMEOUT_SECONDS.
-        try:
-            _t = float(os.getenv("NULLRUN_APPROVAL_TIMEOUT_SECONDS", "300"))
-        except ValueError:
-            _t = 300.0
-        self._approval_timeout_seconds: float = _t
-
         # Phase B: control plane transport. The SDK connects to the server's
         # WS endpoint and receives state push events (killed/paused) within
         # ~100ms of the operator action -- vs the previous 1s HTTP poll.
@@ -466,16 +409,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
 
         # Phase 1.4: Sensitive tools that require strict mode (pre-execution enforcement)
         # These tools MUST go through /execute endpoint, NOT direct execution
-        # Phase 4 (2026-07-05): is_sensitive_tool is the hot
-        # path on every @protect call against a sensitive tool.
-        # We keep a pre-lowercased mirror so the read does not
-        # have to build a set comprehension on every call. The
-        # cache is mutated alongside _sensitive_tools under
-        # _tools_lock (see add/remove_sensitive_tool below) and
-        # every value is lowercased at insertion time.
-        self._sensitive_tools_lower: frozenset[str] = frozenset()
-        self._strict_mode_tools_lower: frozenset[str] = frozenset()
-        self._sensitive_tools: set[str] = {
+        self._sensitive_tools: set = {
             # Financial operations
             "stripe.charge",
             "stripe.refund",
@@ -505,13 +439,6 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             "admin.disable_user",
         }
         self._strict_mode_tools: set[str] = set()
-        # Snapshot the lowercase view of the built-in list so the
-        # hot path is a single frozenset membership check (no set
-        # comprehension per call). Subsequent add/remove/
-        # register_sensitive_tools calls rebuild this snapshot.
-        self._sensitive_tools_lower = frozenset(
-            t.lower() for t in self._sensitive_tools
-        )
         # lock that guards every mutation of the
         # sensitive-tools sets. The pre-fix code did
         # ``self._strict_mode_tools.add(tool_name)`` from
@@ -1040,13 +967,9 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 logger.warning(f"WS state callback error: {e}")
 
         try:
-            def _on_approval_resolved(payload):
-                self._handle_approval_resolved(payload)
-
             conn = await self._transport.connect_websocket(
                 organization_id=self.organization_id,
                 on_state_change=on_state_change,
-                on_approval_resolved=_on_approval_resolved,
             )
             self._ws_connection = conn
         except Exception as e:
@@ -1179,113 +1102,6 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 )
         except Exception as e:
             logger.debug(f"Failed to fetch remote state for {workflow_id}: {e}")
-
-    def _handle_approval_resolved(self, payload: dict[str, Any]) -> None:
-        """Drift section 7 (2026-07-06): WS push handler for an
-        approval resolution. Releases the matching gate
-        reservation (approved) or raises WorkflowKilledInterrupt
-        (denied) so the agent can resume from the same
-        execution_id.
-
-        Args:
-            payload: The WsMessage::ApprovalResolved dict from the
-                server. Schema:
-                {approval_id, workflow_id, execution_id, outcome,
-                note, resolved_at, message_id}.
-        """
-        approval_id = payload.get("approval_id", "")
-        outcome = (payload.get("outcome", "") or "").lower()
-        execution_id = payload.get("execution_id", "")
-
-        with self._approval_lock:
-            entry = self._approval_pending.pop(approval_id, None)
-
-        if entry is None:
-            # The WS push arrived for an approval we never
-            # registered (a duplicate, a stale message from a
-            # previous SDK instance, or a backend-version mismatch).
-            # Log at debug because this is normal during a
-            # restart cycle; do NOT raise.
-            logger.debug(
-                "WS approval push for unknown approval_id=%s -- ignoring",
-                approval_id,
-            )
-            return
-
-        # Release the threading.Event so the gate call wakes up.
-        event = entry.get("event")
-        if event is not None:
-            event.set()
-        # Stash the payload on the entry so the waiter can read
-        # outcome + note without re-querying.
-        entry["outcome"] = outcome
-        entry["note"] = payload.get("note")
-        entry["resolved_at"] = payload.get("resolved_at")
-
-    def _wait_for_approval_resolution(
-        self,
-        approval_id: str,
-        workflow_id: str,
-        execution_id: str,
-    ) -> dict[str, Any]:
-        """Drift section 7 (2026-07-06): block the calling thread
-        until the WS approval push arrives (or the per-approval
-        timeout elapses). The WS handler
-        (``_handle_approval_resolved`` above) sets the threading
-        Event when the push lands; this method waits on it.
-
-        Args:
-            approval_id: The approval id from the /gate response.
-            workflow_id: Workflow the approval gates.
-            execution_id: Execution the approval gates.
-
-        Returns:
-            The entry dict, with ``outcome`` populated (either
-            ``"approved"`` or ``"denied"``). On timeout, returns
-            a sentinel ``{"outcome": "timeout", "timed_out": True}``
-            and the caller is expected to fall back to the
-            legacy /status poll path.
-
-        Raises:
-            Nothing. Approval timeouts are returned, not raised,
-            so the caller can choose the right recovery action
-            (raise WorkflowKilledInterrupt on denied, resume on
-            approved, fall back to poll on timeout).
-        """
-        event = threading.Event()
-        entry: dict[str, Any] = {
-            "approval_id": approval_id,
-            "workflow_id": workflow_id,
-            "execution_id": execution_id,
-            "event": event,
-        }
-        with self._approval_lock:
-            self._approval_pending[approval_id] = entry
-
-        try:
-            signaled = event.wait(timeout=self._approval_timeout_seconds)
-            if not signaled:
-                logger.warning(
-                    "approval %s: WS push silent for %.1fs -- "
-                    "falling back to /status poll",
-                    approval_id,
-                    self._approval_timeout_seconds,
-                )
-                with self._approval_lock:
-                    self._approval_pending.pop(approval_id, None)
-                return {
-                    "outcome": "timeout",
-                    "timed_out": True,
-                    "approval_id": approval_id,
-                }
-            return entry
-        except Exception:
-            # On any wait error, drop the registration to avoid
-            # leaking a stuck entry that would block a future
-            # approval for the same id.
-            with self._approval_lock:
-                self._approval_pending.pop(approval_id, None)
-            raise
 
     def check_control_plane(self, workflow_id: str) -> None:
         """
@@ -1488,11 +1304,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 # Cache miss or expired — go to the server, then store.
                 try:
                     response = self._transport.check(check_req)
-                except (httpx.HTTPError, NullRunError) as exc:
-                    # Narrow catch (Phase 6 H5): fail-OPEN only on
-                    # transport + classified SDK errors. Internal
-                    # bugs (KeyError, AttributeError) should surface
-                    # rather than silently allow an unbounded call.
+                except Exception as exc:  # noqa: BLE001
                     logger.warning(
                         f"check_workflow_budget: /gate unavailable, failing open: {exc}"
                     )
@@ -1586,67 +1398,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 workflow_id=workflow_id,
                 reason="; ".join(reasons),
             )
-        if decision == "throttle":
-            reasons = (
-                response.get("explanations")
-                or ([response["explanation"]] if response.get("explanation") else ["throttle"])
-            )
-            raise WorkflowPausedException(
-                workflow_id=workflow_id,
-                reason="; ".join(reasons),
-            )
 
-        if decision == "require_approval":
-            # Drift section 7 (2026-07-06): the gate requires a
-            # human-approval before the call may proceed. Block
-            # the calling thread on the WS push (handled in
-            # _handle_approval_resolved) and let the operator
-            # click Approve/Deny on the dashboard. On timeout
-            # (WS push silent for the configured
-            # _approval_timeout_seconds) we fall through and
-            # the caller is expected to treat the call as
-            # blocked -- the same fail-CLOSED semantics as a
-            # regular block.
-            approval_id = response.get("approval_id", "") or ""
-            if not approval_id:
-                logger.warning(
-                    "check_workflow_budget: require_approval decision but no approval_id in response"
-                )
-                raise WorkflowKilledInterrupt(
-                    workflow_id=workflow_id,
-                    reason="approval_id missing in require_approval response",
-                )
-            logger.info(
-                f"check_workflow_budget: require_approval id={approval_id} -- waiting for WS push"
-            )
-            result = self._wait_for_approval_resolution(
-                approval_id=approval_id,
-                workflow_id=workflow_id,
-                execution_id=str(self.organization_id or "local"),
-            )
-            outcome = (result.get("outcome") or "").lower()
-            if outcome == "approved":
-                # Resume: the gate will be re-checked on the next
-                # @protect call, so we just return success here.
-                # The caller proceeds with the original
-                # function body.
-                logger.info(
-                    f"check_workflow_budget: approval {approval_id} approved -- resuming"
-                )
-                return
-            if outcome == "denied":
-                raise WorkflowKilledInterrupt(
-                    workflow_id=workflow_id,
-                    reason=f"approval denied: {result.get('note') or 'operator denied'}",
-                )
-            # timeout: fail-CLOSED -- do not run the call.
-            raise WorkflowKilledInterrupt(
-                workflow_id=workflow_id,
-                reason=(
-                    f"approval {approval_id} timeout: WS push silent for "
-                    f"{self._approval_timeout_seconds:.0f}s"
-                ),
-            )
     # =============================================================================
     # v3 wire-protocol helpers
     # =============================================================================
@@ -2075,18 +1827,11 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         ``add_sensitive_tool``. The lock is uncontended under
         CPython's GIL, so the cost is negligible.
         """
-        # Phase 4 (2026-07-05): O(1) lookup against the
-        # pre-lowercased frozenset snapshot. The lock is still
-        # taken to keep the snapshot coherent with the live
-        # set during concurrent add/remove_sensitive_tool calls
-        # (the snapshot is rebuilt under the lock), but the
-        # read itself is a single frozenset membership check.
         needle = tool_name.lower()
         with self._tools_lock:
-            return (
-                needle in self._sensitive_tools_lower
-                or needle in self._strict_mode_tools_lower
-            )
+            return needle in {t.lower() for t in self._sensitive_tools} or needle in {
+                t.lower() for t in self._strict_mode_tools
+            }
 
     def get_org_status(self, org_id: str | None = None) -> dict[str, Any]:
         """Public helper for reading ``/api/v1/orgs/{org_id}/status``.
@@ -2149,11 +1894,6 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         """
         with self._tools_lock:
             self._strict_mode_tools.add(tool_name)
-            # Phase 4: rebuild the lowercase snapshot so the
-            # hot-path is_sensitive_tool sees the new entry.
-            self._strict_mode_tools_lower = frozenset(
-                t.lower() for t in self._strict_mode_tools
-            )
 
     def remove_sensitive_tool(self, tool_name: str) -> None:
         """
@@ -2170,10 +1910,6 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         """
         with self._tools_lock:
             self._strict_mode_tools.discard(tool_name)
-            # Phase 4: rebuild the lowercase snapshot.
-            self._strict_mode_tools_lower = frozenset(
-                t.lower() for t in self._strict_mode_tools
-            )
 
     def register_sensitive_tools(self, tool_names: list[str]) -> None:
         """
@@ -2190,15 +1926,8 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 "send_email"
             ])
         """
-        with self._tools_lock:
-            for tool_name in tool_names:
-                self._strict_mode_tools.add(tool_name)
-            # Phase 4: rebuild the lowercase snapshot once
-            # after the batch insert (a single set comprehension
-            # beats N rebuilds in the loop).
-            self._strict_mode_tools_lower = frozenset(
-                t.lower() for t in self._strict_mode_tools
-            )
+        for tool_name in tool_names:
+            self._strict_mode_tools.add(tool_name)
 
     def get_sensitive_tools(self) -> set[str]:
         """
@@ -2820,28 +2549,8 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         raise last_exc
 
 
-# Module-level convenience functions.
-# Phase 3 (2026-07-05): the legacy _runtime module slot is now a
-# proxy over the registry (see __getattr__ below). Reads and
-# writes route through :class:`nullrun._registry.RuntimeRegistry`,
-# which is the single source of truth. External code that imports
-# nullrun.runtime._runtime keeps working unchanged.
-
-
-def __getattr__(name):
-    if name == "_runtime":
-        from nullrun._registry import get_active_runtime
-        return get_active_runtime()
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
-# Phase 3 (2026-07-05): the module-level  slot is a
-# proxy over the registry. The PEP 562  above handles
-# reads; writes go through the proxy class installed by
-# . See the long-form comment in
-# nullrun._singleton for why a plain  does not work
-# on module instances.
-
+# Module-level convenience functions
+_runtime: NullRunRuntime | None = None
 
 
 # 2026-07-04 (v0.12.0 wiring fix — ):
@@ -3069,18 +2778,11 @@ def _build_v3_track_payload(
 
 
 def get_runtime() -> NullRunRuntime:
-    """Get or create the global runtime instance.
-
-    Phase 3 (2026-07-05): prefer the registry. We keep the
-    legacy global _runtime slot as a backwards-compat cache so
-    external code that imports nullrun.runtime._runtime still
-    works, but the canonical source of truth is the registry
-    (see nullrun._registry.RuntimeRegistry).
-    """
-    cached = get_active_runtime()
-    if cached is not None:
-        return cached
-    return NullRunRuntime.get_instance()
+    """Get or create the global runtime instance."""
+    global _runtime
+    if _runtime is None:
+        _runtime = NullRunRuntime.get_instance()
+    return _runtime
 
 
 def track(event: dict[str, Any]) -> dict[str, Any]:
@@ -3143,14 +2845,3 @@ def track_tool(
             metadata).
     """
     return get_runtime().track_tool(tool_name, duration_ms=duration_ms, **kwargs)
-
-
-# Phase 3 (2026-07-05): install the registry-backed proxy on the
-# module class so reads AND writes to ``runtime._runtime`` route
-# through the registry. PEP 562 ``__getattr__`` alone covers the
-# read path; writes need a real data descriptor on the module's
-# metaclass — see ``nullrun._singleton._RuntimeProxyModule`` for
-# the long-form rationale.
-from nullrun._singleton import install_runtime_proxy
-
-install_runtime_proxy(__name__)
