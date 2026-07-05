@@ -2167,6 +2167,7 @@ def _parse_v3_error_envelope(
             max_allowed_cents=details.get("max_allowed_cents"),
             actual_cost_cents=details.get("actual_cost_cents"),
             epsilon_cents=details.get("epsilon_cents"),
+            status_code=status,  # 422 per backend mapping
         )
 
     if backend_code == "CHAIN_MAX_DURATION_EXCEEDED" or backend_code == "CHAIN_CROSS_ORG" or backend_code == "CHAIN_ORG_MISMATCH":
@@ -2175,12 +2176,14 @@ def _parse_v3_error_envelope(
             chain_id=details.get("chain_id"),
             backend_code=backend_code,
             details=details,
+            status_code=status,  # 402/403 per backend mapping
         )
 
     if backend_code == "WORKFLOW_INACTIVE":
         return NullRunWorkflowInactiveError(
             full_message,
             workflow_id=details.get("workflow_id"),
+            status_code=status,  # 403 per backend mapping
         )
 
     if backend_code == "RATE_LIMIT_REDIS_UNAVAILABLE":
@@ -2223,9 +2226,19 @@ def _parse_v3_error_envelope(
             # workflow_id (str) + reason (str) positional args. Use
             # the workflow_id / reason from the envelope details if
             # present, otherwise synthesise from the endpoint label.
+            #
+            # 2026-07-04 (drift.md P1-1): forward the wire HTTP
+            # status so FastAPI exception handlers reading
+            # ``exc.status_code`` get 402 for BUDGET_HARD_BLOCKED
+            # (not None / 500). The backend maps each budget
+            # error_code to a specific HTTP status (error_codes.rs
+            # 189-233), but the only signal a transport caller
+            # has is ``response.status_code`` — we propagate it
+            # here so the exception is self-describing.
             return NullRunBudgetError(
                 workflow_id=str(details.get("workflow_id") or "unknown"),
                 reason=full_message,
+                status_code=status,
             )
         if catalog is NullRunRateLimitRedisError:
             # NullRunError base takes (message, error_code=, user_action=,

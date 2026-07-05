@@ -22,6 +22,31 @@ the authoritative table; deviations require an ADR amendment (Rule 5).
 | `_enforce_sensitive_tool` (default `_fallback_mode=permissive`) | CLOSED -- body MUST NOT run when `decision_source` is any `FALLBACK_*` | n/a (body did not run) | `NULLRUN_SENSITIVE_FAIL_OPEN=1` -- explicitly documented as "OPEN-when-engine-unavailable" |
 | `_enforce_sensitive_tool` (`_fallback_mode=strict`) | CLOSED -- transport returns `decision=block, decision_source=FALLBACK_*` | n/a | none |
 | `_emit_span_start` / `_emit_span_end` | n/a -- never blocks | n/a | n/a |
+| `/track` batch path (legacy) | OPEN-on-network-error (event dropped, no retry) | n/a -- circuit breaker backoff applies | none |
+
+**Drift fix 2026-07-04 (drift.md P1-2):** the SDK_README.md claim
+"Fail-OPEN на инфраструктурных сбоях. Если backend недоступен, бюджет
+не блокирует агента" is **partially wrong** — it conflates SDK-side
+transport failure with backend-side budget-enforcement failure. The
+honest split is:
+
+* **SDK-side transport failure** (network timeout, 5xx, breaker open)
+  → fail-OPEN on the *check* path so a dead backend doesn't freeze
+  the user's agent loop (this is what the README describes).
+* **Backend-side budget-enforcement failure** (the /gate or /track
+  handler actually returned a wire response, just one indicating a
+  Redis outage or aggregate rate-limit Redis unavailable) → the
+  wire response is what it is, and the SDK raises the corresponding
+  exception. ``BUDGET_REDIS_UNAVAILABLE`` → 402 ``NullRunBudgetError``
+  (fail-CLOSED, the backend rejected the request because Redis was
+  unreachable for the budget counter — this is the authoritative
+  enforcement signal, not a transport blip). ``RATE_LIMIT_REDIS_UNAVAILABLE``
+  → 503 ``NullRunRateLimitRedisError`` (fail-CLOSED for the same
+  reason). The SDK does NOT silently fall-OPEN on a wire 4xx/5xx
+  that names an enforcement failure.
+
+The table above is authoritative; if any of these change, the
+README claim must be updated in lockstep.
 
 The "Opt-out" column makes it explicit that `NULLRUN_SKIP_BUDGET_CHECK=1`
 is a **different category** of action than
@@ -2179,6 +2204,26 @@ class NullRunRuntime:
                 else:
                     enriched["execution_id"] = smid
 
+        # 2026-07-04 (drift.md P1-5): propagate the in-scope
+        # /check idempotency_key onto the wire_event so the v3
+        # /track single-event payload carries the same anchor and
+        # the backend's replay branch returns 200 +
+        # ``idempotent_replay: true`` on retry (handlers.rs:
+        # 4654-4725). Without this, a transport-level retry on the
+        # SAME event either re-runs CONSUME_SCRIPT (→ 503
+        # RESERVATION_NOT_FOUND, since the reservation key was
+        # DEL'ed after the first successful consume per §25) or
+        # double-bills. Read via the same contextvar written at
+        # ``_capture_server_minted_execution_id`` time — symmetric
+        # lifetime with ``execution_id`` (cleared together on
+        # /track emit and on workflow/chain block exit).
+        if "idempotency_key" not in enriched:
+            from nullrun.context import get_server_minted_idempotency_key
+
+            idem_key = get_server_minted_idempotency_key()
+            if idem_key:
+                enriched["idempotency_key"] = idem_key
+
         # Add type if not present
         if "type" not in enriched:
             enriched["type"] = "event"
@@ -2547,6 +2592,7 @@ def _capture_server_minted_execution_id(response: dict[str, Any]) -> str | None:
     from nullrun.context import (
         clear_server_minted_execution_id,
         set_server_minted_execution_id,
+        set_server_minted_idempotency_key,
         set_server_minted_reservation_at,
     )
 
@@ -2586,6 +2632,18 @@ def _capture_server_minted_execution_id(response: dict[str, Any]) -> str | None:
 
     set_server_minted_execution_id(raw)
     set_server_minted_reservation_at(_time.monotonic())
+    # 2026-07-04 (drift.md P1-5): capture the /check
+    # idempotency_key so the matching /track event can carry the
+    # same anchor (handlers.rs:4654-4725 — replay returns 200 +
+    # idempotent_replay: true on key hit). We look at the
+    # request body via the response's ``operation_id`` field
+    # when the server echoes it (the /check request sets
+    # ``idempotency_key = operation_id`` at runtime.py:1260);
+    # when absent, fall back to None and let the /track wire
+    # payload drop the field.
+    op_id = response.get("operation_id") if isinstance(response, dict) else None
+    if isinstance(op_id, str) and op_id:
+        set_server_minted_idempotency_key(op_id)
     logger.debug(
         "_capture_server_minted_execution_id: captured %s",
         raw,
@@ -2686,6 +2744,34 @@ def _build_v3_track_payload(
     ):
         if k in wire_event and wire_event[k] is not None:
             payload[k] = wire_event[k]
+
+    # Wire idempotency_key (CLAUDE.md §23, drift.md P1-5): the
+    # backend's /track handler (``handlers.rs:4654-4725``) accepts
+    # ``idempotency_key: Option<String>`` and, on hit of the same
+    # key, replays the original response with 200 OK +
+    # ``idempotent_replay: true``. Without this, a transport-level
+    # retry (5xx, timeout) on the SAME event would re-call the v3
+    # CONSUME_SCRIPT and either double-bill or get 503
+    # ``RESERVATION_NOT_FOUND`` (because the reservation key was
+    # DEL'ed after the first successful consume per §25).
+    #
+    # Source of truth: ``check_req.idempotency_key`` (set in
+    # ``check_workflow_budget`` to the operation_id UUID v4, see
+    # runtime.py:1260) is captured into a contextvar by
+    # ``_capture_server_minted_execution_id`` and stamped onto the
+    # wire_event by ``_enrich_event``. We accept EITHER source —
+    # ``wire_event`` takes precedence (explicit caller override),
+    # then the contextvar fallback (covers tests / flows that call
+    # ``_build_v3_track_payload`` directly without going through
+    # ``_enrich_event``). When both are absent, omit the field and
+    # the backend falls back to ``execution_id`` only.
+    idem_key = wire_event.get("idempotency_key")
+    if not idem_key:
+        from nullrun.context import get_server_minted_idempotency_key
+
+        idem_key = get_server_minted_idempotency_key()
+    if idem_key:
+        payload["idempotency_key"] = str(idem_key)
 
     return payload
 

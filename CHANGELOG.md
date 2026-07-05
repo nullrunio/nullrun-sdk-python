@@ -8,6 +8,33 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 ---
 
 
+## [0.13.0] - 2026-07-04
+
+Drift-fixes release. Closes the SDK-side items on `docs/drift.md` (2026-07-04); no on-wire breaking change — backends on `1.0.0` keep working unchanged.
+
+### Added
+
+- **Idempotency-key propagation to `/track` v3 single-event** — new `nullrun.context._server_minted_idempotency_key_var` + `get_/set_/reset_/clear_server_minted_idempotency_key` helpers. `_capture_server_minted_execution_id` now also reads `response["operation_id"]` (which equals the `/check` `idempotency_key` per `runtime.py:1260`); `_enrich_event` stamps it onto `wire_event` for `llm_call`; `_build_v3_track_payload` propagates it onto the v3 `/track` body with a contextvar fallback for tests and direct callers. Without this, transport-level retry on the same event either 503'd with `RESERVATION_NOT_FOUND` (reservation key DEL'd after first consume per CLAUDE.md §25) or double-billed the underlying budget.
+
+### Changed
+
+- `runtime.py` module docstring now distinguishes **SDK-side transport failure** (network / 5xx / breaker open → fail-OPEN on the `/check` path) from **wire 4xx/5xx that names an enforcement failure** (`BUDGET_REDIS_UNAVAILABLE` → 402 fail-CLOSED, `RATE_LIMIT_REDIS_UNAVAILABLE` → 503 fail-CLOSED). The previous README claim "Fail-OPEN na infrastructure failures" was conflating the two — the SDK code is now correctly documented in the docstring; the README rewrite is tracked under `drift.md` P0-1 (deferred to a separate doc PR).
+
+### Fixed
+
+- **Wire `status_code` preserved on every decision exception** — `NullRunBlockedException`, `NullRunBudgetError`, `NullRunChainError`, `NullRunWorkflowInactiveError`, `NullRunConsumeOverbudgetError` now all accept `status_code: int | None = None`. `_parse_v3_error_envelope` populates it from `response.status_code` for every branch (402 budget, 403 workflow/chain cross-org, 422 `CONSUME_OVERBUDGET`, 503 `RATE_LIMIT_REDIS_UNAVAILABLE`, ...). FastAPI exception handlers reading `exc.status_code` previously got `None` / 500 for budget blocks because the backend's 402 was lost in the constructor chain.
+- **Patch-coverage gap from 0.12.2 closed** — `tests/test_v3_wire_contract.py::TestGateCacheRuntimeFlow` (3 tests) drives `NullRunRuntime.check_workflow_budget` inside `with chain(...)` and exercises the `cache_enabled` / cache-hit / cache-miss / cache-bypass-via-env branches in `runtime.py:1287-1310` that were previously uncovered (was dragging codecov/patch below the 70% floor on PR #52).
+
+### Tests
+
+- `tests/test_drift_fixes_2026_07_04.py` — 15 new tests: 5 idempotency-key contextvar lifecycle + payload-shape, 8 status_code on every decision exception, 2 fail-CLOSED on wire 503 `RATE_LIMIT_REDIS_UNAVAILABLE`. All pass on the 0.13.0 source.
+- `tests/test_v3_wire_contract.py::TestGateCacheRuntimeFlow` — 3 runtime-level chain-mode cache tests as described above.
+
+### Audit
+
+- New `docs/drift.md` records the six P0 + P1 items that turned up during pre-publish review of 0.12.2 (idempotency-key wiring, status_code on exceptions, fail-CLOSED honesty, plus four P0/P1 README issues that are deferred to a README rewrite PR and explicitly NOT in this release).
+
+
 ## [0.12.2] - 2026-07-04
 
 Bug-fix release. Two related correctness fixes layered on top of 0.12.1; no wire-format change.

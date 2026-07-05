@@ -426,11 +426,17 @@ class NullRunChainError(NullRunDecision):
         chain_id: str | None = None,
         backend_code: str | None = None,
         details: dict[str, Any] | None = None,
+        status_code: int | None = None,
         **kwargs: Any,
     ) -> None:
         self.chain_id = chain_id
         self.backend_code = backend_code or self.error_code
         self.details = details or {}
+        # 2026-07-04 (drift.md P1-1): preserve the wire HTTP
+        # status. Chain errors map to 402/403/404 depending on
+        # the specific code — FastAPI handlers reading
+        # ``exc.status_code`` should see the right one.
+        self.status_code = status_code
         super().__init__(message, **kwargs)
 
 
@@ -476,6 +482,7 @@ class NullRunConsumeOverbudgetError(NullRunDecision):
         max_allowed_cents: int | None = None,
         actual_cost_cents: int | None = None,
         epsilon_cents: int | None = None,
+        status_code: int | None = None,
         **kwargs: Any,
     ) -> None:
         self.execution_id = execution_id
@@ -483,6 +490,10 @@ class NullRunConsumeOverbudgetError(NullRunDecision):
         self.max_allowed_cents = max_allowed_cents
         self.actual_cost_cents = actual_cost_cents
         self.epsilon_cents = epsilon_cents
+        # 2026-07-04 (drift.md P1-1): CONSUME_OVERBUDGET maps to
+        # 422 on the wire (CLAUDE.md §25) — surface it so FastAPI
+        # handlers don't fall back to 500.
+        self.status_code = status_code
         super().__init__(message, **kwargs)
 
 
@@ -514,9 +525,14 @@ class NullRunWorkflowInactiveError(NullRunDecision):
         message: str,
         *,
         workflow_id: str | None = None,
+        status_code: int | None = None,
         **kwargs: Any,
     ) -> None:
         self.workflow_id = workflow_id
+        # 2026-07-04 (drift.md P1-1): WORKFLOW_INACTIVE maps to
+        # 403 on the wire (CLAUDE.md §13) — surface it so FastAPI
+        # handlers don't fall back to 500.
+        self.status_code = status_code
         super().__init__(message, **kwargs)
 
 
@@ -687,6 +703,18 @@ class NullRunBlockedException(NullRunDecision):
             ``None`` when the block is workflow-scoped rather than
             tool-scoped.
         details: Free-form structured payload forwarded by the caller.
+        status_code: HTTP status code the backend sent on the wire
+            when the block was derived from a server response (e.g.
+            402 for ``BUDGET_HARD_BLOCKED``, 403 for
+            ``TOOL_BLOCKED`` / ``WORKFLOW_INACTIVE``, 429 for
+            ``RATE_LIMIT_EXCEEDED``). ``None`` for client-side
+            blocks (sensitive-tool pre-check, loop detection, retry
+            storm) where there was no wire response. Lets FastAPI /
+            Starlette exception handlers map to the correct HTTP
+            status without re-deriving it from
+            ``type(exc).__name__``. Drift fix 2026-07-04
+            (drift.md P1-1: SDK_README's NR-B004 → 429 claim was
+            wrong; the real wire status is 402).
     """
 
     error_code = "NR-X001"  # generic block; subclasses override
@@ -703,12 +731,19 @@ class NullRunBlockedException(NullRunDecision):
         reason: str,
         action: str = "block",
         tool_name: str | None = None,
+        status_code: int | None = None,
         **details: Any,
     ) -> None:
         self.workflow_id = workflow_id
         self.reason = reason
         self.action = action
         self.tool_name = tool_name
+        # 2026-07-04 (drift.md P1-1): wire HTTP status preserved
+        # so FastAPI exception handlers can return the correct
+        # status without re-deriving from the error class. ``None``
+        # when the block fired client-side (loop detection, retry
+        # storm, sensitive-tool pre-check).
+        self.status_code = status_code
         self.details = details
         tool_suffix = f", tool={tool_name}" if tool_name else ""
         # ``code`` / ``user_action`` / ``retryable`` can be overridden
@@ -722,7 +757,7 @@ class NullRunBlockedException(NullRunDecision):
             retryable = self.retryable
         super().__init__(
             f"Workflow {workflow_id} blocked: {reason} "
-            f"(action={action}{tool_suffix}, details={details})",
+            f"(action={action}{tool_suffix}, status_code={status_code}, details={details})",
             error_code=error_code,
             user_action=user_action,
             retryable=retryable,
