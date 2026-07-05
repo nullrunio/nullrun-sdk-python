@@ -140,7 +140,68 @@ Backends on 1.0.0 keep working unchanged. Pinning unchanged:
 SDK_MIN_VERSION_FOR_V3 = "0.12.0". Recommended upgrade
 path: 0.12.2 -> 0.13.0 (no on-wire breaking change; the SDK
 will pick up the new idempotency_key stamping automatically).
+
+---
+
+v3.15 / 0.13.1 (2026-07-04) — drift-fixes release: closes the four
+BLOCKER items from the SDK↔backend drift audit that were still active
+in 0.13.0.
+
+  1. ``Transport.check_v3`` (drift B1): was POSTing to ``/api/v1/check``
+     (removed 2026-06-27 — handler now returns 410 Gone with
+     ``replacement: /api/v1/gate``). Now delegates to ``Transport.check``
+     which targets ``/api/v1/gate`` and forwards all v3 wire fields
+     (``chain_id``, ``chain_op``, ``idempotency_key``, ``stream``).
+     ``check()`` is the canonical entry point; ``check_v3`` is kept
+     as a v3-named alias for callers/tests that already use it.
+
+  2. ``Transport.track_single`` docstring + ``tests/test_v3_wire_contract.py::
+     test_track_single_includes_protocol_header`` body (drift B2): the
+     docstring described a fictitious wire shape ``{execution_id,
+     actual_cost_cents, api_key_id, cost_source}``. The real backend
+     ``TrackRequestRaw`` is ``{workflow_id, tokens, cost_cents, ...}``
+     (built by ``runtime._build_v3_track_payload``) — ``execution_id``
+     is replaced by ``reservation_id``, and the SDK always emits
+     ``cost_cents: 0`` because the backend recomputes the authoritative
+     cost from tokens + the org's pricing policy (see
+     ``_WIRE_STRIP_FIELDS`` in runtime.py). ``api_key_id`` is derived
+     server-side from the request auth, not supplied by the SDK.
+     Docstring + test body now match the real contract.
+
+  3. ``Transport.chain_end`` (drift B3): was POSTing to
+     ``/api/v1/chain/end`` — that endpoint was never registered on
+     the backend (``backend/src/proxy/http/routes.rs`` has zero
+     matches). Now POSTs to ``/api/v1/gate`` with ``chain_op: "end"``
+     (matches the documented backend contract from
+     ``backend/src/proxy/http/cancel.rs:39``'s own comment).
+
+  4. ``Transport.approximate_budget`` (drift M3): was appending
+     ``?organization_id=<id>`` to the URL. The backend's
+     ``approximate_budget_handler`` (``backend/src/proxy/http/
+     budget.rs:130-145``) resolves the org from the X-API-Key /
+     Authorization header — it does NOT accept a query parameter.
+     The method now calls the bare URL. The ``organization_id``
+     argument is retained as an accepted-but-unused parameter for
+     backward compatibility with any external caller that still
+     passes it (silently no-ops).
+
+Tests touched (in ``tests/test_v3_wire_contract.py``):
+  * ``test_check_v3_includes_protocol_header`` — re-mocked against
+    /api/v1/gate (was /api/v1/check).
+  * ``test_check_v3_accepts_chain_context`` — re-mocked against
+    /api/v1/gate (was /api/v1/check).
+  * ``test_chain_end_includes_protocol_header`` — re-mocked against
+    /api/v1/gate (was /api/v1/chain/end); added chain_op=end check.
+  * ``test_chain_end_sends_chain_id_in_body`` — re-mocked against
+    /api/v1/gate (was /api/v1/chain/end); added chain_op=end check.
+  * ``test_track_single_includes_protocol_header`` — body now matches
+    the real wire shape (reservation_id + workflow_id + tokens +
+    cost_cents:0 + cost_source:"provisional").
+
+1037 lib tests pass (no regression). Recommended upgrade path:
+0.13.0 -> 0.13.1. No SDK_MIN_VERSION bump — wire format is the same
+from the caller's perspective; only the URLs and docstrings changed.
 """
 
-__version__ = "0.13.0"
+__version__ = "0.13.1"
 __platform_version__ = "1.0.0"
