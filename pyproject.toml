@@ -9,7 +9,10 @@ name = "nullrun"
 # decision exception + fail-CLOSED/OPEN honesty in module docstring).
 # No on-wire breaking change; backends on 1.0.0 keep working
 # unchanged. See docs/drift.md for the full audit trail.
-version = "0.13.0"
+# 0.13.1 (2026-07-04): drift-fixes release — see __version__.py
+# for the four BLOCKER closes (B1 check_v3, B2 track_single
+# docstring, B3 chain_end, M3 approximate_budget query param).
+version = "0.13.1"
 # Long form used by PyPI page meta-description and search snippets.
 # Kept under the 200-char preview threshold so the full line is visible
 # without an "expand" click. Keywords are matched against likely search
