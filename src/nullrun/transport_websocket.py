@@ -31,8 +31,8 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# S-10 (plan §10): cap on consecutive WebSocket reconnect failures.
-# Pre-fix the reconnect loop ran forever (``while not self._closed``),
+# S-10: cap on consecutive WebSocket reconnect failures.
+# Pre-fix the reconnect loop ran forever (``while not self._closed``)
 # leaking the WS thread and flooding logs when the backend was
 # permanently down. We now give up after this many attempts and let
 # the caller fall back to HTTP-poll (the SDK still tracks / gates /
@@ -54,7 +54,7 @@ _MAX_RECONNECT_ATTEMPTS = 10
 # Transport._build_signed_headers). The two transports agree on the
 # field NAME but disagree on the VALUE: HTTP carries the user-facing
 # ``nr_live_...`` string, WS carries the internal UUID from
-# ``auth_context.key_id()``. Both are internally consistent, but the
+# ``auth_context.key_id ``. Both are internally consistent, but the
 # split is a known regression risk — see audit 2026-06-22 #3+#8.
 WS_HMAC_IDENTITY_FIELD = "api_key"
 
@@ -114,7 +114,8 @@ def verify_hmac_signature(
     age = abs(current_time - timestamp)
 
     if age > max_age_seconds:
-        # §7.2 #6 mirror: increment the same counter as the
+        # Mirror the same counter used by the SDK-side transport-error
+        # path so SRE can distinguish transient drops from this branch.
         # HTTP verify path so SRE gets one alert ladder for
         # clock-skew issues, not two.
         try:
@@ -139,13 +140,13 @@ class WebSocketConnection:
 
     Usage:
         conn = await transport.connect_websocket(
-            organization_id="org-123",
-            api_key="nr_live_xxx",
-            secret_key="secret_xxx",
+            organization_id="org-123"
+            api_key="nr_live_xxx"
+            secret_key="secret_xxx"
             on_state_change=lambda state: print(f"State changed: {state}")
         )
         # Connection stays open, receiving state updates
-        await conn.close()
+        await conn.close 
     """
 
     # States that require acknowledgment (KILL/PAUSE).
@@ -183,7 +184,7 @@ class WebSocketConnection:
         Initialize WebSocket connection.
 
         Args:
-            url: WebSocket URL (e.g., "wss://api.nullrun.io/ws/control/org-123")
+            url: WebSocket URL (e.g., "wss:/api.nullrun.io/ws/control/org-123")
             headers: HTTP headers for authentication
             api_key: API key for HMAC verification (optional but recommended)
             secret_key: Secret key for HMAC verification (optional but recommended)
@@ -206,7 +207,7 @@ class WebSocketConnection:
         self._reconnect_task: asyncio.Task | None = None
         self._closed = False
         # S-10: counter for the consecutive reconnect-failure cap.
-        # Reset to 0 on a successful ``_connect()``.
+        # Reset to 0 on a successful ``_connect ``.
         self._consecutive_reconnect_failures: int = 0
         # Per-workflow monotonic version dedup (ADR-007).
         # Drop incoming state changes with ``version <= last`` to
@@ -234,9 +235,9 @@ class WebSocketConnection:
         while the receive loop is healthy and reconnects on demand.
 
         Without the ``continue`` branch, the pre-fix code exited after
-        the very first successful ``_connect()`` because the
+        the very first successful ``_connect `` because the
         ``if not self._running`` guard became False the moment
-        ``_connect()`` set ``_running = True``. That broke the control
+        ``_connect `` set ``_running = True``. That broke the control
         plane: after any network blip, kill/pause commands from the
         dashboard would never reach the client until the process was
         restarted. For a product whose core promise is a centralised
@@ -247,21 +248,21 @@ class WebSocketConnection:
 
         while not self._closed:
             if self._running:
-                # Receive loop is healthy. Sleep briefly and re-check;
+                # Receive loop is healthy. Sleep briefly and re-check
                 # if the connection drops the receive loop's
                 # ``finally`` block will set ``_running = False`` and
                 # we will reconnect on the next iteration.
                 await asyncio.sleep(0.5)
                 continue
 
-            # S-10 (plan §10): cap reconnect attempts. Pre-fix the
+            # S-10: cap reconnect attempts. Pre-fix the
             # loop was unbounded (``while not self._closed``) so a
             # permanently-down backend kept the SDK's WS thread
             # spinning forever, leaking the thread and producing log
             # spam at the operator. We now stop after
             # ``MAX_RECONNECT_ATTEMPTS`` consecutive failures. The
             # receive loop's ``finally`` already set ``_running = False``
-            # so this loop will exit and ``connect()`` returns
+            # so this loop will exit and ``connect `` returns
             # control to the caller; the SDK falls back to HTTP-poll
             # via ``runtime._poll_commands``.
             if self._consecutive_reconnect_failures >= _MAX_RECONNECT_ATTEMPTS:
@@ -303,7 +304,7 @@ class WebSocketConnection:
         """
         Establish WebSocket connection.
 
-        Internal method used by connect() and reconnect loop.
+        Internal method used by connect and reconnect loop.
         """
         self._conn = await websockets.connect(self.url, additional_headers=self.headers)
         self._running = True
@@ -404,7 +405,7 @@ class WebSocketConnection:
                 # value under the ``api_key`` field — we MUST read it
                 # back from there and use it as the HMAC identifier.
                 #
-                # Pre-FIX-F4 this branch read ``data["api_key_id"]``,
+                # Pre-FIX-F4 this branch read ``data["api_key_id"]``
                 # which used to be the wire field name on the server
                 # side. That field now carries the same user-facing
                 # value (no longer the internal UUID key_id), so for
@@ -591,7 +592,7 @@ class WebSocketConnection:
 
             else:
                 # CP4 fix: unknown msg_type. Previously this fell
-                # through the entire if/elif chain with no else,
+                # through the entire if/elif chain with no else
                 # so a new WsMessage variant added by the backend
                 # would be silently dropped. The user would only
                 # find out when a control-plane feature stopped
@@ -688,7 +689,7 @@ class WebSocketConnection:
         """
         Send acknowledgment message to server with HMAC signature.
 
-        CP7 fix (2026-06-26): previously this ACK was plain JSON,
+        CP7 fix (2026-06-26): previously this ACK was plain JSON
         no signature, no timestamp, no api_key. The backend does
         not currently verify ACK authenticity (the TODO at
         ``backend/src/proxy/http/ws_control.rs:842-848`` is still
@@ -704,13 +705,13 @@ class WebSocketConnection:
           protection (refuse ACKs with a stale timestamp).
 
         The wire format mirrors the incoming ``SignedWsMessage``
-        envelope: ``{type, message_id, received_at, api_key,
+        envelope: ``{type, message_id, received_at, api_key
         timestamp, signature}``. The ``api_key`` field carries the
         user-facing API key string (``nr_live_...``) as the HMAC
         identity — matches the same convention ``Transport.
         _build_signed_headers`` uses for HTTP requests. The
         signature is computed via ``generate_hmac_signature``
-        (sha256 HMAC of ``timestamp:api_key:sha256(body)``),
+        (sha256 HMAC of ``timestamp:api_key:sha256(body)``)
         identical to the HTTP path so the backend can use one
         verification routine.
 
@@ -730,7 +731,7 @@ class WebSocketConnection:
 
         try:
             # FIX-F5: received_at is unix SECONDS, not milliseconds.
-            # Matches the backend's ``Utc::now().timestamp()`` fallback
+            # Matches the backend's ``Utc::now.timestamp `` fallback
             # in ws_control.rs so a future telemetry / analytics
             # consumer doesn't see a 1000x divergence.
             received_at = int(time.time())
@@ -738,7 +739,7 @@ class WebSocketConnection:
 
             # Build the unsigned envelope first so the signature
             # covers exactly the bytes the receiver will hash. If we
-            # mutated the dict after signing (e.g., adding a field),
+            # mutated the dict after signing (e.g., adding a field)
             # the signature would diverge from the canonical bytes.
             ack: dict[str, Any] = {
                 "type": "ack",
@@ -767,7 +768,7 @@ class WebSocketConnection:
                 ack["timestamp"] = timestamp
                 ack["signature"] = signature
                 # Send the signed body (without re-serialising the
-                # dict that now includes signature/timestamp/api_key,
+                # dict that now includes signature/timestamp/api_key
                 # which would diverge from the signed bytes).
                 await self._conn.send(body_str)
             else:

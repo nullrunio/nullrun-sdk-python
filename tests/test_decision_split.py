@@ -3,15 +3,15 @@
 These tests pin the categorical contract that lets host code write::
 
     try:
-        ...
-    except NullRunDecision as d:           # budget, tool, rate, loop, pause
-        return d.user_message()
+...
+    except NullRunDecision as d: # budget, tool, rate, loop, pause
+        return d.user_message 
     except NullRunInfrastructureError as e: # transport, backend, auth, config
         sentry.capture_exception(e)
         return "service unavailable"
 
 Backward compat is also asserted — every existing ``except`` clause
-(``except NullRunError:``, ``except NullRunBlockedException:``, ...)
+(``except NullRunError:``, ``except NullRunBlockedException:``,...)
 must keep matching after the refactor.
 """
 from __future__ import annotations

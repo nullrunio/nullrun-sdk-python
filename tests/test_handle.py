@@ -1,17 +1,17 @@
-"""Tests for the minimal-boilerplate error helpers (``nullrun.handle``,
+"""Tests for the minimal-boilerplate error helpers (``nullrun.handle``
 ``nullrun.guarded``).
 
 Contract:
 
-* Both translate any :class:`nullrun.NullRunError` into a single
+* Both translate any:class:`nullrun.NullRunError` into a single
   ``print(format_user_message(exc), file=sys.stderr)`` and then
   ``sys.exit(1)``.
-* :class:`nullrun.WorkflowKilledInterrupt` (BaseException) propagates
+*:class:`nullrun.WorkflowKilledInterrupt` (BaseException) propagates
   unchanged — kill must not be swallowed into a graceful exit.
 * Non-NullRun exceptions also propagate unchanged so the user's own
   bugs surface as honest tracebacks.
 * No runtime is required — these helpers work without
-  ``nullrun.init()``.
+  ``nullrun.init ``.
 """
 from __future__ import annotations
 
@@ -38,8 +38,8 @@ def test_handle_catches_nullrun_error_and_exits(monkeypatch, capsys):
 
     with pytest.raises(SystemExit):
         with handle():
-            # NullRunBudgetError inherits from NullRunBlockedException,
-            # whose __init__ takes (workflow_id, reason, ...).
+            # NullRunBudgetError inherits from NullRunBlockedException
+            # whose __init__ takes (workflow_id, reason,...).
             raise NullRunBudgetError("wf-1", "workflow budget exhausted")
 
     captured = capsys.readouterr()
@@ -154,7 +154,7 @@ def test_no_init_required():
 # ---------------------------------------------------------------------------
 
 class _FakeNoopRuntime:
-    """Sentinel returned by a stubbed init(). init_or_die should pass
+    """Sentinel returned by a stubbed init. init_or_die should pass
     it through unchanged."""
 
 

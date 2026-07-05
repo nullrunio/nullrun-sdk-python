@@ -107,7 +107,7 @@ def test_validate_sdk_version_against_legacy_backend():
 
 def test_validate_sdk_version_handles_unparseable_versions():
     """Defensive: non-numeric SDK versions don't crash — the helper
-    treats them as (0,) which makes the comparison degenerate to
+    treats them as (0) which makes the comparison degenerate to
     False. No false-positive warnings."""
     payload = {
         "server_minted_execution_id": True,
@@ -127,8 +127,8 @@ def test_validate_sdk_version_handles_unparseable_versions():
     )
     warnings = validate_sdk_version("0.11.0", caps_bad)
     assert len(warnings) == 1  # 0.11.0 < 0.0.0 = False, but parsing fails
-    # Note: the (0,) tuple parse is lossy — both sides compare
-    # against the (0,) base. This is acceptable for a startup
+    # Note: the (0) tuple parse is lossy — both sides compare
+    # against the (0) base. This is acceptable for a startup
     # warning; the gate still rejects with PROTOCOL_TOO_OLD.
 
 
@@ -191,7 +191,7 @@ def test_probe_capabilities_returns_caps_on_2xx():
 def test_probe_capabilities_returns_none_on_non_2xx():
     """A non-2xx /health response returns None (advisory, not fatal).
 
-    Pins the ``logger.debug("... returned %d", ...)` branch in
+    Pins the ``logger.debug("... returned %d",...)` branch in
     probe_capabilities so a future refactor can't silently swallow
     the response code without a test catching it.
     """
@@ -207,7 +207,7 @@ def test_probe_capabilities_returns_none_on_network_error():
     """Connection failures return None — the caller should treat
     ``None`` as 'best-effort probe failed, proceed without it'.
 
-    Pins the ``logger.debug("... probe failed for %s: %s", ...)``
+    Pins the ``logger.debug("... probe failed for %s: %s",...)``
     branch (transport-level exception path).
     """
     with respx.mock:
@@ -219,7 +219,7 @@ def test_probe_capabilities_returns_none_on_network_error():
 
 
 def test_probe_capabilities_returns_none_on_malformed_json():
-    """Malformed JSON (ValueError on json()) returns None — same
+    """Malformed JSON (ValueError on json ) returns None — same
     contract as a transport error: best-effort, not fatal.
     """
     with respx.mock:

@@ -112,14 +112,14 @@ def patch_autogen(runtime: Any) -> bool:
                         # priority order, matching the multi-source
                         # pattern in langgraph's
                         # ``_extract_model_from_response``:
-                        #   1. ``self.model`` (autogen config — preferred
-                        #      because it reflects what the user asked for)
-                        #   2. ``result.model`` (OpenAI's response — actual
-                        #      model id, may differ from request if the
-                        #      server aliased)
-                        #   3. None — let the runtime-level warning log
-                        #      (added 2026-06-28 in runtime.py:track())
-                        #      surface which path produced the gap.
+                        # 1. ``self.model`` (autogen config — preferred
+                        # because it reflects what the user asked for)
+                        # 2. ``result.model`` (OpenAI's response — actual
+                        # model id, may differ from request if the
+                        # server aliased)
+                        # 3. None — let the runtime-level warning log
+                        # (added 2026-06-28 in runtime.py:track )
+                        # surface which path produced the gap.
                         model = (
                             getattr(self, "model", None)
                             or getattr(result, "model", None)

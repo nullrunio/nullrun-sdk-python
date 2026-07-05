@@ -22,7 +22,7 @@ from nullrun.breaker.circuit_breaker import CircuitBreaker
 
 class TestPublishHalfOpen:
     def test_publish_half_open_state_is_called_on_transition(self):
-        """When the local state transitions from OPEN to HALF_OPEN,
+        """When the local state transitions from OPEN to HALF_OPEN
         ``_publish_half_open_state`` must be called so other workers
         see the new state in Redis.
         """
@@ -80,7 +80,7 @@ class TestPublishHalfOpen:
 # ``_half_open_calls += 1`` increment. The current code wraps
 # both inside ``with self._lock:`` (see circuit_breaker.py line
 # 278-281) so the invariant holds. This test pins it so a
-# future "optimisation" that removes the lock breaks the test,
+# future "optimisation" that removes the lock breaks the test
 # not the production guarantee.
 
 
@@ -97,7 +97,7 @@ class TestHalfOpenConcurrencyLimit:
         the ``+= 1`` increment. The current code wraps both in
         ``with self._lock:`` (see circuit_breaker.py:278-281) so
         the invariant holds. This test forces the threads to
-        block INSIDE ``call()`` until all 10 have entered the
+        block INSIDE ``call `` until all 10 have entered the
         half-open gate, so a regression that removes the lock
         (and lets more than ``half_open_max_calls`` threads pass
         the check before any of them increments) would show up as

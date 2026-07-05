@@ -47,7 +47,7 @@ class TestNoSignalHandlerInstalled:
             t.stop()
 
     def test_construction_does_not_call_signal_signal(self):
-        """Sanity check: even calling Transport() many times must
+        """Sanity check: even calling Transport many times must
         not touch the signal table at all."""
         original = signal.getsignal(signal.SIGTERM)
         try:
@@ -77,7 +77,7 @@ class TestNoSignalHandlerInstalled:
             # must not register one. The previous code installed
             # `def _handle_shutdown(signum, frame): sys.exit(0)`.
             handler = signal.getsignal(signal.SIGTERM)
-            # On Windows, signal handlers can be `signal.SIG_DFL`,
+            # On Windows, signal handlers can be `signal.SIG_DFL`
             # `signal.SIG_IGN`, or a Python callable. Only a Python
             # callable would be a SDK bug.
             if callable(handler) and not isinstance(
@@ -126,7 +126,7 @@ class TestAtexitViaWeakref:
 
     def test_weakref_fires_on_gc(self):
         """If the transport is GC'd before process exit, the
-        weakref-based flush must NOT raise (the transport is gone,
+        weakref-based flush must NOT raise (the transport is gone
         so it must no-op)."""
         t = Transport(
             api_url="https://api.test.nullrun.io",
@@ -158,13 +158,13 @@ class TestAtexitViaWeakref:
         that only emits a DEBUG log line. There is no buffer / WAL
         / httpx-client reach inside the finalizer — by the time
         ``weakref.finalize`` fires, ``self`` is already being
-        collected. Crash-safety lives in ``stop()`` (which calls
+        collected. Crash-safety lives in ``stop `` (which calls
         ``_persist_to_wal``) and the context-manager pattern, NOT
         in the finalizer. We pin both:
 
         1. Direct call (0 args, matching the weakref-finalize
            contract): never raises regardless of upstream state.
-        2. Direct call with an unexpected positional arg (1 arg,
+        2. Direct call with an unexpected positional arg (1 arg
            matching the original test signature intent): also
            never raises — the method signature accepts the
            optional positional arg defensively.
@@ -187,23 +187,23 @@ class TestAtexitViaWeakref:
 
     def test_atexit_flush_does_not_persist_buffer(self):
         """0.7.0 contract pin: the weakref finalizer is a no-op.
-        Buffered events that survived without ``stop()`` are
+        Buffered events that survived without ``stop `` are
         LOST — the SDK logs a DEBUG warning instead of writing
         them to the WAL.
 
-        Rationale (per the 0.7.0 thin-client refactor): the
+        Rationale (the 0.7.0 thin-client refactor): the
         ``Transport._buffer`` is gone by the time the finalizer
         fires (the instance is being GC'd; weakref.finalize
         receives no ``self`` reference). Attempting to WAL-persist
         from inside the finalizer would need a parallel registry
         of live buffers, which contradicts the thin-client
-        architecture (the backend is authoritative for delivery,
+        architecture (the backend is authoritative for delivery
         not the local SDK).
 
         Callers MUST use one of:
           * ``with Transport(...) as t:`` — context manager
-            calls ``stop()`` on ``__exit__``.
-          * explicit ``t.start()`` / ``t.stop()`` pair.
+            calls ``stop `` on ``__exit__``.
+          * explicit ``t.start `` / ``t.stop `` pair.
           * rely on the interpreter-level ``atexit`` runner, but
             understand that buffered events that did not reach
             ``_persist_to_wal`` BEFORE interpreter shutdown will
@@ -225,7 +225,7 @@ class TestAtexitViaWeakref:
             api_key="test-key-12345678",
         )
         try:
-            # Enqueue events that simulate the case where stop()
+            # Enqueue events that simulate the case where stop 
             # was never called (e.g. user script just runs
             # ``nullrun.init(...)`` and exits).
             t.track({"event_id": "drop-1", "type": "cost", "amount": 42})
@@ -264,7 +264,7 @@ class TestAtexitViaWeakref:
 
     def test_weakref_finalize_logs_warning_only(self, caplog):
         """End-to-end: a Transport that is GC'd without an
-        explicit ``stop()`` MUST NOT silently drop /track events
+        explicit ``stop `` MUST NOT silently drop /track events
         on the floor — the SDK logs a DEBUG line so operators
         can see the data-loss signal in their log pipeline.
 
@@ -272,7 +272,7 @@ class TestAtexitViaWeakref:
         writes the buffer to the WAL. It only emits a single
         DEBUG-level log line via ``logger.debug``. To survive
         a crash, callers must use the context manager or call
-        ``stop()`` explicitly — see ``test_atexit_flush_does_not_persist_buffer``
+        ``stop `` explicitly — see ``test_atexit_flush_does_not_persist_buffer``
         for the rationale.
         """
         import logging
@@ -283,7 +283,7 @@ class TestAtexitViaWeakref:
         wal_path = f"{wal_dir}/nullrun.wal"
         try:
             # Step 1: build a Transport, enqueue events, GC it
-            # without calling stop(). This is what happens when
+            # without calling stop. This is what happens when
             # a user script just does ``nullrun.init(...)`` and
             # exits.
             t = Transport(
@@ -294,7 +294,7 @@ class TestAtexitViaWeakref:
             t.track({"event_id": "e2e-1", "type": "cost"})
             t.track({"event_id": "e2e-2", "type": "cost"})
 
-            # Detach the finalizer that stop() would detach, so
+            # Detach the finalizer that stop would detach, so
             # the explicit-stop path doesn't suppress it. We're
             # testing the no-stop path.
             t._finalizer.detach()
@@ -327,7 +327,7 @@ class TestAtexitViaWeakref:
 
 class TestContextManagerLifecycle:
     """`Transport` must work as a context manager so callers have a
-    safe lifecycle without explicit `start()` / `stop()` pairs."""
+    safe lifecycle without explicit `start ` / `stop ` pairs."""
 
     def test_with_block_starts_and_stops(self):
         with Transport(

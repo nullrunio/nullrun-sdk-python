@@ -52,7 +52,7 @@ __api_version__ = "1.0"
 
 # 2026-07-02 (v0.11.0): wire-protocol version handshake.
 #
-# CLAUDE.md §32 (v3) — the backend's `proxy/http/gate/protocol.rs`
+# — the backend's `proxy/http/gate/protocol.rs`
 # middleware rejects every signed POST that does not carry
 # `X-NULLRUN-PROTOCOL: <n>` with HTTP 400 + `error_code:
 # PROTOCOL_HEADER_REQUIRED` (or `PROTOCOL_TOO_OLD` / `PROTOCOL_TOO_NEW`
@@ -161,7 +161,7 @@ def generate_hmac_signature(
     # 2026-06-27: accept both ``str`` (legacy callers + verify_hmac_signature
     # path which decodes the request body) and ``bytes`` (the four signed
     # POST call sites that serialise via ``_signed_request_body`` and pass
-    # the wire bytes directly). Encoding twice (``.encode()`` on bytes)
+    # the wire bytes directly). Encoding twice (``.encode `` on bytes)
     # raised AttributeError on the /track/batch flush loop and silently
     # killed every analytics event -- the backend then logged "missing
     # signature headers" on the next batch retry because nothing was sent.
@@ -201,7 +201,7 @@ def verify_hmac_signature(
     # Check timestamp freshness
     current_time = int(time.time())
     if abs(current_time - timestamp) > max_age_seconds:
-        # §7.2 #6: separate counter so SRE can distinguish
+        # separate counter so SRE can distinguish
         # "our clock drifted" from "someone is forging packets".
         # The two cases need different runbooks — NTP sync
         # vs. incident response.
@@ -226,7 +226,7 @@ def _signed_request_body(payload: dict[str, Any]) -> bytes:
     signature is computed over.
 
     All four signed POST call sites -- ``Transport.track`` (batched
-    via ``_send_batch_with_retry_info``), ``Transport.gate``,
+    via ``_send_batch_with_retry_info``), ``Transport.gate``
     ``Transport.check``, and ``Transport.execute`` -- MUST serialise
     via this helper and pass the result with ``content=body`` to
     ``httpx.Client.post``. Sending via ``json=...`` lets httpx
@@ -444,7 +444,7 @@ class Transport:
     HTTP transport with batching support.
 
     Features:
-    - Non-blocking track() calls (append to buffer)
+    - Non-blocking track calls (append to buffer)
     - Background flush at intervals or when batch_size reached
     - Retry logic for failed requests
     - Thread-safe for sync usage
@@ -464,9 +464,9 @@ class Transport:
 
         # TLS enforcement: reject non-localhost HTTP URLs. The check
         # must NOT be a startswith chain — that allowed homograph
-        # attacks (http://127.0.0.1.attacker.com, http://localhost.evil.com)
-        # and rejected legitimate inputs (http://[::1]:8080, http://LOCALHOST).
-        # We use urllib.parse.urlparse to extract the canonical hostname,
+        # attacks (http:/127.0.0.1.attacker.com, http:/localhost.evil.com)
+        # and rejected legitimate inputs (http:/[::1]:8080, http:/LOCALHOST).
+        # We use urllib.parse.urlparse to extract the canonical hostname
         # then check the host against a small allow-list that includes the
         # full IPv4 loopback range (127.0.0.0/8) and IPv6 loopback (::1).
         # For IPv4 we use ``ipaddress.ip_address`` so that
@@ -565,7 +565,7 @@ class Transport:
             redis_client=redis_client,
             name="transport",
         )
-        self._stopped = False  # Track if stop() was called
+        self._stopped = False  # Track if stop was called
         # 0.7.0 thin client: no local policy cache. The backend is
         # authoritative on every gate/execute call.
         _masked = api_key[:8] + "***" if api_key and len(api_key) >= 8 else "***"
@@ -581,7 +581,7 @@ class Transport:
         # Register final-flush hook via weakref.finalize so the
         # callback only fires if this Transport instance is still
         # alive at process exit. Replaces the previous
-        # ``atexit.register`` (which accumulated one handler per
+        # ``atexit.register`` (which accumulated one handler
         # Transport in long-running deployments) and the previous
         # ``signal.signal`` handler (which hijacked SIGTERM/SIGINT
         # process-wide and called ``sys.exit(0)`` from inside the
@@ -597,7 +597,7 @@ class Transport:
         reference to ``self`` has been dropped by the time the
         callback fires). We cannot reach into the transport from
         here — the buffer, the httpx client, and the lock are all
-        gone. The recommended lifecycle is to call ``stop()``
+        gone. The recommended lifecycle is to call ``stop ``
         explicitly (or use ``Transport`` as a context manager).
         If the caller did neither, we log a one-time DEBUG line
         and return.
@@ -640,8 +640,8 @@ class Transport:
         Honours ``NULLRUN_WAL_PATH`` so crash-recovery lands on a
         writable mount in containers with
         ``readOnlyRootFilesystem: true``. Default lands in the
-        platform temp dir (``tempfile.gettempdir()`` — typically
-        ``/tmp`` on Linux, ``/var/folders/...`` on macOS,
+        platform temp dir (``tempfile.gettempdir `` — typically
+        ``/tmp`` on Linux, ``/var/folders/...`` on macOS
         ``%TEMP%`` on Windows). Using the platform helper rather
         than a hardcoded ``/tmp`` keeps us off S108's insecure
         path list and lets the SDK work on Windows out of the
@@ -765,8 +765,8 @@ class Transport:
         """Context-manager entry: start the flush thread and return self.
 
         Pairs with ``__exit__`` so callers can write
-        ``with Transport(...) as t:`` and rely on ``stop()`` running
-        on the way out. Replaces the manual ``start() / stop()`` pair
+        ``with Transport(...) as t:`` and rely on ``stop `` running
+        on the way out. Replaces the manual ``start / stop `` pair
         that was easy to forget in long-running services.
         """
         self.start()
@@ -793,7 +793,7 @@ class Transport:
         self._do_flush()  # Final flush
         self._persist_to_wal()  # WAL any remaining events
         self._client.close()
-        # Detach the weakref finalizer — stop() is the canonical
+        # Detach the weakref finalizer — stop is the canonical
         # "I am done" path. After this point the finalizer will
         # silently no-op even if the interpreter is still alive.
         if getattr(self, "_finalizer", None) is not None and self._finalizer.alive:
@@ -842,7 +842,7 @@ class Transport:
         except BreakerTransportError:
             # Circuit breaker is open - re-add batch to buffer for retry later
             logger.warning(f"Circuit breaker OPEN. Batch of {len(batch)} events will be re-queued.")
-            # P0-4 (plan §10): drop NEWEST non-critical events instead of
+            # P0-4: drop NEWEST non-critical events instead of
             # oldest. For cost-audit the oldest events are the
             # most valuable (incident start, billing-period start) —
             # losing them would silently break per-customer monthly
@@ -866,7 +866,7 @@ class Transport:
         the current buffer. Returns ``None`` when empty.
 
         Used by ``tests/test_buffer_invariants.py``. The full flush
-        logic (CB, re-queue, metrics) lives in ``_do_flush_locked``;
+        logic (CB, re-queue, metrics) lives in ``_do_flush_locked``
         this method is the read-only counterpart.
         """
         with self._lock:
@@ -879,7 +879,7 @@ class Transport:
     # Event types that MUST NOT be dropped on buffer overflow.
     # These are control-plane events: the dashboard's KILL/PAUSE has
     # to land even under sustained backend outage, otherwise the
-    # kill-switch promise is broken (plan §11.4 P0-4 recommendation).
+    # kill-switch promise is broken.
     _CRITICAL_EVENT_TYPES = frozenset(
         {
             "state_change",
@@ -898,7 +898,7 @@ class Transport:
         ``batch``, preserving critical events (state_change etc.)
         even when they happen to be the newest.
 
-        Cost-audit invariant (plan §10 P0-4): under overflow we keep
+        Cost-audit invariant: under overflow we keep
         the OLDEST events because the start of an incident / start of
         the billing period is exactly what a billing investigator
         will look up first. Dropping oldest silently breaks
@@ -1030,12 +1030,12 @@ class Transport:
             headers["X-Signature"] = signature
         if extra:
             headers.update(extra)
-        # CLAUDE.md §32 (v3): wire-protocol handshake. The backend
+        # wire-protocol handshake. The backend
         # rejects every signed POST without `X-NULLRUN-PROTOCOL: 3`
         # with 400 PROTOCOL_HEADER_REQUIRED before the gate pipeline
         # even starts. Setting it inside the canonical
         # `_build_signed_headers` helper means every existing signed
-        # POST (`/gate`, `/execute`, `/track/batch`,
+        # POST (`/gate`, `/execute`, `/track/batch`
         # `_refetch_credentials`) automatically gets the header
         # without each call site having to remember to add it.
         headers[HEADER_PROTOCOL] = _protocol_header_value()
@@ -1091,12 +1091,12 @@ class Transport:
     def _send_batch_with_retry_info(self, batch: list[dict[str, Any]]) -> "SendResult":
         """Send batch to server using batch endpoint. Returns SendResult with retry info.
 
-        P0 #2: the post() call below is wrapped with _retry_with_backoff so a
+        P0 #2: the post call below is wrapped with _retry_with_backoff so a
         transient backend 5xx no longer drops the entire batch. Pre-fix the
-        call was a single self._client.post(...) followed by raise_for_status;
+        call was a single self._client.post(...) followed by raise_for_status
         a 500 raised out of the flush path, the buffer was cleared at the
         call site, and every event in the batch was lost. See
-        audit_result.md §16.B (P0 #2).
+        audit_result.md.B (P0 #2).
         """
         logger.debug(f"Sending batch of {len(batch)} events to {self.api_url}/api/v1/track/batch")
         # 2026-07-02 (v0.11.0 refactor): route through the canonical
@@ -1118,12 +1118,12 @@ class Transport:
         # a body that does not match the body the HMAC signature was
         # computed over. See plan B6.
         # The inner function is the unit of retry:
-        # * 5xx → raise_for_status() raises HTTPStatusError → retry helper backs off
-        #   and re-attempts. 429 is included in this category (the helper honors
-        #   Retry-After when present).
-        # * 4xx (other than 429) → return as-is, the outer raise_for_status()
-        #   surfaces it. These are real client bugs (auth, payload) and must
-        #   NOT be retried — retrying a 401 just wastes the user's budget.
+        # * 5xx → raise_for_status raises HTTPStatusError → retry helper backs off
+        # and re-attempts. 429 is included in this category (the helper honors
+        # Retry-After when present).
+        # * 4xx (other than 429) → return as-is, the outer raise_for_status 
+        # surfaces it. These are real client bugs (auth, payload) and must
+        # NOT be retried — retrying a 401 just wastes the user's budget.
         def _post_batch() -> httpx.Response:
             resp = self._client.post(
                 f"{self.api_url}/api/v1/track/batch",
@@ -1266,8 +1266,8 @@ class Transport:
         with only ``read``/``write`` scopes drive a sensitive-tool decision --
         scope gate would be skipped entirely.
 
-        /api/v1/gate is reserved for budget pre-flight (``Transport.check``);
-        see CLAUDE.md ``fail-CLOSED`` table for sensitive tools.
+        /api/v1/gate is reserved for budget pre-flight (``Transport.check``)
+        see ``fail-CLOSED`` table for sensitive tools.
 
         Args:
             organization_id: Organization identifier
@@ -1304,7 +1304,7 @@ class Transport:
             # but never read by the backend
             # (`backend/src/proxy/http/gate/internal.rs:42-54`). The
             # backend's `EnforcementMode` is selected by the route
-            # handler (`gate.rs:33`, `check.rs:?`, `execute.rs:59`),
+            # handler (`gate.rs:33`, `check.rs:?`, `execute.rs:59`)
             # NOT by this string. We keep the field for now to avoid a
             # breaking change for any third-party proxies that mirror
             # the wire shape, but the SDK does NOT honour this value
@@ -1360,11 +1360,11 @@ class Transport:
             # Phase 5 #5.10: ADR-008 lets callers opt into a
             # classified-error handler. Round 3 (Phase 0.4.0):
             # on_transport_error accepts both callables AND strings:
-            #   "raise"  -> raise NullRunTransportError (classified)
-            #   "open"    -> return synthetic allow with FALLBACK_* source
-            #   "closed"  -> return synthetic block with FALLBACK_* source
-            #   callable  -> call with the breaker error, return the result
-            #   None      -> fall through to the legacy fallback-mode default
+            # "raise" -> raise NullRunTransportError (classified)
+            # "open" -> return synthetic allow with FALLBACK_* source
+            # "closed" -> return synthetic block with FALLBACK_* source
+            # callable -> call with the breaker error, return the result
+            # None -> fall through to the legacy fallback-mode default
             if on_transport_error == "raise":
                 # Re-raise as a classified transport error.
                 raise NullRunTransportError(
@@ -1481,8 +1481,8 @@ class Transport:
             ),
         }
 
-        # 2026-07-02 (v0.11.0): wire-protocol v3 fields (CLAUDE.md
-        # §16). Forwarded only when present so legacy /gate callers
+        # 2026-07-02 (v0.11.0): wire-protocol v3 fields (
+        #). Forwarded only when present so legacy /gate callers
         # (which never set chain_id) keep their previous payload
         # shape. The backend treats missing as "single-shot Hard".
         if check_request.get("chain_id") is not None:
@@ -1609,12 +1609,12 @@ class Transport:
             )
         )
 
-        # 2026-07-02 (v0.11.0 refactor): WS upgrade is a GET-with-no-body,
+        # 2026-07-02 (v0.11.0 refactor): WS upgrade is a GET-with-no-body
         # so the signed-headers helper (which adds HMAC headers for
         # the body) does not fit. We use the GET helper instead —
         # same Content-Type + X-API-Key + Authorization +
         # X-NULLRUN-PROTOCOL + trace context shape, no HMAC.
-        # The backend's protocol middleware (CLAUDE.md §32) runs on
+        # The backend's protocol middleware runs on
         # the WS upgrade path too, so the header is mandatory here.
         headers = self._auth_headers_for_get()
 
@@ -1704,46 +1704,46 @@ class Transport:
             logger.error(f"Error refetching credentials: {e}")
 
     # =============================================================================
-    # Wire-protocol v3 endpoints (CLAUDE.md §3, §13, §16, §17, §22-§26, §29)
+    # Wire-protocol v3 endpoints
     # =============================================================================
     #
     # The v3 wire contract adds six endpoints that the legacy /gate +
     # /execute + /track/batch surface does not cover. Each new method
     # follows the same shape as the existing `check` method:
     #
-    #   1. Build headers via ``_build_signed_headers`` (gets X-API-Key +
-    #      Authorization + X-NULLRUN-PROTOCOL + HMAC + trace context).
-    #   2. Serialise the body via ``_signed_request_body`` so the wire
-    #      bytes match the HMAC-signed bytes.
-    #   3. POST through the shared ``self._client`` (mTLS, connection
-    #      pool, circuit breaker all apply).
-    #   4. Map non-2xx responses through ``_parse_v3_error_envelope``
-    #      so callers can ``except NullRunBudgetError`` / ``except
-    #      NullRunConsumeOverbudgetError`` / etc. without parsing the
-    #      raw error_code string.
+    # 1. Build headers via ``_build_signed_headers`` (gets X-API-Key +
+    # Authorization + X-NULLRUN-PROTOCOL + HMAC + trace context).
+    # 2. Serialise the body via ``_signed_request_body`` so the wire
+    # bytes match the HMAC-signed bytes.
+    # 3. POST through the shared ``self._client`` (mTLS, connection
+    # pool, circuit breaker all apply).
+    # 4. Map non-2xx responses through ``_parse_v3_error_envelope``
+    # so callers can ``except NullRunBudgetError`` / ``except
+    # NullRunConsumeOverbudgetError`` / etc. without parsing the
+    # raw error_code string.
 
     def check_v3(
         self,
         request: dict[str, Any],
         on_transport_error: Callable[[Exception], dict[str, Any]] | str | None = None,
     ) -> dict[str, Any]:
-        """Pre-execution gate — wire-protocol v3 (drift.md B1 fix 2026-07-04).
+        """Pre-execution gate — wire-protocol v3 (B1 fix 2026-07-04).
 
         Pre-fix this method POSTed to ``/api/v1/check``. That endpoint
         was removed on 2026-06-27 — the handler now returns
         ``410 Gone`` with a ``replacement: /api/v1/gate`` hint. The
-        SDK's ``check()`` method already targets ``/api/v1/gate`` and
-        forwards every v3 wire field (CLAUDE.md §16) — ``chain_id``,
+        SDK's ``check `` method already targets ``/api/v1/gate`` and
+        forwards every v3 wire field — ``chain_id``
         ``chain_op``, ``idempotency_key``, ``stream``. This method
         is kept as a v3-named alias so existing call sites and tests
-        continue to work; internally it delegates to ``check()`` with
+        continue to work; internally it delegates to ``check `` with
         the same body.
 
         Args:
-            request: Gate request body. Must include ``organization_id``,
+            request: Gate request body. Must include ``organization_id``
                 ``execution_id`` (for backward compat — server mints its
                 own on /check), ``operation_id``, and ``check_type``.
-            on_transport_error: Mirrors the ``check()`` flag.
+            on_transport_error: Mirrors the ``check `` flag.
 
         Returns:
             Parsed JSON dict, augmented with ``decision_source =
@@ -1751,9 +1751,9 @@ class Transport:
             fallback synthetic response.
 
         Raises:
-            NullRunAuthenticationError: 401/403 (PROTOCOL_TOO_OLD,
+            NullRunAuthenticationError: 401/403 (PROTOCOL_TOO_OLD
                 PROTOCOL_TOO_NEW, API_KEY_REVOKED, CHAIN_CROSS_ORG).
-            NullRunConsumeOverbudgetError: 422 (placeholder for /track;
+            NullRunConsumeOverbudgetError: 422 (placeholder for /track
                 not raised on /gate).
             NullRunBudgetError: 402 BUDGET_HARD_BLOCKED /
                 BUDGET_SOFT_BLOCKED / BUDGET_OVERDRAFT_EXCEEDED.
@@ -1763,9 +1763,9 @@ class Transport:
             NullRunBackendError: 5xx / BUDGET_DATA_UNAVAILABLE /
                 RATE_LIMIT_REDIS_UNAVAILABLE.
         """
-        # drift.md 2026-07-04 (B1): /api/v1/check returns 410 Gone.
-        # ``check()`` already targets /api/v1/gate with all v3 wire
-        # fields forwarded (chain_id, chain_op, idempotency_key,
+        # 2026-07-04 (B1): /api/v1/check returns 410 Gone.
+        # ``check `` already targets /api/v1/gate with all v3 wire
+        # fields forwarded (chain_id, chain_op, idempotency_key
         # stream, tools). Delegate rather than duplicate the wire
         # shape — single source of truth for the v3 body.
         return self.check(request, on_transport_error=on_transport_error)
@@ -1776,10 +1776,10 @@ class Transport:
     ) -> dict[str, Any]:
         """POST /api/v1/track — wire-protocol v3 single-event consume.
 
-        CLAUDE.md §5, §22-§25. The single-event path is the v3
+. The single-event path is the v3
         replacement for the legacy `/api/v1/track/batch` POST body.
         It runs the CONSUME_SCRIPT invariant
-        ``actual_cost <= reserved_cents + epsilon_cents`` (§25,
+        ``actual_cost <= reserved_cents + epsilon_cents`` (§25
         ADR-005) and rejects with 422 CONSUME_OVERBUDGET on
         violation. The reserved binding is the one created by the
         matching ``/check`` call (same ``reservation_id``).
@@ -1801,32 +1801,32 @@ class Transport:
                   pricing policy; sending a wrong number risks
                   double-billing, see _WIRE_STRIP_FIELDS in runtime.py)
                 * ``cost_source`` (str, ``"provisional"`` /
-                  ``"authoritative"`` per §22 — SDK always emits
+                  ``"authoritative"`` per — SDK always emits
                   ``"provisional"``)
 
-                Optional fields: ``input_tokens``, ``output_tokens``,
-                ``model``, ``latency_ms``, ``metadata``, ``trace_id``,
-                ``span_id``, ``agent_id``, ``environment``,
-                ``agent_type``, ``attempt_index``, ``is_retry``,
+                Optional fields: ``input_tokens``, ``output_tokens``
+                ``model``, ``latency_ms``, ``metadata``, ``trace_id``
+                ``span_id``, ``agent_id``, ``environment``
+                ``agent_type``, ``attempt_index``, ``is_retry``
                 ``idempotency_key``.
 
         Returns:
             Parsed JSON dict with at least
-            ``{"status": "ok"|"idempotent_replay", ...}``.
+            ``{"status": "ok"|"idempotent_replay",...}``.
 
         Raises:
             NullRunConsumeOverbudgetError: 422 CONSUME_OVERBUDGET —
                 ``actual_cost > reserved + epsilon_cents``. The
-                reservation is NOT silently re-reserved (§25).
+                reservation is NOT silently re-reserved.
             NullRunBackendError: 503 RESERVATION_NOT_FOUND /
                 EXECUTION_NOT_BOUND.
             NullRunAuthenticationError: 401/403.
 
-        drift.md 2026-07-04 (B2): pre-fix this docstring (and the
+         2026-07-04 (B2): pre-fix this docstring (and the
         surrounding module comment) described a fictitious wire
-        shape ``{execution_id, actual_cost_cents, api_key_id,
+        shape ``{execution_id, actual_cost_cents, api_key_id
         cost_source}``. The backend's actual ``TrackRequestRaw`` is
-        ``{workflow_id, tokens, cost_cents, ...}``; ``execution_id``
+        ``{workflow_id, tokens, cost_cents,...}``; ``execution_id``
         is replaced by ``reservation_id``, ``actual_cost_cents`` is
         replaced by ``cost_cents`` (the SDK always sends 0 — see
         ``_WIRE_STRIP_FIELDS``), and ``api_key_id`` is derived
@@ -1862,7 +1862,7 @@ class Transport:
     ) -> dict[str, Any]:
         """POST /api/v1/cancel — cancel an in-flight execution.
 
-        CLAUDE.md §23 (idempotency contract). The server uses
+. The server uses
         ``cancel:{execution_id}`` SETNX to deduplicate repeated
         cancellations: a 200 OK response is idempotent. A
         non-existent ``execution_id`` returns 404 — we surface it
@@ -1877,8 +1877,8 @@ class Transport:
                 cancellation (audit trail).
 
         Returns:
-            Parsed JSON dict (typically ``{"status": "ok",
-            "execution_id": ..., "cancelled_at": ts}``).
+            Parsed JSON dict (typically ``{"status": "ok"
+            "execution_id":..., "cancelled_at": ts}``).
         """
         request: dict[str, Any] = {"execution_id": execution_id}
         if reason:
@@ -1912,11 +1912,11 @@ class Transport:
     ) -> dict[str, Any]:
         """POST /api/v1/heartbeat — extend a chain's idle TTL.
 
-        CLAUDE.md §26. The server runs
+. The server runs
         ``EXPIRE chain:{org}:{chain_id} 300`` atomically and
         deduplicates repeated heartbeats via
         ``heartbeat:{chain_id}:{ts_floor_30s}`` SETNX
-        (TTL = 35s — the 5s tail absorbs ±5s skew per §26).
+        (TTL = 35s — the 5s tail absorbs ±5s skew per).
 
         Recommended cadence: every 30s of wall-clock time (the
         SDK's ``ping_chain`` helper wraps this method with the
@@ -1927,8 +1927,8 @@ class Transport:
             chain_id: Active chain_id.
 
         Returns:
-            Parsed JSON dict (typically ``{"status": "ok",
-            "chain_id": ..., "last_active": ts}``).
+            Parsed JSON dict (typically ``{"status": "ok"
+            "chain_id":..., "last_active": ts}``).
         """
         request = {"chain_id": chain_id}
         headers = self._build_signed_headers()
@@ -1958,7 +1958,7 @@ class Transport:
         chain_id: str,
     ) -> dict[str, Any]:
         """Close a chain explicitly via /api/v1/gate with chain_op=end
-        (CLAUDE.md §6, drift.md B3 fix 2026-07-04).
+.
 
         Pre-fix this method POSTed to ``/api/v1/chain/end``. That
         endpoint was never registered on the backend
@@ -1975,16 +1975,16 @@ class Transport:
             chain_id: Chain to close.
 
         Returns:
-            Parsed JSON dict (typically ``{"decision": "allow",
-            "chain_id": ...}``).
+            Parsed JSON dict (typically ``{"decision": "allow"
+            "chain_id":...}``).
         """
-        # drift.md 2026-07-04 (B3): POST /api/v1/gate with
+        # 2026-07-04 (B3): POST /api/v1/gate with
         # ``chain_op: "end"``. The backend's gate handler
         # (``backend/src/proxy/http/gate/gate.rs``) accepts the same
-        # body shape as ``check()`` — the ``chain_op`` field routes
+        # body shape as ``check `` — the ``chain_op`` field routes
         # the request through the chain state machine rather than the
         # budget reserve path. No execution_id minting or reservation
-        # is created on this code path (the chain is being torn down,
+        # is created on this code path (the chain is being torn down
         # not started), so we reuse the caller's chain_id as a stable
         # placeholder for the signature.
         request = {
@@ -1992,7 +1992,7 @@ class Transport:
             "chain_op": "end",
             # execution_id is required by the backend's gate handler
             # even on chain_end — the handler reads it but does not
-            # mint a reservation for op=end. Use a fresh uuidv7 per
+            # mint a reservation for op=end. Use a fresh uuidv7
             # call (the server ignores it on this path).
             "execution_id": uuid.uuid4().hex,
         }
@@ -2024,14 +2024,14 @@ class Transport:
     ) -> dict[str, Any]:
         """GET /api/v1/budget/approximate — UI-only budget estimation.
 
-        CLAUDE.md §17. NEVER for enforcement — the backend stamps
+. NEVER for enforcement — the backend stamps
         ``is_approximate: true`` on every response. The endpoint
         returns 503 ``BUDGET_DATA_UNAVAILABLE`` if all three sources
         (Redis period counter → Postgres cost_events → last-known
         cache) fail — NEVER returns 0, because a UI that displays
         "≈ $0 spent" when no data is available misleads the user.
 
-        Used by ``nullrun.cost_dashboard()`` / ``examples/cost_dashboard.py``
+        Used by ``nullrun.cost_dashboard `` / ``examples/cost_dashboard.py``
         and the dashboard rollup panel.
 
         Args:
@@ -2039,7 +2039,7 @@ class Transport:
                 transport's bound org via the auth/verify result.
 
         Returns:
-            Parsed JSON dict with ``current_spend_cents_estimate``,
+            Parsed JSON dict with ``current_spend_cents_estimate``
             ``is_approximate: True``, ``source`` (BudgetSource enum
             string), ``confidence`` (High/Medium/Low), and
             ``last_updated_at``.
@@ -2050,11 +2050,11 @@ class Transport:
                 unavailable" + retry button, NOT "$0 spent".
             NullRunAuthenticationError: 401/403.
         """
-        # ApproximateBudget uses GET (not POST) per the wire contract;
-        # no signed body, so we use _auth_headers() directly instead
-        # of _build_signed_headers().
+        # ApproximateBudget uses GET (not POST) per the wire contract
+        # no signed body, so we use _auth_headers directly instead
+        # of _build_signed_headers.
         #
-        # drift.md 2026-07-04 (M3 fix): the backend's
+        # 2026-07-04 (M3 fix): the backend's
         # ``approximate_budget_handler`` (``backend/src/proxy/http/
         # budget.rs:130-145``) resolves the org from the X-API-Key
         # / Authorization header — it does NOT take a ``organization_id``
@@ -2104,9 +2104,9 @@ class Transport:
 # This is the live wire path. It supersedes the frozen
 # ``_parse_error_envelope`` helper below (which the test suite still
 # references as a frozen contract test). The v3 parser exists because
-# the new endpoints (/check, /track, /cancel, /heartbeat, /chain/end,
+# the new endpoints (/check, /track, /cancel, /heartbeat, /chain/end
 # /budget/approximate) return machine-readable error envelopes with
-# codes from CLAUDE.md §13 — PROTOCOL_TOO_OLD, CONSUME_OVERBUDGET,
+# codes from — PROTOCOL_TOO_OLD, CONSUME_OVERBUDGET
 # CHAIN_CROSS_ORG, WORKFLOW_INACTIVE, REDIS_UNAVAILABLE, etc.
 #
 # The mapping table lives at the bottom of the file so the wire-shape
@@ -2120,8 +2120,8 @@ def _parse_v3_error_envelope(
     SDK exception.
 
     The backend returns errors as a JSON envelope of the shape
-    ``{"error_code": "BUDGET_HARD_BLOCKED", "error_message": "...",
-    "details": {...}, "retry_after_ms": N}`` (CLAUDE.md §13). The
+    ``{"error_code": "BUDGET_HARD_BLOCKED", "error_message": "..."
+    "details": {...}, "retry_after_ms": N}``. The
     parser maps the backend's ``error_code`` string to the closest
     SDK exception class, attaching the structured envelope fields
     as instance attributes so callers can introspect them.
@@ -2131,7 +2131,7 @@ def _parse_v3_error_envelope(
     """
     # Lazy imports: the exception classes import the transport
     # types (TransportErrorSource), so a top-level import here
-    # would create a cycle. The price is one extra import per
+    # would create a cycle. The price is one extra import
     # non-2xx response — irrelevant for the failure path.
     from nullrun.breaker.exceptions import (
         NullRunBackendError,
@@ -2171,10 +2171,10 @@ def _parse_v3_error_envelope(
             pass
 
     # Per-class dispatcher. Each exception has its own constructor
-    # signature (RateLimitError requires source+endpoint,
+    # signature (RateLimitError requires source+endpoint
     # NullRunBackendError requires endpoint+status_code, etc.) so a
     # uniform ``error_cls(**kwargs)`` does not work. The switches
-    # below mirror the exact field mapping from CLAUDE.md §13.
+    # below mirror the exact field mapping from.
     full_message = f"{endpoint}: {message}"
 
     if backend_code == "PROTOCOL_TOO_OLD" or backend_code == "PROTOCOL_TOO_NEW":
@@ -2214,7 +2214,7 @@ def _parse_v3_error_envelope(
     if backend_code == "RATE_LIMIT_REDIS_UNAVAILABLE":
             # NullRunRateLimitRedisError → NullRunInfrastructureError
             # → NullRunError base. Base constructor accepts only
-            # message + (error_code, user_action, retryable, docs_url,
+            # message + (error_code, user_action, retryable, docs_url
             # cause) — NOT a generic ``details=``. The catalog value
             # already encodes error_code + retryable, so we just pass
             # the message.
@@ -2252,7 +2252,7 @@ def _parse_v3_error_envelope(
             # the workflow_id / reason from the envelope details if
             # present, otherwise synthesise from the endpoint label.
             #
-            # 2026-07-04 (drift.md P1-1): forward the wire HTTP
+            # 2026-07-04: forward the wire HTTP
             # status so FastAPI exception handlers reading
             # ``exc.status_code`` get 402 for BUDGET_HARD_BLOCKED
             # (not None / 500). The backend maps each budget
@@ -2266,7 +2266,7 @@ def _parse_v3_error_envelope(
                 status_code=status,
             )
         if catalog is NullRunRateLimitRedisError:
-            # NullRunError base takes (message, error_code=, user_action=,
+            # NullRunError base takes (message, error_code=, user_action=
             # retryable=, docs_url=, cause=). The catalog value here
             # already encodes error_code + retryable, so we pass
             # the message only.
@@ -2336,7 +2336,7 @@ def _build_v3_error_code_map() -> dict[str, type[BaseException]]:
     )
 
     return {
-        # 400 — protocol mismatch (CLAUDE.md §32)
+        # 400 — protocol mismatch
         "PROTOCOL_TOO_OLD": NullRunProtocolError,
         "PROTOCOL_TOO_NEW": NullRunProtocolError,
         # 402 — budget family
@@ -2353,7 +2353,7 @@ def _build_v3_error_code_map() -> dict[str, type[BaseException]]:
         "WORKFLOW_INACTIVE": NullRunWorkflowInactiveError,
         # 401/403 — auth
         "API_KEY_REVOKED": NullRunAuthError,
-        # 422 — consume invariant violation (CLAUDE.md §25)
+        # 422 — consume invariant violation
         "CONSUME_OVERBUDGET": NullRunConsumeOverbudgetError,
         # 429 — rate limit
         "RATE_LIMIT_EXCEEDED": RateLimitError,
@@ -2372,19 +2372,19 @@ _V3_ERROR_CODE_MAP: dict[str, type[BaseException]] = _build_v3_error_code_map()
 # drift; the resolution was to mark it stable rather than wire it up.
 #
 # Rationale for keeping it as dead code instead of deleting:
-#   1. ``tests/test_error_envelope.py`` and
-#      ``tests/test_transport_branches.py`` import this helper as a
-#      pure-function reference for the canonical mapping table the
-#      tests encode. Deleting the helper would force the tests to
-#      duplicate the mapping, which is exactly the kind of drift the
-#      helper exists to prevent.
-#   2. Live SDK endpoints each do their own ``raise_for_status()`` or
-#      status-code branch because the production error_code taxonomy
-#      (``NR-A003``, ``NR-B001``, …) is intentionally separate from
-#      the backend's SCREAMING_SNAKE envelope codes. Wiring the
-#      helper into the wire path would require picking one
-#      taxonomy, and neither is wrong — they serve different
-#      audiences (machine triage vs. end-user message).
+# 1. ``tests/test_error_envelope.py`` and
+# ``tests/test_transport_branches.py`` import this helper as a
+# pure-function reference for the canonical mapping table the
+# tests encode. Deleting the helper would force the tests to
+# duplicate the mapping, which is exactly the kind of drift the
+# helper exists to prevent.
+# 2. Live SDK endpoints each do their own ``raise_for_status `` or
+# status-code branch because the production error_code taxonomy
+# (``NR-A003``, ``NR-B001``, …) is intentionally separate from
+# the backend's SCREAMING_SNAKE envelope codes. Wiring the
+# helper into the wire path would require picking one
+# taxonomy, and neither is wrong — they serve different
+# audiences (machine triage vs. end-user message).
 #
 # DO NOT call this from a wire path without first deciding which
 # taxonomy wins. If you ever do wire it up, delete this ADR block

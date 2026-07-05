@@ -8,7 +8,7 @@ backend (if one is running) and verifies that an OpenAI call
 made through the SDK shows up in the usage endpoint.
 
 Run with:
-    NULLRUN_E2E_BASE_URL=http://localhost:8080 \
+    NULLRUN_E2E_BASE_URL=http:/localhost:8080 \
     NULLRUN_E2E_API_KEY=nr_live_test_xxx \
     NULLRUN_E2E_ORG_ID=org-e2e \
     pytest tests/test_e2e_observation.py -q
@@ -120,7 +120,7 @@ def test_e2e_manual_track_event_lands_in_backend(e2e_workflow_id: str) -> None:
 @pytest.mark.skipif(not HAS_OPENAI_KEY, reason="OPENAI_API_KEY not set")
 def test_e2e_openai_call_lands_in_backend(e2e_workflow_id: str) -> None:
     """
-    init → openai.OpenAI().chat.completions.create(...) → backend records.
+    init → openai.OpenAI.chat.completions.create(...) → backend records.
 
     Exercises the full auto-instrumentation path: vendor patch → SDK
     transport → backend ingest → /usage rollup. This is the test the

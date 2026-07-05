@@ -10,7 +10,7 @@ bypass were broken).
 
 The bypass is implemented in ``breaker/exceptions.py`` by
 calling ``BaseException.__init__`` directly instead of
-``super().__init__()`` (which would re-emit the parent's warning).
+``super.__init__ `` (which would re-emit the parent's warning).
 This test pins the contract.
 """
 
@@ -29,9 +29,9 @@ from nullrun.breaker.exceptions import (
 class TestWorkflowKilledInterruptBypass:
     def test_interrupt_does_not_emit_deprecation_warning(self):
         """Constructing ``WorkflowKilledInterrupt`` must not emit
-        the parent's ``DeprecationWarning``. If this test fails,
+        the parent's ``DeprecationWarning``. If this test fails
         a recent refactor probably re-introduced the
-        ``super().__init__()`` call in the subclass.
+        ``super.__init__ `` call in the subclass.
         """
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
@@ -72,7 +72,7 @@ class TestWorkflowKilledInterruptBypass:
     def test_interrupt_is_baseexception_not_exception(self):
         """``WorkflowKilledInterrupt`` is a ``BaseException`` subclass
         by design — ``except Exception`` in user code must NOT
-        catch a kill signal. Pinned by docs/kill-contract.md §6.
+        catch a kill signal. Pinned by docs/kill-contract.md.
         """
         assert issubclass(WorkflowKilledInterrupt, BaseException)
         assert not issubclass(WorkflowKilledInterrupt, Exception)

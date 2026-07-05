@@ -8,7 +8,7 @@ Phase 7 of the production-readiness plan adds three new patches:
 - autogen (BaseChatAgent.on_messages + OpenAIChatCompletionClient.create)
 
 The 6 placeholder tests removed on 2026-06-28 were
-``@pytest.mark.skipif(True, ...)`` stubs with empty bodies — they
+``@pytest.mark.skipif(True,...)`` stubs with empty bodies — they
 provided no coverage and gave a false sense of green-on-arrival.
 Real coverage for these frameworks lives in the framework-specific
 integration suites (one per repo, gated on the framework being
@@ -93,13 +93,13 @@ def test_new_framework_modules_importable():
 # Sprint 2.9 (B47): safe_patch wrapper for centralised error visibility
 # ===========================================================================
 # Pre-fix: the auto-instrumentation modules had 25+ scattered
-# ``try/except Exception: pass  # pragma: no cover`` blocks. A
+# ``try/except Exception: pass # pragma: no cover`` blocks. A
 # patch failure (e.g. a vendor SDK signature change) would
 # silently disable cost tracking. The operator would only find
 # out when the bill arrived.
 #
 # Post-fix: every patch call in `auto_instrument` is wrapped in
-# ``safe_patch()`` which logs at WARNING with the patch name +
+# ``safe_patch `` which logs at WARNING with the patch name +
 # exception. These tests pin the wrapper contract.
 
 

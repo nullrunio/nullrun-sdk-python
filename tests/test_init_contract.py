@@ -1,14 +1,14 @@
 """
-Regression tests for the 0.3.0 init() contract.
+Regression tests for the 0.3.0 init contract.
 
 The 0.3.0 T3-S2 work shipped the "no silent local-mode fallback" rule.
-`nullrun.init()` and `NullRunRuntime(...)` MUST raise
+`nullrun.init ` and `NullRunRuntime(...)` MUST raise
 `NullRunAuthenticationError` when neither `api_key` kwarg nor
 `NULLRUN_API_KEY` env is set. This is the safety contract the whole
 release shipped. A refactor that re-introduces a silent fallback
 would land without CI catching it unless this test is in place.
 
-Also pins the singleton-state contract (plan item B3) and the
+Also pins the singleton-state contract (item B3) and the
 unknown-kwarg rejection (the 7-symbol surface of the SDK is
 `init(api_key, api_url, debug)` — no `organization_id`).
 """
@@ -30,7 +30,7 @@ class TestInitRaisesWithoutApiKey:
     """T3-S2 (0.3.0): api_key is required. A missing key must hard-error."""
 
     def test_init_raises_when_api_key_missing(self, monkeypatch, mock_api):
-        """``nullrun.init()`` with no api_key and no env raises
+        """``nullrun.init `` with no api_key and no env raises
         ``NullRunAuthenticationError``. The error message must mention
         the api_key requirement so the user knows what to fix.
         """
@@ -41,7 +41,7 @@ class TestInitRaisesWithoutApiKey:
     def test_runtime_init_raises_when_api_key_missing(self, monkeypatch, mock_api):
         """``NullRunRuntime(...)`` with no api_key and no env raises.
         This is the direct construction path used by tests and
-        advanced callers; the public ``init()`` raises first with
+        advanced callers; the public ``init `` raises first with
         a friendlier message, but this constructor-level raise is
         the contract for everyone else.
         """
@@ -76,9 +76,9 @@ class TestInitRejectsUnknownKwargs:
 
 
 class TestInitWritesAllSingletonSlots:
-    """Plan B3: init() must atomically write all three singleton slots
+    """Plan B3: init must atomically write all three singleton slots
     so the decorator's @protect wrapper, the runtime module's
-    track_* helpers, and NullRunRuntime.get_instance() all see the
+    track_* helpers, and NullRunRuntime.get_instance all see the
     same instance.
     """
 
@@ -94,7 +94,7 @@ class TestInitWritesAllSingletonSlots:
             rt.shutdown()
 
     def test_init_is_thread_safe(self, monkeypatch, mock_api):
-        """Concurrent init() calls must not leave the three singleton
+        """Concurrent init calls must not leave the three singleton
         slots in an inconsistent state (one slot pointing at runtime
         A, the other two at runtime B). The init_lock added in 0.3.1
         serialises the writes.
@@ -147,7 +147,7 @@ class TestInitWritesAllSingletonSlots:
 
 class TestInitCapabilityProbeLogging:
     """Pins the ``logger.warning/info/debug`` branches added in 0.12.0
-    when ``init()`` runs the /health capability probe. These tests
+    when ``init `` runs the /health capability probe. These tests
     exist to keep the new logging paths covered so a refactor that
     accidentally drops one (e.g. replacing ``logger.info`` with
     ``print``) gets caught in CI rather than at first production init.
@@ -174,13 +174,13 @@ class TestInitCapabilityProbeLogging:
     def test_init_replaces_existing_runtime_logs_warning(
         self, monkeypatch, mock_api, caplog
     ):
-        """A second ``init()`` while a runtime is still alive logs a
+        """A second ``init `` while a runtime is still alive logs a
         WARNING about shutting down the old one (C3 fix).
 
-        Pins the ``logger.warning("nullrun.init() called while a
-        previous runtime is still alive ...")`` branch on lines 301-305
-        and the ``logger.warning("previous runtime shutdown raised ...")``
-        on line 309. We force the previous ``shutdown()`` to raise so
+        Pins the ``logger.warning("nullrun.init called while a
+        previous runtime is still alive...")`` branch on lines 301-305
+        and the ``logger.warning("previous runtime shutdown raised...")``
+        on line 309. We force the previous ``shutdown `` to raise so
         the second log line (the except branch) is exercised too.
         """
         import logging
@@ -189,7 +189,7 @@ class TestInitCapabilityProbeLogging:
         monkeypatch.setenv("NULLRUN_API_URL", "https://api.test.nullrun.io")
         first = nullrun.init()
         try:
-            # Force the C3 path's existing.shutdown() call to raise
+            # Force the C3 path's existing.shutdown call to raise
             # so the except branch on line 308-311 is exercised.
             first.shutdown = lambda: (_ for _ in ()).throw(  # type: ignore[method-assign]
                 RuntimeError("simulated shutdown failure")
@@ -220,10 +220,10 @@ class TestInitCapabilityProbeLogging:
     def test_init_logs_info_when_probe_unreachable(
         self, monkeypatch, mock_api, caplog
     ):
-        """When ``/health`` is unreachable, ``init()`` logs at INFO
+        """When ``/health`` is unreachable, ``init `` logs at INFO
         that the probe was skipped (does NOT fail init).
 
-        Pins the ``logger.info("nullrun.init: could not probe %s/health ...")``
+        Pins the ``logger.info("nullrun.init: could not probe %s/health...")``
         branch on lines 358-362.
         """
         import httpx
@@ -233,13 +233,13 @@ class TestInitCapabilityProbeLogging:
         monkeypatch.setenv("NULLRUN_API_KEY", "test-key-12345678")
         monkeypatch.setenv("NULLRUN_API_URL", "https://api.test.nullrun.io")
         # Override the /health mock from `mock_api` to fail. We have
-        # to do this inside the respx.mock context that mock_api opened,
+        # to do this inside the respx.mock context that mock_api opened
         # so we route through respx again rather than nesting.
         with respx.mock:
             respx.get("https://api.test.nullrun.io/health").mock(
                 return_value=httpx.Response(503)
             )
-            # Re-mock the other endpoints that init() hits so the
+            # Re-mock the other endpoints that init hits so the
             # runtime can come up cleanly.
             respx.post("https://api.test.nullrun.io/api/v1/auth/verify").mock(
                 return_value=httpx.Response(
@@ -267,7 +267,7 @@ class TestInitCapabilityProbeLogging:
         self, monkeypatch, mock_api, caplog
     ):
         """When ``probe_capabilities`` itself raises (not just returns
-        None), ``init()`` catches it and logs at DEBUG.
+        None), ``init `` catches it and logs at DEBUG.
 
         Pins the ``logger.debug("nullrun.init: capability probe raised %s", e)``
         branch on line 363-364. We force a raise by stubbing
@@ -279,7 +279,7 @@ class TestInitCapabilityProbeLogging:
         monkeypatch.setenv("NULLRUN_API_URL", "https://api.test.nullrun.io")
 
         # Force probe_capabilities to raise — the try/except wrapper
-        # in init() must catch it and log at DEBUG.
+        # in init must catch it and log at DEBUG.
         import nullrun.capabilities as _caps_mod
 
         original_probe = _caps_mod.probe_capabilities

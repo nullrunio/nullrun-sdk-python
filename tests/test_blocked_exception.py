@@ -10,7 +10,7 @@ and stored it on `self.tool_name`.
 Backwards compat: `tool_name` is optional and defaults to `None`, so
 all existing raise sites that do not pass it still work.
 
-Sprint 2.2: the previously-tested subclasses ``LoopDetectedException``,
+Sprint 2.2: the previously-tested subclasses ``LoopDetectedException``
 ``RetryStormException``, and ``RateLimitExceededException`` were
 removed because they had no in-tree callers. The base-class
 attribute surface tests below still pin the contract for any future

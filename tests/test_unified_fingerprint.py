@@ -6,18 +6,18 @@ Before this fix the httpx transport hook (``NullRunSyncTransport._emit``)
 and the LangChain callback (``NullRunCallback.on_llm_end``) each computed
 their own ``_fingerprint`` from different inputs:
 
-    httpx transport:  sha256(host|status|body)[:16]
-    LangChain callback: sha256(json({path:"langchain_callback", run_id,
-                                       response_id, model, provider,
+    httpx transport: sha256(host|status|body)[:16]
+    LangChain callback: sha256(json({path:"langchain_callback", run_id
+                                       response_id, model, provider
                                        invocation_params}))[:16]
 
 The two fingerprints could not collide, so the dedup LRU at
-``runtime.track()`` could not collapse the sibling emission for the same
-real LLM call. On a typical ``app.invoke()`` with 6 LLM calls the backend
+``runtime.track `` could not collapse the sibling emission for the same
+real LLM call. On a typical ``app.invoke `` with 6 LLM calls the backend
 saw ~12 ``llm_call`` events on the wire (2 per real call), which doubled
 the dashboard's ``llm_call_count`` and skewed ``cost_events`` aggregates.
 
-The fix: a single helper ``_fingerprint_for_llm_call(model, provider,
+The fix: a single helper ``_fingerprint_for_llm_call(model, provider
 response_id)`` that both observers call with the same three signals.
 
 Contract pinned by these tests:
@@ -33,7 +33,7 @@ Contract pinned by these tests:
 5. The dedup LRU recognises the two emissions as duplicates and only
    the first one reaches ``/track``.
 
-These tests use the real helper + a stand-in runtime (no live network),
+These tests use the real helper + a stand-in runtime (no live network)
 so they exercise the production code path without flakiness.
 """
 
@@ -115,8 +115,8 @@ def test_fingerprint_tolerates_none_response_id():
 
 
 def test_fingerprint_matches_old_body_scheme_for_none_id():
-    """Regression guard: when neither observer can recover the response id,
-    the helper still produces a deterministic key — NOT an empty string,
+    """Regression guard: when neither observer can recover the response id
+    the helper still produces a deterministic key — NOT an empty string
     which would short-circuit the dedup LRU at ``_fingerprint_is_seen``.
 
     The ``make_dedup_state`` + ``_fingerprint_is_seen`` short-circuit
@@ -191,7 +191,7 @@ def test_httpx_transport_emits_unified_fingerprint():
             response = client.post("/v1/chat/completions", json={"model": "gpt-4.1-mini"})
             assert response.status_code == 200
 
-    # Exactly one track() call from the transport.
+    # Exactly one track call from the transport.
     assert rt.track.call_count == 1
     event = rt.track.call_args_list[0][0][0]
     fp = event["_fingerprint"]
@@ -255,10 +255,10 @@ class _FakeLLMResult:
     the response_id at every location the real NullRunCallback probes.
 
     The four locations (in priority order) are:
-      1. ``response.llm_output["id"]``  (langchain-openai 1.x primary)
-      2. ``response.id``                 (some wrappers)
-      3. ``response.generations[0][0].message.id``  (AIMessage inside generation)
-      4. ``response.response_metadata["id"]``      (langchain 0.x AIMessage metadata)
+      1. ``response.llm_output["id"]`` (langchain-openai 1.x primary)
+      2. ``response.id`` (some wrappers)
+      3. ``response.generations[0][0].message.id`` (AIMessage inside generation)
+      4. ``response.response_metadata["id"]`` (langchain 0.x AIMessage metadata)
 
     Each test below exercises one of these locations and asserts the
     resulting fingerprint matches the one the httpx transport produces
@@ -463,7 +463,7 @@ def test_callback_no_id_anywhere_falls_back_to_model_provider_only():
     response = _FakeLLMResult(
         model_name="custom-model-1",
         response_id="ignored",
-        # No llm_output_id, no response_id_attr, no message_id,
+        # No llm_output_id, no response_id_attr, no message_id
         # no response_metadata_id — every id location is missing.
     )
     # Also strip llm_output["id"] explicitly.

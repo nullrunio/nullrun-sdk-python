@@ -1,4 +1,4 @@
-"""Tests for the Layer 3 ``nullrun.status()`` introspection API.
+"""Tests for the Layer 3 ``nullrun.status `` introspection API.
 
 The contract:
 
@@ -51,7 +51,7 @@ def _reset_runtime():
 
 def _make_runtime(api_key: str = "nr_live_test_key_1234") -> NullRunRuntime:
     """Construct a NullRunRuntime in _test_mode without going
-    through ``init()`` (which would try to call the backend).
+    through ``init `` (which would try to call the backend).
     """
     rt = NullRunRuntime(api_key=api_key, _test_mode=True)
     import nullrun.runtime as _rt_mod
@@ -74,8 +74,8 @@ class TestNoRuntime:
         assert err.retryable is False
 
     def test_status_never_lazily_creates_runtime(self):
-        # Sanity: calling status() must NOT trigger
-        # NullRunRuntime.get_instance() (which would itself
+        # Sanity: calling status must NOT trigger
+        # NullRunRuntime.get_instance (which would itself
         # raise a different config error about missing
         # api_key). The whole point of NR-C004 is a clean
         # "no runtime" signal.
@@ -190,7 +190,7 @@ class TestRecentErrors:
             )
         snap = ring.snapshot()
         assert len(snap) == 10
-        # The FIRST 5 were evicted; the LAST 10 (err-5 .. err-14)
+        # The FIRST 5 were evicted; the LAST 10 (err-5.. err-14)
         # are present.
         assert snap[0].message == "err-5"
         assert snap[-1].message == "err-14"
@@ -238,7 +238,7 @@ class TestWorkflowState:
 
 
 # ---------------------------------------------------------------------------
-# 6. summary() — human-readable one-liner
+# 6. summary — human-readable one-liner
 # ---------------------------------------------------------------------------
 class TestSummary:
     def test_ok_summary(self):
@@ -250,7 +250,7 @@ class TestSummary:
 
     def test_summary_with_organization_and_workflow(self):
         # Covers the ``if self.organization_id`` and
-        # ``if self.workflow_id`` branches of summary().
+        # ``if self.workflow_id`` branches of summary.
         rt = _make_runtime()
         rt.organization_id = "org_abcdef1234567890"
         rt.workflow_id = "wf_xyzzy1234567890"
@@ -260,7 +260,7 @@ class TestSummary:
         assert "wf=wf_xyzzy" in out
 
     def test_summary_includes_workflow_state_when_not_normal(self):
-        # Branch: ``self.workflow_state and .state != "Normal"``.
+        # Branch: ``self.workflow_state and.state != "Normal"``.
         rt = _make_runtime()
         rt.workflow_id = "wf-test-1"
         rt._set_remote_state(
@@ -285,7 +285,7 @@ class TestSummary:
 
     def test_summary_includes_backend_unreachable(self):
         # Branch: ``self.backend_reachable is False``.
-        # ``backend_reachable`` is a local in ``status()``, not a stored
+        # ``backend_reachable`` is a local in ``status ``, not a stored
         # attribute on the runtime — construct the snapshot directly.
         s = NullRunStatus(
             state="degraded",

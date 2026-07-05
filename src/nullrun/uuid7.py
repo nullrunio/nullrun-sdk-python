@@ -11,17 +11,17 @@ Why UUID v7 (not v4):
   parsing `created_at` timestamps.
 - 122 bits of entropy (same as v4) — collision-free in
   practice even at fleet-wide throughput.
-- Monotonic sub-millisecond precision in the leading 48 bits,
+- Monotonic sub-millisecond precision in the leading 48 bits
   which means log scrapers can bucket events into 5-second
   windows purely by ID.
 
 Implementation note: this is the standard "Unix timestamp ms in
 48 bits + 4-bit version + 12 bits rand_a + 62 bits rand_b" layout
-per RFC 9562 §5.7. We use `secrets.token_bytes(10)` for the
+per RFC 9562. We use `secrets.token_bytes(10)` for the
 random component (cryptographically secure) rather than the
 stdlib `random` module (predictable for tests).
 
-Per CLAUDE.md §24 the backend's `gate_reserve_v3` also mints
+Per the backend's `gate_reserve_v3` also mints
 its own UUID v7 — the two paths produce the same layout so
 both sides of the wire agree on the sort order.
 """
@@ -32,9 +32,9 @@ import secrets
 import time
 import uuid
 
-# UUID v7 layout per RFC 9562 §5.7:
-#   48 bits unix_ts_ms | 4 bits version (0x7) | 12 bits rand_a |
-#   2 bits variant (0b10) | 62 bits rand_b
+# UUID v7 layout per RFC 9562:
+# 48 bits unix_ts_ms | 4 bits version (0x7) | 12 bits rand_a |
+# 2 bits variant (0b10) | 62 bits rand_b
 #
 # Stdlib's `uuid.UUID` accepts bytes via `uuid.UUID(bytes=...)`
 # and the layout is big-endian, so we pack the 16-byte array
@@ -51,7 +51,7 @@ def uuid7() -> uuid.UUID:
 
     Example:
         >>> from nullrun.uuid7 import uuid7
-        >>> id_ = uuid7()
+        >>> id_ = uuid7 
         >>> str(id_)
         '0190c5b5-7c9a-7def-8a1b-...'
     """

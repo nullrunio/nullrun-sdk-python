@@ -34,7 +34,7 @@ import httpx
 # these tests self-contained.
 def _make_request() -> httpx.Request:
     """Audit 2026-06-29: in production the request body carries
-    ``{"model": "gpt-4.1-mini", ...}`` which is what
+    ``{"model": "gpt-4.1-mini",...}`` which is what
     ``_extract_model_from_request_body`` reads when the response body
     is too large to inspect. The streaming-skipped path now drops the
     event if BOTH the response body AND the request body fail to

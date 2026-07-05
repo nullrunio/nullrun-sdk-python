@@ -2,9 +2,9 @@
 tests/test_track_batch_retry.py — regression coverage for P0 #2.
 
 Pre-fix, _send_batch_with_retry_info issued a single self._client.post(...)
-and immediately called raise_for_status(). A backend 500 raised out of the
+and immediately called raise_for_status. A backend 500 raised out of the
 flush path; the in-memory buffer was cleared at the call site and every
-event in the batch was lost. P0 #2 wraps the post() in _retry_with_backoff
+event in the batch was lost. P0 #2 wraps the post in _retry_with_backoff
 so a transient 5xx is retried (max 3 attempts, exponential backoff +
 jitter, capped at 10s). 429s are also retried (the helper honors
 Retry-After when present).
@@ -13,7 +13,7 @@ These tests pin the new contract:
 
 * a single 5xx followed by 200 — batch is accepted, only one event-loss
   is observable by the caller.
-* three consecutive 5xx — final call raises after exhausting retries;
+* three consecutive 5xx — final call raises after exhausting retries
   the caller learns the batch was lost (acceptable: backend confirmed
   it could not accept).
 * 429 with Retry-After — helper honors the header before the next

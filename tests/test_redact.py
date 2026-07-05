@@ -10,11 +10,11 @@ often >50 chars before the dict payload), the substring was gone
 from the truncated slice, the redact pass saw nothing, and the raw
 ``details={...}`` payload leaked into the span_event.
 
-Post-fix ``_safe_repr`` runs redact-then-truncate on the full repr,
+Post-fix ``_safe_repr`` runs redact-then-truncate on the full repr
 and is the single source of truth (P3-3).
 
 SECURITY INVARIANT (the only thing this test guards):
-    The PII payload (``details={'card_number': ...}``) MUST NOT
+    The PII payload (``details={'card_number':...}``) MUST NOT
     appear in the output of ``_safe_repr``, regardless of whether
     the ``<redacted>`` marker is preserved by the truncate.
 
@@ -50,7 +50,7 @@ class TestSafeReprRedactsBeforeTruncating:
         )
 
     def test_details_within_truncation_window_is_redacted(self):
-        """Sanity: when ``details=`` is within the truncation window,
+        """Sanity: when ``details=`` is within the truncation window
         redaction happens AND the marker is preserved (pre-fix
         happy path is unaffected by the post-fix order)."""
         value = "details={'x': 1}"
@@ -117,7 +117,7 @@ class TestSafeErrorStrPipeline:
         assert _safe_error_str(None) is None
 
     def test_safe_error_str_preserves_non_details_text(self):
-        """Redaction is surgical — only ``details={...}`` is replaced,
+        """Redaction is surgical — only ``details={...}`` is replaced
         free-form text around it is preserved (when not truncated)."""
         exc_msg = "Operation failed: foo bar details={'secret': 'x'} baz"
         out = _safe_error_str(Exception(exc_msg))

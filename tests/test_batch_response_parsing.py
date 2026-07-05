@@ -8,7 +8,7 @@ Single /track still uses `TrackResponse.actions_taken` (Vec<ActionTaken>)
 
 These tests pin both schemas so a future backend rename can't silently
 break the SDK. Forward-compat path (legacy `actions_taken` dropped in
-SDK 0.8.0 per CHANGELOG §0.8.0) is documented but no longer parsed.
+SDK 0.8.0 per CHANGELOG.0) is documented but no longer parsed.
 """
 
 from __future__ import annotations
@@ -61,7 +61,7 @@ def _runtime(api_key: str = "test-key"):
     """Build a runtime with the test API key and base URL.
 
     Returns the constructed instance directly. ``NullRunRuntime.__init__``
-    does NOT assign ``_instance`` — only ``get_instance()`` does that —
+    does NOT assign ``_instance`` — only ``get_instance `` does that —
     so reading ``NullRunRuntime._instance`` after a direct constructor
     call returns ``None``.
     """
@@ -113,7 +113,7 @@ def test_new_schema_actions_and_messages_processed(mock_api):
     # NOTE: the fixture already wraps the test in `respx.mock(...)`, so
     # we must NOT add another `with mock_api:` here — re-entering the
     # router clears the auth/verify mock registered by the fixture
-    # (respx's `__exit__` calls `rollback()` + `reset()`).
+    # (respx's `__exit__` calls `rollback ` + `reset `).
     rt._transport._send_batch_with_retry_info(
         batch=[
             {
@@ -219,7 +219,7 @@ def test_legacy_actions_taken_string_field_does_not_crash(mock_api):
     )
 
     # Should NOT raise. The legacy `actions_taken` field is ignored
-    # (per transport.py:1176-1177 comment, "legacy actions_taken
+    # (transport.py:1176-1177 comment, "legacy actions_taken
     # fallback was removed"). `actions = data.get("actions") or []`
     # returns [].
     rt._transport._send_batch_with_retry_info(

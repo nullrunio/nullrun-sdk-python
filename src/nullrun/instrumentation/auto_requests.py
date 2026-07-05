@@ -29,7 +29,7 @@ What this module owns:
   `urllib3` patch (which `requests` uses under the hood) can skip
   already-tracked requests. See plan section P2 / "requests ↔ urllib3".
 
-0.9.0: counter-bump helpers (`_safe_bump_coverage`,
+0.9.0: counter-bump helpers (`_safe_bump_coverage`
 `_bump_streaming_skipped`) are gone — coverage is now derived from
 llm_call span metadata. Each emit site tags `metadata.tracked: bool`
 and `metadata.streaming_skipped: bool` so the backend can compute
@@ -195,7 +195,7 @@ def patch_requests(runtime: Any) -> bool:
         # restore. Without this, a second `patch_requests` would
         # no-op (class marker still set) AND the closure inside the
         # existing wrap would still reference the first runtime —
-        # silently losing track() calls from later test runs.
+        # silently losing track calls from later test runs.
         _orig_session_send = Session.send
 
         def _wrapped_send(self: Any, request: Any, **kwargs: Any) -> Any:
@@ -244,7 +244,7 @@ def patch_requests(runtime: Any) -> bool:
             if usage is None:
                 return response
 
-            # Mark BEFORE the track call so a track-failure (network,
+            # Mark BEFORE the track call so a track-failure (network
             # validation) still records the request as tracked from a
             # coverage perspective — the response WAS successfully
             # extracted, even if the server rejected the event.
@@ -254,7 +254,7 @@ def patch_requests(runtime: Any) -> bool:
                 # Some PreparedRequest subclasses disallow attribute
                 # assignment; we just lose the dedup marker in that
                 # case (a future urllib3 patch may double-emit, which
-                # is deduped by fingerprint at the track() sink).
+                # is deduped by fingerprint at the track sink).
                 pass
             _emit_to_runtime(
                 runtime, request, host, usage, body, response.status_code

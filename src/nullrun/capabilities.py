@@ -1,6 +1,6 @@
-"""Server capability probe — used by `init()` to validate SDK ↔ backend compatibility.
+"""Server capability probe — used by `init ` to validate SDK ↔ backend compatibility.
 
-Per CLAUDE.md §32 the backend exposes a `/health` (and `/.well-known/capabilities`)
+Per the backend exposes a `/health` (and `/.well-known/capabilities`)
 endpoint that reports:
 - `min_protocol_version` / `max_protocol_version` — wire contract range
 - `server_minted_execution_id` — boolean; True means the v3 path is
@@ -15,14 +15,14 @@ endpoint that reports:
 - `heartbeat_time_based` — boolean; True means /heartbeat uses
   the time-based cadence (vs. chunk-count deprecated v2 path)
 
-The SDK_MIN_VERSION check is the operational coordination per
-CLAUDE.md §0 pre-flip checklist: if the backend requires
+The SDK_MIN_VERSION check is the operational coordination
+ pre-flip checklist: if the backend requires
 `server_minted_execution_id=true` and the SDK is < 0.12.0, we
-raise a loud warning at init() so the operator sees the
+raise a loud warning at init so the operator sees the
 mismatch BEFORE the first /check fails with 503.
 
 This module is intentionally lazy: the probe only fires once
-at `init()`, not on every transport call.
+at `init `, not on every transport call.
 """
 
 from __future__ import annotations
@@ -64,7 +64,7 @@ class ServerCapabilities:
     def is_v3_ready(self) -> bool:
         """True if the backend supports the v3 wire contract.
 
-        Per CLAUDE.md §0 pre-flip checklist, this is the gate
+        Per pre-flip checklist, this is the gate
         for SDK_MIN_VERSION coordination. Old SDKs connecting
         to a v3-ready backend will get 503 RESERVATION_NOT_FOUND
         on /track (their `reservation_id` won't be a Uuid); old
@@ -122,13 +122,13 @@ def probe_capabilities(api_url: str, timeout: float = 2.0) -> ServerCapabilities
     JSON). The caller should NOT treat `None` as a hard error —
     it's advisory. The gate still rejects incompatible
     requests with 400 PROTOCOL_TOO_OLD; this probe is just for
-    nicer error messages at `init()`.
+    nicer error messages at `init `.
 
     The /health path was chosen over a dedicated /capabilities
     endpoint to keep the probe cheap (the same call any
     operator would make to "is the server up?"). The backend's
-    /health response includes all capability fields per
-    CLAUDE.md §32.
+    /health response includes all capability fields
+.
     """
     url = api_url.rstrip("/") + "/health"
     try:
@@ -148,7 +148,7 @@ def validate_sdk_version(sdk_version: str, caps: ServerCapabilities) -> list[str
     """Return a list of warnings for SDK ↔ backend version mismatch.
 
     Empty list means "everything looks good". The caller
-    decides whether to fail `init()` (we don't — we just log
+    decides whether to fail `init ` (we don't — we just log
     so the operator sees the gap on startup, not on first
     failed /check).
     """

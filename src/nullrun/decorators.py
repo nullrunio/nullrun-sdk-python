@@ -23,11 +23,11 @@ Usage:
     # Manual: protected functions compose into a tree automatically
     @nullrun.protect
     def orchestrator(q):
-        return researcher(q)        # researcher is a child span
+        return researcher(q) # researcher is a child span
 
     @nullrun.protect
     def researcher(q):
-        return get_current_span()   # parent's span_id == its parent_span_id
+        return get_current_span # parent's span_id == its parent_span_id
 
 `reset` and `get_protected_runtime` are the runtime-lifecycle helpers.
 """
@@ -71,7 +71,7 @@ F = TypeVar("F", bound=Callable[..., Any])
 # missed obvious PII tokens and credential names; ``@sensitive`` and
 # ``_safe_kwargs`` would have shipped them in the audit log.
 # Matching is case-insensitive (see ``_safe_kwargs`` which calls
-# ``.lower()`` on the key).
+# ``.lower `` on the key).
 SENSITIVE_ARG_KEYS = frozenset(
     {
         # Credentials / secrets
@@ -112,22 +112,22 @@ SENSITIVE_ARG_KEYS = frozenset(
 def _safe_repr(value: object, max_len: int = 50) -> str:
     """Safe representation of an argument for logging.
 
-    P0-6 (plan §10): redaction happens BEFORE truncation, not after.
+    P0-6: redaction happens BEFORE truncation, not after.
     Pre-fix the order was truncate-then-redact: ``_safe_repr`` cut the
     repr to 50 chars first, and ``_strip_details_balanced`` then tried
     to find ``details={...}`` in that 50-char slice. If ``details=``
-    lived past position 50 (a common case — repr() of an HTTPError
+    lived past position 50 (a common case — repr of an HTTPError
     with a long URL places the dict payload well into the string), the
     substring was gone, the redact pass saw nothing, and the raw
     ``details={...}`` payload leaked into the audit log.
 
     Post-fix the order is redact-then-truncate: call
-    ``_strip_details_balanced`` first (which works on the full repr),
+    ``_strip_details_balanced`` first (which works on the full repr)
     then truncate. The cost is a single string scan over ``len(repr)``
     instead of ``len(repr[:50])`` — irrelevant for the 200-byte
     strings we actually pass through this code path.
 
-    P3-3 (plan §10): also consolidates the two-pass flow that
+    P3-3: also consolidates the two-pass flow that
     previously lived as separate ``_safe_repr`` + ``_strip_details_balanced``
     calls — there are now two callers that compose them, and the
     invariant ``redact BEFORE truncate`` was being maintained by
@@ -155,7 +155,7 @@ def _safe_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
 
 
 def _safe_args(fn: Callable[..., Any], args: tuple[Any, ...]) -> list[Any]:
-    """Mask sensitive positional args (P0-1, plan §10).
+    """Mask sensitive positional args (P0-1, plan).
 
     Pre-fix only kwargs were masked via SENSITIVE_ARG_KEYS. A
     ``def charge(card_number, amount)`` with positional call
@@ -277,8 +277,8 @@ def _safe_error_str(error: BaseException | None) -> str | None:
 
 # Module-level cache for the runtime instance — the @protect decorator needs
 # a runtime to emit span_start/span_end events, but the runtime is normally
-# created via `nullrun.init()`. We lazily instantiate one if @protect is
-# used before init(). The slot is also where tests can inject a noop.
+# created via `nullrun.init `. We lazily instantiate one if @protect is
+# used before init. The slot is also where tests can inject a noop.
 _runtime: NullRunRuntime | None = None
 
 
@@ -286,25 +286,25 @@ def _get_or_create_runtime() -> NullRunRuntime:
     """Lazy initialization of runtime from environment.
 
     Order of resolution:
-      1. The module-level `_runtime` slot (set by tests or by `init()`)
-      2. The global `NullRunRuntime.get_instance()` singleton, which
+      1. The module-level `_runtime` slot (set by tests or by `init `)
+      2. The global `NullRunRuntime.get_instance ` singleton, which
          reads `NULLRUN_API_KEY` / `NULLRUN_API_URL` from the environment
          and constructs the canonical cloud runtime.
 
-    FIX-4 (0.3.x): the previous code wrapped `get_instance()` in a
+    FIX-4 (0.3.x): the previous code wrapped `get_instance ` in a
     `try/except` that caught every exception and rebuilt a no-arg
-    `NullRunRuntime()` as a "fallback". That fallback was doubly broken
+    `NullRunRuntime ` as a "fallback". That fallback was doubly broken
     in 0.3.0: it silently swallowed `NullRunAuthenticationError` raised
     by the env-var-less branch, then crashed with the same error from
-    the no-arg `NullRunRuntime()` constructor (which also requires
+    the no-arg `NullRunRuntime ` constructor (which also requires
     `api_key` per T3-S2). The net effect was a delayed crash with a
     worse error message, plus a misleading "we have a runtime" log line.
 
-    The fix removes the fallback entirely. `get_instance()` propagates
+    The fix removes the fallback entirely. `get_instance ` propagates
     `NullRunAuthenticationError` to the caller, where it surfaces at
     the first `@protect` invocation — the same fail-loud path that
-    `nullrun.init()` uses. This aligns with the T3-S2 invariant that
-    the SDK has no local mode: a missing API key must be a hard error,
+    `nullrun.init ` uses. This aligns with the T3-S2 invariant that
+    the SDK has no local mode: a missing API key must be a hard error
     not a silent allow-all.
 
     Tries to patch OpenAI on first creation so the auto-instrumentation
@@ -322,7 +322,7 @@ def _get_or_create_runtime() -> NullRunRuntime:
     # attribute. All OpenAI v1.0+ traffic is now tracked
     # vendor-independently by the httpx transport hook in
     # nullrun.instrumentation.auto, which is wired by
-    # nullrun.init() — not at the lazy-resolve path here.
+    # nullrun.init — not at the lazy-resolve path here.
     logger.info("NullRun runtime initialized: mode=cloud")
     return _runtime
 
@@ -392,11 +392,11 @@ def protect(fn: F | None = None) -> F | Callable[[F], F]:
     Usage:
         @nullrun.protect
         def my_agent(query: str) -> str:
-            ...
+...
 
         @nullrun.protect
         async def my_async_agent(query: str) -> str:
-            ...
+...
 
     The span hierarchy is built automatically from the calling context
     (via `nullrun.tracing.SpanContext` contextvars) — nested `@protect`
@@ -407,7 +407,7 @@ def protect(fn: F | None = None) -> F | Callable[[F], F]:
 
     The wrapper runs three gates in this order. KILL short-circuits:
 
-        1. `check_control_plane`   — KILL/PAUSE is terminal.
+        1. `check_control_plane` — KILL/PAUSE is terminal.
         2. `check_workflow_budget` — "any budget left?" via /gate.
         3. `_enforce_sensitive_tool` — per-tool policy (no-op if not
                                       marked sensitive).
@@ -418,16 +418,16 @@ def protect(fn: F | None = None) -> F | Callable[[F], F]:
     can render the kill with span context.
 
     `fn` may be omitted to return the decorator itself (the standard
-    `@decorator` vs `@decorator()` shape), so this works for both:
+    `@decorator` vs `@decorator ` shape), so this works for both:
 
         @nullrun.protect
-        def f(): ...
+        def f:...
 
-        @nullrun.protect()
-        def g(): ...
+        @nullrun.protect 
+        def g:...
     """
     if fn is None:
-        # `@nullrun.protect()` with empty parens — return the decorator
+        # `@nullrun.protect ` with empty parens — return the decorator
         # bound to itself so the next call wraps the target function.
         return protect
 
@@ -440,7 +440,7 @@ def protect(fn: F | None = None) -> F | Callable[[F], F]:
             token = set_span(span)
 
             # ADR-008 Rule 4: gate order is
-            #   control_plane  →  budget  →  span_start  →  sensitive
+            # control_plane → budget → span_start → sensitive
             # Wrapped in try/except so span_end still emits on KILL/PAUSE.
             error: BaseException | None = None
             try:
@@ -486,7 +486,7 @@ def protect(fn: F | None = None) -> F | Callable[[F], F]:
         token = set_span(span)
 
         # ADR-008 Rule 4: gate order is
-        #   control_plane  →  budget  →  span_start  →  sensitive
+        # control_plane → budget → span_start → sensitive
         # Wrapped in try/except so span_end still emits on KILL/PAUSE.
         error: BaseException | None = None
         try:
@@ -515,7 +515,7 @@ def protect(fn: F | None = None) -> F | Callable[[F], F]:
             # the @protect boundary so callers can catch a single
             # NullRunBlockedException for both policy blocks and
             # sensitive-tool blocks. Direct calls to
-            # check_workflow_budget() still raise the original
+            # check_workflow_budget still raise the original
             # exception type so callers that distinguish hard vs
             # soft blocks keep that signal.
             if isinstance(exc, (WorkflowKilledInterrupt, WorkflowPausedException)):
@@ -592,9 +592,9 @@ def _enforce_sensitive_tool(
     This is the opposite of `check_workflow_budget` /
     `check_control_plane`, which deliberately fail-OPEN — a transient
     backend outage must not freeze the user's agent. Sensitive tools
-    have a different threat model: an unblocked `charge_card()` that
+    have a different threat model: an unblocked `charge_card ` that
     runs when the policy engine is down is worse than a denied
-    `charge_card()` during an outage.
+    `charge_card ` during an outage.
 
     Opt-out: set `NULLRUN_SENSITIVE_FAIL_OPEN=1` to restore the prior
     fail-OPEN behavior on transport error. Useful in dev / test
@@ -711,7 +711,7 @@ def _enforce_sensitive_tool(
             ),
         )
         # Layer 2: emit for the generic exception path too.
-        # (The NullRunTransportError path above already emits;
+        # (The NullRunTransportError path above already emits
         # this covers the catch-all ``except Exception`` arm.)
         runtime._emit_sdk_error(
             err,
@@ -801,19 +801,19 @@ def sensitive(fn: F) -> F:
         @nullrun.sensitive
         @nullrun.protect
         def charge_card(amount: int) -> str:
-            ...
+...
     """
     try:
         # Use the same slot the @protect wrapper uses so the
         # registration lands on the same runtime instance the
-        # wrapper will consult. Falling back to get_runtime()
+        # wrapper will consult. Falling back to get_runtime 
         # would hit a different singleton and silently no-op in
         # tests that build a custom runtime.
         rt = _get_or_create_runtime()
         rt.add_sensitive_tool(fn.__name__)
     except Exception as exc:
         # Sensitive tool registration is part of the fail-CLOSED contract
-        # (ADR-008 / CLAUDE.md sensitive-tool-fail-closed memory). If we
+        # (ADR-008 / sensitive-tool-fail-closed memory). If we
         # cannot reach the runtime to register the tool, the body MUST NOT
         # execute later — but since `@sensitive` only registers the name
         # and the wrapper enforces it on each call, raising here is the
@@ -850,7 +850,7 @@ def get_protected_runtime() -> NullRunRuntime | None:
         return _runtime
     # Fall back to the global singleton if the decorator-level slot is
     # empty — this matches the behaviour of every other helper that
-    # reads from `get_runtime()`.
+    # reads from `get_runtime `.
     try:
         return get_runtime()
     except Exception:

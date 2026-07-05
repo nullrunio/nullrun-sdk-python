@@ -30,7 +30,7 @@ def reset_runtime():
     _dec._runtime = None
     _act._action_handler = None
     # Module-level cache used by `nullrun.track_llm` / `nullrun.track_tool` →
-    # `get_runtime()`. Without this, a stale singleton from a previous test
+    # `get_runtime `. Without this, a stale singleton from a previous test
     # leaks across the suite (e.g. a test that did `nullrun.init(...)` with
     # the prod URL leaves that URL pinned for the next test).
     _rt_mod._runtime = None
@@ -127,9 +127,9 @@ def make_runtime(mock_api):
         )
         defaults.update(kwargs)
         rt = NullRunRuntime(**defaults)
-        # Pin for @protect decorator's lazy resolution. Without this,
-        # @protect would call NullRunRuntime.get_instance() which reads
-        # env vars, finds no NULLRUN_API_KEY in the test environment,
+        # Pin for @protect decorator's lazy resolution. Without this
+        # @protect would call NullRunRuntime.get_instance which reads
+        # env vars, finds no NULLRUN_API_KEY in the test environment
         # and raise NullRunAuthenticationError.
         _dec._runtime = rt
         return rt

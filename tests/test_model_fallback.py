@@ -6,9 +6,9 @@ falling back to ``DEFAULT_RATE`` (≈$0 per call).
 
 Pre-fix: when the OpenAI Responses API or streaming final-chunk
 returned without a top-level ``model`` field, the SDK's
-``NullRunSyncTransport._emit`` sent the event with ``model=None``,
+``NullRunSyncTransport._emit`` sent the event with ``model=None``
 which the wire-format builder dropped, which the backend then
-``unwrap_or("default")``'d and warned ``no canonical rate for model;
+``unwrap_or("default")``'d and warned ``no canonical rate for model
 falling back to DEFAULT_RATE``.
 
 Post-fix: ``_extract_model_from_request_body`` reads the ``model``
@@ -41,7 +41,7 @@ def _request_with_body(body: bytes | None) -> httpx.Request:
     """Build an httpx.Request whose ``.content`` returns the given body."""
     req = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
     # httpx.Request stores the content as a property; assignment via
-    # ``.read()`` requires content to be bytes. The simplest path is
+    # ``.read `` requires content to be bytes. The simplest path is
     # to construct with content= via the constructor.
     return httpx.Request(
         "POST",

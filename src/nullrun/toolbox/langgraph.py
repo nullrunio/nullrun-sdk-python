@@ -7,7 +7,7 @@ integrations. It is a thin convenience layer that wires the
 LangGraph compiled app so that every `app.invoke(...)` and
 `app.stream(...)` call fires the LangChain callback hooks. The
 callback extracts `input_tokens` / `output_tokens` from the LLM
-response and forwards them to the runtime's `track()` method —
+response and forwards them to the runtime's `track ` method —
 cost is then recomputed by the backend from the org's pricing
 policy.
 
@@ -47,8 +47,8 @@ def wrapper(app: Any, runtime: Any | None = None) -> Any:
         from nullrun import init
         from nullrun.toolbox.langgraph import wrapper
 
-        runtime = init()
-        graph = build_my_graph()
+        runtime = init 
+        graph = build_my_graph 
         graph = wrapper(graph, runtime=runtime)
 
         result = graph.invoke({"messages": [("user", "hi")]})
@@ -57,7 +57,7 @@ def wrapper(app: Any, runtime: Any | None = None) -> Any:
         app: A compiled LangGraph `StateGraph` (anything with
              `.invoke` and `.stream`).
         runtime: Optional `NullRunRuntime`. Defaults to the
-             module-level singleton from `get_runtime()`.
+             module-level singleton from `get_runtime `.
 
     Returns:
         The same `app` object, with `.invoke` and `.stream`

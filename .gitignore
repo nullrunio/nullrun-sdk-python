@@ -59,6 +59,7 @@ coverage.xml
 .env.*.local
 *.pem
 *.key
+.venv-ci
 
 # Claude Code / claude-flow project-local state
 .claude/

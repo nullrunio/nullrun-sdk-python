@@ -194,9 +194,9 @@ BASE_URL = "https://api.test.nullrun.io"
 # ===========================================================================
 # Pre-Sprint-3-follow-up: 6 fields were defined on the dataclasses
 # but never incremented:
-#   - TransportMetrics: retries_total, circuit_breaker_opens,
-#     fallback_mode_activations, timeouts, last_error
-#   - RuntimeMetrics: cost_limit_exceeded
+# - TransportMetrics: retries_total, circuit_breaker_opens
+# fallback_mode_activations, timeouts, last_error
+# - RuntimeMetrics: cost_limit_exceeded
 # These tests pin the wiring so a future regression that
 # removes an increment call breaks here, not in production.
 
@@ -241,7 +241,7 @@ class TestAllMetricsWired:
         assert result == "ok"
 
         # Two retries happened (attempts 1 and 2 failed, attempt 3
-        # succeeded). retries_total increments PER RETRY, not per
+        # succeeded). retries_total increments PER RETRY, not
         # attempt, so it should be 2.
         assert metrics.transport.retries_total == 2, (
             f"retries_total expected 2 after 2 failed attempts; "
@@ -331,7 +331,7 @@ class TestAllMetricsWired:
         from httpx import Response
 
         with respx.mock(assert_all_called=False) as mock:
-            # The transport's ``check()`` method POSTs to
+            # The transport's ``check `` method POSTs to
             # /api/v1/gate (unified endpoint), not /api/v1/check.
             mock.post("https://api.test.nullrun.io/api/v1/gate").mock(
                 return_value=Response(
@@ -370,7 +370,7 @@ class TestAllMetricsWired:
 
         self._reset_metrics()
         # respx mock that returns 5xx for /gate — triggers the
-        # fallback path inside transport.execute().
+        # fallback path inside transport.execute.
         import respx
         from httpx import Response
 
