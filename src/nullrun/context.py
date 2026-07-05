@@ -207,6 +207,22 @@ _server_minted_execution_id_var: ContextVar[str | None] = ContextVar(
 _server_minted_reservation_at_var: ContextVar[float] = ContextVar(
     "server_minted_reservation_at", default=0.0
 )
+# 2026-07-04 (drift.md P1-5): /track idempotency anchor.
+# The /check request carries ``idempotency_key = operation_id`` (UUID v4);
+# the backend's /track handler (handlers.rs:4654-4725) accepts the same
+# key and replays the original response on hit (200 + ``idempotent_replay:
+# true``). Without forwarding the key from /check onto the /track payload,
+# a transport-level retry on the SAME event either re-runs CONSUME_SCRIPT
+# (→ 503 RESERVATION_NOT_FOUND, since the reservation key was DEL'ed by
+# the first successful consume per §25) or double-bills.
+#
+# Captured into a contextvar at the same instant as
+# ``server_minted_execution_id`` so the two values always refer to the
+# same /check. ``None`` when the /check didn't supply one (legacy or
+# capability-disabled backend) — the /track payload then omits the field.
+_server_minted_idempotency_key_var: ContextVar[str | None] = ContextVar(
+    "server_minted_idempotency_key", default=None
+)
 
 
 def get_server_minted_execution_id() -> str | None:
@@ -232,6 +248,22 @@ def get_server_minted_reservation_at() -> float:
     refer to the same /check.
     """
     return _server_minted_reservation_at_var.get()
+
+
+def get_server_minted_idempotency_key() -> str | None:
+    """Return the /check ``idempotency_key`` for the in-scope
+    reservation, or ``None`` if none captured.
+
+    Read by ``NullRunRuntime._enrich_event`` to tag the /track
+    v3 single-event payload. The /check request sets
+    ``idempotency_key = operation_id`` (a UUID v4) at
+    runtime.py:1260; the /track handler honors it for replay
+    per CLAUDE.md §23.
+
+    Pairs with :func:`get_server_minted_execution_id` and shares
+    the same capture token; ``None`` on the legacy v1/v2 path.
+    """
+    return _server_minted_idempotency_key_var.get()
 
 
 def set_server_minted_execution_id(value: str | None) -> Token[str | None]:
@@ -263,6 +295,19 @@ def set_server_minted_reservation_at(value: float) -> Token[float]:
     return _server_minted_reservation_at_var.set(value)
 
 
+def set_server_minted_idempotency_key(value: str | None) -> Token[str | None]:
+    """Capture the /check ``idempotency_key`` (the operation_id UUID v4
+    on the v3 path) alongside the matching execution_id.
+
+    Lifetime is symmetric with
+    :func:`set_server_minted_execution_id` — the runtime captures
+    both at the same instant and resets both at the matching
+    /track emission (or workflow/chain block exit). Returns the
+    matching Token.
+    """
+    return _server_minted_idempotency_key_var.set(value)
+
+
 def reset_server_minted_execution_id(token: Token[str | None]) -> None:
     """Restore the previous server-minted execution_id value.
 
@@ -282,6 +327,14 @@ def reset_server_minted_reservation_at(token: Token[float]) -> None:
     _server_minted_reservation_at_var.reset(token)
 
 
+def reset_server_minted_idempotency_key(token: Token[str | None]) -> None:
+    """Restore the previous /check idempotency_key value.
+
+    Pair with :func:`set_server_minted_idempotency_key`.
+    """
+    _server_minted_idempotency_key_var.reset(token)
+
+
 def clear_server_minted_execution_id() -> None:
     """Erase the captured server-minted execution_id + timestamp.
 
@@ -290,6 +343,7 @@ def clear_server_minted_execution_id() -> None:
 
         _server_minted_execution_id_var.set(None)
         _server_minted_reservation_at_var.set(0.0)
+        _server_minted_idempotency_key_var.set(None)
 
     Use :func:`reset_server_minted_execution_id` instead when you
     have a Token to consume — that path restores the previous
@@ -297,6 +351,7 @@ def clear_server_minted_execution_id() -> None:
     """
     _server_minted_execution_id_var.set(None)
     _server_minted_reservation_at_var.set(0.0)
+    _server_minted_idempotency_key_var.set(None)
 
 
 def set_attempt_index(index: int) -> None:

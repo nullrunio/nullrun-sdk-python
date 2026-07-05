@@ -46,6 +46,7 @@ from nullrun.context import (
     chain,
     get_chain_id,
     set_chain_id,
+    workflow,
 )
 from nullrun.transport import (
     _V3_ERROR_CODE_MAP,
@@ -944,3 +945,192 @@ class TestGateCache:
         )
         assert cache_enabled is False
         os.environ.pop("NULLRUN_GATE_CACHE_DISABLE", None)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# BUG #5 — chain-mode gate cache at the runtime level
+#   (CLAUDE.md §26 — collapse 100 /gate calls into 1 inside `with chain(...)`)
+# ─────────────────────────────────────────────────────────────────────
+#
+# The TestGateCache data-structure tests above pin the runtime's
+# `_GATE_CACHE` dict invariants in isolation; this class drives the
+# full NullRunRuntime.check_workflow_budget() path so the
+# cache_enabled predicate + cache hit/miss branches in
+# ``runtime.py:1287-1310`` are actually exercised end-to-end. Without
+# these tests ``pytest-cov`` reports that exact range as uncovered,
+# which dragged patch coverage on PR #52 below the 70% Codecov floor.
+
+
+class TestGateCacheRuntimeFlow:
+    """Runtime-level chain-mode gate cache coverage.
+
+    Drives ``NullRunRuntime.check_workflow_budget()`` inside
+    ``with workflow(...) + with chain(...)`` and verifies the
+    /gate roundtrip count vs. expected after the 5s in-process
+    cache is applied.
+    """
+
+    def setup_method(self):
+        from nullrun import runtime as rt_mod
+
+        rt_mod._GATE_CACHE.clear()
+
+    def teardown_method(self):
+        from nullrun import runtime as rt_mod
+
+        rt_mod._GATE_CACHE.clear()
+        # Always unset the gate-cache-disable opt-out so tests don't
+        # leak state between runs.
+        import os
+
+        os.environ.pop("NULLRUN_GATE_CACHE_DISABLE", None)
+
+    @respx.mock
+    def test_chain_mode_collapses_three_checks_to_one_gate_call(self):
+        """3 consecutive check_workflow_budget inside `with chain(...)`
+        must hit /gate exactly ONCE — the 2nd and 3rd calls fall
+        into the cache hit branch (runtime.py:1302).
+
+        Covers:
+          runtime.py:1291-1310 (cache_enabled predicate),
+          runtime.py:1302 (cache hit `response = cached[1]`),
+          runtime.py:1306 (cache miss → transport.check + store).
+        """
+        from nullrun.runtime import NullRunRuntime
+
+        respx.post(f"{BASE_URL}/api/v1/gate").mock(
+            return_value=Response(
+                200,
+                json={"decision": "allow", "decision_source": "gateway"},
+            )
+        )
+        rt_inst = NullRunRuntime(
+            api_key="nr_live_abc123",
+            api_url=BASE_URL,
+            _test_mode=True,  # skip _authenticate handshake
+            polling=False,  # no background WS/HTTP poll thread
+        )
+        try:
+            with workflow("wf-runtime-cache") as _wf_id, chain(
+                "chain-runtime-cache"
+            ) as _cid:
+                # Direct calls in chain scope — bypasses @protect but
+                # exercises the same check_workflow_budget codepath.
+                rt_inst.check_workflow_budget()
+                rt_inst.check_workflow_budget()
+                rt_inst.check_workflow_budget()
+            gate_calls = [
+                c for c in respx.calls if c.request.url.path.endswith("/gate")
+            ]
+            assert len(gate_calls) == 1, (
+                f"chain-mode cache must collapse 3 calls into 1 /gate "
+                f"roundtrip; got {len(gate_calls)}"
+            )
+        finally:
+            try:
+                rt_inst.shutdown()
+            except Exception:
+                pass
+
+    @respx.mock
+    def test_chain_mode_emits_fresh_uuid7_execution_id_per_call(self):
+        """BUG #4 wire at the runtime level: every /gate payload must
+        carry a fresh execution_id == uuid7 (NOT workflow_id).
+
+        Disables the chain-mode cache so both ``check_workflow_budget``
+        calls actually POST a /gate body — the cache would otherwise
+        collapse the second call into a hit and we'd never see the
+        second payload.
+
+        Covers:
+          runtime.py:1247-1255 (execution_id = uuid7_str()),
+          runtime.py:1310-1323 (no-cache branch — direct transport.check).
+        """
+        import json as _json
+        import os
+
+        from nullrun.runtime import NullRunRuntime
+
+        os.environ["NULLRUN_GATE_CACHE_DISABLE"] = "1"
+        try:
+            respx.post(f"{BASE_URL}/api/v1/gate").mock(
+                return_value=Response(
+                    200,
+                    json={"decision": "allow", "decision_source": "gateway"},
+                )
+            )
+            rt_inst = NullRunRuntime(
+                api_key="nr_live_abc123",
+                api_url=BASE_URL,
+                _test_mode=True,
+                polling=False,
+            )
+            try:
+                with workflow("wf-runtime-uuid7"), chain("chain-runtime-uuid7"):
+                    rt_inst.check_workflow_budget()
+                    rt_inst.check_workflow_budget()
+                gate_calls = [
+                    c for c in respx.calls if c.request.url.path.endswith("/gate")
+                ]
+                assert len(gate_calls) == 2
+                first = _json.loads(gate_calls[0].request.content)["execution_id"]
+                second = _json.loads(gate_calls[1].request.content)["execution_id"]
+                assert first != second
+                assert uuid.UUID(first).version == 7
+                assert uuid.UUID(second).version == 7
+                assert first != "wf-runtime-uuid7"
+                assert second != "wf-runtime-uuid7"
+            finally:
+                try:
+                    rt_inst.shutdown()
+                except Exception:
+                    pass
+        finally:
+            os.environ.pop("NULLRUN_GATE_CACHE_DISABLE", None)
+
+    @respx.mock
+    def test_chain_mode_disabled_via_env_bypasses_cache(self):
+        """NULLRUN_GATE_CACHE_DISABLE=1 → cache_enabled=False → every
+        call hits /gate (runtime.py:1275-1277 fallback, runtime.py:1324
+        direct transport.check path).
+
+        Covers:
+          runtime.py:1294-1295 (cache_enabled=False exit),
+          runtime.py:1310-1323 (no-cache branch).
+        """
+        import os
+
+        from nullrun.runtime import NullRunRuntime
+
+        os.environ["NULLRUN_GATE_CACHE_DISABLE"] = "1"
+        try:
+            respx.post(f"{BASE_URL}/api/v1/gate").mock(
+                return_value=Response(
+                    200,
+                    json={"decision": "allow", "decision_source": "gateway"},
+                )
+            )
+            rt_inst = NullRunRuntime(
+                api_key="nr_live_abc123",
+                api_url=BASE_URL,
+                _test_mode=True,
+                polling=False,
+            )
+            try:
+                with workflow("wf-no-cache"), chain("chain-no-cache"):
+                    rt_inst.check_workflow_budget()
+                    rt_inst.check_workflow_budget()
+                gate_calls = [
+                    c for c in respx.calls if c.request.url.path.endswith("/gate")
+                ]
+                assert len(gate_calls) == 2, (
+                    f"with NULLRUN_GATE_CACHE_DISABLE=1 every call must "
+                    f"hit /gate; got {len(gate_calls)}"
+                )
+            finally:
+                try:
+                    rt_inst.shutdown()
+                except Exception:
+                    pass
+        finally:
+            os.environ.pop("NULLRUN_GATE_CACHE_DISABLE", None)

@@ -4,12 +4,12 @@ build-backend = "hatchling.build"
 
 [project]
 name = "nullrun"
-# Version bump: 0.12.1 → 0.12.2 in `release(0.12.2)` (fresh
-# execution_id per /check + in-process chain-mode gate cache). The
-# runtime commit bumped `src/nullrun/__version__.py` together with
-# this field — same drift prevention as #50, but proactive this
-# time (caught during pre-merge audit, not after a publish error).
-version = "0.12.2"
+# Version bump: 0.12.2 → 0.13.0 in `release(0.13.0)` (drift-fixes
+# release: idempotency_key on /track + status_code on every
+# decision exception + fail-CLOSED/OPEN honesty in module docstring).
+# No on-wire breaking change; backends on 1.0.0 keep working
+# unchanged. See docs/drift.md for the full audit trail.
+version = "0.13.0"
 # Long form used by PyPI page meta-description and search snippets.
 # Kept under the 200-char preview threshold so the full line is visible
 # without an "expand" click. Keywords are matched against likely search
