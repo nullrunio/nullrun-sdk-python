@@ -1727,30 +1727,22 @@ class Transport:
         request: dict[str, Any],
         on_transport_error: Callable[[Exception], dict[str, Any]] | str | None = None,
     ) -> dict[str, Any]:
-        """POST /api/v1/check — wire-protocol v3 pre-execution gate.
+        """Pre-execution gate — wire-protocol v3 (drift.md B1 fix 2026-07-04).
 
-        CLAUDE.md §3, §16, §22-§24. The v3 replacement for ``check()``
-        (/api/v1/gate). Adds three new optional fields on top of the
-        v2 wire shape:
-
-        * ``chain_id`` (UUID v4, optional) — pairs with ``chain_op``
-          (``"start"`` / ``"continue"`` / ``"end"``). Enables the
-          backend's soft-mode gate (§5) which only allows budget
-          overdrafts when a chain is active.
-        * ``chain_op`` (string, optional) — ``"start"`` creates a
-          chain in REGISTERED state, ``"continue"`` extends the TTL,
-          ``"end"`` closes the chain. Absent means auto-register.
-        * ``idempotency_key`` (UUID v4, optional) — replays return
-          the original decision instead of re-running the gate.
-
-        The response carries a server-minted ``execution_id`` (§24) —
-        callers MUST NOT treat the request's ``execution_id`` field
-        as authoritative; the backend overwrites it on the response.
+        Pre-fix this method POSTed to ``/api/v1/check``. That endpoint
+        was removed on 2026-06-27 — the handler now returns
+        ``410 Gone`` with a ``replacement: /api/v1/gate`` hint. The
+        SDK's ``check()`` method already targets ``/api/v1/gate`` and
+        forwards every v3 wire field (CLAUDE.md §16) — ``chain_id``,
+        ``chain_op``, ``idempotency_key``, ``stream``. This method
+        is kept as a v3-named alias so existing call sites and tests
+        continue to work; internally it delegates to ``check()`` with
+        the same body.
 
         Args:
             request: Gate request body. Must include ``organization_id``,
                 ``execution_id`` (for backward compat — server mints its
-                own), ``operation_id``, and ``check_type``.
+                own on /check), ``operation_id``, and ``check_type``.
             on_transport_error: Mirrors the ``check()`` flag.
 
         Returns:
@@ -1762,7 +1754,7 @@ class Transport:
             NullRunAuthenticationError: 401/403 (PROTOCOL_TOO_OLD,
                 PROTOCOL_TOO_NEW, API_KEY_REVOKED, CHAIN_CROSS_ORG).
             NullRunConsumeOverbudgetError: 422 (placeholder for /track;
-                not raised on /check).
+                not raised on /gate).
             NullRunBudgetError: 402 BUDGET_HARD_BLOCKED /
                 BUDGET_SOFT_BLOCKED / BUDGET_OVERDRAFT_EXCEEDED.
             NullRunChainError: 402 CHAIN_MAX_DURATION_EXCEEDED /
@@ -1771,42 +1763,12 @@ class Transport:
             NullRunBackendError: 5xx / BUDGET_DATA_UNAVAILABLE /
                 RATE_LIMIT_REDIS_UNAVAILABLE.
         """
-        gate_request = dict(request)
-        headers = self._build_signed_headers()
-        body = _signed_request_body(gate_request)
-
-        try:
-            response = self._client.post(
-                f"{self.api_url}/api/v1/check",
-                content=body,
-                headers=headers,
-                timeout=5.0,
-            )
-        except httpx.RequestError as e:
-            if on_transport_error == "raise":
-                raise NullRunTransportError(
-                    f"Network error on /check: {e}",
-                    source=TransportErrorSource.NETWORK_ERROR,
-                    endpoint="check",
-                ) from e
-            logger.warning(f"/check request failed: {e}")
-            return {
-                "decision": "block",
-                "decision_source": DecisionSource.FALLBACK,
-                "execution_id": None,
-                "remaining_budget_cents": 0,
-                "projected_cost_cents": 0,
-                "explanations": [f"/check request failed: {e}"],
-                "suggestions": ["Check API availability"],
-            }
-
-        if response.status_code == 200:
-            data = response.json()
-            data.setdefault("decision_source", DecisionSource.GATEWAY)
-            return data  # type: ignore[no-any-return]
-
-        # Non-2xx — map through the v3 error envelope parser.
-        raise _parse_v3_error_envelope(response, "check")
+        # drift.md 2026-07-04 (B1): /api/v1/check returns 410 Gone.
+        # ``check()`` already targets /api/v1/gate with all v3 wire
+        # fields forwarded (chain_id, chain_op, idempotency_key,
+        # stream, tools). Delegate rather than duplicate the wire
+        # shape — single source of truth for the v3 body.
+        return self.check(request, on_transport_error=on_transport_error)
 
     def track_single(
         self,
@@ -1820,13 +1782,33 @@ class Transport:
         ``actual_cost <= reserved_cents + epsilon_cents`` (§25,
         ADR-005) and rejects with 422 CONSUME_OVERBUDGET on
         violation. The reserved binding is the one created by the
-        matching ``/check`` call (same ``execution_id``).
+        matching ``/check`` call (same ``reservation_id``).
+
+        The wire shape is built by ``runtime._build_v3_track_payload``
+        (see ``runtime.py:2679-2776``); this method just forwards
+        whatever dict the caller hands it. The post-fix schema is:
 
         Args:
-            request: Consume request body. Must include
-                ``execution_id``, ``actual_cost_cents``,
-                ``api_key_id``. Optional ``cost_source``
-                (``"provisional"`` / ``"authoritative"``) — see §22.
+            request: Consume request body. Must include:
+
+                * ``reservation_id`` (str, server-minted uuidv7 from
+                  the matching /check response — wired via
+                  ``_capture_server_minted_execution_id``)
+                * ``workflow_id`` (str, the workflow the call belongs to)
+                * ``tokens`` (int, sum of input + output tokens)
+                * ``cost_cents`` (int, ``0`` — backend computes the
+                  authoritative cost from tokens + the org's
+                  pricing policy; sending a wrong number risks
+                  double-billing, see _WIRE_STRIP_FIELDS in runtime.py)
+                * ``cost_source`` (str, ``"provisional"`` /
+                  ``"authoritative"`` per §22 — SDK always emits
+                  ``"provisional"``)
+
+                Optional fields: ``input_tokens``, ``output_tokens``,
+                ``model``, ``latency_ms``, ``metadata``, ``trace_id``,
+                ``span_id``, ``agent_id``, ``environment``,
+                ``agent_type``, ``attempt_index``, ``is_retry``,
+                ``idempotency_key``.
 
         Returns:
             Parsed JSON dict with at least
@@ -1839,6 +1821,17 @@ class Transport:
             NullRunBackendError: 503 RESERVATION_NOT_FOUND /
                 EXECUTION_NOT_BOUND.
             NullRunAuthenticationError: 401/403.
+
+        drift.md 2026-07-04 (B2): pre-fix this docstring (and the
+        surrounding module comment) described a fictitious wire
+        shape ``{execution_id, actual_cost_cents, api_key_id,
+        cost_source}``. The backend's actual ``TrackRequestRaw`` is
+        ``{workflow_id, tokens, cost_cents, ...}``; ``execution_id``
+        is replaced by ``reservation_id``, ``actual_cost_cents`` is
+        replaced by ``cost_cents`` (the SDK always sends 0 — see
+        ``_WIRE_STRIP_FIELDS``), and ``api_key_id`` is derived
+        server-side from the request auth, not supplied by the SDK.
+        The docstring now matches the real wire contract.
         """
         headers = self._build_signed_headers()
         body = _signed_request_body(request)
@@ -1964,35 +1957,58 @@ class Transport:
         self,
         chain_id: str,
     ) -> dict[str, Any]:
-        """POST /api/v1/chain/end — close a chain explicitly.
+        """Close a chain explicitly via /api/v1/gate with chain_op=end
+        (CLAUDE.md §6, drift.md B3 fix 2026-07-04).
 
-        CLAUDE.md §6 (chain state machine). The handler is already
-        idempotent — a no-op 200 OK for an unknown chain_id is the
-        documented success path. The SDK still raises through the
-        envelope parser on a true non-2xx so unexpected backend
+        Pre-fix this method POSTed to ``/api/v1/chain/end``. That
+        endpoint was never registered on the backend
+        (``backend/src/proxy/http/routes.rs`` has zero matches for
+        ``chain/end`` or ``chain_end_handler``) — the only documented
+        way to close a chain is to POST /api/v1/gate with
+        ``{"chain_id": "...", "chain_op": "end"}``. The handler is
+        already idempotent — a no-op 200 OK for an unknown chain_id
+        is the documented success path. The SDK still raises through
+        the envelope parser on a true non-2xx so unexpected backend
         regressions surface.
 
         Args:
             chain_id: Chain to close.
 
         Returns:
-            Parsed JSON dict (typically ``{"status": "ok",
+            Parsed JSON dict (typically ``{"decision": "allow",
             "chain_id": ...}``).
         """
-        request = {"chain_id": chain_id}
+        # drift.md 2026-07-04 (B3): POST /api/v1/gate with
+        # ``chain_op: "end"``. The backend's gate handler
+        # (``backend/src/proxy/http/gate/gate.rs``) accepts the same
+        # body shape as ``check()`` — the ``chain_op`` field routes
+        # the request through the chain state machine rather than the
+        # budget reserve path. No execution_id minting or reservation
+        # is created on this code path (the chain is being torn down,
+        # not started), so we reuse the caller's chain_id as a stable
+        # placeholder for the signature.
+        request = {
+            "chain_id": chain_id,
+            "chain_op": "end",
+            # execution_id is required by the backend's gate handler
+            # even on chain_end — the handler reads it but does not
+            # mint a reservation for op=end. Use a fresh uuidv7 per
+            # call (the server ignores it on this path).
+            "execution_id": uuid.uuid4().hex,
+        }
         headers = self._build_signed_headers()
         body = _signed_request_body(request)
 
         try:
             response = self._client.post(
-                f"{self.api_url}/api/v1/chain/end",
+                f"{self.api_url}/api/v1/gate",
                 content=body,
                 headers=headers,
                 timeout=5.0,
             )
         except httpx.RequestError as e:
             raise NullRunTransportError(
-                f"Network error on /chain/end: {e}",
+                f"Network error on /gate (chain_end): {e}",
                 source=TransportErrorSource.NETWORK_ERROR,
                 endpoint="chain_end",
             ) from e
@@ -2037,10 +2053,19 @@ class Transport:
         # ApproximateBudget uses GET (not POST) per the wire contract;
         # no signed body, so we use _auth_headers() directly instead
         # of _build_signed_headers().
+        #
+        # drift.md 2026-07-04 (M3 fix): the backend's
+        # ``approximate_budget_handler`` (``backend/src/proxy/http/
+        # budget.rs:130-145``) resolves the org from the X-API-Key
+        # / Authorization header — it does NOT take a ``organization_id``
+        # query parameter. Pre-fix this method appended
+        # ``?organization_id=...`` to the URL, which the backend
+        # ignored silently and the audit flagged as drift. We now
+        # call the bare URL and keep the ``organization_id`` arg as
+        # an accepted-but-unused parameter for backward compatibility
+        # with any external caller that still passes it.
         headers = self._auth_headers_for_get()
         url = f"{self.api_url}/api/v1/budget/approximate"
-        if organization_id:
-            url += f"?organization_id={organization_id}"
 
         try:
             response = self._client.get(url, headers=headers, timeout=5.0)
