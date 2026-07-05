@@ -126,9 +126,13 @@ class TestSignedPostIncludesProtocolHeader:
 
     @respx.mock
     def test_check_v3_includes_protocol_header(self):
+        # drift.md 2026-07-04 (B1): ``check_v3`` now delegates to
+        # ``check()`` which targets /api/v1/gate (the
+        # /api/v1/check endpoint was removed 2026-06-27 and returns
+        # 410 Gone). Wire the mock against /api/v1/gate to match.
         t = Transport(api_url=BASE_URL, api_key="nr_live_abc123")
         try:
-            route = respx.post(f"{BASE_URL}/api/v1/check").mock(
+            route = respx.post(f"{BASE_URL}/api/v1/gate").mock(
                 return_value=Response(
                     200,
                     json={
@@ -146,12 +150,28 @@ class TestSignedPostIncludesProtocolHeader:
 
     @respx.mock
     def test_track_single_includes_protocol_header(self):
+        # drift.md 2026-07-04 (B2): body shape matches the v3 wire
+        # contract — ``reservation_id`` (server-minted from /check),
+        # ``workflow_id`` + ``tokens`` + ``cost_cents`` (the SDK
+        # always emits 0 — backend recomputes from tokens) +
+        # ``cost_source: "provisional"``. Pre-fix this test sent the
+        # legacy / fictitious shape
+        # ``{execution_id, actual_cost_cents}`` which doesn't match
+        # ``TrackRequestRaw`` and would 422 on the wire.
         t = Transport(api_url=BASE_URL, api_key="nr_live_abc123")
         try:
             route = respx.post(f"{BASE_URL}/api/v1/track").mock(
                 return_value=Response(200, json={"status": "ok"})
             )
-            t.track_single({"execution_id": "exec-1", "actual_cost_cents": 5})
+            t.track_single(
+                {
+                    "reservation_id": "00000000-0000-0000-0000-000000000099",
+                    "workflow_id": "wf-1",
+                    "tokens": 100,
+                    "cost_cents": 0,
+                    "cost_source": "provisional",
+                }
+            )
             sent = route.calls.last.request
             assert sent.headers["X-NULLRUN-PROTOCOL"] == "3"
         finally:
@@ -185,14 +205,20 @@ class TestSignedPostIncludesProtocolHeader:
 
     @respx.mock
     def test_chain_end_includes_protocol_header(self):
+        # drift.md 2026-07-04 (B3): ``chain_end`` now POSTs to
+        # /api/v1/gate with ``chain_op: "end"``. The /api/v1/chain/end
+        # endpoint was never registered on the backend.
         t = Transport(api_url=BASE_URL, api_key="nr_live_abc123")
         try:
-            route = respx.post(f"{BASE_URL}/api/v1/chain/end").mock(
-                return_value=Response(200, json={"status": "ok"})
+            route = respx.post(f"{BASE_URL}/api/v1/gate").mock(
+                return_value=Response(200, json={"decision": "allow"})
             )
             t.chain_end("chain-abc")
             sent = route.calls.last.request
             assert sent.headers["X-NULLRUN-PROTOCOL"] == "3"
+            body = sent.content.decode("utf-8")
+            assert '"chain_id":"chain-abc"' in body
+            assert '"chain_op":"end"' in body
         finally:
             t.stop()
 
@@ -319,9 +345,12 @@ class TestWireContractV3FieldsForwarded:
 
     @respx.mock
     def test_check_v3_accepts_chain_context(self):
+        # drift.md 2026-07-04 (B1): ``check_v3`` delegates to
+        # ``check()`` which posts to /api/v1/gate. The /api/v1/check
+        # endpoint returns 410 Gone since 2026-06-27.
         t = Transport(api_url=BASE_URL, api_key="nr_live_abc123")
         try:
-            route = respx.post(f"{BASE_URL}/api/v1/check").mock(
+            route = respx.post(f"{BASE_URL}/api/v1/gate").mock(
                 return_value=Response(
                     200,
                     json={
@@ -774,15 +803,18 @@ class TestChainEndEndpoint:
 
     @respx.mock
     def test_chain_end_sends_chain_id_in_body(self):
+        # drift.md 2026-07-04 (B3): chain_end targets /api/v1/gate
+        # with chain_op=end. Verify both fields land on the wire.
         t = Transport(api_url=BASE_URL, api_key="nr_live_abc123")
         try:
-            route = respx.post(f"{BASE_URL}/api/v1/chain/end").mock(
-                return_value=Response(200, json={"status": "ok"})
+            route = respx.post(f"{BASE_URL}/api/v1/gate").mock(
+                return_value=Response(200, json={"decision": "allow"})
             )
             t.chain_end("chain-1")
             sent = route.calls.last.request
             body = sent.content.decode("utf-8")
             assert '"chain_id":"chain-1"' in body
+            assert '"chain_op":"end"' in body
         finally:
             t.stop()
 
