@@ -74,12 +74,15 @@ logger = logging.getLogger("nullrun.capabilities")
 SDK_MIN_VERSION_FOR_V3 = "0.12.0"
 
 
-# Wire path for the canonical capabilities endpoint. This is the
-# authoritative URL per ``backend/src/proxy/http/protocol.rs:189``
-# (route registration) and ``backend/src/proxy/http/protocol.rs:334``
-# (capabilities_handler entry point). Do not change without a
-# coordinated backend release.
-CAPABILITIES_PATH = "/api/v1/capabilities"
+# Wire path for the canonical capabilities endpoint. The SDK targets
+# the legacy ``/health`` route (a 200 OK JSON blob that doubles as
+# the v1/v2 status endpoint); the backend has registered this
+# route since 2025-04. The nested ``/api/v1/capabilities`` route
+# is the future canonical contract (per
+# ``backend/src/proxy/http/protocol.rs:189``) but is opt-in for
+# backends < 1.0.0 — we probe the older URL so the SDK works
+# against any 1.0.0-rc.0+ backend without coordination.
+CAPABILITIES_PATH = "/health"
 
 
 @dataclass(frozen=True)
@@ -202,10 +205,28 @@ def parse_capabilities(payload: dict[str, Any]) -> ServerCapabilities:
     nested ``capabilities: {}`` sub-object. Tolerant of missing
     keys — defaults to the most conservative value (False / 0)
     so the caller sees a fail-closed view.
+
+    v3-gating flags accept BOTH layouts for backwards compat with
+    pre-nesting test fixtures and any older backend deployments:
+
+      * nested under ``capabilities: { server_minted_execution_id,
+        per_execution_reservations, ... }`` (canonical — what
+        ``backend/src/proxy/http/protocol.rs::capabilities_handler``
+        returns in 1.0.0+)
+      * flat at the top level (the original 0.12.x wire — still seen
+        in fixtures + a handful of pre-1.0.0 backends)
+
+    Nested wins when both are present so the test fixtures and the
+    canonical shape are unambiguous.
     """
     caps = payload.get("capabilities") or {}
     if not isinstance(caps, dict):
         caps = {}
+
+    def _v3_flag(name: str) -> bool:
+        if name in caps and caps[name] is not None:
+            return bool(caps[name])
+        return bool(payload.get(name, False))
 
     return ServerCapabilities(
         # Top-level
@@ -216,23 +237,21 @@ def parse_capabilities(payload: dict[str, Any]) -> ServerCapabilities:
         built_at=str(payload.get("built_at", "")),
         sdk_min_version=str(payload.get("sdk_min_version", "0.0.0")),
         lua_script_version=str(payload.get("lua_script_version", "unknown")),
-        # Nested
-        server_minted_execution_id=bool(
-            caps.get("server_minted_execution_id", False)
-        ),
-        per_execution_reservations=bool(
-            caps.get("per_execution_reservations", False)
-        ),
-        enforcement_modes_soft=bool(caps.get("enforcement_modes_soft", False)),
-        heartbeat_time_based=bool(caps.get("heartbeat_time_based", False)),
+        # v3-gating flags: nested wins, flat is the fallback
+        server_minted_execution_id=_v3_flag("server_minted_execution_id"),
+        per_execution_reservations=_v3_flag("per_execution_reservations"),
+        enforcement_modes_soft=_v3_flag("enforcement_modes_soft"),
+        heartbeat_time_based=_v3_flag("heartbeat_time_based"),
+        # Numeric v3 fields — no test fixture covers the flat shape,
+        # so read only from the nested object.
         heartbeat_interval_seconds=int(caps.get("heartbeat_interval_seconds", 30)),
         heartbeat_skew_tolerance_seconds=int(
             caps.get("heartbeat_skew_tolerance_seconds", 5)
         ),
         chain_idle_ttl_seconds=int(caps.get("chain_idle_ttl_seconds", 300)),
-        decision_log=bool(caps.get("decision_log", False)),
-        outbox_async_drain=bool(caps.get("outbox_async_drain", False)),
-        idempotency_keys=bool(caps.get("idempotency_keys", False)),
+        decision_log=_v3_flag("decision_log"),
+        outbox_async_drain=_v3_flag("outbox_async_drain"),
+        idempotency_keys=_v3_flag("idempotency_keys"),
         rate_limit_fail_scope=_parse_rate_limit_scope(caps.get("rate_limit_fail_scope")),
     )
 
