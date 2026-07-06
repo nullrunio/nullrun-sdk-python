@@ -274,7 +274,7 @@ def test_normal_endpoint_unchanged():
 
 
 def test_install_is_idempotent():
-    """Calling install() twice on the same app must not double-register
+    """Calling install twice on the same app must not double-register
     handlers — the second call replaces the first."""
     app = FastAPI()
     nr_fastapi.install(app)

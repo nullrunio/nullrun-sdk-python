@@ -1,4 +1,4 @@
-"""Tests for the Layer 2 global ``nullrun.on_error()`` hook.
+"""Tests for the Layer 2 global ``nullrun.on_error `` hook.
 
 The hook contract is:
 
@@ -13,7 +13,7 @@ The hook contract is:
   * Hook exceptions are caught and logged at DEBUG — a
     misbehaving hook cannot break the SDK.
   * When no hook is registered, the SDK adds zero allocation /
-    zero lock cost (see ``has_hooks()`` short-circuit in
+    zero lock cost (see ``has_hooks `` short-circuit in
     ``_emit_sdk_error`` / ``_emit_for_transport_error``).
 """
 
@@ -133,14 +133,14 @@ class TestEmitError:
         # When no hook is registered, emit_error must return
         # without dispatching anything. The test asserts no
         # exception is raised — the real assertion is that
-        # ``has_hooks()`` is False (so the SDK skips the call
+        # ``has_hooks `` is False (so the SDK skips the call
         # entirely on the hot path).
         assert has_hooks() is False
         emit_error(NullRunError("test"), ErrorContext(stage="init"))  # must not raise
 
     def test_hook_exception_is_swallowed_and_logged(self):
         # A misbehaving hook must NOT break the SDK. The exception
-        # is caught and emitted at DEBUG (per design decision
+        # is caught and emitted at DEBUG (design decision
         # 2026-06-24 — silent at INFO/CRITICAL).
         def bad_hook(err, ctx):
             raise RuntimeError("hook boom")
@@ -246,7 +246,7 @@ class TestPublicAPI:
         assert has_hooks() is False
 
     def test_on_error_fires_on_init_failure(self, monkeypatch):
-        # Re-raise no-api_key init() — the on_error hook should
+        # Re-raise no-api_key init — the on_error hook should
         # see it before the exception escapes.
         monkeypatch.delenv("NULLRUN_API_KEY", raising=False)
         captured: list[tuple[Any, ErrorContext]] = []
@@ -280,7 +280,7 @@ class TestPublicAPI:
 # ---------------------------------------------------------------------------
 class TestKillBypass:
     def test_kill_interrupt_does_not_fire_hook(self):
-        # Per design decision A (2026-06-24): kill is a signal,
+        # Per design decision A (2026-06-24): kill is a signal
         # not an error. Hooks MUST NOT fire for BaseException
         # subclasses — that would mask the intent of
         # ``except WorkflowKilledInterrupt`` at the top of the

@@ -53,7 +53,7 @@ class TestNullRunRuntimeInit:
         monkeypatch.setenv("NULLRUN_API_KEY", "test-key-12345678")
         monkeypatch.setenv("NULLRUN_API_URL", "https://api.test.nullrun.io")
         rt1 = make_runtime()
-        # After make_runtime(), get_instance should return the same instance
+        # After make_runtime, get_instance should return the same instance
         # (if env vars match or if singleton was already set)
         rt2 = NullRunRuntime.get_instance()
         # Either it's the same instance, or get_instance created a new one with different params
@@ -69,7 +69,7 @@ class TestNullRunRuntimeInit:
 
 
 # ──────────────────────────────────────────────────────────────
-# NullRunRuntime — track()
+# NullRunRuntime — track 
 # ──────────────────────────────────────────────────────────────
 
 
@@ -144,12 +144,12 @@ class TestNullRunRuntimeTrack:
 
 
 # ──────────────────────────────────────────────────────────────
-# NullRunRuntime — execute()
+# NullRunRuntime — execute 
 # ──────────────────────────────────────────────────────────────
 
 
 # ──────────────────────────────────────────────────────────────
-# NullRunRuntime — execute()
+# NullRunRuntime — execute 
 # ──────────────────────────────────────────────────────────────
 
 
@@ -227,7 +227,7 @@ class TestNullRunRuntimeExecute:
         assert exc_info.value.endpoint == "execute"
 
     # T3-S2 (0.3.0): `test_execute_local_mode_allows` was removed along
-    # with the `local_mode` field. The execute() path now always hits
+    # with the `local_mode` field. The execute path now always hits
     # the /execute endpoint — there is no local stub to test.
 
 
@@ -308,17 +308,17 @@ class TestProtectDecorator:
         when no runtime exists AND no env var is set.
 
         Before the fix, `_get_or_create_runtime` wrapped
-        `get_instance()` in `try/except Exception` and rebuilt a
-        no-arg `NullRunRuntime()` as a "fallback". That fallback was
+        `get_instance ` in `try/except Exception` and rebuilt a
+        no-arg `NullRunRuntime ` as a "fallback". That fallback was
         doubly broken in 0.3.0: it swallowed the auth error, then
         crashed with the same error from the no-arg constructor (which
         also requires `api_key` per T3-S2). The net effect was a
         delayed crash with a worse error message.
 
         After the fix, `_get_or_create_runtime` lets the error
-        propagate from `get_instance()` unchanged. The user's first
+        propagate from `get_instance ` unchanged. The user's first
         `@protect` call surfaces the same clear error that
-        `nullrun.init()` would have raised at startup.
+        `nullrun.init ` would have raised at startup.
         """
         from nullrun import reset
         from nullrun.breaker.exceptions import NullRunAuthenticationError
@@ -418,7 +418,7 @@ class TestRuntimeDI:
         rt.shutdown()
 
     def test_runtime_singleton_reset_clears_instance(self, mock_api, monkeypatch):
-        """NullRunRuntime.reset_instance() properly clears singleton.
+        """NullRunRuntime.reset_instance properly clears singleton.
 
         T3-S2 (0.3.0): api_key is now required, so we pin
         NULLRUN_API_KEY in env so the singleton builder has something

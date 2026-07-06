@@ -1,5 +1,5 @@
 """Layer 3 of the "give the user a chance" design — the
-``nullrun.status()`` introspection API.
+``nullrun.status `` introspection API.
 
 Pre-Layer-3: the only way to know if the SDK was healthy was to
 trigger a protected call and see whether it raised. There was no
@@ -7,14 +7,14 @@ synchronous snapshot — the user could not "look at the SDK" in a
 debugger or in a dashboard without instrumenting every code
 path.
 
-Post-Layer-3: ``nullrun.status()`` returns a frozen
+Post-Layer-3: ``nullrun.status `` returns a frozen
 ``NullRunStatus`` dataclass describing the runtime's current
-state — backend reachability, WS connection, policy freshness,
+state — backend reachability, WS connection, policy freshness
 workflow state, and a ring buffer of recent errors. Designed
 for the "the agent is stuck, what's wrong?" runbook:
 
   1. Open the dashboard / dev console.
-  2. ``print(nullrun.status())``.
+  2. ``print(nullrun.status )``.
   3. See ``state="degraded"`` and ``fallback_reason="backend 401
      at 15:58:01"`` — root cause in one line.
 
@@ -29,7 +29,7 @@ The ``state`` field is the headline answer. It is derived from
 the rest of the snapshot — the user can read it as "is the SDK
 doing what I think it's doing?" without inspecting the rest:
 
-  * ``"misconfigured"`` — no api_key, or ``init()`` raised a
+  * ``"misconfigured"`` — no api_key, or ``init `` raised a
     config error and the runtime was never bound. The SDK is
     not operating; fix the config.
   * ``"offline"`` — backend is not reachable AND no successful
@@ -83,25 +83,25 @@ class RecentError:
     error fired before the runtime was bound.
     """
 
-    #: Stable error code (e.g. ``"NR-A003"``).
+    # Stable error code (e.g. ``"NR-A003"``).
     error_code: str
 
-    #: Stage identifier from the Layer-2 ``STAGES`` catalogue.
+    # Stage identifier from the Layer-2 ``STAGES`` catalogue.
     stage: str
 
-    #: Workflow at the time of the error, or ``None`` for
-    #: pre-bind errors.
+    # Workflow at the time of the error, or ``None`` for
+    # pre-bind errors.
     workflow_id: str | None
 
-    #: Tool at the time of the error, or ``None`` for
-    #: non-tool errors.
+    # Tool at the time of the error, or ``None`` for
+    # non-tool errors.
     tool_name: str | None
 
-    #: UTC wall-clock timestamp.
+    # UTC wall-clock timestamp.
     timestamp: datetime
 
-    #: Truncated message (200 chars) — long enough for human
-    #: reading, short enough to keep the snapshot small.
+    # Truncated message (200 chars) — long enough for human
+    # reading, short enough to keep the snapshot small.
     message: str
 
 
@@ -131,8 +131,8 @@ class WorkflowState:
 class NullRunStatus:
     """Synchronous snapshot of the SDK runtime.
 
-    Build with ``NullRunRuntime.status()`` or the top-level
-    ``nullrun.status()`` shortcut. The dataclass is frozen so
+    Build with ``NullRunRuntime.status `` or the top-level
+    ``nullrun.status `` shortcut. The dataclass is frozen so
     snapshots can be cached, shared across threads, and
     compared with ``==`` without defensive copying.
     """
@@ -161,14 +161,14 @@ class NullRunStatus:
         """``True`` iff ``state == "ok"``. Convenience for
         guard clauses:
 
-            if not nullrun.status().is_healthy():
+            if not nullrun.status.is_healthy: 
                 return render_degraded_banner(status)
         """
         return self.state == STATE_OK
 
     def summary(self) -> str:
         """One-line human-readable summary. Designed for
-        ``print(nullrun.status().summary())`` in a debug
+        ``print(nullrun.status.summary )`` in a debug
         console.
 
         Example outputs:

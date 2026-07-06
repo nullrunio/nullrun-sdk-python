@@ -4,7 +4,7 @@ Regression tests for MEDIUM-hygiene fixes in 0.4.0.
 Phase 6:
 - #6.1: NULLRUN_FALLBACK_MODE env var override.
 - #6.2: _rebuild strips Transfer-Encoding alongside Content-Encoding.
-- #6.3: shutdown() join caps (0.5s) for signal-handler safety.
+- #6.3: shutdown join caps (0.5s) for signal-handler safety.
 - #6.6: WS URL built via urllib.parse.
 - #6.7: DEDUP_LRU_MAX raised 512 -> 4096.
 """

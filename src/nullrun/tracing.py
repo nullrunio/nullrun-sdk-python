@@ -22,7 +22,7 @@ own current span.
 
 What this module does NOT do:
   - It does not emit events. `SpanContext` is a pure data
-    structure. The runtime's `track_event()` is what actually
+    structure. The runtime's `track_event ` is what actually
     posts `span_start` / `span_end` events to the backend. See
     `_emit_span_start` / `_emit_span_end` in `nullrun.decorators`
     for the wiring.
@@ -34,7 +34,7 @@ What this module does NOT do:
 from __future__ import annotations
 
 import uuid
-from contextvars import ContextVar
+from contextvars import ContextVar, Token
 from dataclasses import dataclass
 
 
@@ -43,7 +43,7 @@ def _new_id() -> str:
 
     Returns a real UUID4 with dashes (e.g. ``95ca7c0b-...-2788803ef3b8``)
     so the backend's `Uuid::parse_str` accepts it on the wire. Earlier
-    we shipped `uuid.uuid4().hex` (32 hex chars, no dashes) which the
+    we shipped `uuid.uuid4.hex` (32 hex chars, no dashes) which the
     backend silently dropped to NULL.
     """
     return str(uuid.uuid4())
@@ -55,11 +55,11 @@ class SpanContext:
     One span in the call tree.
 
     Attributes:
-        trace_id:    Stable across the whole trace (root + all descendants).
-        span_id:     Unique to this span. Children reference it as
+        trace_id: Stable across the whole trace (root + all descendants).
+        span_id: Unique to this span. Children reference it as
                      `parent_span_id`.
         parent_span_id: The parent's `span_id`, or None for the root span.
-        depth:       0 for the root, parent.depth + 1 for each child.
+        depth: 0 for the root, parent.depth + 1 for each child.
                      Useful for the waterfall UI's indentation.
     """
 
@@ -129,24 +129,24 @@ def create_root_span() -> SpanContext:
     )
 
 
-def set_span(ctx: SpanContext):
+def set_span(ctx: SpanContext) -> Token[SpanContext | None]:
     """
     Make `ctx` the current span. Returns a token that MUST be passed
     back to `reset_span` in a `finally` block to restore the previous
     context (which may itself be None).
 
     Usage:
-        span = create_root_span()
+        span = create_root_span 
         token = set_span(span)
         try:
-            ...
+...
         finally:
             reset_span(token)
     """
     return _current_span.set(ctx)
 
 
-def reset_span(token) -> None:
+def reset_span(token: Token[SpanContext | None]) -> None:
     """
     Restore the context that was active before the matching `set_span`.
     Pair with `set_span` — never call reset_span with a token from a

@@ -1,12 +1,12 @@
 """
 Regression tests for the P0 InsecureTransportError check.
 
-Pre-fix: ``Transport.__init__`` used a ``startswith("http://127.0.0.1")``
+Pre-fix: ``Transport.__init__`` used a ``startswith("http:/127.0.0.1")``
 chain. That had three classes of bugs:
-  1. Homograph attacks — ``http://127.0.0.1.attacker.com`` matched
+  1. Homograph attacks — ``http:/127.0.0.1.attacker.com`` matched
      the prefix and was allowed.
-  2. Case sensitivity — ``http://LOCALHOST:8080`` was rejected.
-  3. IPv6 miss — ``http://[::1]:8080`` was rejected even though
+  2. Case sensitivity — ``http:/LOCALHOST:8080`` was rejected.
+  3. IPv6 miss — ``http:/[::1]:8080`` was rejected even though
      ``[::1]`` is the IPv6 loopback.
 
 The fix replaces the startswith chain with a ``urllib.parse.urlparse``
@@ -81,7 +81,7 @@ class TestInsecureTransportAllowsLegitimateLocalhost:
         t = Transport(api_url=url, api_key="test-key-12345678")
         assert t is not None
         # Make sure we do not actually start a flush thread (we did
-        # not call start()), so the test does not hit a real network.
+        # not call start ), so the test does not hit a real network.
         assert t._client is not None
 
 

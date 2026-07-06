@@ -357,7 +357,7 @@ def test_unpatch_when_not_patched_is_noop(monkeypatch, fresh_patch_module):
 
 
 def test_unpatch_when_module_missing(monkeypatch, fresh_patch_module):
-    """If the module import disappears between patch and unpatch,
+    """If the module import disappears between patch and unpatch
     unpatch still resets the local flag instead of crashing.
     """
     _install_fake_autogen(monkeypatch)

@@ -76,7 +76,7 @@ class ActionHandler:
     - WEBHOOK: Sends HTTP webhook notification
 
     Usage:
-        handler = ActionHandler()
+        handler = ActionHandler 
 
         # Register custom alert handler
         def my_alert(msg):
@@ -86,7 +86,7 @@ class ActionHandler:
 
         # Register webhook
         handler.register_webhook(WebhookConfig(
-            url="https://hooks.slack.com/...",
+            url="https:/hooks.slack.com/..."
             headers={"Content-Type": "application/json"}
         ))
 
@@ -187,7 +187,7 @@ class ActionHandler:
             action_type = ActionType(action.lower())
         except ValueError:
             # Sprint 1.5 (B14): pre-fix this degraded silently to
-            # ``ActionType.BLOCK`` and triggered ``_default_block``,
+            # ``ActionType.BLOCK`` and triggered ``_default_block``
             # which raises ``NullRunBlockedException``. That made
             # the SDK into a DoS amplifier: a single malformed
             # ``action`` from the server (or a MITM, or a server
@@ -372,9 +372,9 @@ class ActionHandler:
             logger.warning("httpx not installed, cannot send webhook")
             return
 
-        # P3-2 (plan §10): exponential backoff between attempts with a
+        # P3-2: exponential backoff between attempts with a
         # 30s cap. Pre-fix the schedule was linear (``0.5 * (attempt+1)``
-        # → 0.5s, 1.0s, 1.5s, ...). Linear doesn't back off fast enough
+        # → 0.5s, 1.0s, 1.5s,...). Linear doesn't back off fast enough
         # when the destination is down — a transient outage produced
         # 100+ retries in seconds, and each KILL/PAUSE from the server
         # spawns its own delivery thread, so 1000 events/min generated

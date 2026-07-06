@@ -3,7 +3,7 @@ Unit tests for the URL-keyed extractor table in
 `nullrun.instrumentation.auto`.
 
 Each extractor is fed a canonical response body for its vendor and
-asserts the right `(prompt_tokens, completion_tokens, total_tokens,
+asserts the right `(prompt_tokens, completion_tokens, total_tokens
 model)` come back. We also cover:
 
 - error responses (`status >= 400`) -> None

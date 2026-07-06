@@ -6,7 +6,7 @@ extraction in two places:
 * ``nullrun.instrumentation.auto._normalize_finish_reason`` and the
   new branches in ``_openai_extractor`` / ``_anthropic_extractor`` /
   etc.
-* ``nullrun.instrumentation.langgraph._safe_get_gen_message``,
+* ``nullrun.instrumentation.langgraph._safe_get_gen_message``
   ``_get_finish_reason``, and the Phase 4.1 second-tier fields of
   ``extract_usage_from_response``.
 
@@ -217,7 +217,7 @@ class TestSafeGetGenMessage:
         assert _safe_get_gen_message(response) is msg
 
     def test_returns_none_when_message_attr_missing(self) -> None:
-        # Generation present but ``.message`` is None — still a hit,
+        # Generation present but ``.message`` is None — still a hit
         # just nothing to return.
         response = SimpleNamespace(generations=[[SimpleNamespace(message=None)]])
         assert _safe_get_gen_message(response) is None
@@ -297,7 +297,7 @@ class TestExtractUsagePhase41:
         assert out["cache_write_tokens"] == 20
 
     def test_cache_read_tokens_from_openai_prompt_details(self) -> None:
-        # OpenAI nests cached_tokens under prompt_tokens_details;
+        # OpenAI nests cached_tokens under prompt_tokens_details
         # the extractor must reach in there too.
         response = SimpleNamespace(
             usage={
@@ -321,7 +321,7 @@ class TestExtractUsagePhase41:
         assert out["reasoning_tokens"] == 30
 
     def test_tool_names_collected_from_message(self) -> None:
-        # When the response is an AIMessage (not an LLMResult),
+        # When the response is an AIMessage (not an LLMResult)
         # tool_calls live on ``response.tool_calls`` directly.
         response = SimpleNamespace(
             usage={"input_tokens": 1, "output_tokens": 1},

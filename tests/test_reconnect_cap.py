@@ -3,14 +3,14 @@ Regression test for plan item S-10: WebSocket reconnect loop must
 give up after a bounded number of consecutive failures.
 
 Pre-fix, ``_reconnect_loop`` ran ``while not self._closed:`` with no
-attempt cap. If the backend was permanently unreachable (DNS gone,
+attempt cap. If the backend was permanently unreachable (DNS gone
 DDoS, decommissioned region), the WS thread spun forever leaking
 the thread and producing log spam. The receive loop's ``finally``
 block set ``_running = False`` so the loop body ran the connect
 attempt forever.
 
 Post-fix the loop increments ``_consecutive_reconnect_failures`` on
-each failed ``_connect()`` and gives up after
+each failed ``_connect `` and gives up after
 ``_MAX_RECONNECT_ATTEMPTS`` consecutive failures (default 10). After
 giving up, ``_closed = True`` is set so the loop exits; the runtime
 falls back to HTTP-poll for control plane state delivery.
@@ -28,7 +28,7 @@ from nullrun.transport_websocket import (
 
 
 def _make_conn():
-    """Construct a WebSocketConnection without going through connect()
+    """Construct a WebSocketConnection without going through connect 
     — we only test ``_reconnect_loop`` in isolation."""
     return WebSocketConnection(
         url="ws://localhost:18080/ws/control/org-test",
@@ -39,7 +39,7 @@ def _make_conn():
 
 @pytest.mark.asyncio
 async def test_reconnect_loop_gives_up_after_max_attempts():
-    """When every ``_connect()`` raises, the loop must exit after
+    """When every ``_connect `` raises, the loop must exit after
     ``_MAX_RECONNECT_ATTEMPTS`` consecutive failures. Pre-fix this
     test would never terminate.
 
@@ -77,7 +77,7 @@ async def test_reconnect_loop_gives_up_after_max_attempts():
 
 @pytest.mark.asyncio
 async def test_reconnect_loop_resets_counter_on_success():
-    """A successful ``_connect()`` resets the failure counter.
+    """A successful ``_connect `` resets the failure counter.
 
     We verify this directly on the source: the success branch in
     ``_reconnect_loop`` is a single assignment ``self._consecutive_reconnect_failures = 0``.
@@ -128,6 +128,6 @@ async def test_reconnect_loop_logs_warning_at_cap():
 
 
 def test_default_max_attempts_matches_plan():
-    """The cap is 10 by default (per plan §13.4). Bumping this is a
+    """The cap is 10 by default. Bumping this is a
     deliberate change that should show up in code review."""
     assert _MAX_RECONNECT_ATTEMPTS == 10

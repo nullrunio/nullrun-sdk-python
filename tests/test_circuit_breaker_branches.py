@@ -7,10 +7,10 @@ Focuses on:
   - ``_call_async`` happy path and exception paths
   - ``_maybe_apply_open_jitter_sync`` (no-op when not ready, sleep when ready)
   - ``_maybe_apply_open_jitter_async``
-  - Redis state branches (``_check_global_state``, ``_publish_open_state``,
-    ``_publish_half_open_state``, ``_clear_global_state``,
+  - Redis state branches (``_check_global_state``, ``_publish_open_state``
+    ``_publish_half_open_state``, ``_clear_global_state``
     ``_global_state_allows_call``)
-  - ``get_metrics()`` format
+  - ``get_metrics `` format
   - ``CircuitBreakerMetrics.__init__`` coverage
 """
 
@@ -74,7 +74,7 @@ def test_open_jitter_sync_sleeps_when_recovery_elapsed():
     with patch("time.sleep") as mock_sleep:
         cb._maybe_apply_open_jitter_sync()
         mock_sleep.assert_called_once()
-        # Sleep must be 0 ≤ t ≤ 5.0 (capped per §7.2 #35).
+        # Sleep must be 0 ≤ t ≤ 5.0 (capped per #35).
         args = mock_sleep.call_args.args
         assert 0.0 <= args[0] <= 5.0
 
@@ -321,7 +321,7 @@ def test_global_state_allows_call_redis_half_open_at_cap():
     assert cb._global_state_allows_call() is False
 
 
-# ─── call() routes async coroutines ─────────────────────────────────
+# ─── call routes async coroutines ─────────────────────────────────
 
 
 def test_call_sync_function_via_call_returns_result():

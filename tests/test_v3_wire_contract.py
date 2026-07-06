@@ -1,7 +1,7 @@
 """
-Contract tests pinning the v3 wire format (CLAUDE.md v3.4 alignment).
+Contract tests pinning the v3 wire format.
 
-Background: 0.11.0 added six new endpoints (/check, /track,
+Background: 0.11.0 added six new endpoints (/check, /track
 /cancel, /heartbeat, /chain/end, /budget/approximate) and a
 mandatory ``X-NULLRUN-PROTOCOL: 3`` header. Each test in this file
 guards a specific class of wire-drift so a future SDK refactor
@@ -60,13 +60,13 @@ BASE_URL = "https://api.test.nullrun.io"
 
 
 # ─────────────────────────────────────────────────────────────────────
-# FIX §32: every signed POST must carry X-NULLRUN-PROTOCOL: <current>
+# FIX: every signed POST must carry X-NULLRUN-PROTOCOL: <current>
 # ─────────────────────────────────────────────────────────────────────
 #
 # Without this header the backend's protocol middleware rejects with
 # HTTP 400 + error_code PROTOCOL_HEADER_REQUIRED BEFORE the gate
 # pipeline runs. Centralising the value in
-# ``nullrun.transport._protocol_header_value()`` means a future
+# ``nullrun.transport._protocol_header_value `` means a future
 # bump is a one-line change.
 
 
@@ -75,7 +75,7 @@ class TestProtocolHeaderConstant:
 
     def test_version_is_three(self):
         # Bumping this requires a coordinated backend release —
-        # see CLAUDE.md §32 (semver: major = breaking wire change).
+        # see (semver: major = breaking wire change).
         assert NULLRUN_PROTOCOL_VERSION == 3
 
     def test_header_name_is_dashed(self):
@@ -126,8 +126,8 @@ class TestSignedPostIncludesProtocolHeader:
 
     @respx.mock
     def test_check_v3_includes_protocol_header(self):
-        # drift.md 2026-07-04 (B1): ``check_v3`` now delegates to
-        # ``check()`` which targets /api/v1/gate (the
+        # 2026-07-04 (B1): ``check_v3`` now delegates to
+        # ``check `` which targets /api/v1/gate (the
         # /api/v1/check endpoint was removed 2026-06-27 and returns
         # 410 Gone). Wire the mock against /api/v1/gate to match.
         t = Transport(api_url=BASE_URL, api_key="nr_live_abc123")
@@ -150,8 +150,8 @@ class TestSignedPostIncludesProtocolHeader:
 
     @respx.mock
     def test_track_single_includes_protocol_header(self):
-        # drift.md 2026-07-04 (B2): body shape matches the v3 wire
-        # contract — ``reservation_id`` (server-minted from /check),
+        # 2026-07-04 (B2): body shape matches the v3 wire
+        # contract — ``reservation_id`` (server-minted from /check)
         # ``workflow_id`` + ``tokens`` + ``cost_cents`` (the SDK
         # always emits 0 — backend recomputes from tokens) +
         # ``cost_source: "provisional"``. Pre-fix this test sent the
@@ -205,7 +205,7 @@ class TestSignedPostIncludesProtocolHeader:
 
     @respx.mock
     def test_chain_end_includes_protocol_header(self):
-        # drift.md 2026-07-04 (B3): ``chain_end`` now POSTs to
+        # 2026-07-04 (B3): ``chain_end`` now POSTs to
         # /api/v1/gate with ``chain_op: "end"``. The /api/v1/chain/end
         # endpoint was never registered on the backend.
         t = Transport(api_url=BASE_URL, api_key="nr_live_abc123")
@@ -284,7 +284,7 @@ class TestSignedPostIncludesProtocolHeader:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# §16 — chain_id / chain_op / idempotency_key / stream forwarding on
+# — chain_id / chain_op / idempotency_key / stream forwarding on
 # /gate and /check. Additive: missing keys are omitted, not nulled.
 # ─────────────────────────────────────────────────────────────────────
 
@@ -345,8 +345,8 @@ class TestWireContractV3FieldsForwarded:
 
     @respx.mock
     def test_check_v3_accepts_chain_context(self):
-        # drift.md 2026-07-04 (B1): ``check_v3`` delegates to
-        # ``check()`` which posts to /api/v1/gate. The /api/v1/check
+        # 2026-07-04 (B1): ``check_v3`` delegates to
+        # ``check `` which posts to /api/v1/gate. The /api/v1/check
         # endpoint returns 410 Gone since 2026-06-27.
         t = Transport(api_url=BASE_URL, api_key="nr_live_abc123")
         try:
@@ -379,11 +379,11 @@ class TestWireContractV3FieldsForwarded:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# §13 — v3 error envelope → typed exception mapping
+# — v3 error envelope → typed exception mapping
 # ─────────────────────────────────────────────────────────────────────
 #
 # The backend returns errors as a JSON envelope of the shape
-# ``{"error_code": "BUDGET_HARD_BLOCKED", "error_message": "...",
+# ``{"error_code": "BUDGET_HARD_BLOCKED", "error_message": "..."
 # "details": {...}, "retry_after_ms": N}``. The mapping is
 # exhaustive (16 codes), so a future addition to the backend is
 # caught here as a missing key in ``_V3_ERROR_CODE_MAP``.
@@ -431,7 +431,7 @@ class TestV3ErrorEnvelopeMapping:
         assert isinstance(exc, NullRunBudgetError)
 
     def test_redis_unavailable_maps_to_budget_error(self):
-        # CLAUDE.md §4: REDIS_UNAVAILABLE is fail-CLOSED → 402
+        #: REDIS_UNAVAILABLE is fail-CLOSED → 402
         resp = self._make_response(
             402,
             {"error_code": "REDIS_UNAVAILABLE", "error_message": "Redis down"},
@@ -510,7 +510,7 @@ class TestV3ErrorEnvelopeMapping:
         assert exc.retry_after == 5.0
 
     def test_rate_limit_redis_unavailable_maps_to_infra_error(self):
-        # CLAUDE.md §4: fail-CLOSED for aggregate rate limit
+        #: fail-CLOSED for aggregate rate limit
         resp = self._make_response(
             503,
             {"error_code": "RATE_LIMIT_REDIS_UNAVAILABLE", "error_message": "redis down"},
@@ -519,7 +519,7 @@ class TestV3ErrorEnvelopeMapping:
         assert isinstance(exc, NullRunRateLimitRedisError)
 
     def test_budget_data_unavailable_maps_to_backend_error(self):
-        # CLAUDE.md §17: dashboard must show "Data unavailable", not "$0"
+        #: dashboard must show "Data unavailable", not "$0"
         resp = self._make_response(
             503,
             {"error_code": "BUDGET_DATA_UNAVAILABLE", "error_message": "no sources"},
@@ -540,7 +540,7 @@ class TestV3ErrorEnvelopeMapping:
         assert exc.details.get("status_code") == 503
 
     def test_retry_after_header_takes_precedence_over_json(self):
-        # Server-side convention: header is canonical (RFC 7231),
+        # Server-side convention: header is canonical (RFC 7231)
         # JSON is a NullRun-specific fallback. Header wins on conflict.
         resp = httpx.Response(
             429,
@@ -553,11 +553,11 @@ class TestV3ErrorEnvelopeMapping:
 
 
 class TestV3ErrorMapCatalog:
-    """Every backend code listed in CLAUDE.md §13 has a mapping entry."""
+    """Every backend error code has a mapping entry to a typed exception."""
 
     def test_catalog_covers_all_documented_codes(self):
-        # Frozen catalog: every backend code documented in CLAUDE.md
-        # §13 must have a mapping entry. If you add a new code on
+        # Frozen catalog: every backend code documented in 
+        # must have a mapping entry. If you add a new code on
         # the backend side, add it here too.
         expected = {
             "PROTOCOL_TOO_OLD",
@@ -583,7 +583,7 @@ class TestV3ErrorMapCatalog:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# §6 — chain context helpers (contextmanager, getters, setters)
+# — chain context helpers (contextmanager, getters, setters)
 # ─────────────────────────────────────────────────────────────────────
 
 
@@ -627,16 +627,16 @@ class TestChainContextHelpers:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# §26 — time-based heartbeat scheduling
+# — time-based heartbeat scheduling
 # ─────────────────────────────────────────────────────────────────────
 
 
 class TestPingChainScheduler:
-    """NullRunRuntime.ping_chain — time-based heartbeat (CLAUDE.md §26)."""
+    """NullRunRuntime.ping_chain sends time-based heartbeats."""
 
     def test_ping_chain_emits_heartbeats_on_time_schedule(self):
         # The scheduler is a real background thread. We replace
-        # the transport's heartbeat() with a counter via
+        # the transport's heartbeat with a counter via
         # ``patch.object`` AND monkey-patch ``threading.Event.wait``
         # so each scheduler iteration takes ~50ms instead of the
         # real 10s interval — turns a 10s test into a sub-second one
@@ -707,7 +707,7 @@ class TestPingChainScheduler:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# §17 — ApproximateBudget is NEVER for enforcement
+# — ApproximateBudget is NEVER for enforcement
 # ─────────────────────────────────────────────────────────────────────
 
 
@@ -754,7 +754,7 @@ class TestApproximateBudgetEndpoint:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# §23 — /cancel idempotency contract
+# — /cancel idempotency contract
 # ─────────────────────────────────────────────────────────────────────
 
 
@@ -794,7 +794,7 @@ class TestCancelEndpoint:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# §6 — /chain/end idempotency
+# — /chain/end idempotency
 # ─────────────────────────────────────────────────────────────────────
 
 
@@ -803,7 +803,7 @@ class TestChainEndEndpoint:
 
     @respx.mock
     def test_chain_end_sends_chain_id_in_body(self):
-        # drift.md 2026-07-04 (B3): chain_end targets /api/v1/gate
+        # 2026-07-04 (B3): chain_end targets /api/v1/gate
         # with chain_op=end. Verify both fields land on the wire.
         t = Transport(api_url=BASE_URL, api_key="nr_live_abc123")
         try:
@@ -820,12 +820,12 @@ class TestChainEndEndpoint:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# §24 — /gate execution_id is fresh uuidv7 per call (BUG #4 fix)
+# — /gate execution_id is fresh uuidv7 per call (BUG #4 fix)
 # ─────────────────────────────────────────────────────────────────────
 
 
 class TestGateExecutionId:
-    """CLAUDE.md §24: /gate execution_id must be a fresh uuidv7
+    """: /gate execution_id must be a fresh uuidv7
     per call, NOT the workflow_id. Pre-fix the SDK sent
     `execution_id = workflow_id` which broke the v3 reservation
     binding on /track (consume_budget_v3 looks up
@@ -901,14 +901,14 @@ class TestGateExecutionId:
             body = _json.loads(respx.calls.last.request.content)
             eid = body["execution_id"]
             parsed = uuid.UUID(eid)
-            # UUID v7 has version nibble == 7 (RFC 9562 §5.7)
+            # UUID v7 has version nibble == 7 (RFC 9562)
             assert parsed.version == 7
         finally:
             t.stop()
 
 
 # ─────────────────────────────────────────────────────────────────────
-# BUG #5 — In-process gate cache for chain-mode (CLAUDE.md §26)
+# BUG #5 — In-process gate cache for chain-mode
 # ─────────────────────────────────────────────────────────────────────
 
 
@@ -957,7 +957,7 @@ class TestGateCache:
 
     def test_cache_gate_disabled_when_no_chain_id(self):
         # Mirror the runtime's cache_enabled predicate:
-        #   chain_id is not None AND NULLRUN_GATE_CACHE_DISABLE != "1"
+        # chain_id is not None AND NULLRUN_GATE_CACHE_DISABLE != "1"
         import os
         os.environ["NULLRUN_GATE_CACHE_DISABLE"] = ""
         chain_id = None
@@ -981,22 +981,22 @@ class TestGateCache:
 
 # ─────────────────────────────────────────────────────────────────────
 # BUG #5 — chain-mode gate cache at the runtime level
-#   (CLAUDE.md §26 — collapse 100 /gate calls into 1 inside `with chain(...)`)
+#`)
 # ─────────────────────────────────────────────────────────────────────
 #
 # The TestGateCache data-structure tests above pin the runtime's
 # `_GATE_CACHE` dict invariants in isolation; this class drives the
-# full NullRunRuntime.check_workflow_budget() path so the
+# full NullRunRuntime.check_workflow_budget path so the
 # cache_enabled predicate + cache hit/miss branches in
 # ``runtime.py:1287-1310`` are actually exercised end-to-end. Without
-# these tests ``pytest-cov`` reports that exact range as uncovered,
+# these tests ``pytest-cov`` reports that exact range as uncovered
 # which dragged patch coverage on PR #52 below the 70% Codecov floor.
 
 
 class TestGateCacheRuntimeFlow:
     """Runtime-level chain-mode gate cache coverage.
 
-    Drives ``NullRunRuntime.check_workflow_budget()`` inside
+    Drives ``NullRunRuntime.check_workflow_budget `` inside
     ``with workflow(...) + with chain(...)`` and verifies the
     /gate roundtrip count vs. expected after the 5s in-process
     cache is applied.
@@ -1024,8 +1024,8 @@ class TestGateCacheRuntimeFlow:
         into the cache hit branch (runtime.py:1302).
 
         Covers:
-          runtime.py:1291-1310 (cache_enabled predicate),
-          runtime.py:1302 (cache hit `response = cached[1]`),
+          runtime.py:1291-1310 (cache_enabled predicate)
+          runtime.py:1302 (cache hit `response = cached[1]`)
           runtime.py:1306 (cache miss → transport.check + store).
         """
         from nullrun.runtime import NullRunRuntime
@@ -1075,7 +1075,7 @@ class TestGateCacheRuntimeFlow:
         second payload.
 
         Covers:
-          runtime.py:1247-1255 (execution_id = uuid7_str()),
+          runtime.py:1247-1255 (execution_id = uuid7_str )
           runtime.py:1310-1323 (no-cache branch — direct transport.check).
         """
         import json as _json
@@ -1127,7 +1127,7 @@ class TestGateCacheRuntimeFlow:
         direct transport.check path).
 
         Covers:
-          runtime.py:1294-1295 (cache_enabled=False exit),
+          runtime.py:1294-1295 (cache_enabled=False exit)
           runtime.py:1310-1323 (no-cache branch).
         """
         import os

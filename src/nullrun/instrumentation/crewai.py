@@ -108,6 +108,15 @@ def patch_crewai(runtime: Any) -> bool:
 
             kwargs["step_callback"] = step_cb
 
+        # Defensive guard: getattr(Crew, "kickoff_async", None) returns
+        # None when the installed crewai version predates the async
+        # API. Without this branch the previous code crashed with
+        # "object NoneType is not callable" on the first async kickoff
+        # (mypy flagged the call site for the same reason). We fall
+        # through to the sync _orig_kickoff and let the runtime decide
+        # what to do with a sync wrapper being awaited.
+        if _orig_kickoff_async is None:
+            return _wrap_kickoff(self, inputs=inputs, **kwargs)
         result = await _orig_kickoff_async(self, inputs=inputs, **kwargs)
         _emit_usage_metrics(runtime, self)
         return result

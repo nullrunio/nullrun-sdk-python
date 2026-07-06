@@ -3,15 +3,15 @@
 These tests pin two invariants:
 
 1. Every ``error_code`` raised by the SDK has a default message in
-   :data:`nullrun.messages.DEFAULT_MESSAGES`. Adding a new code in
+:data:`nullrun.messages.DEFAULT_MESSAGES`. Adding a new code in
    ``exceptions.py`` without an entry here is a regression — end users
    would see the generic fallback instead of a meaningful message.
 
-2. :func:`format_user_message` returns a non-empty, non-internal-jargon
+2.:func:`format_user_message` returns a non-empty, non-internal-jargon
    string for every exception class the SDK can raise. The tests do
    NOT assert the exact wording (NULLRUN reserves the right to tune
    phrasing) — only that the message is non-empty and contains no
-   developer-facing substrings (``workflow``, ``budget_cents``,
+   developer-facing substrings (``workflow``, ``budget_cents``
    ``api_key``, ``NULLRUN_`` env vars).
 """
 from __future__ import annotations
@@ -20,7 +20,6 @@ import pytest
 
 from nullrun import messages
 from nullrun.breaker import exceptions as exc
-
 
 # ---------------------------------------------------------------------------
 # Catalog completeness — every code in the SDK has a default message

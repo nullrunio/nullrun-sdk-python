@@ -31,7 +31,7 @@ from nullrun.tracing import (
 @pytest.fixture
 def capturing_runtime(make_runtime, mock_api):
     """
-    A runtime that records every event passed to its `track()`.
+    A runtime that records every event passed to its `track `.
 
     We monkey-patch the *instance* method (not the class) so the rest
     of the runtime (transport, breaker, enrichment) still runs as

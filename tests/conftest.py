@@ -30,7 +30,7 @@ def reset_runtime():
     _dec._runtime = None
     _act._action_handler = None
     # Module-level cache used by `nullrun.track_llm` / `nullrun.track_tool` →
-    # `get_runtime()`. Without this, a stale singleton from a previous test
+    # `get_runtime `. Without this, a stale singleton from a previous test
     # leaks across the suite (e.g. a test that did `nullrun.init(...)` with
     # the prod URL leaves that URL pinned for the next test).
     _rt_mod._runtime = None
@@ -82,6 +82,23 @@ def mock_api():
                 },
             )
         )
+        # Execute endpoint. 2026-07-05 retry-budget bump surfaced
+        # the test suite previously relied on respx allow-all for
+        # unmocked URLs, which only worked because the old
+        #  × 5s httpx timeout still completed in
+        # <2s. Adding the explicit mock makes the execute path
+        # deterministic regardless of the retry count.
+        respx.post(f"{BASE_URL}/api/v1/execute").mock(
+            return_value=Response(
+                200,
+                json={
+                    "decision": "allow",
+                    "decision_source": "gateway",
+                    "explanation": "allowed",
+                    "policy_version": 1,
+                },
+            )
+        )
         # Check endpoint
         respx.post(f"{BASE_URL}/check").mock(
             return_value=Response(
@@ -127,9 +144,9 @@ def make_runtime(mock_api):
         )
         defaults.update(kwargs)
         rt = NullRunRuntime(**defaults)
-        # Pin for @protect decorator's lazy resolution. Without this,
-        # @protect would call NullRunRuntime.get_instance() which reads
-        # env vars, finds no NULLRUN_API_KEY in the test environment,
+        # Pin for @protect decorator's lazy resolution. Without this
+        # @protect would call NullRunRuntime.get_instance which reads
+        # env vars, finds no NULLRUN_API_KEY in the test environment
         # and raise NullRunAuthenticationError.
         _dec._runtime = rt
         return rt

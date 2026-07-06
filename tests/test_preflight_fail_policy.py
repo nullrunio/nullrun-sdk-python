@@ -217,7 +217,7 @@ class TestEnforceSensitiveToolFailClosed:
         return rt, charge_card, calls
 
     def test_transport_error_fails_closed(self, make_runtime, mock_api, monkeypatch):
-        """Network error on /execute → NullRunBlockedException,
+        """Network error on /execute → NullRunBlockedException
         body does NOT run. Regression for bug #2."""
         respx.post(f"{BASE_URL}/api/v1/execute").mock(
             side_effect=httpx.ConnectError("connection refused")
@@ -261,7 +261,7 @@ class TestEnforceSensitiveToolFailClosed:
     def test_defense_in_depth_fallback_source_fails_closed(self, make_runtime, mock_api):
         """Even if `runtime.execute` returns a dict with
         `decision_source` starting with `FALLBACK_*` (e.g. a future
-        regression drops the `on_transport_error="raise"` argument),
+        regression drops the `on_transport_error="raise"` argument)
         the decorator MUST still raise NullRunBlockedException. This
         is the "defense in depth" path in ADR-008 Rule 1 / Rule 2.
 

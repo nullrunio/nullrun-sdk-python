@@ -2,7 +2,7 @@
 Regression tests for Phase 8 release polish.
 
 Phase 8:
-- #8.1: get_org_status() public method on NullRunRuntime.
+- #8.1: get_org_status public method on NullRunRuntime.
 - #8.4: NULLRUN_BATCH_SIZE / NULLRUN_FLUSH_INTERVAL_MS env vars.
 - #8.6: RecordingSession does not persist _fingerprint.
 - Circuit-breaker sleep capped at 5s.
@@ -146,7 +146,7 @@ def test_open_to_halfopen_sleep_capped_at_5s():
     """The OPEN -> HALF_OPEN jitter sleep is bounded by 5.0s.
 
     We pin the cap by reading the source of the jitter helpers
-    — §7.2 #35 split the cap into ``_maybe_apply_open_jitter_sync``
+    — #35 split the cap into ``_maybe_apply_open_jitter_sync``
     and ``_maybe_apply_open_jitter_async`` so async callers can
     await instead of blocking the event loop. The cap itself
     stays at 5.0s in both branches.

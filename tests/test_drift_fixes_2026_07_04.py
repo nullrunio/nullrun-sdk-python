@@ -1,24 +1,24 @@
 """
-Contract tests for the drift.md 2026-07-04 fixes.
+Contract tests for the 2026-07-04 fixes.
 
 Background
 ----------
-drift.md (NULLRUN/drift.md, 2026-07-04) flagged three real
+ (NULLRUN/, 2026-07-04) flagged three real
 SDK gaps whose wire effect was observable to customers:
 
-  F1 (drift.md P1-5) / open Q4: /track v3 single-event
+  F1 / open Q4: /track v3 single-event
       payload did NOT carry a wire ``idempotency_key``. Backend
       (handlers.rs:4654-4725) supports replay on hit, but
       without the field the SDK's transport-level retry either
       re-ran CONSUME_SCRIPT (→ 503 ``RESERVATION_NOT_FOUND``)
       or double-billed. Fix: ``_capture_server_minted_execution_id``
       now captures ``operation_id`` from the /check response
-      into a contextvar (``get_server_minted_idempotency_key``),
+      into a contextvar (``get_server_minted_idempotency_key``)
       ``_enrich_event`` stamps it on the wire_event, and
       ``_build_v3_track_payload`` propagates it onto the v3
       /track payload.
 
-  F2 (drift.md P1-1): NR-B004 → 402 not 429. The wire envelope
+  F2: NR-B004 → 402 not 429. The wire envelope
       parser preserved the HTTP status on ``NullRunBackendError``
       but not on ``NullRunBudgetError`` /
       ``NullRunWorkflowInactiveError`` /
@@ -29,7 +29,7 @@ SDK gaps whose wire effect was observable to customers:
       ``_parse_v3_error_envelope`` populates it from
       ``response.status_code``.
 
-  F3 (drift.md P1-2): SDK_README "Fail-OPEN на инфраструктурных
+  F3: SDK_README "Fail-OPEN на инфраструктурных
       сбоях" is half-wrong. The honest split (now in the
       runtime module-top docstring):
         * SDK-side transport error (network/5xx/breaker open):
@@ -61,13 +61,12 @@ from nullrun.breaker.exceptions import (
     NullRunWorkflowInactiveError,
 )
 
-
 # ---------------------------------------------------------------------------
 # F1: wire idempotency_key propagation
 # ---------------------------------------------------------------------------
 
 class TestIdempotencyKeyOnTrackPayload:
-    """F1 (drift.md P1-5): /track v3 single-event carries the
+    """F1: /track v3 single-event carries the
     /check operation_id as the wire ``idempotency_key`` so the
     backend's replay branch returns 200 + ``idempotent_replay:
     true`` on hit.
@@ -120,7 +119,7 @@ class TestIdempotencyKeyOnTrackPayload:
 
     def test_clear_drops_idempotency_key(self):
         """``clear_server_minted_execution_id`` must also clear the
-        idempotency_key (symmetric lifetime — drift.md P1-5).
+        idempotency_key (symmetric lifetime — ).
         """
         from nullrun.runtime import _capture_server_minted_execution_id
 
@@ -199,7 +198,7 @@ class TestIdempotencyKeyOnTrackPayload:
 # ---------------------------------------------------------------------------
 
 class TestStatusCodeOnExceptions:
-    """F2 (drift.md P1-1): the wire envelope parser preserves
+    """F2: the wire envelope parser preserves
     ``response.status_code`` on every decision exception so FastAPI
     exception handlers reading ``exc.status_code`` don't fall back
     to 500.
@@ -247,8 +246,8 @@ class TestStatusCodeOnExceptions:
 
     def test_redis_unavailable_preserves_402(self):
         """BUDGET_REDIS_UNAVAILABLE is fail-CLOSED on the wire
-        (CLAUDE.md §4) — the SDK raises exactly as the backend
-        returned it (drift.md P1-2 honesty).
+ — the SDK raises exactly as the backend
+        returned it (P1-2 honesty).
         """
         exc = self._raise_via_parser("REDIS_UNAVAILABLE", 402)
         assert isinstance(exc, NullRunBudgetError)
@@ -292,11 +291,11 @@ class TestStatusCodeOnExceptions:
 
 
 # ---------------------------------------------------------------------------
-# F3: fail-CLOSED / fail-OPEN honesty (drift.md P1-2)
+# F3: fail-CLOSED / fail-OPEN honesty
 # ---------------------------------------------------------------------------
 
 class TestFailClosedHonesty:
-    """F3 (drift.md P1-2): the SDK reads backend enforcement
+    """F3: the SDK reads backend enforcement
     responses as fail-CLOSED even when they're named with the word
     "Redis" — wire 4xx/5xx that names an enforcement failure must
     NOT be silently treated as a transport blip.
@@ -305,7 +304,7 @@ class TestFailClosedHonesty:
     def test_redis_unavailable_is_fail_closed_402(self):
         """``REDIS_UNAVAILABLE`` / ``BUDGET_REDIS_UNAVAILABLE`` →
         NullRunBudgetError (fail-CLOSED). The SDK must not turn
-        this into a silent ALLOW — drift.md P1-2 explicitly
+        this into a silent ALLOW — explicitly
         flagged the SDK_README claim that contradicted this.
         """
         from nullrun.transport import _parse_v3_error_envelope
@@ -333,7 +332,7 @@ class TestFailClosedHonesty:
 
     def test_rate_limit_redis_unavailable_is_fail_closed_503(self):
         """``RATE_LIMIT_REDIS_UNAVAILABLE`` → NullRunRateLimitRedisError
-        (fail-CLOSED per CLAUDE.md §4 — aggregate rate limit is
+        (fail-CLOSED per — aggregate rate limit is
         the authoritative gate)."""
         from nullrun.breaker.exceptions import NullRunRateLimitRedisError
         from nullrun.transport import _parse_v3_error_envelope

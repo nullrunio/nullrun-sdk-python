@@ -5,7 +5,7 @@ Every enforcement decision arrives from the backend via /gate and
 regression that re-introduces a local Policy class trips the test
 loudly.
 
-Audit context (D-01, 2026-06-26): ``Policy.from_dict()`` was silently
+Audit context (D-01, 2026-06-26): ``Policy.from_dict `` was silently
 parsing backend responses and falling back to hardcoded defaults
 (budget_cents=1000, rate_limit=100, loop_threshold=6) when fields
 were missing. Per-org policy enforcement through the SDK was an
@@ -82,7 +82,7 @@ def test_loop_tracker_class_removed():
 
 
 def test_track_does_no_local_check():
-    """track() forwards to transport without local pre-filter.
+    """track forwards to transport without local pre-filter.
 
     With local enforcement removed, the SDK does not block calls
     based on internal counters — every gate decision comes from

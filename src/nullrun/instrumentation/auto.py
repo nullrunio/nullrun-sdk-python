@@ -3,7 +3,7 @@ Vendor-independent auto-instrumentation for NullRun SDK.
 
 Phase D of the hardening plan: a single `nullrun.init(api_key=...)` call should
 track every LLM call regardless of vendor. The user does not need to remember
-to call `patch_openai()` or wire callbacks.
+to call `patch_openai ` or wire callbacks.
 
 Three observation paths feed a single sink (`runtime.track`):
 
@@ -196,25 +196,25 @@ def _openai_extractor(body: bytes, status: int) -> ExtractedUsage | None:
 # The httpx transport and the LangChain callback both observe the same
 # real LLM call, but until this commit they computed fingerprints from
 # different inputs:
-#   - httpx transport:  sha256(host|status|body)
-#   - LangChain callback: sha256(json({path, run_id, response_id, ...}))
+# - httpx transport: sha256(host|status|body)
+# - LangChain callback: sha256(json({path, run_id, response_id,...}))
 # Because the inputs differ, the two fingerprints never collided and the
-# dedup LRU at runtime.track() could not collapse the two emissions for the
-# same call. On a typical `app.invoke()` with 6 LLM calls the backend
+# dedup LRU at runtime.track could not collapse the two emissions for the
+# same call. On a typical `app.invoke ` with 6 LLM calls the backend
 # saw ~12 llm_call events on the wire (2 per real call), which doubled
 # the dashboard's `llm_call_count` and skewed `cost_events` aggregates.
 #
 # The fix: a single helper that both observers call with the same three
 # signals (model + provider + upstream chat-completion id). The three are
 # reachable from every observer:
-#   - httpx transport reads `model` and `id` straight out of the response
-#     body JSON (`payload["model"]`, `payload["id"]`).
-#   - LangChain callback reads `model` from `invocation_params` /
-#     `response.llm_output["model_name"]` and `id` from
-#     `response.llm_output["id"]` / `response.id` / the generation's
-#     AIMessage `.id` / `response.response_metadata["id"]` — all four
-#     locations are populated by langchain-openai 1.x for OpenAI chat
-#     completions.
+# - httpx transport reads `model` and `id` straight out of the response
+# body JSON (`payload["model"]`, `payload["id"]`).
+# - LangChain callback reads `model` from `invocation_params` /
+# `response.llm_output["model_name"]` and `id` from
+# `response.llm_output["id"]` / `response.id` / the generation's
+# AIMessage `.id` / `response.response_metadata["id"]` — all four
+# locations are populated by langchain-openai 1.x for OpenAI chat
+# completions.
 # When any of the three signals is missing, the helper falls back to the
 # empty string on that slot; the resulting fingerprint is still
 # deterministic for the call, just less specific. That's intentional —
@@ -232,7 +232,7 @@ def _fingerprint_for_llm_call(
     Both the httpx transport hook (``NullRunSyncTransport._emit`` /
     ``NullRunAsyncTransport._emit``) and the LangChain callback
     (``NullRunCallback.on_llm_end``) call this with the same three
-    signals so the dedup LRU at ``runtime.track()`` can collapse the
+    signals so the dedup LRU at ``runtime.track `` can collapse the
     sibling emission for the same call to a single wire event.
 
     Args:
@@ -240,7 +240,7 @@ def _fingerprint_for_llm_call(
             (``"gpt-4.1-mini-2025-04-14"`` for OpenAI, ``"claude-3-5-sonnet-..."``
             for Anthropic, etc.). None is acceptable; the slot still
             contributes to the fingerprint.
-        provider: short provider label (``"openai"``, ``"anthropic"``,
+        provider: short provider label (``"openai"``, ``"anthropic"``
             ``"gemini"``, etc.). Same fallback semantics as ``model``.
         response_id: upstream chat-completion id (``"chatcmpl-..."`` for
             OpenAI, ``"msg_..."`` for Anthropic, etc.). This is the
@@ -251,7 +251,7 @@ def _fingerprint_for_llm_call(
 
     Returns:
         A 16-char hex digest suitable for the ``_fingerprint`` event
-        field consumed by ``NullRunRuntime.track()``.
+        field consumed by ``NullRunRuntime.track ``.
     """
     payload = f"{model or ''}|{provider or ''}|{response_id or ''}"
     h = hashlib.sha256()
@@ -265,7 +265,7 @@ def _anthropic_extractor(body: bytes, status: int) -> ExtractedUsage | None:
 
     response.usage.{input_tokens, output_tokens}.
     Anthropic is the only major provider that exposes BOTH cache read
-    AND cache write tokens: ``cache_read_input_tokens`` (cache hit,
+    AND cache write tokens: ``cache_read_input_tokens`` (cache hit
     cheaper) and ``cache_creation_input_tokens`` (cache miss that
     writes a new cache entry, billed at a higher rate).
     """
@@ -299,7 +299,7 @@ def _anthropic_extractor(body: bytes, status: int) -> ExtractedUsage | None:
         "completion_tokens": out,
         "total_tokens": inp + out,
         "model": payload.get("model"),
-        # Audit 2026-06-29 (unified fingerprint): Anthropic message id,
+        # Audit 2026-06-29 (unified fingerprint): Anthropic message id
         # e.g. ``"msg_01HXYZ..."``. See _openai_extractor comment.
         "id": payload.get("id"),
         "cache_read_tokens": int(usage.get("cache_read_input_tokens", 0) or 0),
@@ -356,7 +356,7 @@ def _gemini_extractor(body: bytes, status: int) -> ExtractedUsage | None:
         "total_tokens": total or (prompt + completion),
         "model": payload.get("modelVersion"),
         # Audit 2026-06-29 (unified fingerprint): Gemini doesn't
-        # currently surface a stable response id at the top level;
+        # currently surface a stable response id at the top level
         # fall back to ``None`` and rely on model+provider to
         # disambiguate. See _openai_extractor for the rationale.
         "id": payload.get("responseId") or payload.get("id"),
@@ -396,7 +396,7 @@ def _cohere_extractor(body: bytes, status: int) -> ExtractedUsage | None:
         return None
 
     # Cohere tool_calls are top-level (not under choices[]). The
-    # schema varies: v2 uses {id, type: "function", function: {name,
+    # schema varies: v2 uses {id, type: "function", function: {name
     # arguments}}; some adapters use {name, parameters}. We accept
     # both shapes.
     tool_names: list[str] = []
@@ -437,7 +437,7 @@ def _bedrock_extractor(body: bytes, status: int) -> ExtractedUsage | None:
     Bedrock adapters (Mistral, Titan) don't have prompt caching.
 
     Tool names: shape depends on the underlying model. Anthropic-on-
-    Bedrock reuses Anthropic's ``content[type=tool_use]`` shape;
+    Bedrock reuses Anthropic's ``content[type=tool_use]`` shape
     Mistral-on-Bedrock reuses OpenAI's ``choices[].message.tool_calls``
     shape. We attempt both and return whatever we find.
     """
@@ -472,9 +472,9 @@ def _bedrock_extractor(body: bytes, status: int) -> ExtractedUsage | None:
         return None
 
     # Tool names — model-adapter-dependent. Try shapes in order:
-    #   1. Anthropic-on-Bedrock / Anthropic-native: content[type=tool_use]
-    #   2. Mistral-on-Bedrock / OpenAI-compat: choices[].message.tool_calls
-    #   3. Llama-3-on-Bedrock: output.message.content[type=tool_use]
+    # 1. Anthropic-on-Bedrock / Anthropic-native: content[type=tool_use]
+    # 2. Mistral-on-Bedrock / OpenAI-compat: choices[].message.tool_calls
+    # 3. Llama-3-on-Bedrock: output.message.content[type=tool_use]
     # Other Bedrock adapters (Titan, Cohere-on-Bedrock) don't expose
     # a stable tool schema; we leave tool_names empty rather than
     # guessing. If a future adapter adds a fourth shape, add it here
@@ -582,14 +582,14 @@ def _extract_model_from_request_body(request: httpx.Request) -> str | None:
 
     The user typically passes ``ChatOpenAI(model="gpt-4.1-mini")`` and
     that string appears in the request body's ``model`` field — even if
-    the response omits it (streaming edge cases, Responses API,
+    the response omits it (streaming edge cases, Responses API
     middleware that strips model from responses). Returning the
     request-side model keeps the SDK's cost event attributable to the
     real catalog entry (``gpt-4.1-mini`` substring → 400 microcents /
     1M input in ``MODEL_RATES``) instead of falling through to
     ``DEFAULT_RATE`` ($0 per call).
 
-    Returns ``None`` if the body is not JSON, has no ``model`` field,
+    Returns ``None`` if the body is not JSON, has no ``model`` field
     or has an empty ``model``. Callers must treat the result as
     optional and still surface the SDK's "missing model" warning when
     both response and request lookups fail.
@@ -628,7 +628,7 @@ def _match_extractor(host: str) -> Callable[[bytes, int], ExtractedUsage | None]
 
 def _check_kill_before_send(runtime: Any, request: httpx.Request) -> None:
     """
-    L2 of the kill contract (see docs/kill-contract.md §2).
+    L2 of the kill contract (see docs/kill-contract.md).
 
     Pre-request gate: inspects the cached remote state for the workflow
     bound to the current context / API key. If the workflow has been
@@ -662,7 +662,7 @@ def _check_kill_before_send(runtime: Any, request: httpx.Request) -> None:
     # Phase 5 #5.8: the kill check is independent of which LLM host
     # the user is talking to. Previously the check was gated on the
     # extractor table, so a custom LLM endpoint silently bypassed the
-    # dashboard KILL switch. The kill state lives in `_remote_states`,
+    # dashboard KILL switch. The kill state lives in `_remote_states`
     # which is keyed by workflow, not by host.
     workflow_id = runtime._resolve_workflow_id(None)
     if not workflow_id:
@@ -696,7 +696,7 @@ def _check_kill_before_send(runtime: Any, request: httpx.Request) -> None:
 # NOTE (Sprint 2.3): the ``_STREAMING_CONTENT_TYPES`` constant was
 # defined here but only consumed in ``auto_requests.py`` (same
 # constant is re-defined there). The streaming branch in the
-# httpx transport wrapper does not actually consult this table;
+# httpx transport wrapper does not actually consult this table
 # it just reads the body and lets the extractors return ``None``
 # for non-usage bodies. The constant is deleted to avoid the
 # false impression that this module has streaming-specific
@@ -724,11 +724,11 @@ class NullRunSyncTransport(httpx.BaseTransport):
         response = self._inner.handle_request(request)
         try:
             # P0-3: bounded read — never buffer more than
-            # MAX_RESPONSE_BYTES for tracking purposes. Above the cap,
+            # MAX_RESPONSE_BYTES for tracking purposes. Above the cap
             # we skip tracking (the user still gets the full body via
             # the rebuilt response below). The body still needs to
             # be reconstructed for downstream consumers, so when the
-            # cap is hit we fall through to ``read()`` for the
+            # cap is hit we fall through to ``read `` for the
             # rebuild path only.
             body = _read_body_with_cap(response, MAX_RESPONSE_BYTES)
             if body is None:
@@ -765,11 +765,11 @@ class NullRunSyncTransport(httpx.BaseTransport):
         body: bytes,
         request: httpx.Request,
     ) -> httpx.Response:
-        # `response.read()` above consumed the streamed body — and httpx
+        # `response.read ` above consumed the streamed body — and httpx
         # transparently decompresses gzip/br/zstd during that read. We
         # MUST strip the encoding header on the rebuilt response, otherwise
         # the downstream caller (e.g. openai/httpx) sees `content-encoding:
-        # gzip` and tries to decompress an already-decompressed body,
+        # gzip` and tries to decompress an already-decompressed body
         # raising `zlib.error: Error -3 while decompressing data:
         # incorrect header check`. content-length also has to be recomputed
         # against the post-decompression byte count.
@@ -812,7 +812,7 @@ class NullRunSyncTransport(httpx.BaseTransport):
     ) -> None:
         # 2026-06-28 (Issue 2 fix): if the extractor returned ``None``
         # for ``model`` (response body lacked the field — observed for
-        # some OpenAI Responses-API and Anthropic streaming edge cases),
+        # some OpenAI Responses-API and Anthropic streaming edge cases)
         # fall back to the model name embedded in the request body. The
         # backend cost pipeline logs WARN and falls back to DEFAULT_RATE
         # (≈$0 per call) whenever ``model`` is missing — see
@@ -842,7 +842,7 @@ class NullRunSyncTransport(httpx.BaseTransport):
             # out of raw_usage onto the event itself. The backend's
             # gate/budget/loop detection needs them as first-class
             # columns; raw_usage is no longer on the wire (stripped
-            # at the track() boundary — see _WIRE_STRIP_FIELDS in
+            # at the track boundary — see _WIRE_STRIP_FIELDS in
             # runtime.py).
             #
             # Audit 2026-06-29 (unified fingerprint): we use the
@@ -899,7 +899,7 @@ class NullRunSyncTransport(httpx.BaseTransport):
 class NullRunAsyncTransport(httpx.AsyncBaseTransport):
     """Asynchronous httpx transport. Mirrors `NullRunSyncTransport` for
     async httpx clients. The body is consumed in a single pass via
-    `response.aread()`; for streamed responses, awaiting the body
+    `response.aread `; for streamed responses, awaiting the body
     accumulates chunks so the final usage object (last SSE chunk) is
     visible to the extractor.
     """
@@ -924,7 +924,7 @@ class NullRunAsyncTransport(httpx.AsyncBaseTransport):
             body = await _aread_body_with_cap(response, MAX_RESPONSE_BYTES)
             if body is None:
                 # 0.9.0: emit llm_call with metadata.streaming_skipped: true
-                # so the call counts toward coverage (host known,
+                # so the call counts toward coverage (host known
                 # tracked: false because usage wasn't extractable).
                 _emit_streaming_skipped(self._runtime, request, host)
                 logger.debug(
@@ -1102,17 +1102,17 @@ def _fingerprint_for_event_dict(event: dict[str, Any]) -> str:
 # We wrap httpx.Client.__init__ / httpx.AsyncClient.__init__ so that ANY
 # subsequent client construction automatically gets the NullRun transport
 # applied to the user's chosen transport. This means the user does not need
-# to do anything special — `openai.OpenAI(http_client=httpx.Client())` will
+# to do anything special — `openai.OpenAI(http_client=httpx.Client )` will
 # be auto-instrumented.
 
 _httpx_patched = False
 _httpx_lock = threading.Lock()
-# §7.2 #47: separate locks for the langchain / langgraph
+# separate locks for the langchain / langgraph
 # patch functions. The pre-fix code did ``if _x_patched:
-# return True`` and ``getattr(SomeClass, "_nullrun_patched",
+# return True`` and ``getattr(SomeClass, "_nullrun_patched"
 # False)`` without a lock — two threads racing through
 # ``auto_instrument`` simultaneously could both pass the early
-# check, both fall through to ``_orig_init = SomeClass.__init__``,
+# check, both fall through to ``_orig_init = SomeClass.__init__``
 # and double-wrap the class. With CPython's GIL the race is
 # narrow but real; on free-threaded builds (PEP 703) it's wide
 # open. One lock per framework, held for the entire patch
@@ -1124,7 +1124,7 @@ _langgraph_lock = threading.Lock()
 # restore httpx.Client / AsyncClient to the un-patched state. Without
 # this, a second `patch_httpx` would no-op (class marker still set)
 # AND the closure inside the existing wrap would still reference the
-# first runtime — silently losing track() calls from later test runs.
+# first runtime — silently losing track calls from later test runs.
 _orig_sync_init: Callable[..., Any] | None = None
 _orig_async_init: Callable[..., Any] | None = None
 # Audit 2026-06-29 (reset_for_tests gap): stash the originals of the
@@ -1156,7 +1156,7 @@ def patch_httpx(runtime: Any) -> bool:
         if getattr(httpx.Client, "_nullrun_patched", False):
             # Already patched by an earlier import. The class-level marker
             # is the source of truth; mirror it into the module-level flag
-            # so callers can introspect with is_auto_instrumented().
+            # so callers can introspect with is_auto_instrumented.
             _httpx_patched = True
             return True
 
@@ -1187,18 +1187,18 @@ def patch_httpx(runtime: Any) -> bool:
         # __init__ patch only wraps httpx.Clients created AFTER it is
         # installed. If a user does
         #
-        #     llm = ChatOpenAI(model="gpt-4.1-mini")  # before init()
-        #     nullrun.init(api_key=...)              # patch installed here
+        # llm = ChatOpenAI(model="gpt-4.1-mini") # before init 
+        # nullrun.init(api_key=...) # patch installed here
         #
         # ``ChatOpenAI`` already built its internal httpx.Client (or
-        # will on first .invoke()), but that client is reachable from
+        # will on first.invoke ), but that client is reachable from
         # the running process right now and is using the unpatched
         # transport. Without the eager sweep below, the httpx path
         # emits nothing for that LLM — every call silently zero-billed
         # via the langchain callback fallback (or the bare-LLMResult
         # path with no model).
         #
-        # We sweep gc.get_objects() once and wrap any pre-existing
+        # We sweep gc.get_objects once and wrap any pre-existing
         # httpx.Client/AsyncClient whose transport isn't already a
         # NullRun*Transport. The class-level marker on ``__init__`` is
         # set, so future constructions auto-wrap — this sweep is the
@@ -1223,22 +1223,22 @@ def _wrap_pre_existing_httpx_clients(runtime: Any) -> tuple[int, int]:
 
     Audit 2026-06-29 (init-ordering hazard): the typical sequence
 
-        llm = ChatOpenAI(model=...)  # builds internal httpx.Client
-        nullrun.init(api_key=...)    # installs the __init__ patch
+        llm = ChatOpenAI(model=...) # builds internal httpx.Client
+        nullrun.init(api_key=...) # installs the __init__ patch
 
     leaves ``llm``'s internal client with the unpatched transport.
-    New ``httpx.Client()`` constructions are auto-wrapped by the
+    New ``httpx.Client `` constructions are auto-wrapped by the
     class-level patch; this sweep is the back-fill.
 
     Returns ``(sync_count, async_count)`` for logging. Errors are
     swallowed by the caller — this is a best-effort back-fill, never
     a hard requirement.
 
-    We use ``gc.get_objects()`` because httpx does not maintain a
-    weakref registry of its Client instances. The sweep is O(heap);
+    We use ``gc.get_objects `` because httpx does not maintain a
+    weakref registry of its Client instances. The sweep is O(heap)
     on a typical agent process (hundreds of MB heap, mostly strings
     and small dicts) this takes <50 ms. We bail early on
-    ``RuntimeError`` (raised by ``gc.get_objects()`` when the
+    ``RuntimeError`` (raised by ``gc.get_objects `` when the
     interpreter is shutting down) and on any ``isinstance`` failure
     (a class with a broken ``__class__``).
     """
@@ -1262,7 +1262,7 @@ def _wrap_pre_existing_httpx_clients(runtime: Any) -> tuple[int, int]:
                 # have a broken __class__; skip them rather than abort.
                 continue
     except RuntimeError:
-        # gc.get_objects() raises RuntimeError during interpreter
+        # gc.get_objects raises RuntimeError during interpreter
         # shutdown. Nothing to do.
         pass
     return sync_count, async_count
@@ -1283,11 +1283,11 @@ def patch_langchain_callback(runtime: Any) -> bool:
     """Install NullRunCallback into the LangChain callback manager so all
     LLM calls (including mock providers) flow through it. Idempotent.
 
-    §7.2 #47: the pre-fix code did ``if _langchain_patched: return``
+ #47: the pre-fix code did ``if _langchain_patched: return``
     and ``getattr(BaseCallbackManager, "_nullrun_patched", False)``
     without a lock; two threads racing through ``auto_instrument``
     simultaneously could both pass the early check, then both
-    fall through to ``_orig_init = BaseCallbackManager.__init__``,
+    fall through to ``_orig_init = BaseCallbackManager.__init__``
     capturing the same original and double-wrapping the class.
     We hold ``_langchain_lock`` for the entire patch sequence so
     the read and the write happen atomically from any other
@@ -1350,7 +1350,7 @@ def patch_langchain_callback(runtime: Any) -> bool:
 # no callback manager attached. The patched ``__init__`` runs only when
 # a *new* ``BaseCallbackManager`` is constructed inside
 # ``BaseChatModel.invoke`` / ``Runnable.invoke``. If the LangGraph path
-# goes through a different construction sequence (e.g. caching,
+# goes through a different construction sequence (e.g. caching
 # alternative transports, in-memory mock providers) the new manager
 # might be bypassed and ``on_llm_end`` never fires.
 #
@@ -1458,7 +1458,7 @@ def _inject_handler_into_config(config: Any, ensure: Callable[[Any], list[Any]])
     (e.g. ``config`` is a frozen mapping).
 
     The user may pass either:
-        - a dict like ``{"callbacks": [...]}``  (standard Runnable path)
+        - a dict like ``{"callbacks": [...]}`` (standard Runnable path)
         - a RunnableConfig built from ``ConfigurableFieldSpec`` etc.
         - ``None`` (we synthesise a fresh dict).
     """
@@ -1623,14 +1623,14 @@ def _emit_from_agents_result(runtime: Any, result: Any) -> None:
 # ---------------------------------------------------------------------------
 # D5b: patch_langgraph_compiled — auto-attach callback to compiled LangGraph
 # ---------------------------------------------------------------------------
-# A compiled LangGraph `StateGraph.compile()` returns a `Pregel` instance.
+# A compiled LangGraph `StateGraph.compile ` returns a `Pregel` instance.
 # To capture every invoke/stream/ainvoke/astream call site we monkey-patch
 # the *class* methods so a NullRunCallback is added to
 # `config["callbacks"]` automatically — the user does not have to call
 # `nullrun.toolbox.langgraph.wrapper` explicitly. The patch is global
 # (process-wide) but idempotent and a no-op if `langgraph` is not
 # importable. Users who want per-app control (e.g. multiple runtimes in
-# the same process) should use `wrapper()` instead.
+# the same process) should use `wrapper ` instead.
 
 _langgraph_compiled_patched = False
 # Originals stashed on first patch so reset_for_tests can restore
@@ -1651,7 +1651,7 @@ def patch_langgraph_compiled(runtime: Any) -> bool:
     supplied one. Idempotent. Returns False if `langgraph` is not
     importable.
 
-    §7.2 #47: same fix as ``patch_langchain_callback`` — the
+ #47: same fix as ``patch_langchain_callback`` — the
     pre-fix code read the patched flag and the class-level marker
     without a lock, so two threads racing through
     ``auto_instrument`` could both fall through to
@@ -1745,7 +1745,7 @@ def patch_langgraph_compiled(runtime: Any) -> bool:
 # ---------------------------------------------------------------------------
 # `auto_instrument(runtime)` installs all three observation paths. Each
 # patch is best-effort and silently no-ops if the underlying package is
-# not installed. The user's `init()` call invokes this once.
+# not installed. The user's `init ` call invokes this once.
 
 _auto_installed = False
 _auto_lock = threading.Lock()
@@ -1759,7 +1759,7 @@ def auto_instrument(runtime: Any) -> bool:
     Sprint 2.9 (B47): every patch call is wrapped in ``safe_patch``
     which logs at WARNING if the patch raised a non-ImportError
     exception. Pre-fix the 25+ scattered ``try/except Exception:
-    pass  # pragma: no cover`` blocks meant a vendor SDK breaking
+    pass # pragma: no cover`` blocks meant a vendor SDK breaking
     change (e.g. a renamed method) would silently disable cost
     tracking with no log line. The operator would only find out
     when the bill arrived.
@@ -1783,7 +1783,7 @@ def auto_instrument(runtime: Any) -> bool:
             safe_patch("langchain_callback", lambda: patch_langchain_callback(runtime)),
             # D4b (2026-06-29): belt-and-suspenders callback injection at
             # the BaseChatModel.invoke boundary. Ensures NullRunCallback
-            # fires even when the user creates the LLM BEFORE init() and
+            # fires even when the user creates the LLM BEFORE init and
             # the BaseCallbackManager.__init__ patch is somehow bypassed
             # (LangGraph node-internal calls, cached config paths, etc.).
             safe_patch(
@@ -1799,7 +1799,7 @@ def auto_instrument(runtime: Any) -> bool:
         ]
         # We deliberately mark this as installed even if zero paths
         # succeeded — calling auto_instrument twice must not redo work
-        # (e.g. if the user calls init() twice, we don't want to double-patch).
+        # (e.g. if the user calls init twice, we don't want to double-patch).
         _auto_installed = True
         installed = sum(1 for ok in paths if ok)
         if installed:
@@ -1926,10 +1926,10 @@ def reset_for_tests() -> None:
 
 DEDUP_LRU_MAX = 4096  # Phase 6 #6.7: 4096 entries give a 410ms dedup window at 10K events/sec
 
-# P0-3 (plan §10): streaming-OOM cap. Pre-fix, the sync transport
-# called ``response.read()`` and the async transport called
-# ``await response.aread()`` — both buffer the ENTIRE response body
-# in memory. For an OpenAI streaming completion with max_tokens=8192,
+# P0-3: streaming-OOM cap. Pre-fix, the sync transport
+# called ``response.read `` and the async transport called
+# ``await response.aread `` — both buffer the ENTIRE response body
+# in memory. For an OpenAI streaming completion with max_tokens=8192
 # that's 16+ MB held per request. Under load (10+ concurrent streams)
 # this is a real OOM risk.
 #
@@ -1979,7 +1979,7 @@ def _read_body_with_cap(response: httpx.Response, max_bytes: int) -> bytes | Non
             out.extend(chunk)
     except Exception:
         # Stream already consumed / connection closed — fall back to
-        # ``read()`` so the caller still gets the body for the user.
+        # ``read `` so the caller still gets the body for the user.
         try:
             return response.read()
         except Exception:
@@ -2035,7 +2035,7 @@ def _emit_streaming_skipped(
     """Emit an llm_call event for a response where the body exceeded
     the tracking cap and usage data could not be extracted.
 
-    0.9.0: replaces the old `_safe_bump_coverage(...,
+    0.9.0: replaces the old `_safe_bump_coverage(...
     "_coverage_streaming_skipped", host)` counter bump. The event
     carries `metadata.streaming_skipped: True` and `metadata.tracked:
     False` (extractor did not run because the body was never read)
@@ -2058,10 +2058,10 @@ def _emit_streaming_skipped(
          rejected these with HTTP 422, but the cost-pipeline
          belt-and-suspenders backstop still logged every one as
          `cost_pipeline_missing_model_total` and stamped the 1-cent
-         surcharge. Operators saw 30+ ERROR lines per `app.invoke()`
+         surcharge. Operators saw 30+ ERROR lines per `app.invoke `
          for a workload that actually had 6 real LLM calls.
       2. Because no `_fingerprint` was attached, the dedup LRU at
-         `runtime.track()` could not collapse this emission with
+         `runtime.track ` could not collapse this emission with
          any sibling emission for the same call.
     Fix: drop the event entirely when we cannot recover a usable
     `model` (the request body has been consumed or doesn't carry

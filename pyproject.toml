@@ -12,7 +12,12 @@ name = "nullrun"
 # 0.13.1 (2026-07-04): drift-fixes release — see __version__.py
 # for the four BLOCKER closes (B1 check_v3, B2 track_single
 # docstring, B3 chain_end, M3 approximate_budget query param).
-version = "0.13.1"
+# 0.13.2 (2026-07-06): typing-debt sweep — per-file mypy overrides
+# (no more blanket `ignore_errors`), split nullrun singleton state into
+# nullrun._singleton (the metaclass-backing descriptor) and
+# nullrun._registry (the runtime registry) so runtime.py stays the
+# orchestrator only. See __version__.py for the full changelog.
+version = "0.13.2"
 # Long form used by PyPI page meta-description and search snippets.
 # Kept under the 200-char preview threshold so the full line is visible
 # without an "expand" click. Keywords are matched against likely search
@@ -201,8 +206,19 @@ strict = true
 warn_return_any = true
 warn_unused_ignores = true
 disallow_any_generics = true
-# Pre-existing mypy errors in master / wip/working-tree code:
-# 102 errors across 12 files. Categories include:
+# Vendor SDKs ship with weak / missing type stubs (websockets,
+# langgraph.pregel, autogen_agentchat, llama_index.core, etc.). We
+# want strict checking on OUR code regardless, so the missing-
+# import filter applies to imports only — every signature we
+# construct against the vendor API is still type-checked against
+# whatever stubs (or stub-free Any) the vendor publishes. Without
+# this flag, CI fails on the first try/except ImportError path
+# in `auto.py`, which is the exact place we DO want strictness on
+# our own logic.
+ignore_missing_imports = true
+# Pre-existing typing debt is tracked per-file below. The goal is
+# to keep new files / new code on a strict baseline while legacy
+# modules converge. Categories tracked (12 files, ~120 sites):
 #   - union-attr: Optional types not narrowed (Transport | None)
 #   - no-any-return: not-yet-typed returns
 #   - arg-type: str | None passed where str expected
@@ -210,11 +226,221 @@ disallow_any_generics = true
 #   - unused-ignore: stale "# type: ignore" comments
 #   - assignment: implicit Optional in default values
 #   - import-not-found: langgraph.pregel stub missing
-# Per-file ignores would be more precise but 102 individual
-# overrides across 12 files is out of scope for this follow-up.
-# Track in a dedicated typing pass after the SDK is on a stable
-# mypy --strict baseline (this PR only turns CI green today).
+# Converge via per-file `[[tool.mypy.overrides]]` entries below —
+# each file gets explicit ignore codes so CI breaks when a NEW code
+# appears in that file (rather than the previous blanket
+# `ignore_errors = true` that swallowed everything).
+#
+# Important: this block stays in lockstep with the per-file table.
+# When the count in a file drops to 0, remove its override row.
+
+[[tool.mypy.overrides]]
+module = [
+    "nullrun.capabilities",
+    "nullrun.messages",
+    "nullrun.tracing",
+    "nullrun.uuid7",
+    "nullrun.observability",
+    "nullrun.observability.error_hooks",
+    "nullrun.observability.status",
+    "nullrun.breaker",
+    "nullrun.breaker.circuit_breaker",
+    "nullrun.breaker.exceptions",
+    "nullrun.instrumentation._safe_patch",
+    "nullrun.context",
+    "nullrun._singleton",
+    "nullrun._registry",
+]
+strict = true
+disable_error_code = ["unused-ignore", "no-untyped-def"]
+
+[[tool.mypy.overrides]]
+# `__init__.py` — module-level `__getattr__` (PEP 562) needs
+# Any-typed returns, and `_LAZY_EXPORTS` maps name strings to
+# (mod, attr) tuples which mypy cannot resolve statically.
+module = ["nullrun"]
+disable_error_code = [
+    "no-untyped-def",  # __getattr__ / shutdown / status return Any
+    "arg-type",        # name strings vs. attribute lookup
+    "return-value",    # dynamic attribute resolution
+    "union-attr",      # runtime._runtime | None
+    "unused-ignore",   # legacy `# type: ignore` markers still in tree
+]
+
+[[tool.mypy.overrides]]
+# `_handle.py` — context manager / decorator generators. mypy
+# struggles with contextmanager yields returning Generator types
+# when the underlying callable raises.
+module = ["nullrun._handle"]
+disable_error_code = ["no-untyped-def", "unused-ignore"]
+
+[[tool.mypy.overrides]]
+# `runtime.py` — the orchestrator. The legacy Any-typed
+# `_seen_track_fingerprints` LRU, the singleton `_instance: Optional`
+# plus thread-locking around it, and the dict[str, Any] event
+# envelopes all add up. Targeted fixes only.
+module = ["nullrun.runtime"]
+disable_error_code = [
+    "no-untyped-def",
+    "union-attr",
+    "no-any-return",
+    "arg-type",
+    "assignment",
+    "unused-ignore",
+]
+
+[[tool.mypy.overrides]]
+# `transport.py` — typing debt is concentrated in the WS / HMAC
+# paths where httpx response objects are Any. transport.py also
+# holds the historical pre-strict code that the codebase grew up
+# around; per the comment block above, fix sites individually
+# rather than expanding the override list.
+module = ["nullrun.transport"]
+disable_error_code = [
+    "no-untyped-def",
+    "union-attr",
+    "no-any-return",
+    "arg-type",
+    "assignment",
+    "unused-ignore",
+]
+
+[[tool.mypy.overrides]]
+# `transport_websocket.py` — `websockets` library has incomplete
+# stubs; explicit Any in receive loop is unavoidable.
+module = ["nullrun.transport_websocket"]
+disable_error_code = [
+    "no-untyped-def",
+    "union-attr",
+    "no-any-return",
+    "arg-type",
+    "import-not-found",
+    "unused-ignore",
+]
+
+[[tool.mypy.overrides]]
+# `actions.py` — webhook handlers + dataclasses with Optional
+# fields. ~6 sites.
+module = ["nullrun.actions"]
+disable_error_code = [
+    "no-untyped-def",
+    "union-attr",
+    "no-any-return",
+    "arg-type",
+    "assignment",
+    "unused-ignore",
+]
+
+[[tool.mypy.overrides]]
+# `decorators.py` — sync_wrapper / async_wrapper Any-typed by
+# design (decorator preserves arbitrary return). The `Any`
+# contract is the whole point of `@protect`.
+module = ["nullrun.decorators"]
+disable_error_code = [
+    "no-untyped-def",
+    "union-attr",
+    "no-any-return",
+    "arg-type",
+    "assignment",
+    "return-value",
+    "unused-ignore",
+]
+
+[[tool.mypy.overrides]]
+# `integrations/fastapi.py` — Starlette/FastAPI request types are
+# loosely-typed unions; the JSONResponse helpers are Any-shaped
+# by FastAPI's own API.
+module = ["nullrun.integrations.fastapi"]
+disable_error_code = [
+    "no-untyped-def",
+    "union-attr",
+    "no-any-return",
+    "arg-type",
+    "unused-ignore",
+]
+
+[[tool.mypy.overrides]]
+# `instrumentation/auto.py` — vendor-typed bodies (json.loads
+# returns Any, vendor-specific OpenAI/Anthropic shapes). The
+# extractor functions read untyped JSON; the dicts they return
+# are intentionally Any.
+module = ["nullrun.instrumentation.auto"]
+disable_error_code = [
+    "no-untyped-def",
+    "union-attr",
+    "no-any-return",
+    "arg-type",
+    "assignment",
+    "unused-ignore",
+]
+
+[[tool.mypy.overrides]]
+# `instrumentation/auto_requests.py` — vendor SDK shape.
+module = ["nullrun.instrumentation.auto_requests"]
+disable_error_code = [
+    "no-untyped-def",
+    "union-attr",
+    "no-any-return",
+    "arg-type",
+    "assignment",
+    "unused-ignore",
+]
+
+[[tool.mypy.overrides]]
+# `instrumentation/langgraph.py` — langchain_core callback hooks
+# are Any-typed by design.
+module = ["nullrun.instrumentation.langgraph"]
+disable_error_code = [
+    "no-untyped-def",
+    "union-attr",
+    "no-any-return",
+    "arg-type",
+    "assignment",
+    "unused-ignore",
+]
+
+[[tool.mypy.overrides]]
+# `instrumentation/autogen.py`, `crewai.py`, `llama_index.py` —
+# vendor SDKs with weak typings, all guarded by try/except ImportError.
+module = [
+    "nullrun.instrumentation.autogen",
+    "nullrun.instrumentation.crewai",
+    "nullrun.instrumentation.llama_index",
+]
+disable_error_code = [
+    "no-untyped-def",
+    "union-attr",
+    "no-any-return",
+    "arg-type",
+    "assignment",
+    "import-not-found",
+    "unused-ignore",
+]
+
+[[tool.mypy.overrides]]
+# `toolbox/langgraph.py` — same as langgraph instrumentation.
+module = ["nullrun.toolbox.langgraph"]
+disable_error_code = [
+    "no-untyped-def",
+    "union-attr",
+    "no-any-return",
+    "arg-type",
+    "assignment",
+    "unused-ignore",
+]
+
+[[tool.mypy.overrides]]
+# `integrations/__init__.py` — pure re-export module.
+module = ["nullrun.integrations"]
+disable_error_code = ["no-untyped-def"]
+
+# Tests are excluded from the strict run — pytest fixtures,
+# monkeypatch, and MagicMock patterns defeat mypy's strict
+# checking and would only produce noise.
+[[tool.mypy.overrides]]
+module = ["tests.*"]
 ignore_errors = true
+ignore_missing_imports = true
 
 [tool.ruff]
 target-version = "py310"
@@ -234,13 +460,11 @@ ignore = [
     #                               in the legacy-code fallback path
     #   E402 (import order)     - 5 sites; TYPE_CHECKING blocks
     #   F401 (unused import)    - 2 sites
-    #   F821 (undefined name)   - 1 site; needs investigation
     "S110",
     "E501",
     "F841",
     "E402",
     "F401",
-    "F821",
     # S311 (suspicious random) - 1 site, in circuit_breaker jitter.
     # random.uniform is correct for jitter (we want non-cryptographic
     # randomness to spread reconnection timing across workers).
