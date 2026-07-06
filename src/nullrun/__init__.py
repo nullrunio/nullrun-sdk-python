@@ -310,26 +310,26 @@ def init(
             except Exception as e:  # noqa: BLE001 — best-effort
                 logger.warning("previous runtime shutdown raised during init(): %s", e)
 
+        # Phase 3 (2026-07-05): install the runtime in the registry
+        # so every consumer (decorators, @protect, track_*) sees the
+        # same instance regardless of which init path we use.
+        from nullrun._registry import get_registry
+
+        registry = get_registry()
         runtime = NullRunRuntime(
             api_key=api_key,
             api_url=api_url,
             debug=debug,
         )
+        registry.set(runtime)
 
-        # Register as the module-level singleton so `nullrun.track_llm` /
-        # `nullrun.track_tool` (which resolve via `get_runtime `) and any
-        # other consumers reading the cached instance find *this* runtime —
-        # not whatever a previous test or stale env would otherwise produce.
-        _rt_mod._runtime = runtime
+        # Backwards-compat mirror: NullRunRuntime._instance routes through the metaclass descriptor. through
+        # the metaclass descriptor (see nullrun._singleton). Module-level
+        #  slots in runtime.py / decorators.py are PEP 562
+        # __getattr__ proxies that re-resolve from the registry on every
+        # access. The registry.set(runtime) call above is the authoritative
+        # write that every consumer sees.
         NullRunRuntime._instance = runtime
-
-        # Wire the @protect decorator's own module-level cache to this
-        # runtime too. The decorator short-circuits on its local `_runtime`
-        # slot and never re-resolves via `get_instance `, so without this
-        # assignment a re-init cycle (init → shutdown → init) leaves the
-        # decorator pointing at the dead previous runtime and silently
-        # drops span_start/span_end events.
-        _dec_mod._runtime = runtime
 
     # v3.12 / 0.12.0 — server-minted execution_id default ON. Probe
     # the backend's /health endpoint and log any version mismatch
