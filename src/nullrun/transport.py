@@ -2138,6 +2138,115 @@ class Transport:
 # The mapping table lives at the bottom of the file so the wire-shape
 # contracts are visible in one place. Adding a new error_code is a
 # one-line change here.
+def _extract_error_envelope(
+    body: Any,
+    raw_text: str,
+) -> tuple[str, str, dict[str, Any]]:
+    """Pull ``(error_code, message, details)`` from any error envelope.
+
+    Drift §3 (2026-07-06): the backend emits three distinct shapes
+    for non-2xx responses. This helper normalises them into the
+    ``(error_code, message, details)`` tuple the rest of
+    ``_parse_v3_error_envelope`` consumes.
+
+    Lookup priority:
+
+    1. **v3 envelope** -- ``{"error_code": "BUDGET_HARD_BLOCKED",
+       "error_message": "...", "details": {...}, ...}``. The
+       canonical shape from ``gate/internal.rs`` and
+       ``handlers.rs::track_handler``.
+
+    2. **v3 mixed** -- ``{"error_code": "BUDGET_DATA_UNAVAILABLE",
+       "message": "...", "retry_after_ms": N}``. The 503 path
+       from ``budget.rs:107-112``; same v3 semantics but the
+       message field is called ``message`` not ``error_message``.
+
+    3. **Legacy slug** -- ``{"error": "chain_not_extendable",
+       "message": "...", "chain_state": "..."}``. From
+       ``heartbeat.rs:199-205`` and the ``ApiError`` path on
+       ``cancel.rs``. The slug is lowercased and SCREAMING_SNAKE'd
+       so it matches ``_V3_ERROR_CODE_MAP`` lookups.
+
+    4. **Plaintext** -- ``response.text`` containing a free-form
+       error string (heartbeat.rs:157, heartbeat.rs:166). No JSON,
+       so ``body`` is empty.
+
+    Args:
+        body: Parsed JSON body from the response (``{}`` on parse
+            failure or non-JSON content).
+        raw_text: Raw ``response.text`` fallback for plaintext
+            envelopes.
+
+    Returns:
+        ``(backend_code, message, details)`` where:
+
+        * ``backend_code`` is uppercase SCREAMING_SNAKE if it
+          originated from the v3 envelope, or the lowercased slug
+          otherwise. The mapping table keys are uppercase; the
+          dispatcher lowercases the lookup key before consulting
+          the map.
+        * ``message`` is the human-readable string for the
+          exception class. Falls back to ``raw_text`` if no JSON
+          body.
+        * ``details`` is the machine-readable context payload
+          (``details: {...}`` on the v3 envelope, all other
+          JSON fields flattened on the legacy slug, ``{}`` on
+          plaintext).
+    """
+    if not isinstance(body, dict) or not body:
+        # No JSON body -- plaintext error envelope.
+        # Heartbeat's 404 "chain not found" and 403
+        # "chain org mismatch" land here.
+        return ("", raw_text or "", {})
+
+    # Shape 1: v3 envelope.
+    if "error_code" in body:
+        code = str(body.get("error_code", "") or "")
+        # The 503 budget path uses "message" instead of
+        # "error_message". Accept both.
+        message = str(
+            body.get("error_message") or body.get("message") or raw_text or ""
+        )
+        details_raw = body.get("details") or {}
+        if not isinstance(details_raw, dict):
+            details_raw = {}
+        # Forward any extra top-level fields that look like
+        # context (e.g. ``chain_state`` on heartbeat 409) into
+        # details so downstream code can introspect them.
+        details: dict[str, Any] = dict(details_raw)
+        for key, value in body.items():
+            if key in (
+                "error_code",
+                "error_message",
+                "message",
+                "details",
+                "retry_after_ms",
+            ):
+                continue
+            details.setdefault(key, value)
+        return (code, message, details)
+
+    # Shape 2: legacy slug. ``error`` is the slug,
+    # ``message`` is the human-readable string.
+    if "error" in body:
+        slug = str(body.get("error", "") or "")
+        message = str(body.get("message", "") or raw_text or "")
+        # Convert the legacy lowercase slug to uppercase
+        # SCREAMING_SNAKE so the mapping table can find it.
+        code = slug.upper()
+        # Everything except ``error`` and ``message`` goes into
+        # details for diagnostic context.
+        details = {
+            k: v
+            for k, v in body.items()
+            if k not in ("error", "message") and not k.startswith("_")
+        }
+        return (code, message, details)
+
+    # JSON body but not a recognised envelope shape. Pass through.
+    return ("", raw_text or str(body), dict(body) if isinstance(body, dict) else {})
+
+
 def _parse_v3_error_envelope(
     response: httpx.Response,
     endpoint: str,
@@ -2178,13 +2287,33 @@ def _parse_v3_error_envelope(
     if not isinstance(body, dict):
         body = {}
 
-    backend_code: str = body.get("error_code", "") or ""
-    message: str = (
-        body.get("error_message") or response.text or f"HTTP {status}"
+# Drift §3 (2026-07-06): the wire envelope is NOT one shape.
+    # The backend has three distinct error emission paths today:
+    #
+    # 1. v3 envelope (gate/internal.rs, handlers.rs::track_handler):
+    #    {"error_code": "BUDGET_HARD_BLOCKED", "error_message": "...",
+    #     "details": {...}, "retry_after_ms": N}
+    #
+    # 2. Legacy slug (heartbeat.rs:199-205 chain_not_extendable,
+    #    cancel.rs::error envelopes from the ApiError path):
+    #    {"error": "chain_not_extendable", "message": "...",
+    #     "chain_state": "..."}   <-- lowercase slug, "error" not "error_code"
+    #
+    # 3. Plaintext (heartbeat.rs:157 chain not found,
+    #    heartbeat.rs:166 chain org mismatch):
+    #    "chain not found"   <-- raw response.text, no JSON at all
+    #
+    # Plus a 4th from budget.rs:107-112 (503 BUDGET_DATA_UNAVAILABLE)
+    # which uses {"error_code", "message", "retry_after_ms"} -- the v3
+    # shape but with "message" instead of "error_message". Budget 503
+    # is the only mixed case.
+    #
+    # _extract_error_envelope() handles all four shapes; this block
+    # just consumes the normalised tuple.
+    backend_code, message, details = _extract_error_envelope(body, response.text)
+    retry_after_ms: float | None = (
+        body.get("retry_after_ms") if isinstance(body, dict) else None
     )
-    details: dict[str, Any] = body.get("details") or {}
-    retry_after_ms: float | None = body.get("retry_after_ms")
-
     # Retry-After header takes precedence over the JSON field when
     # both are present (server-side convention — header is canonical
     # per RFC 7231, JSON is a NullRun-specific fallback).
