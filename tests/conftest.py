@@ -82,6 +82,23 @@ def mock_api():
                 },
             )
         )
+        # Execute endpoint. 2026-07-05 retry-budget bump surfaced
+        # the test suite previously relied on respx allow-all for
+        # unmocked URLs, which only worked because the old
+        #  × 5s httpx timeout still completed in
+        # <2s. Adding the explicit mock makes the execute path
+        # deterministic regardless of the retry count.
+        respx.post(f"{BASE_URL}/api/v1/execute").mock(
+            return_value=Response(
+                200,
+                json={
+                    "decision": "allow",
+                    "decision_source": "gateway",
+                    "explanation": "allowed",
+                    "policy_version": 1,
+                },
+            )
+        )
         # Check endpoint
         respx.post(f"{BASE_URL}/check").mock(
             return_value=Response(

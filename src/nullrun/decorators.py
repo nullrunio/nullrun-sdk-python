@@ -41,6 +41,7 @@ import os
 from collections.abc import Callable
 from typing import Any, TypeVar
 
+from nullrun._registry import get_active_runtime
 from nullrun.breaker.exceptions import (
     NullRunBlockedException,
     WorkflowKilledInterrupt,
@@ -276,17 +277,16 @@ def _safe_error_str(error: BaseException | None) -> str | None:
 
 
 # Module-level cache for the runtime instance — the @protect decorator needs
-# a runtime to emit span_start/span_end events, but the runtime is normally
-# created via `nullrun.init `. We lazily instantiate one if @protect is
-# used before init. The slot is also where tests can inject a noop.
-_runtime: NullRunRuntime | None = None
+# The legacy module-level  slot was removed in
+# Phase 3 (2026-07-05). Reads/writes now route through the
+# registry (see nullrun._singleton._RuntimeProxyModule).
 
 
 def _get_or_create_runtime() -> NullRunRuntime:
     """Lazy initialization of runtime from environment.
 
     Order of resolution:
-      1. The module-level `_runtime` slot (set by tests or by `init `)
+      1. The registry (canonical store)
       2. The global `NullRunRuntime.get_instance ` singleton, which
          reads `NULLRUN_API_KEY` / `NULLRUN_API_URL` from the environment
          and constructs the canonical cloud runtime.
@@ -310,13 +310,15 @@ def _get_or_create_runtime() -> NullRunRuntime:
     Tries to patch OpenAI on first creation so the auto-instrumentation
     path picks up the runtime the user will eventually use.
     """
-    global _runtime
-
-    if _runtime is not None:
-        return _runtime
-
-    _runtime = NullRunRuntime.get_instance()
-
+    cached = get_active_runtime()
+    if cached is not None:
+        return cached
+    # No active runtime yet -- fall back to the canonical
+    # get_instance() path. The result is stored in the registry
+    # by the metaclass descriptor on NullRunRuntime._instance
+    # (see nullrun._singleton), so every consumer that reads
+    # `_runtime` afterward sees the same instance.
+    return NullRunRuntime.get_instance()
     # The previous OpenAI v0.x auto-patch hook was removed in 0.4.0:
     # openai>=1.0 does not expose ChatCompletion.create as an
     # attribute. All OpenAI v1.0+ traffic is now tracked
@@ -324,7 +326,10 @@ def _get_or_create_runtime() -> NullRunRuntime:
     # nullrun.instrumentation.auto, which is wired by
     # nullrun.init — not at the lazy-resolve path here.
     logger.info("NullRun runtime initialized: mode=cloud")
-    return _runtime
+    #  writes through the registry descriptor, so
+    # the next caller that reads  (or )
+    # sees the same instance we just created.
+    return NullRunRuntime.get_instance()
 
 
 def _next_span() -> SpanContext:
@@ -833,25 +838,34 @@ def reset() -> None:
     Reset NullRun runtime. Mainly for testing or when you need to
     reinitialize the global runtime instance.
     """
-    global _runtime
-    if _runtime:
+    cached = get_active_runtime()
+    if cached:
         try:
-            _runtime.shutdown()
+            cached.shutdown()
         except Exception as exc:  # noqa: BLE001
             logger.debug(f"Runtime shutdown raised: {exc}")
-    _runtime = None
+    # Clear the registry slot. Module-level `_runtime` proxy
+    # reads through the registry, so the next `@protect` call
+    # sees no active runtime and falls back to get_instance().
+    from nullrun._registry import get_registry
+    get_registry().clear()
     logger.info("NullRun runtime reset")
 
 
 def get_protected_runtime() -> NullRunRuntime | None:
     """Get the current protected runtime (the one `@protect` would use)."""
-    global _runtime
-    if _runtime is not None:
-        return _runtime
-    # Fall back to the global singleton if the decorator-level slot is
-    # empty — this matches the behaviour of every other helper that
-    # reads from `get_runtime `.
+    cached = get_active_runtime()
+    if cached is not None:
+        return cached
+    # Fall back to the global singleton if the registry is empty.
     try:
         return get_runtime()
     except Exception:
         return None
+
+
+# Phase 3 (2026-07-05): install the registry-backed proxy on the
+# module class (see nullrun._singleton for the rationale).
+from nullrun._singleton import install_runtime_proxy
+
+install_runtime_proxy(__name__)

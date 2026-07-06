@@ -20,7 +20,6 @@ import pytest
 
 from nullrun.breaker import exceptions as exc
 
-
 # ---------------------------------------------------------------------------
 # Category membership — every subclass lands in the right bucket
 # ---------------------------------------------------------------------------

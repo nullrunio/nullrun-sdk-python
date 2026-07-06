@@ -173,7 +173,7 @@ def format_user_message(exc: BaseException | object, locale: str = "en") -> str:
 
     Args:
         exc: A NullRun exception (or any object exposing ``error_code``).
-        locale: Locale code. **English only** in this version — any
+        locale: DEPRECATED — reserved for a future locale-pack release. Currently ignored; the catalog is English-only. Will emit a DeprecationWarning in 0.14.0 if the catalog is not yet localised by then.
             non-``"en"`` value falls back to the English message. The
             parameter is reserved for future locale packs.
 

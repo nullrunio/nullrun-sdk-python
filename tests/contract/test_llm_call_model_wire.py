@@ -38,7 +38,6 @@ import pytest
 
 from nullrun.instrumentation.langgraph import _extract_model_from_response
 
-
 # ─── _extract_model_from_response: the actual fix ─────────────────────
 #
 # The chain was promoted so the langchain-openai 1.x primary
@@ -418,10 +417,10 @@ def test_patch_chat_model_invoke_preserves_user_callbacks():
     """If the user already supplied a callback in the config, the
     wrap must NOT replace it — only add the NullRunCallback if absent.
     """
+    from langchain_core.callbacks import BaseCallbackHandler
     from langchain_core.language_models import BaseChatModel
     from langchain_core.messages import AIMessage
     from langchain_core.outputs import ChatGeneration, ChatResult
-    from langchain_core.callbacks import BaseCallbackHandler
 
     from nullrun.instrumentation import auto
     from nullrun.instrumentation.langgraph import NullRunCallback

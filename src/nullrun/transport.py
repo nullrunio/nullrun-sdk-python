@@ -19,7 +19,7 @@ import weakref
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import httpx
 
@@ -34,6 +34,17 @@ from nullrun.breaker.exceptions import (
     TransportErrorSource,
 )
 from nullrun.observability import metrics
+
+if TYPE_CHECKING:
+    # Forward-reference for the return type of
+    # `Transport.connect_websocket`. Importing at runtime would create
+    # a circular dependency between transport.py and
+    # transport_websocket.py -- the WS module already imports
+    # `generate_hmac_signature` from this one. Defining the annotation
+    # as a TYPE_CHECKING-only import keeps the cycle closed and makes
+    # ruff's F821 (undefined name) / mypy's [name-defined] check pass
+    # without the string-quoted forward reference at the call site.
+    from nullrun.transport_websocket import WebSocketConnection
 
 # OpenTelemetry imports (lazy-loaded to support optional dependency)
 try:
@@ -251,7 +262,8 @@ Retry with exponential backoff + jitter + Retry-After header support
 
 def _retry_with_backoff(
     func: Callable[[], Any],
-    max_retries: int = 3,
+    # 2026-07-05: retry budget bumped 3 -> 10.
+    max_retries: int = 10,
     base_delay: float = 0.5,
     max_delay: float = 30.0,
     backoff_factor: float = 2.0,
@@ -417,7 +429,8 @@ class FlushConfig:
 
     batch_size: int = 50
     flush_interval: float = 5.0  # seconds
-    max_retries: int = 3
+    # Mirror _retry_with_backoff default.
+    max_retries: int = 10
     retry_delay: float = 1.0  # seconds
     max_buffer_size: int = 1000  # Max events before dropping oldest
     max_failed_flush: int = 10  # Circuit breaker: stop trying after this many failures
@@ -432,7 +445,7 @@ class ExecuteConfig:
     # Gateway timeout in seconds
     timeout: float = 5.0
     # Max retries for execute calls
-    max_retries: int = 2
+    max_retries: int = 10
     # Cache TTL for CACHED mode (seconds)
     cache_ttl: float = 60.0
     # Cache max size
@@ -939,7 +952,7 @@ class Transport:
 
     @dataclass
     class SendResult:
-        accepted_event_ids: list
+        accepted_event_ids: list[str]
         retry_after_ms: float | None = None
         is_policy_limit: bool = False
 
@@ -1136,9 +1149,10 @@ class Transport:
                 resp.raise_for_status()
             return resp
 
+        max_track_retries = getattr(self, "_track_max_retries", 10)
         response = _retry_with_backoff(
             _post_batch,
-            max_retries=3,
+            max_retries=max_track_retries,
             base_delay=0.5,
             max_delay=10.0,
             backoff_factor=2.0,
@@ -1331,11 +1345,15 @@ class Transport:
                 timeout=5.0,
             )
 
-        # Try Gateway with retry backoff
+        # Try Gateway with retry backoff. The per-instance override
+        # self._execute_max_retries mirrors _track_max_retries
+        # so tests/CI can shrink the budget for fast failure injection
+        # without rewriting call sites.
+        max_execute_retries = getattr(self, "_execute_max_retries", 10)
         try:
             response = _retry_with_backoff(
                 do_execute_request,
-                max_retries=2,
+                max_retries=max_execute_retries,
                 base_delay=0.5,
                 on_transport_error=on_transport_error,
             )
@@ -1364,7 +1382,13 @@ class Transport:
             # "open" -> return synthetic allow with FALLBACK_* source
             # "closed" -> return synthetic block with FALLBACK_* source
             # callable -> call with the breaker error, return the result
-            # None -> fall through to the legacy fallback-mode default
+            # None -> fall through to the legacy fallback-mode default.
+            # The isinstance guard narrows the type before the second
+            # string comparison so mypy stops flagging the
+            # `None | Callable` arm as non-overlapping with the
+            # Literal["raise"] / Literal["open"] branches.
+            if callable(on_transport_error):
+                return on_transport_error(exc)
             if on_transport_error == "raise":
                 # Re-raise as a classified transport error.
                 raise NullRunTransportError(
@@ -1372,8 +1396,6 @@ class Transport:
                     source=TransportErrorSource.NETWORK_ERROR,
                     endpoint="execute",
                 ) from exc
-            if callable(on_transport_error):
-                return on_transport_error(exc)
             if on_transport_error == "open":
                 return {
                     "decision": "allow",
@@ -1393,6 +1415,10 @@ class Transport:
             raise  # Already classified -- propagate as-is
         except httpx.RequestError as exc:
             # Round 3: classify httpx network errors at the call site.
+            # isinstance guard narrows the type so the second string
+            # comparison below no longer overlaps with Callable | None.
+            if callable(on_transport_error):
+                return on_transport_error(exc)
             if on_transport_error == "raise":
                 raise NullRunTransportError(
                     f"Network error on /execute: {exc}",
@@ -1565,7 +1591,7 @@ class Transport:
         on_state_change: Callable[[dict[str, Any]], None] | None = None,
         on_policy_invalidated: Callable[[str, str, int], None] | None = None,
         on_key_rotated: Callable[[str, str, int], None] | None = None,
-    ) -> "WebSocketConnection":
+    ) -> WebSocketConnection:
         """
         Connect to WebSocket control plane for real-time workflow state updates.
 
@@ -2275,7 +2301,18 @@ def _parse_v3_error_envelope(
             return catalog(full_message)
         # Final fallback for catalog classes with a generic
         # (message, **details) signature (NullRunAuthError).
-        return catalog(full_message, details=details)
+        # The details payload is forwarded as a positional kwarg
+        # via **details (typed as Any to satisfy mypy since
+        # type[BaseException] does not expose the kwargs the
+        # catalog subclasses actually accept).
+        #
+        # The catalog lookup produces type[BaseException] (the
+        # union of all class objects), but every entry in
+        # _V3_ERROR_CODE_MAP is a real Exception subclass. Cast
+        # to Exception so mypy stops flagging the return value
+        # as BaseException (the helper declares -> Exception).
+        instance = catalog(full_message, **details)  # type: ignore[call-arg]
+        return cast(Exception, instance)
 
     # Fallback — use HTTP status. The catalog may not yet cover
     # every backend code, so we surface a typed backend error
@@ -2465,3 +2502,27 @@ def _parse_error_envelope(
         status_code=status,
         error_slug=error_slug,
     )
+
+
+# Public surface for `from nullrun.transport import X` consumers
+# (notably runtime.py). Without this list, mypy treats every
+# submodule attribute as private and rejects cross-module imports
+# under `--strict`. The list mirrors the symbols runtime.py
+# actually consumes plus the convenience constructors / constants
+# documented in the README.
+__all__ = [
+    "HEADER_PROTOCOL",
+    "NULLRUN_PROTOCOL_VERSION",
+    "DecisionSource",
+    "FallbackMode",
+    "FlushConfig",
+    "ExecuteConfig",
+    "Transport",
+    "TransportErrorSource",
+    "_retry_with_backoff",
+    "generate_hmac_signature",
+    "verify_hmac_signature",
+    "_signed_request_body",
+    "RateLimitError",
+    "InsecureTransportError",
+]

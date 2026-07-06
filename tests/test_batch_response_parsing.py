@@ -17,10 +17,9 @@ import pytest
 import respx
 from httpx import Response
 
-from nullrun.runtime import NullRunRuntime
-import nullrun.decorators as _dec
 import nullrun.actions as _act
-
+import nullrun.decorators as _dec
+from nullrun.runtime import NullRunRuntime
 
 BASE_URL = "https://api.test.nullrun.io"
 

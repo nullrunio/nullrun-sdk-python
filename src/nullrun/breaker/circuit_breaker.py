@@ -30,7 +30,7 @@ class CBState(Enum):
 class CircuitBreakerMetrics:
     """Metrics for circuit breaker observability."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.circuit_open_count = 0
         self.circuit_half_open_count = 0
         self.circuit_closed_count = 0
@@ -113,20 +113,25 @@ class CircuitBreaker:
             return None
 
     def _check_global_recovered(self) -> bool:
-        """
-        Check if another instance recovered the circuit (closed it in Redis).
+            """
+            Check if another instance recovered the circuit (closed it in Redis).
 
-        Returns True if another instance closed the circuit.
-        """
-        if not self._redis_client:
-            return False
-        try:
-            key = f"{self._redis_key_prefix}state"
-            state = self._redis_client.get(key)
-            return state == "CLOSED"
-        except Exception as e:
-            logger.warning(f"Redis recovery check failed: {e}")
-            return False
+            Returns True if another instance closed the circuit.
+            """
+            if not self._redis_client:
+                return False
+            try:
+                key = f"{self._redis_key_prefix}state"
+                state = self._redis_client.get(key)
+                # Redis client stubs return `Any`; the wire value is
+                # the JSON-encoded state string we set in
+                # `_publish_open_state` / `_publish_half_open_state`.
+                #  cast is required because 
+                # has type  under strict Any narrowing.
+                return bool(state == "CLOSED")
+            except Exception as e:
+                logger.warning(f"Redis recovery check failed: {e}")
+                return False
 
     def _publish_open_state(self) -> None:
         """Publish OPEN state to Redis with TTL."""
@@ -250,7 +255,7 @@ class CircuitBreaker:
                     self._publish_half_open_state()
             return self._state
 
-    def call(self, func: Callable[..., Any], *args, **kwargs) -> Any:
+    def call(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         """Execute func through circuit breaker. Supports both sync and async functions.
 
  #35: the pre-fix code did the OPEN→HALF_OPEN jitter
@@ -310,7 +315,7 @@ class CircuitBreaker:
                 jitter = random.uniform(0, 5.0)
                 await asyncio.sleep(jitter)
 
-    def _call_sync(self, func: Callable[..., Any], needs_open_jitter: bool, *args, **kwargs) -> Any:
+    def _call_sync(self, func: Callable[..., Any], needs_open_jitter: bool, *args: Any, **kwargs: Any) -> Any:
         """Execute sync func through circuit breaker."""
         if needs_open_jitter:
             self._maybe_apply_open_jitter_sync()
@@ -333,7 +338,7 @@ class CircuitBreaker:
             self._on_failure()
             raise
 
-    async def _call_async(self, func: Callable[..., Any], needs_open_jitter: bool, *args, **kwargs) -> Any:
+    async def _call_async(self, func: Callable[..., Any], needs_open_jitter: bool, *args: Any, **kwargs: Any) -> Any:
         """Execute async func through circuit breaker."""
         if needs_open_jitter:
             await self._maybe_apply_open_jitter_async()
@@ -426,7 +431,7 @@ class CircuitBreaker:
         if self._redis_client and self._state == CBState.OPEN:
             self._publish_open_state()
 
-    def get_metrics(self) -> dict:
+    def get_metrics(self) -> dict[str, Any]:
         return {
             "state": self.state.value,
             "failure_count": self._failure_count,

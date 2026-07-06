@@ -64,6 +64,7 @@ coverage.xml
 # Claude Code / claude-flow project-local state
 .claude/
 .claude-flow/
+src/**/.claude-flow/
 CLAUDE.md
 
 # Project-local working notes (kept on disk, not in VCS)

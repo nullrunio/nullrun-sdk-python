@@ -320,8 +320,8 @@ class TestSummary:
     def test_summary_includes_recent_errors_count(self):
         # Branch: ``if self.recent_errors``.
         rt = _make_runtime()
-        from nullrun.observability.error_hooks import ErrorContext
         from nullrun.breaker.exceptions import NullRunError
+        from nullrun.observability.error_hooks import ErrorContext
 
         for i in range(3):
             rt._emit_sdk_error(

@@ -141,6 +141,14 @@ ErrorHook = Callable[["Any", ErrorContext], None]
 # Module-level registry. Thread-safe — hooks may be registered
 # from one thread and fired from another (e.g. register at app
 # startup, fire from a transport background thread).
+#
+# Phase 4 (2026-07-05): the hot path is has_hooks(), which
+# previously took an RLock.acquire on every call (100+ raises/min
+# in a busy agent is enough to show up in profiles). We now keep
+# the hook list under the same RLock but expose has_hooks()
+# as a lock-free len() check. The list itself is private;
+# callers always go through the public functions (which take
+# the lock for the read snapshot during dispatch).
 _lock = threading.RLock()
 _hooks: list[ErrorHook] = []
 
@@ -234,5 +242,12 @@ def has_hooks() -> bool:
     context is small), but the SDK init path uses it because
     the context for an ``init`` failure is large.
     """
-    with _lock:
-        return bool(_hooks)
+    # Lock-free: see the long-form comment above. The list
+    # itself is mutated under _lock, but len() on a list is
+    # atomic in CPython and the worst case is a one-step-stale
+    # read (the very next call sees the truth). For the
+    # hot-path caller this is the right trade-off — the
+    # alternative is a context-built-and-discarded on every
+    # raise, which is the very thing has_hooks() exists to
+    # avoid.
+    return bool(_hooks)

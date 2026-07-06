@@ -375,7 +375,7 @@ class TestAllMetricsWired:
         from httpx import Response
 
         with respx.mock(assert_all_called=False) as mock:
-            mock.post("https://api.test.nullrun.io/api/v1/gate").mock(
+            mock.post("https://api.test.nullrun.io/api/v1/execute").mock(
                 return_value=Response(500, json={"error": "boom"})
             )
             t = Transport(
@@ -383,6 +383,12 @@ class TestAllMetricsWired:
                 api_key="test-key-12345678",
                 secret_key="test-secret",
             )
+            # Pin a small retry budget so the 5xx test does not spend
+            # the full retry window (default 10 attempts × 30s backoff
+            # cap = 64s+ on the test runner's deadline). The metric
+            # we assert (fallback_mode_activations) is bumped on the
+            # FIRST attempt — the retry count is incidental.
+            t._execute_max_retries = 1
             t.start()
             try:
                 # The exact return shape depends on fallback_mode

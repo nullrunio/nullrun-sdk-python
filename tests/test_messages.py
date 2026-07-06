@@ -21,7 +21,6 @@ import pytest
 from nullrun import messages
 from nullrun.breaker import exceptions as exc
 
-
 # ---------------------------------------------------------------------------
 # Catalog completeness — every code in the SDK has a default message
 # ---------------------------------------------------------------------------

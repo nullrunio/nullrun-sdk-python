@@ -13,7 +13,7 @@ import json
 import logging
 import time
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 # CP7 fix: outgoing ACK is now HMAC-signed using the same
 # ``generate_hmac_signature`` helper the HTTP transport uses for
@@ -201,10 +201,10 @@ class WebSocketConnection:
         self.on_state_change = on_state_change
         self.on_policy_invalidated = on_policy_invalidated
         self.on_key_rotated = on_key_rotated
-        self._conn = None
+        self._conn: Any = None  # ClientConnection when websockets is imported
         self._running = False
-        self._receive_task: asyncio.Task | None = None
-        self._reconnect_task: asyncio.Task | None = None
+        self._receive_task: asyncio.Task[Any] | None = None
+        self._reconnect_task: asyncio.Task[Any] | None = None
         self._closed = False
         # S-10: counter for the consecutive reconnect-failure cap.
         # Reset to 0 on a successful ``_connect ``.
@@ -337,8 +337,10 @@ class WebSocketConnection:
         """
         Receive messages from WebSocket and dispatch to handler.
         """
+        if self._conn is None:
+            return
         try:
-            async for message in self._conn:
+            async for message in self._conn:  # type: ignore[union-attr]
                 await self._handle_message(message)
         except websockets.exceptions.ConnectionClosed:
             logger.info("WebSocket connection closed")
@@ -573,7 +575,7 @@ class WebSocketConnection:
                         await self._conn.close()
                     except Exception:  # noqa: BLE001
                         pass
-                    self._conn = None
+                    self._conn = None  # type: ignore[assignment]
 
             elif msg_type == "pong":
                 # Pong response to ping - connection is alive
@@ -857,7 +859,7 @@ class WebSocketConnection:
 
         if self._conn:
             await self._conn.close()
-            self._conn = None
+            self._conn = None  # type: ignore[assignment]
 
         logger.info("WebSocket connection closed")
 

@@ -34,7 +34,7 @@ What this module does NOT do:
 from __future__ import annotations
 
 import uuid
-from contextvars import ContextVar
+from contextvars import ContextVar, Token
 from dataclasses import dataclass
 
 
@@ -129,7 +129,7 @@ def create_root_span() -> SpanContext:
     )
 
 
-def set_span(ctx: SpanContext):
+def set_span(ctx: SpanContext) -> Token[SpanContext | None]:
     """
     Make `ctx` the current span. Returns a token that MUST be passed
     back to `reset_span` in a `finally` block to restore the previous
@@ -146,7 +146,7 @@ def set_span(ctx: SpanContext):
     return _current_span.set(ctx)
 
 
-def reset_span(token) -> None:
+def reset_span(token: Token[SpanContext | None]) -> None:
     """
     Restore the context that was active before the matching `set_span`.
     Pair with `set_span` — never call reset_span with a token from a

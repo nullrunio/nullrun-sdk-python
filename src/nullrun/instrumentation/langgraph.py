@@ -384,8 +384,16 @@ def extract_usage_from_response(response: Any, provider: str, model: str) -> dic
         collected.extend(_extract_tool_names(src))
     # De-duplicate while preserving first-seen order so a tool called
     # multiple times in one response appears once in the wire shape.
+    # The original one-liner relied on set.add() returning None, which
+    # mypy --strict correctly flags as func-returns-value. The explicit
+    # loop below is equivalent in semantics and friendlier to type-checkers.
     seen: set[str] = set()
-    usage["tool_names"] = [n for n in collected if not (n in seen or seen.add(n))]
+    unique: list[str] = []
+    for n in collected:
+        if n not in seen:
+            seen.add(n)
+            unique.append(n)
+    usage["tool_names"] = unique
 
     # Determine if we got real usage data
     usage["has_usage"] = (

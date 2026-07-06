@@ -61,7 +61,6 @@ from nullrun.breaker.exceptions import (
     NullRunWorkflowInactiveError,
 )
 
-
 # ---------------------------------------------------------------------------
 # F1: wire idempotency_key propagation
 # ---------------------------------------------------------------------------

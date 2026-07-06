@@ -83,10 +83,19 @@ class TestInitWritesAllSingletonSlots:
     """
 
     def test_init_writes_all_three_singleton_slots(self, monkeypatch, mock_api):
+        # Phase 3 (2026-07-05): the three slots
+        # (`runtime._runtime`, `NullRunRuntime._instance`,
+        # `decorators._runtime`) all route through the
+        # RuntimeRegistry. We assert the registry pointer directly
+        # and also confirm the legacy read paths see the same
+        # instance (backwards compat).
+        from nullrun._registry import get_active_runtime
+
         monkeypatch.setenv("NULLRUN_API_KEY", "test-key-12345678")
         monkeypatch.setenv("NULLRUN_API_URL", "https://api.test.nullrun.io")
         rt = nullrun.init()
         try:
+            assert get_active_runtime() is rt
             assert _rt_mod._runtime is rt
             assert NullRunRuntime._instance is rt
             assert _dec_mod._runtime is rt
@@ -103,8 +112,15 @@ class TestInitWritesAllSingletonSlots:
         releasing it from multiple threads while observing the
         slots — that directly tests the locking primitive without
         the noise of background WS threads.
+
+        Phase 3 (2026-07-05): the worker writes through the
+        RuntimeRegistry (the canonical store). The
+        NullRunRuntime._instance descriptor routes to the
+        registry, and the module-level `_runtime` proxies re-resolve
+        from the registry on every read.
         """
         from nullrun import _init_lock
+        from nullrun._registry import get_active_runtime
 
         # Simulate the init_lock critical section: each thread
         # writes the three slots under the lock, then releases.
@@ -114,9 +130,7 @@ class TestInitWritesAllSingletonSlots:
         def worker(rt: NullRunRuntime) -> None:
             try:
                 with _init_lock:
-                    _rt_mod._runtime = rt
                     NullRunRuntime._instance = rt
-                    _dec_mod._runtime = rt
                     results.append(rt)
             except Exception as e:  # noqa: BLE001
                 errors.append(e)
@@ -136,13 +150,16 @@ class TestInitWritesAllSingletonSlots:
             t.join(timeout=10.0)
 
         assert not errors, f"worker raised: {errors}"
-        # After all workers have run, the slots point at the LAST
-        # runtime that acquired the lock. All 8 are valid; we just
-        # assert the slots are not None and point at one of them.
-        assert _rt_mod._runtime in runtimes
-        assert NullRunRuntime._instance in runtimes
-        assert _dec_mod._runtime in runtimes
-        assert _rt_mod._runtime is NullRunRuntime._instance is _dec_mod._runtime
+        # After all workers have run, the registry points at the
+        # LAST runtime that acquired the lock. All 8 are valid; we
+        # assert the registry is not None and points at one of
+        # them. The legacy read proxies re-resolve from the
+        # registry on every access, so they always agree.
+        current = get_active_runtime()
+        assert current in runtimes
+        assert _rt_mod._runtime is current
+        assert _dec_mod._runtime is current
+        assert NullRunRuntime._instance is current
 
 
 class TestInitCapabilityProbeLogging:
@@ -226,8 +243,9 @@ class TestInitCapabilityProbeLogging:
         Pins the ``logger.info("nullrun.init: could not probe %s/health...")``
         branch on lines 358-362.
         """
-        import httpx
         import logging
+
+        import httpx
         import respx
 
         monkeypatch.setenv("NULLRUN_API_KEY", "test-key-12345678")

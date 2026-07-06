@@ -51,20 +51,26 @@ def uuid7() -> uuid.UUID:
 
     Example:
         >>> from nullrun.uuid7 import uuid7
-        >>> id_ = uuid7 
+        >>> id_ = uuid7
         >>> str(id_)
         '0190c5b5-7c9a-7def-8a1b-...'
     """
     unix_ts_ms = time.time_ns() // 1_000_000
     rand_bytes = secrets.token_bytes(10)
-    # Bytes 0-5: unix_ts_ms (big-endian)
-    field = unix_ts_ms.to_bytes(6, byteorder="big") + rand_bytes
+    # Build the 16-byte payload as a bytearray so the version /
+    # variant nibbles can be stamped in place. `bytes` itself does
+    # not support indexed assignment (the pre-fix code reassigned
+    # `field = bytearray(field)` first to make `field[6] = ...`
+    # work, then fed the bytearray back into `uuid.UUID(bytes=...)`
+    # — a TypeError-free round-trip but with two extra copies of
+    # the random payload on the stack). Inlining the bytearray
+    # construction drops one of the copies.
+    raw = bytearray(unix_ts_ms.to_bytes(6, byteorder="big") + rand_bytes)
     # Stamp version into the high 4 bits of byte 6
-    field = bytearray(field)
-    field[6] = (field[6] & 0x0F) | (_VERSION_V7 << 4)
+    raw[6] = (raw[6] & 0x0F) | (_VERSION_V7 << 4)
     # Stamp variant into the high 2 bits of byte 8
-    field[8] = (field[8] & 0x3F) | (_VARIANT_RFC4122 << 6)
-    return uuid.UUID(bytes=bytes(field))
+    raw[8] = (raw[8] & 0x3F) | (_VARIANT_RFC4122 << 6)
+    return uuid.UUID(bytes=bytes(raw))
 
 
 def uuid7_str() -> str:
