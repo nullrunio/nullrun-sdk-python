@@ -1591,6 +1591,7 @@ class Transport:
         on_state_change: Callable[[dict[str, Any]], None] | None = None,
         on_policy_invalidated: Callable[[str, str, int], None] | None = None,
         on_key_rotated: Callable[[str, str, int], None] | None = None,
+        on_approval_resolved: Callable[[dict[str, Any]], None] | None = None,
     ) -> "WebSocketConnection":
         """
         Connect to WebSocket control plane for real-time workflow state updates.
@@ -1653,12 +1654,22 @@ class Transport:
             if on_policy_invalidated:
                 on_policy_invalidated(ws_id, policy_id, new_version)
 
-        # Wrap the key rotated callback to re-fetch credentials
+# Wrap the key rotated callback to re-fetch credentials
         async def wrapped_key_rotated(ws_id: str, key_id: str, new_version: int) -> None:
             logger.info(f"Key {key_id} rotated (v{new_version}), re-fetching credentials")
             await self._refetch_credentials()
             if on_key_rotated:
                 on_key_rotated(ws_id, key_id, new_version)
+
+        # Wrap the approval-resolved callback. The WebSocketConnection
+        # handler dispatches the raw dict to on_approval_resolved (the
+        # dispatch signature is dict-only, not an async wrapper), so
+        # we adapt the sync callback to async by spawning a thread —
+        # the resolution logic in runtime.py is short-lived and not
+        # coroutine-bound (it touches a threading.Event).
+        async def wrapped_approval_resolved(payload: dict[str, Any]) -> None:
+            if on_approval_resolved:
+                on_approval_resolved(payload)
 
         conn = WebSocketConnection(
             url=ws_url,
@@ -1668,6 +1679,7 @@ class Transport:
             on_state_change=on_state_change,
             on_policy_invalidated=wrapped_policy_invalidated,
             on_key_rotated=wrapped_key_rotated,
+            on_approval_resolved=wrapped_approval_resolved,
         )
         await conn.connect()
         return conn
