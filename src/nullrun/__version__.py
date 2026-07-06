@@ -201,7 +201,82 @@ Tests touched (in ``tests/test_v3_wire_contract.py``):
 1037 lib tests pass (no regression). Recommended upgrade path:
 0.13.0 -> 0.13.1. No SDK_MIN_VERSION bump — wire format is the same
 from the caller's perspective; only the URLs and docstrings changed.
+
+---
+
+v3.15 / 0.13.2 (2026-07-06) — typing-debt sweep + singleton/registry
+split. No on-wire change; backends on 1.0.0 keep working unchanged.
+
+  1. ``pyproject.toml`` mypy config rewritten from a single
+     blanket ``ignore_errors = true`` (12 files / 102 errors swallowed)
+     to per-file ``[[tool.mypy.overrides]]`` blocks — every legacy
+     module now declares the EXACT error codes it carries, so CI
+     breaks the moment a NEW code appears in that module rather
+     than the previous "everything passes" status. ``strict = true``
+     is enabled on the 14 modules already clean enough to keep it;
+     modules still carrying debt opt in via targeted
+     ``disable_error_code`` lists. Per the comment block at the
+     top of the overrides section: when a file's count drops to 0,
+     remove its override row — the table and the debt tracker stay
+     in lockstep.
+
+  2. Singleton state split out of ``runtime.py`` into two new
+     internal modules:
+
+       * ``nullrun._singleton`` — ``NullRunRuntimeMeta`` descriptor
+         backing the ``_instance`` class attribute (the one and
+         only canonical instance slot). Module-level ``_runtime``
+         PEP 562 ``__getattr__`` proxies in runtime.py /
+         decorators.py route reads through here so
+         ``import nullrun; nullrun.runtime`` and
+         ``from nullrun.runtime import _runtime`` both resolve to
+         the same instance without the legacy
+         ``_instance = runtime`` assignment that broke whenever
+         the metaclass was bypassed (e.g. by ``copy.deepcopy``
+         or by tests that constructed ``NullRunRuntime`` directly
+         without going through ``__init__``).
+
+       * ``nullrun._registry`` — the per-process registry of
+         runtime capabilities (chain-mode gate cache, LRU
+         fingerprints, websocket handles). Previously inlined
+         as module globals in ``runtime.py``; now centralised
+         so the orchestrator module stays under the strict-mypy
+         umbrella and external test code can swap or inspect the
+         registry without monkeypatching the orchestrator.
+
+  3. ``NullRunRuntime._instance = runtime`` backwards-compat line
+     retained at the bottom of ``NullRunRuntime.__init__`` so
+     external callers that read ``NullRunRuntime._instance``
+     directly (and there are a handful in the integration tests
+     shipped by partners) keep working — the new metaclass
+     descriptor makes the assignment a no-op for the singleton
+     case but is still semantically a write so legacy reflection
+     code does not crash.
+
+  4. ``ruff`` ignore list dropped ``F821`` (undefined name) — the
+     one site was a typo fixed by the previous ``fix typos``
+     commit on this branch. The remaining five (S110 / E501 /
+     F841 / E402 / F401) are pre-existing and explicitly tracked
+     in the pyproject comment block for a future cleanup PR.
+
+  5. ``tests/test_registry.py`` (new, 12 tests) — covers the
+     registry / singleton contract end-to-end:
+     ``NullRunRuntimeMeta`` raises on second ``__init__``,
+     ``reset_for_tests`` clears the registry without touching
+     the class descriptor, ``_capture_server_minted_*`` context
+     helpers round-trip through the new module, and the legacy
+     ``_instance`` read path still returns the live singleton
+     after the split.
+
+Tests:
+  * ``tests/test_registry.py`` — 12 tests for the new modules.
+  * Existing suite untouched: 1037 lib tests still pass.
+
+Backends on 1.0.0 keep working unchanged. Pinning unchanged:
+SDK_MIN_VERSION_FOR_V3 = "0.12.0". Recommended upgrade path:
+0.13.1 -> 0.13.2 (typing-only change for end users; visible
+delta is the per-file mypy table in pyproject.toml).
 """
 
-__version__ = "0.13.1"
+__version__ = "0.13.2"
 __platform_version__ = "1.0.0"
