@@ -179,6 +179,7 @@ class WebSocketConnection:
         on_state_change: Callable[[dict[str, Any]], None] | None = None,
         on_policy_invalidated: Callable[[str, str, int], None] | None = None,
         on_key_rotated: Callable[[str, str, int], None] | None = None,
+        on_approval_resolved: Callable[[dict[str, Any]], None] | None = None,
     ):
         """
         Initialize WebSocket connection.
@@ -193,6 +194,15 @@ class WebSocketConnection:
                                  Args: (organization_id, policy_id, new_version)
             on_key_rotated: Callback when secret key should be re-fetched
                            Args: (organization_id, key_id, new_version)
+            on_approval_resolved: Callback when a pending human-approval
+                                 request was approved or denied by an
+                                 operator via the dashboard. The SDK uses
+                                 this to release the gate reservation
+                                 (approved) or surface WorkflowKilledInterrupt
+                                 (denied) so the agent can resume from the
+                                 same execution_id without polling /status.
+                                 Args: ({approval_id, workflow_id,
+                                 execution_id, outcome, note, resolved_at})
         """
         self.url = url
         self.headers = headers or {}
@@ -201,6 +211,7 @@ class WebSocketConnection:
         self.on_state_change = on_state_change
         self.on_policy_invalidated = on_policy_invalidated
         self.on_key_rotated = on_key_rotated
+        self.on_approval_resolved = on_approval_resolved
         self._conn: Any = None  # ClientConnection when websockets is imported
         self._running = False
         self._receive_task: asyncio.Task[Any] | None = None
@@ -554,6 +565,38 @@ class WebSocketConnection:
                         self.on_key_rotated(organization_id, key_id, new_version)
                     except Exception as e:
                         logger.warning(f"Key rotation callback error: {e}")
+
+            elif msg_type == "approval_resolved":
+                # Drift section 7 (2026-07-06): human-approval
+                # resolution notification. The dashboard operator
+                # approved or denied a pending approval; the SDK
+                # uses this to release the gate reservation
+                # (approved) or surface WorkflowKilledInterrupt
+                # (denied) so the agent can resume from the same
+                # execution_id without polling /status.
+                #
+                # Wire shape (backend WsMessage::ApprovalResolved):
+                # {
+                #   approval_id:   UUID string,
+                #   workflow_id:   UUID string,
+                #   execution_id:  UUID string,
+                #   outcome:       "approved" | "denied",
+                #   note:          Option<String>,
+                #   resolved_at:   i64 Unix seconds,
+                #   message_id:    Option<String>,
+                # }
+                approval_id = data.get("approval_id", "")
+                outcome = data.get("outcome", "")
+                execution_id = data.get("execution_id", "")
+                workflow_id = data.get("workflow_id", "")
+                logger.info(
+                    f"Approval {outcome}: id={approval_id} exec={execution_id} wf={workflow_id}"
+                )
+                if self.on_approval_resolved:
+                    try:
+                        self.on_approval_resolved(data)
+                    except Exception as e:
+                        logger.warning(f"Approval resolved callback error: {e}")
 
             elif msg_type == "resync_required":
                 # Server overflowed its broadcast channel. Per

@@ -366,6 +366,35 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         self._remote_states: dict[str, dict[str, Any]] = {}
         self._states_lock = threading.RLock()
 
+        # Drift section 7 (2026-07-06): human-approval pending registry.
+        # When a /gate response carries decision="require_approval",
+        # the SDK stores the (approval_id, workflow_id, execution_id)
+        # tuple here and blocks until either:
+        #   - the WS push arrives with outcome="approved" (release
+        #     the gate, resume from the same execution_id), or
+        #   - the WS push arrives with outcome="denied" (surface
+        #     WorkflowKilledInterrupt), or
+        #   - the per-approval timeout elapses (fall back to the
+        #     /status poll path; emit a warning so the operator
+        #     knows WS push is silent).
+        #
+        # Keyed by approval_id because the WS push carries the
+        # approval id, not the execution id. The execution_id
+        # lets the SDK distinguish "approval for THIS gate call"
+        # from a stale pending approval for a different execution
+        # in the same workflow.
+        self._approval_pending: dict[str, dict[str, Any]] = {}
+        self._approval_lock = threading.RLock()
+        # Default timeout for WS approval push. Set to None to
+        # block indefinitely (the legacy poll path is still
+        # active as a backstop, so the SDK cannot hang forever).
+        # Override with NULLRUN_APPROVAL_TIMEOUT_SECONDS.
+        try:
+            _t = float(os.getenv("NULLRUN_APPROVAL_TIMEOUT_SECONDS", "300"))
+        except ValueError:
+            _t = 300.0
+        self._approval_timeout_seconds: float = _t
+
         # Phase B: control plane transport. The SDK connects to the server's
         # WS endpoint and receives state push events (killed/paused) within
         # ~100ms of the operator action -- vs the previous 1s HTTP poll.
@@ -1011,9 +1040,13 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 logger.warning(f"WS state callback error: {e}")
 
         try:
+            def _on_approval_resolved(payload):
+                self._handle_approval_resolved(payload)
+
             conn = await self._transport.connect_websocket(
                 organization_id=self.organization_id,
                 on_state_change=on_state_change,
+                on_approval_resolved=_on_approval_resolved,
             )
             self._ws_connection = conn
         except Exception as e:
@@ -1146,6 +1179,113 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 )
         except Exception as e:
             logger.debug(f"Failed to fetch remote state for {workflow_id}: {e}")
+
+    def _handle_approval_resolved(self, payload: dict[str, Any]) -> None:
+        """Drift section 7 (2026-07-06): WS push handler for an
+        approval resolution. Releases the matching gate
+        reservation (approved) or raises WorkflowKilledInterrupt
+        (denied) so the agent can resume from the same
+        execution_id.
+
+        Args:
+            payload: The WsMessage::ApprovalResolved dict from the
+                server. Schema:
+                {approval_id, workflow_id, execution_id, outcome,
+                note, resolved_at, message_id}.
+        """
+        approval_id = payload.get("approval_id", "")
+        outcome = (payload.get("outcome", "") or "").lower()
+        execution_id = payload.get("execution_id", "")
+
+        with self._approval_lock:
+            entry = self._approval_pending.pop(approval_id, None)
+
+        if entry is None:
+            # The WS push arrived for an approval we never
+            # registered (a duplicate, a stale message from a
+            # previous SDK instance, or a backend-version mismatch).
+            # Log at debug because this is normal during a
+            # restart cycle; do NOT raise.
+            logger.debug(
+                "WS approval push for unknown approval_id=%s -- ignoring",
+                approval_id,
+            )
+            return
+
+        # Release the threading.Event so the gate call wakes up.
+        event = entry.get("event")
+        if event is not None:
+            event.set()
+        # Stash the payload on the entry so the waiter can read
+        # outcome + note without re-querying.
+        entry["outcome"] = outcome
+        entry["note"] = payload.get("note")
+        entry["resolved_at"] = payload.get("resolved_at")
+
+    def _wait_for_approval_resolution(
+        self,
+        approval_id: str,
+        workflow_id: str,
+        execution_id: str,
+    ) -> dict[str, Any]:
+        """Drift section 7 (2026-07-06): block the calling thread
+        until the WS approval push arrives (or the per-approval
+        timeout elapses). The WS handler
+        (``_handle_approval_resolved`` above) sets the threading
+        Event when the push lands; this method waits on it.
+
+        Args:
+            approval_id: The approval id from the /gate response.
+            workflow_id: Workflow the approval gates.
+            execution_id: Execution the approval gates.
+
+        Returns:
+            The entry dict, with ``outcome`` populated (either
+            ``"approved"`` or ``"denied"``). On timeout, returns
+            a sentinel ``{"outcome": "timeout", "timed_out": True}``
+            and the caller is expected to fall back to the
+            legacy /status poll path.
+
+        Raises:
+            Nothing. Approval timeouts are returned, not raised,
+            so the caller can choose the right recovery action
+            (raise WorkflowKilledInterrupt on denied, resume on
+            approved, fall back to poll on timeout).
+        """
+        event = threading.Event()
+        entry: dict[str, Any] = {
+            "approval_id": approval_id,
+            "workflow_id": workflow_id,
+            "execution_id": execution_id,
+            "event": event,
+        }
+        with self._approval_lock:
+            self._approval_pending[approval_id] = entry
+
+        try:
+            signaled = event.wait(timeout=self._approval_timeout_seconds)
+            if not signaled:
+                logger.warning(
+                    "approval %s: WS push silent for %.1fs -- "
+                    "falling back to /status poll",
+                    approval_id,
+                    self._approval_timeout_seconds,
+                )
+                with self._approval_lock:
+                    self._approval_pending.pop(approval_id, None)
+                return {
+                    "outcome": "timeout",
+                    "timed_out": True,
+                    "approval_id": approval_id,
+                }
+            return entry
+        except Exception:
+            # On any wait error, drop the registration to avoid
+            # leaking a stuck entry that would block a future
+            # approval for the same id.
+            with self._approval_lock:
+                self._approval_pending.pop(approval_id, None)
+            raise
 
     def check_control_plane(self, workflow_id: str) -> None:
         """
@@ -1446,7 +1586,67 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 workflow_id=workflow_id,
                 reason="; ".join(reasons),
             )
+        if decision == "throttle":
+            reasons = (
+                response.get("explanations")
+                or ([response["explanation"]] if response.get("explanation") else ["throttle"])
+            )
+            raise WorkflowPausedException(
+                workflow_id=workflow_id,
+                reason="; ".join(reasons),
+            )
 
+        if decision == "require_approval":
+            # Drift section 7 (2026-07-06): the gate requires a
+            # human-approval before the call may proceed. Block
+            # the calling thread on the WS push (handled in
+            # _handle_approval_resolved) and let the operator
+            # click Approve/Deny on the dashboard. On timeout
+            # (WS push silent for the configured
+            # _approval_timeout_seconds) we fall through and
+            # the caller is expected to treat the call as
+            # blocked -- the same fail-CLOSED semantics as a
+            # regular block.
+            approval_id = response.get("approval_id", "") or ""
+            if not approval_id:
+                logger.warning(
+                    "check_workflow_budget: require_approval decision but no approval_id in response"
+                )
+                raise WorkflowKilledInterrupt(
+                    workflow_id=workflow_id,
+                    reason="approval_id missing in require_approval response",
+                )
+            logger.info(
+                f"check_workflow_budget: require_approval id={approval_id} -- waiting for WS push"
+            )
+            result = self._wait_for_approval_resolution(
+                approval_id=approval_id,
+                workflow_id=workflow_id,
+                execution_id=str(self.organization_id or "local"),
+            )
+            outcome = (result.get("outcome") or "").lower()
+            if outcome == "approved":
+                # Resume: the gate will be re-checked on the next
+                # @protect call, so we just return success here.
+                # The caller proceeds with the original
+                # function body.
+                logger.info(
+                    f"check_workflow_budget: approval {approval_id} approved -- resuming"
+                )
+                return
+            if outcome == "denied":
+                raise WorkflowKilledInterrupt(
+                    workflow_id=workflow_id,
+                    reason=f"approval denied: {result.get('note') or 'operator denied'}",
+                )
+            # timeout: fail-CLOSED -- do not run the call.
+            raise WorkflowKilledInterrupt(
+                workflow_id=workflow_id,
+                reason=(
+                    f"approval {approval_id} timeout: WS push silent for "
+                    f"{self._approval_timeout_seconds:.0f}s"
+                ),
+            )
     # =============================================================================
     # v3 wire-protocol helpers
     # =============================================================================
