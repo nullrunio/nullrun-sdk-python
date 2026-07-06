@@ -1591,7 +1591,7 @@ class Transport:
         on_state_change: Callable[[dict[str, Any]], None] | None = None,
         on_policy_invalidated: Callable[[str, str, int], None] | None = None,
         on_key_rotated: Callable[[str, str, int], None] | None = None,
-    ) -> WebSocketConnection:
+    ) -> "WebSocketConnection":
         """
         Connect to WebSocket control plane for real-time workflow state updates.
 
