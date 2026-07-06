@@ -1,11 +1,11 @@
 """
 Regression test for the silent zero-billing bug (2026-06-29).
 
-Pre-fix: when an ``llm_call`` event reached the runtime's ``track()``
+Pre-fix: when an ``llm_call`` event reached the runtime's ``track ``
 with ``model=None`` (or absent), the wire-format builder at
 ``runtime.py:1427-1431`` dropped the None value entirely, the
 backend's cost pipeline ``unwrap_or("default")``'d, and every call
-was recorded as approximately zero. Budget enforcement, billing,
+was recorded as approximately zero. Budget enforcement, billing
 and plan-limit accounting silently broke for every model on every
 provider.
 
@@ -15,14 +15,14 @@ Post-fix: three layers of defense
      model on every known response shape — including
      ``LLMResult.llm_output['model_name']``, the location
      langchain-openai 1.x uses for the date-suffixed id.
-  2. ``runtime.track()`` promotes the missing-model warning to
+  2. ``runtime.track `` promotes the missing-model warning to
      ERROR, bumps ``dropped_llm_call_no_model``, and tags the
      wire event with ``__missing_model: True`` so the backend
      can reject with HTTP 422.
   3. ``patch_httpx`` eagerly wraps any pre-existing httpx.Client
-     instances when ``nullrun.init()`` is called — closing the
+     instances when ``nullrun.init `` is called — closing the
      init-ordering hazard where ``ChatOpenAI(...)`` is created
-     before ``init()``.
+     before ``init ``.
 
 This file pins all three invariants at the unit level so a future
 refactor can't silently re-break the wire.
@@ -37,7 +37,6 @@ from unittest.mock import MagicMock
 import pytest
 
 from nullrun.instrumentation.langgraph import _extract_model_from_response
-
 
 # ─── _extract_model_from_response: the actual fix ─────────────────────
 #
@@ -85,7 +84,7 @@ def test_extracts_from_llm_output_model_key():
 
 
 def test_extracts_from_llm_output_key_containing_model():
-    """Custom wrappers (e.g. ``model_id``, ``modelName``,
+    """Custom wrappers (e.g. ``model_id``, ``modelName``
     ``resolved_model``) fall through the generic any-key
     sweep."""
     response = _make_llmresult(llm_output={"model_id": "claude-haiku-4-5-20251001"})
@@ -95,7 +94,7 @@ def test_extracts_from_llm_output_key_containing_model():
 def test_llm_output_checked_before_response_metadata():
     """Audit invariant: when BOTH ``llm_output['model_name']`` and
     ``response_metadata['model_name']`` are set, the llm_output
-    value wins. Pre-fix the order was response_metadata first,
+    value wins. Pre-fix the order was response_metadata first
     which meant a populated response_metadata shadowed the
     real (date-suffixed) llm_output value."""
     response = _make_llmresult(
@@ -152,7 +151,7 @@ def test_empty_string_in_llm_output_falls_through():
     assert _extract_model_from_response(response) == "gpt-4.1-mini"
 
 
-# ─── track() fail-loud behavior ──────────────────────────────────────
+# ─── track fail-loud behavior ──────────────────────────────────────
 #
 # The runtime layer is the front door for the wire. Pre-fix it
 # warned at WARN and continued; the backend then silently
@@ -163,7 +162,7 @@ def test_empty_string_in_llm_output_falls_through():
 
 def test_track_promotes_missing_model_to_error_and_tags_event(make_runtime, caplog):
     """Regression: an ``llm_call`` event with ``model=None`` reaches
-    ``track()`` and (a) is logged at ERROR, (b) gets the
+    ``track `` and (a) is logged at ERROR, (b) gets the
     ``__missing_model: True`` flag, (c) is still sent on the wire
     so the backend can reject with HTTP 422 (not silently free)."""
     rt = make_runtime()
@@ -230,11 +229,11 @@ def test_track_does_not_tag_non_llm_call_events_with_missing_model(make_runtime)
 # ─── patch_httpx: eager wrap of pre-existing clients ────────────────
 #
 # Pre-fix the class-level patch on ``httpx.Client.__init__`` only
-# wrapped clients created AFTER ``nullrun.init()`` ran. The user's
+# wrapped clients created AFTER ``nullrun.init `` ran. The user's
 # script (and many real codebases) does
 #
-#     llm = ChatOpenAI(model=...)   # before init
-#     nullrun.init(api_key=...)     # patch installed too late
+# llm = ChatOpenAI(model=...) # before init
+# nullrun.init(api_key=...) # patch installed too late
 #
 # which left ``llm``'s internal httpx.Client unpatched. Post-fix
 # the patch sweep finds and wraps pre-existing clients.
@@ -307,7 +306,7 @@ def test_patch_httpx_eager_wrap_is_idempotent():
         assert isinstance(wrapped_transport, NullRunSyncTransport)
 
         # Reset the patch flag and call again — simulates a
-        # double-init() (e.g. test fixtures). The sweep must NOT
+        # double-init (e.g. test fixtures). The sweep must NOT
         # wrap the already-wrapped transport a second time.
         auto._httpx_patched = False
         # The class-level patch marker (``_nullrun_patched``) is
@@ -326,12 +325,12 @@ def test_patch_httpx_eager_wrap_is_idempotent():
 # Audit 2026-06-29 (silent zero-billing): the LangGraph case the
 # production trace exposed is
 #
-#     llm = ChatOpenAI(model=...)  # before init
-#     nullrun.init(api_key=...)    # patch installed too late
-#     graph.invoke(input)          # llm.invoke() inside the node
+# llm = ChatOpenAI(model=...) # before init
+# nullrun.init(api_key=...) # patch installed too late
+# graph.invoke(input) # llm.invoke inside the node
 #
 # `patch_httpx` covers the eager-sweep path (pre-existing
-# ``httpx.Client`` instances are wrapped). For LangChain chat models,
+# ``httpx.Client`` instances are wrapped). For LangChain chat models
 # the `BaseCallbackManager.__init__` patch is the original defence.
 # ``patch_chat_model_invoke`` is the new belt-and-suspenders layer
 # that wraps ``BaseChatModel.invoke`` / ``ainvoke`` directly so a
@@ -418,10 +417,10 @@ def test_patch_chat_model_invoke_preserves_user_callbacks():
     """If the user already supplied a callback in the config, the
     wrap must NOT replace it — only add the NullRunCallback if absent.
     """
+    from langchain_core.callbacks import BaseCallbackHandler
     from langchain_core.language_models import BaseChatModel
     from langchain_core.messages import AIMessage
     from langchain_core.outputs import ChatGeneration, ChatResult
-    from langchain_core.callbacks import BaseCallbackHandler
 
     from nullrun.instrumentation import auto
     from nullrun.instrumentation.langgraph import NullRunCallback
@@ -431,7 +430,7 @@ def test_patch_chat_model_invoke_preserves_user_callbacks():
 
     class UserCallback(BaseCallbackHandler):
         """Real BaseCallbackHandler so LangChain's manager doesn't
-        trip on missing attributes (``ignore_chat_model``,
+        trip on missing attributes (``ignore_chat_model``
         ``raise_error``, etc.) when it tries to fire the callback."""
         seen_callbacks: list = []
 

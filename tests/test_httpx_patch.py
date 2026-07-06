@@ -2,7 +2,7 @@
 Tests for the httpx transport hook in `nullrun.instrumentation.auto`.
 
 Covers:
-- A new httpx.Client() created after `patch_httpx` automatically wraps
+- A new httpx.Client created after `patch_httpx` automatically wraps
   its transport with `NullRunSyncTransport`.
 - An OpenAI-shaped response triggers exactly one `runtime.track(...)`
   call with the right provider/tokens/model.
@@ -13,7 +13,7 @@ Covers:
 - Idempotency: calling `patch_httpx` twice does not double-wrap.
 - `reset_for_tests` lets the test suite re-patch in long-lived runs.
 - A real-world gzip-encoded OpenAI response (which `httpx` decompresses
-  during `response.read()`) is rebuilt WITHOUT the `content-encoding`
+  during `response.read `) is rebuilt WITHOUT the `content-encoding`
   header — otherwise the downstream openai/anthropic client tries to
   decompress an already-decompressed body and raises `zlib.error: Error
   -3 while decompressing data: incorrect header check`. Regression
@@ -194,11 +194,11 @@ def test_httpx_module_flag_set_after_patch(runtime):
 
 # ---------------------------------------------------------------------------
 # Gzip-encoding regression: the transport consumes the body via
-# `response.read()`, which makes httpx transparently decompress gzip/br/zstd.
+# `response.read `, which makes httpx transparently decompress gzip/br/zstd.
 # The rebuilt response must NOT carry the original `content-encoding` header
 # — otherwise the caller (e.g. openai/AsyncOpenAI) re-decompresses an
-# already-decompressed body and raises `zlib.error: Error -3 ... incorrect
-# header check`. Symptom: every LLM call after `nullrun.init()` raised
+# already-decompressed body and raises `zlib.error: Error -3... incorrect
+# header check`. Symptom: every LLM call after `nullrun.init ` raised
 # `openai.APIConnectionError: Connection error` from inside the openai
 # transport. Root cause was `NullRunSyncTransport._rebuild` passing the
 # raw `response.headers` (which still include `content-encoding: gzip`)
@@ -232,7 +232,7 @@ def _gzip_openai_response_body() -> bytes:
 
 def test_gzip_response_strips_content_encoding_header(runtime):
     """Real OpenAI traffic comes back `content-encoding: gzip`. The transport
-    decompresses during `response.read()`; the rebuilt response must drop
+    decompresses during `response.read `; the rebuilt response must drop
     the header so the downstream caller does not double-decompress."""
     patch_httpx(runtime)
     plain_body = _gzip_openai_response_body()
@@ -258,7 +258,7 @@ def test_gzip_response_strips_content_encoding_header(runtime):
             assert event["tokens"] == 7
             # CRITICAL: the rebuilt response must NOT advertise
             # `content-encoding: gzip` — the body it carries is already
-            # plain. Without this fix, downstream `response.json()` would
+            # plain. Without this fix, downstream `response.json ` would
             # try to re-decompress and raise zlib.error.
             assert "content-encoding" not in {k.lower() for k in response.headers}
             # And the caller can read the body as JSON without errors.
@@ -274,11 +274,11 @@ def test_gzip_response_with_extractor_skip_still_strips_encoding(runtime):
     is stripped even when no `track` call fires — the bug was a header
     leak, not a missing track."""
     patch_httpx(runtime)
-    # Use a host the extractor table does NOT match — extractor is None,
+    # Use a host the extractor table does NOT match — extractor is None
     # so handle_request returns the inner response untouched. This test
     # only exercises the rebuild path through a known host with a body
     # the extractor returns None for (status gate). Skip if we can't
-    # construct such a response: covered above by the openai 4xx case,
+    # construct such a response: covered above by the openai 4xx case
     # which already asserts body round-trips. Here we just check the
     # async transport's rebuild strips encoding too.
     plain = json.dumps({"usage": {"prompt_tokens": 0, "completion_tokens": 0}}).encode()

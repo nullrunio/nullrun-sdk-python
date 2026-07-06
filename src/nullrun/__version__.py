@@ -3,7 +3,7 @@
 v3.12 / 0.12.0 (2026-07-03) — server-minted execution_id default ON.
 
 The backend `gate_reserve_v3` now mints a uuidv7 execution_id
-internally (CLAUDE.md §24). This version (`0.12.0`) is the
+internally. This version (`0.12.0`) is the
 SDK_MIN_VERSION for the v3 rollout — older SDKs continue to
 work because the gate IGNORES the client-supplied execution_id
 (it mints its own), but they cannot fully participate in the
@@ -36,7 +36,7 @@ but the SDK still routed through /track/batch and ignored
      v3 single-event endpoint ``/api/v1/track`` via
      ``Transport.track_single``, so the backend's
      ``gate_consume_v3`` validates the consume-vs-reserve +
-     ε invariant (CLAUDE.md §25).
+     ε invariant.
   4. ``NULLRUN_V3_TRACK_DISABLE=1`` opt-out for backends still
      on the v1/v2 path.
 
@@ -47,7 +47,7 @@ in production with the v3 wiring.
 
 ---
 
-v3.12 / 0.12.2 (2026-07-04) — bug-fix: fresh execution_id per
+v3.12 / 0.12.2 (2026-07-04) — bug-fix: fresh execution_id
 /check + in-process chain-mode gate cache.
 
 Two related correctness fixes on top of 0.12.1:
@@ -58,7 +58,7 @@ Two related correctness fixes on top of 0.12.1:
      own anyway, but a client-side placeholder that collides
      across calls confuses the reservation binding on
      /track when ``track_single`` returns 503
-     ``RESERVATION_NOT_FOUND`` (CLAUDE.md §29). The server
+     ``RESERVATION_NOT_FOUND``. The server
      overwrites the field on response, so the freshly-minted
      ``reservation_id`` captured by
      ``_capture_server_minted_execution_id`` still drives
@@ -86,32 +86,32 @@ path: 0.12.1 -> 0.12.2.
 
 v3.13 / 0.13.0 (2026-07-04) — drift-fixes release: closes the SDK-side
 items left over from the docs-vs-code audit captured in
-`docs/drift.md`.
+`docs/`.
 
   1. ``idempotency_key`` wired onto the v3 /track single-event
      payload. New contextvar
      ``nullrun.context._server_minted_idempotency_key_var`` +
-     ``get_/set_/reset_/clear_server_minted_idempotency_key``;
+     ``get_/set_/reset_/clear_server_minted_idempotency_key``
      ``_capture_server_minted_execution_id`` now also captures
      ``response["operation_id"]`` (which equals the /check
      idempotency_key, runtime.py:1260); ``_enrich_event`` stamps
-     the value onto the ``wire_event`` for ``llm_call``;
+     the value onto the ``wire_event`` for ``llm_call``
      ``_build_v3_track_payload`` propagates it onto the v3 /track
      body with a contextvar fallback for tests + direct callers.
      Without this, transport-level retry on the same event either
      503'd with ``RESERVATION_NOT_FOUND`` (reservation key DEL'd
-     after the first consume per CLAUDE.md §25) or double-billed
+     after the first consume per ) or double-billed
      the underlying budget.
 
   2. Wire ``status_code`` preserved through every decision
-     exception class. ``NullRunBlockedException``,
-     ``NullRunBudgetError``, ``NullRunChainError``,
-     ``NullRunWorkflowInactiveError``,
+     exception class. ``NullRunBlockedException``
+     ``NullRunBudgetError``, ``NullRunChainError``
+     ``NullRunWorkflowInactiveError``
      ``NullRunConsumeOverbudgetError`` now all accept
      ``status_code: int | None = None``; ``_parse_v3_error_envelope``
      sets it from ``response.status_code`` for every branch —
      402 budget, 403 workflow/chain cross-org, 422
-     ``CONSUME_OVERBUDGET``, 503 ``RATE_LIMIT_REDIS_UNAVAILABLE``,
+     ``CONSUME_OVERBUDGET``, 503 ``RATE_LIMIT_REDIS_UNAVAILABLE``
      etc. FastAPI exception handlers reading ``exc.status_code``
      previously got ``None`` / 500 for budget blocks (the backend's
      402 was lost in the constructor chain).
@@ -125,7 +125,7 @@ items left over from the docs-vs-code audit captured in
      "fail-OPEN on infra failures" claim.
 
 Tests:
-  * ``tests/test_drift_fixes_2026_07_04.py`` — 15 tests (5 idempotency,
+  * ``tests/test_drift_fixes_2026_07_04.py`` — 15 tests (5 idempotency
     8 status_code on every decision exception, 2 fail-CLOSED on
     wire 503 RATE_LIMIT_REDIS_UNAVAILABLE).
   * ``tests/test_v3_wire_contract.py::TestGateCacheRuntimeFlow`` — 3
@@ -152,14 +152,14 @@ in 0.13.0.
      ``replacement: /api/v1/gate``). Now delegates to ``Transport.check``
      which targets ``/api/v1/gate`` and forwards all v3 wire fields
      (``chain_id``, ``chain_op``, ``idempotency_key``, ``stream``).
-     ``check()`` is the canonical entry point; ``check_v3`` is kept
+     ``check `` is the canonical entry point; ``check_v3`` is kept
      as a v3-named alias for callers/tests that already use it.
 
   2. ``Transport.track_single`` docstring + ``tests/test_v3_wire_contract.py::
      test_track_single_includes_protocol_header`` body (drift B2): the
-     docstring described a fictitious wire shape ``{execution_id,
+     docstring described a fictitious wire shape ``{execution_id
      actual_cost_cents, api_key_id, cost_source}``. The real backend
-     ``TrackRequestRaw`` is ``{workflow_id, tokens, cost_cents, ...}``
+     ``TrackRequestRaw`` is ``{workflow_id, tokens, cost_cents,...}``
      (built by ``runtime._build_v3_track_payload``) — ``execution_id``
      is replaced by ``reservation_id``, and the SDK always emits
      ``cost_cents: 0`` because the backend recomputes the authoritative
@@ -201,7 +201,82 @@ Tests touched (in ``tests/test_v3_wire_contract.py``):
 1037 lib tests pass (no regression). Recommended upgrade path:
 0.13.0 -> 0.13.1. No SDK_MIN_VERSION bump — wire format is the same
 from the caller's perspective; only the URLs and docstrings changed.
+
+---
+
+v3.15 / 0.13.2 (2026-07-06) — typing-debt sweep + singleton/registry
+split. No on-wire change; backends on 1.0.0 keep working unchanged.
+
+  1. ``pyproject.toml`` mypy config rewritten from a single
+     blanket ``ignore_errors = true`` (12 files / 102 errors swallowed)
+     to per-file ``[[tool.mypy.overrides]]`` blocks — every legacy
+     module now declares the EXACT error codes it carries, so CI
+     breaks the moment a NEW code appears in that module rather
+     than the previous "everything passes" status. ``strict = true``
+     is enabled on the 14 modules already clean enough to keep it;
+     modules still carrying debt opt in via targeted
+     ``disable_error_code`` lists. Per the comment block at the
+     top of the overrides section: when a file's count drops to 0,
+     remove its override row — the table and the debt tracker stay
+     in lockstep.
+
+  2. Singleton state split out of ``runtime.py`` into two new
+     internal modules:
+
+       * ``nullrun._singleton`` — ``NullRunRuntimeMeta`` descriptor
+         backing the ``_instance`` class attribute (the one and
+         only canonical instance slot). Module-level ``_runtime``
+         PEP 562 ``__getattr__`` proxies in runtime.py /
+         decorators.py route reads through here so
+         ``import nullrun; nullrun.runtime`` and
+         ``from nullrun.runtime import _runtime`` both resolve to
+         the same instance without the legacy
+         ``_instance = runtime`` assignment that broke whenever
+         the metaclass was bypassed (e.g. by ``copy.deepcopy``
+         or by tests that constructed ``NullRunRuntime`` directly
+         without going through ``__init__``).
+
+       * ``nullrun._registry`` — the per-process registry of
+         runtime capabilities (chain-mode gate cache, LRU
+         fingerprints, websocket handles). Previously inlined
+         as module globals in ``runtime.py``; now centralised
+         so the orchestrator module stays under the strict-mypy
+         umbrella and external test code can swap or inspect the
+         registry without monkeypatching the orchestrator.
+
+  3. ``NullRunRuntime._instance = runtime`` backwards-compat line
+     retained at the bottom of ``NullRunRuntime.__init__`` so
+     external callers that read ``NullRunRuntime._instance``
+     directly (and there are a handful in the integration tests
+     shipped by partners) keep working — the new metaclass
+     descriptor makes the assignment a no-op for the singleton
+     case but is still semantically a write so legacy reflection
+     code does not crash.
+
+  4. ``ruff`` ignore list dropped ``F821`` (undefined name) — the
+     one site was a typo fixed by the previous ``fix typos``
+     commit on this branch. The remaining five (S110 / E501 /
+     F841 / E402 / F401) are pre-existing and explicitly tracked
+     in the pyproject comment block for a future cleanup PR.
+
+  5. ``tests/test_registry.py`` (new, 12 tests) — covers the
+     registry / singleton contract end-to-end:
+     ``NullRunRuntimeMeta`` raises on second ``__init__``,
+     ``reset_for_tests`` clears the registry without touching
+     the class descriptor, ``_capture_server_minted_*`` context
+     helpers round-trip through the new module, and the legacy
+     ``_instance`` read path still returns the live singleton
+     after the split.
+
+Tests:
+  * ``tests/test_registry.py`` — 12 tests for the new modules.
+  * Existing suite untouched: 1037 lib tests still pass.
+
+Backends on 1.0.0 keep working unchanged. Pinning unchanged:
+SDK_MIN_VERSION_FOR_V3 = "0.12.0". Recommended upgrade path:
+0.13.1 -> 0.13.2 (typing-only change for end users; visible
+delta is the per-file mypy table in pyproject.toml).
 """
 
-__version__ = "0.13.1"
+__version__ = "0.13.2"
 __platform_version__ = "1.0.0"

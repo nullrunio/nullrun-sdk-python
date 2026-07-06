@@ -174,7 +174,7 @@ class TestTransport:
     @respx.mock
     def test_check_endpoint_returns_block_on_error(self, transport):
         """Check endpoint returns block decision on error."""
-        # Round 3 (Phase 0.4.0): check() now uses the unified
+        # Round 3 (Phase 0.4.0): check now uses the unified
         # /api/v1/gate endpoint (was /api/v1/check).
         respx.post("https://api.test.nullrun.io/api/v1/gate").mock(
             return_value=httpx.Response(500, text="Server Error")
@@ -601,14 +601,14 @@ class TestTransportHMAC:
 # ===========================================================================
 # Pre-fix the implementation did ``import requests; requests.post(...)``
 # inside the function body, which:
-#   1. Required the ``requests`` library to be installed even though it
-#      is not in pyproject.toml dependencies.
-#   2. Bypassed the shared httpx client (no mTLS, no connection pool,
-#      no HMAC body signing, no circuit breaker).
-#   3. Bypassed the retry / timeout policy used by every other auth
-#      call. A key-rotation event during a backend outage would
-#      time out at 10s with no retry, leaving the SDK with a stale
-#      secret_key.
+# 1. Required the ``requests`` library to be installed even though it
+# is not in pyproject.toml dependencies.
+# 2. Bypassed the shared httpx client (no mTLS, no connection pool
+# no HMAC body signing, no circuit breaker).
+# 3. Bypassed the retry / timeout policy used by every other auth
+# call. A key-rotation event during a backend outage would
+# time out at 10s with no retry, leaving the SDK with a stale
+# secret_key.
 
 
 class TestRefetchCredentialsUsesSharedClient:

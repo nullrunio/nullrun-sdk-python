@@ -2,7 +2,7 @@
 
 NULLRUN owns the default messages for every ``error_code`` raised by the
 SDK. Clients should NOT write their own "code -> human text" mapping —
-use :func:`format_user_message` and the text rendered to the end user
+use:func:`format_user_message` and the text rendered to the end user
 will match what every other NullRun-backed application shows.
 
 Why this lives in the SDK
@@ -20,12 +20,12 @@ This catalog also makes it possible to:
 
 Public API
 ----------
-* :func:`format_user_message` — render an exception as a user-facing
+*:func:`format_user_message` — render an exception as a user-facing
   string. This is what host code should call.
-* :func:`set_user_message`   — override the message for a code
+*:func:`set_user_message` — override the message for a code
   (per-process). Use for branded variants in a single deployment.
-* :func:`get_user_message`   — look up the raw text for a code.
-* :func:`reset_overrides`    — clear all per-process overrides.
+*:func:`get_user_message` — look up the raw text for a code.
+*:func:`reset_overrides` — clear all per-process overrides.
   Intended for tests; not part of the stable surface.
 """
 from __future__ import annotations
@@ -48,14 +48,14 @@ if TYPE_CHECKING:
 # catalog completeness is checked by ``test_messages.py``.
 #
 # Tone rules:
-#   * Polite, neutral, no jargon ("workflow", "budget_cents", "NullRun").
-#   * Imperative when there is something to do, declarative otherwise.
-#   * Auth/config messages say "contact support" — they should never reach
-#     a real end user because ``init()`` raises at startup, but if a
-#     misconfiguration leaks through we degrade gracefully rather than
-#     crash the bot.
-#   * No internal URLs (https://app.nullrun.io/...) in user-facing text —
-#     those live on the developer-facing ``user_action`` attribute.
+# * Polite, neutral, no jargon ("workflow", "budget_cents", "NullRun").
+# * Imperative when there is something to do, declarative otherwise.
+# * Auth/config messages say "contact support" — they should never reach
+# a real end user because ``init `` raises at startup, but if a
+# misconfiguration leaks through we degrade gracefully rather than
+# crash the bot.
+# * No internal URLs (https:/app.nullrun.io/...) in user-facing text —
+# those live on the developer-facing ``user_action`` attribute.
 DEFAULT_MESSAGES: dict[str, str] = {
     # ---- Policy decisions (expected outcomes) -------------------------------
     # Operator kill via dashboard. End user sees this only when an operator
@@ -81,7 +81,7 @@ DEFAULT_MESSAGES: dict[str, str] = {
     # Circuit breaker open (NullRun SDK is throttling its own requests).
     "NR-B005": "Our service is temporarily unavailable. Please try again shortly.",
     # ---- Configuration / authentication (developer errors) ------------------
-    # These should not reach end users in normal operation — ``init()``
+    # These should not reach end users in normal operation — ``init ``
     # raises them at startup. The messages here are the last line of
     # defence for the case where the host code catches too broadly.
     "NR-A001": "There's a configuration issue. Please contact support.",
@@ -105,13 +105,13 @@ FALLBACK_MESSAGE = "Something went wrong. Please try again."
 # Per-process overrides
 # ---------------------------------------------------------------------------
 # Customers who want to brand their own wording (e.g. "Our support bot
-# is on coffee break ☕") call :func:`set_user_message` once at startup.
+# is on coffee break ☕") call:func:`set_user_message` once at startup.
 # Overrides live in a module-level dict and are checked before the
 # default catalog, so the lookup order is:
 #
-#     override  ->  DEFAULT_MESSAGES  ->  FALLBACK_MESSAGE
+# override -> DEFAULT_MESSAGES -> FALLBACK_MESSAGE
 #
-# State is per-process; tests use :func:`reset_overrides` between cases.
+# State is per-process; tests use:func:`reset_overrides` between cases.
 _overrides: dict[str, str] = {}
 
 
@@ -123,7 +123,7 @@ def set_user_message(code: str, message: str) -> None:
 
     Args:
         code: One of the ``NR-XXXXX`` codes from
-            :mod:`nullrun.breaker.exceptions`. Unknown codes are
+:mod:`nullrun.breaker.exceptions`. Unknown codes are
             accepted (and stored) — they become meaningful if the
             SDK starts raising that code in a future release.
         message: The new user-facing text. ``""`` removes the
@@ -135,8 +135,8 @@ def set_user_message(code: str, message: str) -> None:
 
         # Branded "limit reached" message for this deployment only.
         nullrun.set_user_message(
-            "NR-B004",
-            "You've used all your support credits. Upgrade to keep chatting.",
+            "NR-B004"
+            "You've used all your support credits. Upgrade to keep chatting."
         )
     """
     if message:
@@ -149,7 +149,7 @@ def get_user_message(code: str) -> str:
     """Return the user-facing message for ``code``.
 
     Lookup order: per-process override → ``DEFAULT_MESSAGES`` →
-    :data:`FALLBACK_MESSAGE`. Returns the fallback for any unknown code.
+:data:`FALLBACK_MESSAGE`. Returns the fallback for any unknown code.
 
     Args:
         code: ``NR-XXXXX`` error code.
@@ -169,11 +169,11 @@ def format_user_message(exc: BaseException | object, locale: str = "en") -> str:
     something to an end user. It looks up ``exc.error_code`` and returns
     the corresponding message from the catalog (override → default →
     fallback). Non-NullRun exceptions, or exceptions without an
-    ``error_code`` attribute, return :data:`FALLBACK_MESSAGE`.
+    ``error_code`` attribute, return:data:`FALLBACK_MESSAGE`.
 
     Args:
         exc: A NullRun exception (or any object exposing ``error_code``).
-        locale: Locale code. **English only** in this version — any
+        locale: DEPRECATED — reserved for a future locale-pack release. Currently ignored; the catalog is English-only. Will emit a DeprecationWarning in 0.14.0 if the catalog is not yet localised by then.
             non-``"en"`` value falls back to the English message. The
             parameter is reserved for future locale packs.
 
@@ -206,7 +206,7 @@ def format_user_message(exc: BaseException | object, locale: str = "en") -> str:
 
 
 def reset_overrides() -> None:
-    """Clear all per-process overrides set via :func:`set_user_message`.
+    """Clear all per-process overrides set via:func:`set_user_message`.
 
     Restores the catalog to its default state. Intended for tests that
     mutate overrides between cases; production code should not need

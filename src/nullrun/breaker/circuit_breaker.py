@@ -30,7 +30,7 @@ class CBState(Enum):
 class CircuitBreakerMetrics:
     """Metrics for circuit breaker observability."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.circuit_open_count = 0
         self.circuit_half_open_count = 0
         self.circuit_closed_count = 0
@@ -113,20 +113,25 @@ class CircuitBreaker:
             return None
 
     def _check_global_recovered(self) -> bool:
-        """
-        Check if another instance recovered the circuit (closed it in Redis).
+            """
+            Check if another instance recovered the circuit (closed it in Redis).
 
-        Returns True if another instance closed the circuit.
-        """
-        if not self._redis_client:
-            return False
-        try:
-            key = f"{self._redis_key_prefix}state"
-            state = self._redis_client.get(key)
-            return state == "CLOSED"
-        except Exception as e:
-            logger.warning(f"Redis recovery check failed: {e}")
-            return False
+            Returns True if another instance closed the circuit.
+            """
+            if not self._redis_client:
+                return False
+            try:
+                key = f"{self._redis_key_prefix}state"
+                state = self._redis_client.get(key)
+                # Redis client stubs return `Any`; the wire value is
+                # the JSON-encoded state string we set in
+                # `_publish_open_state` / `_publish_half_open_state`.
+                #  cast is required because 
+                # has type  under strict Any narrowing.
+                return bool(state == "CLOSED")
+            except Exception as e:
+                logger.warning(f"Redis recovery check failed: {e}")
+                return False
 
     def _publish_open_state(self) -> None:
         """Publish OPEN state to Redis with TTL."""
@@ -224,7 +229,7 @@ class CircuitBreaker:
     def state(self) -> CBState:
         # Phase 0.3.1: hold the lock for the whole transition so
         # concurrent threads do not race into HALF_OPEN. The
-        # previous version only held the lock for the dict read,
+        # previous version only held the lock for the dict read
         # which let two workers independently decide they should
         # both probe in HALF_OPEN at the same wall-clock moment.
         # The fix also publishes HALF_OPEN to Redis (was defined
@@ -250,13 +255,13 @@ class CircuitBreaker:
                     self._publish_half_open_state()
             return self._state
 
-    def call(self, func: Callable[..., Any], *args, **kwargs) -> Any:
+    def call(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         """Execute func through circuit breaker. Supports both sync and async functions.
 
-        §7.2 #35: the pre-fix code did the OPEN→HALF_OPEN jitter
+ #35: the pre-fix code did the OPEN→HALF_OPEN jitter
         via ``time.sleep`` here, BEFORE dispatching to
         ``_call_sync`` / ``_call_async``. That meant an async
-        caller invoking ``breaker.call(async_func, ...)`` from
+        caller invoking ``breaker.call(async_func,...)`` from
         inside an event loop would block that loop on a sync
         sleep — turning every HALF_OPEN probe into a 0–5 second
         stall of the entire coroutine scheduler. The fix decides
@@ -288,7 +293,11 @@ class CircuitBreaker:
         return self._call_sync(func, needs_open_jitter, *args, **kwargs)
 
     def _maybe_apply_open_jitter_sync(self) -> None:
-        """Sync version of the OPEN→HALF_OPEN jitter. See §7.2 #35."""
+        """Sync version of the OPEN to HALF_OPEN jitter.
+
+        Mirrors the async path so callers that hold the event loop
+        thread see the same randomised backoff before the first probe.
+        """
         if self._state == CBState.OPEN and self._opened_at is not None:
             time_in_open = time.monotonic() - self._opened_at
             if time_in_open >= self._recovery_timeout:
@@ -299,14 +308,14 @@ class CircuitBreaker:
 
     async def _maybe_apply_open_jitter_async(self) -> None:
         """Async version of the OPEN→HALF_OPEN jitter. Awaits
-        instead of blocking the event loop. See §7.2 #35."""
+        instead of blocking the event loop. See #35."""
         if self._state == CBState.OPEN and self._opened_at is not None:
             time_in_open = time.monotonic() - self._opened_at
             if time_in_open >= self._recovery_timeout:
                 jitter = random.uniform(0, 5.0)
                 await asyncio.sleep(jitter)
 
-    def _call_sync(self, func: Callable[..., Any], needs_open_jitter: bool, *args, **kwargs) -> Any:
+    def _call_sync(self, func: Callable[..., Any], needs_open_jitter: bool, *args: Any, **kwargs: Any) -> Any:
         """Execute sync func through circuit breaker."""
         if needs_open_jitter:
             self._maybe_apply_open_jitter_sync()
@@ -329,7 +338,7 @@ class CircuitBreaker:
             self._on_failure()
             raise
 
-    async def _call_async(self, func: Callable[..., Any], needs_open_jitter: bool, *args, **kwargs) -> Any:
+    async def _call_async(self, func: Callable[..., Any], needs_open_jitter: bool, *args: Any, **kwargs: Any) -> Any:
         """Execute async func through circuit breaker."""
         if needs_open_jitter:
             await self._maybe_apply_open_jitter_async()
@@ -422,7 +431,7 @@ class CircuitBreaker:
         if self._redis_client and self._state == CBState.OPEN:
             self._publish_open_state()
 
-    def get_metrics(self) -> dict:
+    def get_metrics(self) -> dict[str, Any]:
         return {
             "state": self.state.value,
             "failure_count": self._failure_count,

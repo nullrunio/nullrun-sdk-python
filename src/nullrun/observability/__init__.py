@@ -6,7 +6,7 @@ Modules:
 
   * ``metrics`` (this file) — counter / gauge reporting. Transport
     and runtime modules call into it for thread-safe increments.
-  * ``error_hooks`` — the ``nullrun.on_error()`` global hook
+  * ``error_hooks`` — the ``nullrun.on_error `` global hook
     registry. See that module for the Layer-2 design.
 
 Both are reachable as ``nullrun.observability.metrics`` /
@@ -37,7 +37,7 @@ from nullrun.observability.error_hooks import (  # noqa: F401
 # Re-export the Layer-3 status dataclasses so users can do
 # ``from nullrun.observability import NullRunStatus`` without
 # reaching into the submodule. The instance is built by
-# ``nullrun.status()`` — these are the return-shape primitives.
+# ``nullrun.status `` — these are the return-shape primitives.
 from nullrun.observability.status import (  # noqa: F401
     NullRunStatus,
     RecentError,
@@ -75,7 +75,7 @@ class TransportMetrics:
     # be lost without a counter to alert on. The metric here is
     # what a SRE alerts on for "control plane signature integrity".
     hmac_verify_failures_total: int = 0
-    # §7.2 #6: separate counter for the timestamp-expired branch
+    # separate counter for the timestamp-expired branch
     # of verify_hmac_signature. A spike here is almost always
     # a clock-skew issue (NTP drift, VM resume, container clock
     # jump) rather than a forged packet — operators should
@@ -112,7 +112,7 @@ class MetricsRegistry:
     Usage:
         from nullrun.observability import metrics
         print(metrics.transport.events_sent)
-        print(metrics.to_dict())
+        print(metrics.to_dict )
 
         # Thread-safe increments (preferred over direct +=)
         metrics.inc_transport("events_enqueued")

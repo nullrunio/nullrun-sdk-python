@@ -7,7 +7,7 @@ entrypoint should call ``nullrun-doctor`` (see
 ``nullrun.toolbox.diagnostics``) for runtime checks.
 
 Pinned by ``pyproject.toml::[tool.coverage.report].fail_under = 82`` —
-without this test, the five statements in ``main()`` stay at 0% and
+without this test, the five statements in ``main `` stay at 0% and
 the suite trips the threshold by a hair.
 """
 from __future__ import annotations
@@ -20,7 +20,7 @@ from nullrun.breaker.__main__ import main
 
 
 def test_main_returns_zero_and_writes_helpful_message(capsys: pytest.CaptureFixture[str]) -> None:
-    """``main()`` is informational, not an error: return code 0, the
+    """``main `` is informational, not an error: return code 0, the
     message goes to stderr (so it doesn't pollute the consumer's
     stdout pipe)."""
     rc = main()

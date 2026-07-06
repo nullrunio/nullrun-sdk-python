@@ -337,7 +337,7 @@ class TestSignedPostWirePath:
         )
         # Trigger a /gate call via the public path. We use the
         # underlying httpx client directly to avoid the pre-existing
-        # structural issue with execute() and check() in this file's
+        # structural issue with execute and check in this file's
         # surrounding code paths.
         body = '{"organization_id": "o", "execution_id": "e", "trace_id": "t", "tool": "x", "input": {}, "mode": "auto", "operation_id": "op"}'
         t._client.post(

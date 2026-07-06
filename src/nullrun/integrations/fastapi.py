@@ -11,7 +11,7 @@ Usage::
     from nullrun.integrations.fastapi import install
 
     nullrun.init(api_key="nr_live_...")
-    app = FastAPI()
+    app = FastAPI 
     install(app)
 
     @app.post("/chat")
@@ -20,16 +20,16 @@ Usage::
         return agent.run(message)
 
     # POST /chat that triggers a budget cap returns:
-    #   HTTP 429
-    #   {"error_code": "NR-B004",
-    #    "user_message": "You've reached the usage limit...",
-    #    "category": "decision"}
+    # HTTP 429
+    # {"error_code": "NR-B004"
+    # "user_message": "You've reached the usage limit..."
+    # "category": "decision"}
     #
     # POST /chat that triggers a NullRun backend outage returns:
-    #   HTTP 503
-    #   {"error_code": "NR-B001",
-    #    "user_message": "I'm having trouble connecting...",
-    #    "category": "infrastructure"}
+    # HTTP 503
+    # {"error_code": "NR-B001"
+    # "user_message": "I'm having trouble connecting..."
+    # "category": "infrastructure"}
 
 HTTP status mapping
 -------------------
@@ -64,7 +64,7 @@ subclasses) are handled by FastAPI's exception handler chain.
 Locale resolution
 -----------------
 The integration reads ``Accept-Language`` from the request and picks
-the matching ``user_message`` from :func:`nullrun.format_user_message`.
+the matching ``user_message`` from:func:`nullrun.format_user_message`.
 Pass a custom ``locale_resolver`` to override (e.g. when the locale
 comes from a session cookie, a JWT claim, or an upstream header
 instead of ``Accept-Language``).
@@ -90,7 +90,7 @@ from nullrun.messages import format_user_message
 # Decision codes → HTTP status. Kept here (not on the exception classes)
 # because HTTP is a transport-layer concern that the SDK does not own.
 #
-# Anything not listed gets the default below (429 for decisions,
+# Anything not listed gets the default below (429 for decisions
 # 503 for infrastructure). NR-R001 carries ``retry_after``; we surface
 # it as the ``Retry-After`` header per RFC 9110.
 _DECISION_STATUS: dict[str, int] = {
@@ -133,7 +133,7 @@ def _resolve_locale(request: Request, resolver: LocaleResolver | None) -> str:
         return resolver(request) or "en"
     except Exception:
         # Resolver bugs must not break error responses. Degrade to the
-        # default and continue — the user still gets a clean message,
+        # default and continue — the user still gets a clean message
         # just not in their preferred locale.
         return "en"
 
@@ -145,9 +145,9 @@ def _build_headers(exc: BaseException) -> dict[str, str]:
     hint. Two attribute names are checked because different exception
     classes use different conventions:
 
-    * ``retry_after`` — :class:`RateLimitError` (gateway 429 with
+    * ``retry_after`` —:class:`RateLimitError` (gateway 429 with
       ``Retry-After`` header).
-    * ``resume_after`` — :class:`WorkflowPausedException` (workflow
+    * ``resume_after`` —:class:`WorkflowPausedException` (workflow
       cooldown period).
 
     Either maps to the ``Retry-After`` HTTP header per RFC 9110.
@@ -224,7 +224,7 @@ class NullRunMiddleware:
     """ASGI middleware that catches ``WorkflowKilledInterrupt``.
 
     Starlette's ``add_exception_handler`` refuses ``BaseException``
-    subclasses (``assert issubclass(key, Exception)`` at registration),
+    subclasses (``assert issubclass(key, Exception)`` at registration)
     so a kill signal — which is deliberately a ``BaseException`` subclass
     to bypass careless ``except Exception:`` handlers in agent code —
     must be intercepted at the ASGI layer instead. The middleware
@@ -239,7 +239,7 @@ class NullRunMiddleware:
     letting the kill propagate is the safe default (the connection
     drops, the client sees a truncated response).
 
-    Use the ``install()`` helper unless you specifically need to
+    Use the ``install `` helper unless you specifically need to
     register the middleware by hand.
     """
 
@@ -283,7 +283,7 @@ class NullRunMiddleware:
             await response(scope, receive, send)
 
 
-# Module-level resolver — set by :func:`install` and read by the
+# Module-level resolver — set by:func:`install` and read by the
 # FastAPI exception handlers. The middleware gets its own copy via
 # its constructor (Starlette instantiates middleware via
 # ``add_middleware``, which does not let us pass per-request state).
@@ -314,13 +314,13 @@ def install(
         from nullrun.integrations.fastapi import install
 
         nullrun.init(api_key="...")
-        app = FastAPI()
+        app = FastAPI 
         install(app)
 
         # Custom resolver: read locale from a session cookie.
         install(
-            app,
-            locale_resolver=lambda req: req.cookies.get("locale", "en"),
+            app
+            locale_resolver=lambda req: req.cookies.get("locale", "en")
         )
     """
     global _LOCALE_RESOLVER
@@ -334,7 +334,7 @@ def install(
     app.add_exception_handler(NullRunInfrastructureError, _infrastructure_handler)
 
     # ASGI middleware for WorkflowKilledInterrupt (BaseException).
-    # ``add_middleware`` reverses the stack order (last added = outermost),
+    # ``add_middleware`` reverses the stack order (last added = outermost)
     # so we add the kill middleware AFTER exception handlers — actually
     # it doesn't matter here because the exception handlers and the
     # middleware handle disjoint exception classes.

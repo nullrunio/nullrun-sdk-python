@@ -4,11 +4,11 @@ Regression tests for HIGH-reliability fixes in 0.4.0.
 Phase 5 of the production-readiness plan:
 - #5.1: _remote_state_for / _set_remote_state / _states_lock helpers.
 - #5.2: PolicyCache policy_version is its own field, not ttl_seconds.
-- #5.3: get_instance() atomic credential rotation.
+- #5.3: get_instance atomic credential rotation.
 - #5.5: _fetch_remote_state uses shared transport client.
-- #5.6: workflow() emits UUID4 (was wf-{hex32}).
+- #5.6: workflow emits UUID4 (was wf-{hex32}).
 - #5.7: @sensitive fails CLOSED on registration error (wraps original
-  #      exception as RuntimeError with chained __cause__).
+  # exception as RuntimeError with chained __cause__).
 - #5.8: Custom-host KILL reach.
 - #5.10: Transport.execute on_transport_error callback.
 """
@@ -62,7 +62,7 @@ def test_set_remote_state_replaces_atomically():
 # 5.2: PolicyCache / CachedDecision
 # ===========================================================================
 # 0.7.0: PolicyCache and CachedDecision classes were removed along
-# with the FallbackMode.CACHED path. The SDK is now a thin client;
+# with the FallbackMode.CACHED path. The SDK is now a thin client
 # no local policy cache is maintained.
 
 # ===========================================================================
@@ -113,7 +113,7 @@ def test_fetch_remote_state_uses_transport_client(monkeypatch):
 
 
 # ===========================================================================
-# 5.6: workflow() emits UUID4
+# 5.6: workflow emits UUID4
 # ===========================================================================
 
 

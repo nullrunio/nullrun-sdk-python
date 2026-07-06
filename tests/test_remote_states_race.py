@@ -1,10 +1,10 @@
 """Regression tests for the P1-1.1 fix: `_remote_states` thread-safety.
 
 Why this exists. The pre-fix code accessed `self._remote_states`
-directly from at least four call sites — `track()` (TOCTOU write),
-`_on_state_change` (WS push), `_fetch_remote_state` (HTTP poll),
+directly from at least four call sites — `track ` (TOCTOU write)
+`_on_state_change` (WS push), `_fetch_remote_state` (HTTP poll)
 `check_control_plane` (read), and `_poll_commands` (iteration).
-The TOCTOU race in `track()` (line 1126-1127: `if workflow_id not in
+The TOCTOU race in `track ` (line 1126-1127: `if workflow_id not in
 self._remote_states: self._remote_states[workflow_id] = {}`) was
 benign on its own, but combined with `_poll_commands` iterating the
 dict's keys while another thread was writing, the iteration could
@@ -41,7 +41,7 @@ def runtime():
         polling=False,
     )
     yield rt
-    # Cleanup. `shutdown()` is now defensive about missing
+    # Cleanup. `shutdown ` is now defensive about missing
     # attributes (P1-1.1 side fix), so this is safe even though
     # the test-mode runtime never started any threads.
     try:
@@ -118,7 +118,7 @@ class TestRemoteStateForAtomicity:
 
 
 class TestPollCommandsDoesNotRaise:
-    """The HTTP poller iterates `_remote_states.keys()`. The
+    """The HTTP poller iterates `_remote_states.keys `. The
     pre-fix code could raise `RuntimeError: dictionary changed
     size during iteration` when a concurrent write happened.
     The fix snapshots the keys under the lock."""
@@ -167,7 +167,7 @@ class TestPollCommandsDoesNotRaise:
 
 
 class TestTrackDoesNotClobberRemoteState:
-    """The pre-fix `track()` did:
+    """The pre-fix `track ` did:
         if workflow_id not in self._remote_states:
             self._remote_states[workflow_id] = {}
     This TOCTOU race could clobber a "Killed" state set by a
@@ -175,9 +175,9 @@ class TestTrackDoesNotClobberRemoteState:
     and the write. The fix uses `_remote_state_for` which is atomic."""
 
     def test_concurrent_track_does_not_clobber_kill(self, runtime):
-        """While `track()` is being called, a concurrent
+        """While `track ` is being called, a concurrent
         `_set_remote_state(wf, Killed)` must not be overwritten
-        by the `track()` get-or-create."""
+        by the `track ` get-or-create."""
         # Pre-populate the state with a Killed push.
         runtime._set_remote_state(
             "wf-clobber",
@@ -193,7 +193,7 @@ class TestTrackDoesNotClobberRemoteState:
         def track_thread():
             barrier.wait()
             for _ in range(n_iterations):
-                # Simulate the get-or-create from `track()`.
+                # Simulate the get-or-create from `track `.
                 runtime._remote_state_for("wf-clobber")
 
         def verify_thread():

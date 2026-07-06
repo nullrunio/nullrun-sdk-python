@@ -69,7 +69,7 @@ def _build_real_server_envelope(
 ) -> dict:
     """Mimic the real server's signing shape (FIX-D): the HMAC is
     computed over ``api_key_id`` (the UUID key_id from
-    ``auth_context.key_id()``), NOT over the user-facing
+    ``auth_context.key_id ``), NOT over the user-facing
     ``nr_live_...`` api_key. The envelope publishes only
     ``api_key_id`` — the user-facing key never appears on the wire.
 
@@ -96,7 +96,7 @@ def _build_real_server_envelope(
 
 
 def _build_legacy_envelope(message: dict, api_key: str, secret_key: str) -> dict:
-    """Pre-FIX-C envelope: signature, timestamp, api_key_id present,
+    """Pre-FIX-C envelope: signature, timestamp, api_key_id present
     but signed_payload absent. The bytes the server signed were
     `serde_json::to_string(&message)`; we deliberately do NOT embed
     that on the wire so the receiver has to fall back to the legacy
@@ -156,7 +156,7 @@ def test_hex_round_trip_preserves_signed_bytes():
 class _StubWS:
     """Minimal stand-in for the websockets connection that captures
     what the SDK writes back. We use it to assert that a message
-    signed with the new scheme actually flows through the dispatcher,
+    signed with the new scheme actually flows through the dispatcher
     and a tampered one does not."""
 
     def __init__(self) -> None:
@@ -331,7 +331,7 @@ async def test_replayed_signed_payload_with_spliced_body_is_rejected(monkeypatch
     body. The signature is over the bytes inside signed_payload
     (which say "Normal"), so the dispatcher reads the inner bytes —
     not the forged outer body. The attack is harmless: even if the
-    signature verifies, the dispatched state is the captured "Normal",
+    signature verifies, the dispatched state is the captured "Normal"
     not the forged "Killed".
 
     This test pins both sides of that contract:
@@ -490,14 +490,14 @@ async def test_ws_ack_lowercase_state_still_sends_ack(monkeypatch):
 @pytest.mark.asyncio
 async def test_real_server_envelope_with_distinct_api_key_id_is_accepted(monkeypatch):
     """FIX-D regression: the real NULLRUN backend signs HMAC over
-    ``api_key_id`` (the UUID key_id from ``auth_context.key_id()``),
+    ``api_key_id`` (the UUID key_id from ``auth_context.key_id ``)
     NOT the user-facing ``nr_live_...`` api_key passed to
-    ``nullrun.init()``. The SDK must read ``api_key_id`` from the
+    ``nullrun.init ``. The SDK must read ``api_key_id`` from the
     envelope and use it as the HMAC identifier — otherwise every
     signed WS message is rejected with "Invalid HMAC signature".
 
     Pre-FIX-D behaviour: SDK called ``verify_hmac_signature(
-    self.api_key, ...)`` with the user-facing key, which never matched
+    self.api_key,...)`` with the user-facing key, which never matched
     the server's UUID-based signature. This test would fail under that
     code path with the same production error reported on 2026-06-22.
     """
@@ -648,7 +648,7 @@ def test_ws_hmac_identity_field_used_in_receiver():
     monkey-patching ``transport_websocket.WebSocketConnection`` to a
     fake class without restoring it (a pre-existing test-isolation
     leak — see the ``_FakeConn`` assignments at test_transport_branches.py:553
-    and :581). With ``inspect.getsource`` the patched fake class has
+    and:581). With ``inspect.getsource`` the patched fake class has
     no ``_handle_message`` and this test crashes; with direct file
     reads we verify the source-of-truth bytes regardless of class
     identity at test time.

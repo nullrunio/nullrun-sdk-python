@@ -4,9 +4,9 @@ T5 (2026-06-27) regression test: SDK → /gate → real decision.
 Bug that this test pins down: pre-T1, every SDK `/gate` call for any
 workflow with a budget was hard-blocked with
   "Tool 'llm' was blocked because policy 'Rule 1 (cost_limit)' (score 70.00) matched"
-because the backend's `PolicyEvaluationGraph.evaluate()` stub
+because the backend's `PolicyEvaluationGraph.evaluate ` stub
 returned `Block` for any synthetic `cost_limit` rule with score > 0.8
-(see `backend/src/policy/graph.rs:448-462`,
+(see `backend/src/policy/graph.rs:448-462`
  `backend/src/proxy/http/gate/internal.rs:619-628` pre-T1).
 
 This file asserts the fixed behaviour:
@@ -77,7 +77,7 @@ class TestGateRealPathRegression:
         call must return `allow` from /gate (NOT the old blanket
         block on the synthetic `cost_limit` rule)."""
         rt = make_runtime()
-        # No set_call_context — uses defaults (model=None, tools=())
+        # No set_call_context — uses defaults (model=None, tools= )
         rt.check_workflow_budget()
         # If we got here without WorkflowKilledInterrupt, the gate
         # path returned allow. Inspect the captured request body.
@@ -184,7 +184,7 @@ class TestSetCallContext:
     def test_clear_call_context(
         self, make_runtime, mock_api, captured_bodies
     ):
-        """set_call_context(tools=[]) clears the previously-set tools,
+        """set_call_context(tools=[]) clears the previously-set tools
         and the next gate call must not include the `tools` key.
         Distinguishing "no tools" from "I didn't tell you" is
         important for backend tool_block enforcement."""

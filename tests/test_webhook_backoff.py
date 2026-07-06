@@ -70,7 +70,7 @@ def test_webhook_uses_exponential_backoff():
 
 def test_webhook_backoff_capped_at_30_seconds():
     """For retries past the cap boundary, the sleep must be 30s
-    (not 64s, 128s, ...). Without the cap a webhook with
+    (not 64s, 128s,...). Without the cap a webhook with
     retries=10 would sleep ~1024 seconds between the last two
     attempts."""
     handler = _make_handler_with_webhook(retries=8)

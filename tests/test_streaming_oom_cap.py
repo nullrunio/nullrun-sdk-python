@@ -2,8 +2,8 @@
 Regression test for plan item P0-3: streaming response body must not
 exceed ``MAX_RESPONSE_BYTES`` before tracking is attempted.
 
-Pre-fix the sync transport called ``response.read()`` and the async
-transport called ``await response.aread()``. Both buffer the ENTIRE
+Pre-fix the sync transport called ``response.read `` and the async
+transport called ``await response.aread ``. Both buffer the ENTIRE
 response body in memory before the extractor runs. For a streaming
 OpenAI completion with ``max_tokens=8192`` the buffered body is
 16+ MB. Under load (10+ concurrent streams) this is a real OOM risk

@@ -17,7 +17,7 @@ We cover the contract at two levels:
    real `WebSocketConnection` class, push a `state_change` frame, and
    assert the callback fires within 200ms.
 
-The wire test pins the actual server → client protocol (the JSON shape,
+The wire test pins the actual server → client protocol (the JSON shape
 the dispatch flow, the no-HMAC dev path), so a backend wire-format
 regression breaks this test, not just the unit test.
 """
@@ -61,7 +61,7 @@ def _make_runtime(workflow_id: str = "wf-1") -> NullRunRuntime:
 
 def test_kill_state_surfaces_as_workflow_killed_exception():
     """If the WS push writes a Killed state, the next
-    check_control_plane() raises WorkflowKilledException."""
+    check_control_plane raises WorkflowKilledException."""
     rt = _make_runtime("wf-kill")
 
     # Simulate the WS push: on_state_change writes to _remote_states.
@@ -163,7 +163,7 @@ async def _kill_handler(ws, ready: threading.Event):
     ready.set()
     # Tiny delay so the client's _receive_task is actually scheduled
     # before we send. Without this the message can arrive before the
-    # task is awaiting recv() and be dropped on the floor.
+    # task is awaiting recv and be dropped on the floor.
     await asyncio.sleep(0.05)
     push = {
         "type": "state_change",
@@ -209,7 +209,7 @@ def test_ws_push_kill_state_fires_callback_within_200ms():
                 )
             )
             # 2) Wait for the server's push (handler sends it after
-            #    reading the subscribe frame).
+            # reading the subscribe frame).
             raw = await ws.recv()
             sent_at_holder.append(time.time())
             data = json.loads(raw)

@@ -1,16 +1,16 @@
 """
 Tests for the dedup LRU used by `NullRunRuntime.track` to collapse
-duplicate events from multiple observation paths (httpx transport,
+duplicate events from multiple observation paths (httpx transport
 LangChain callback, OpenAI Agents tracer).
 
 The dedup contract:
 - A fingerprint is `sha256(host|status|body)[:16]`.
-- The first time a fingerprint is seen, track() runs the real path.
+- The first time a fingerprint is seen, track runs the real path.
 - Subsequent calls with the same fingerprint short-circuit and return
   a `deduped: True` envelope so the caller still has a well-formed dict.
 - The LRU is bounded at `DEDUP_LRU_MAX` (512) entries; the oldest
   entry is dropped on overflow.
-- The LRU is shared per-runtime (one `OrderedDict` per
+- The LRU is shared per-runtime (one `OrderedDict`
   `NullRunRuntime` instance).
 """
 
@@ -117,7 +117,7 @@ def test_lru_empty_fingerprint_short_circuits_to_unseen():
 
 
 # ---------------------------------------------------------------------------
-# End-to-end: track() collapses duplicate LLM calls
+# End-to-end: track collapses duplicate LLM calls
 # ---------------------------------------------------------------------------
 
 
@@ -149,8 +149,8 @@ def _llm_body() -> bytes:
 
 def _make_test_runtime() -> tuple[MagicMock, dict]:
     """Build a minimal stand-in for NullRunRuntime that exercises the
-    dedup branch in track() without a real runtime. We monkeypatch
-    the track() method's `_seen_track_fingerprints` attribute onto the
+    dedup branch in track without a real runtime. We monkeypatch
+    the track method's `_seen_track_fingerprints` attribute onto the
     mock so the real production dedup code path runs against our LRU.
     """
     rt = MagicMock()
@@ -161,7 +161,7 @@ def _make_test_runtime() -> tuple[MagicMock, dict]:
 def test_two_identical_llm_calls_dedupe_to_one_track(runtime):
     """Simulate the same LLM call hitting the runtime twice (e.g. once
     via httpx transport and once via LangChain callback). With the
-    dedup LRU, only the first call should reach `track()`; the second
+    dedup LRU, only the first call should reach `track `; the second
     should short-circuit."""
     from nullrun.instrumentation.auto import _fingerprint_for
 
@@ -172,12 +172,12 @@ def test_two_identical_llm_calls_dedupe_to_one_track(runtime):
     runtime._seen_track_fingerprints = make_dedup_state()
     runtime._seen_track_fingerprints[fp] = None
 
-    # Now build a track() call that exercises the dedup gate. We can't
-    # easily call the real NullRunRuntime.track() without a full
-    # network stack, so we inline the dedup check that track() runs.
+    # Now build a track call that exercises the dedup gate. We can't
+    # easily call the real NullRunRuntime.track without a full
+    # network stack, so we inline the dedup check that track runs.
     is_seen = _fingerprint_is_seen(runtime._seen_track_fingerprints, fp)
     assert is_seen is True
-    # The dedup branch in track() would return immediately here.
+    # The dedup branch in track would return immediately here.
     # runtime.track was never called in production code either; this
     # test pins the contract that the LRU contains the fingerprint
     # and a re-pass returns True.
@@ -198,8 +198,8 @@ def test_distinct_llm_calls_have_distinct_fingerprints(runtime):
 
 def test_httpx_then_langchain_simulation_dedupes():
     """End-to-end: one OpenAI call fires both the httpx transport AND
-    a LangChain callback. The transport always calls `runtime.track`;
-    the runtime's `track()` consults the LRU and short-circuits on
+    a LangChain callback. The transport always calls `runtime.track`
+    the runtime's `track ` consults the LRU and short-circuits on
     repeat fingerprints. This test pins the contract that the
     transport embeds the SAME fingerprint for the same body, and that
     a re-emitted event with the same fingerprint is recognised by the
@@ -220,7 +220,7 @@ def test_httpx_then_langchain_simulation_dedupes():
     with respx.mock(base_url="https://api.openai.com") as mock:
         mock.post("/v1/chat/completions").mock(return_value=httpx.Response(200, content=body))
         with httpx.Client(base_url="https://api.openai.com") as client:
-            # First call: track() called with an event that has a fingerprint.
+            # First call: track called with an event that has a fingerprint.
             response1 = client.post("/v1/chat/completions", json={"model": "gpt-4o-mini"})
             assert response1.status_code == 200
             assert rt.track.call_count == 1
@@ -234,14 +234,14 @@ def test_httpx_then_langchain_simulation_dedupes():
             _fingerprint_is_seen(rt._seen_track_fingerprints, fp1)
             # Second call (same body, simulating LangChain firing on
             # the same LLMResult): the transport wraps again, so
-            # track() is called again with the same fingerprint.
+            # track is called again with the same fingerprint.
             response2 = client.post("/v1/chat/completions", json={"model": "gpt-4o-mini"})
             assert response2.status_code == 200
             event2 = rt.track.call_args_list[1][0][0]
             assert event2["_fingerprint"] == fp1
             # The runtime's dedup gate would now short-circuit.
             assert _fingerprint_is_seen(rt._seen_track_fingerprints, fp1) is True
-    # Transport contract: track() is called for EVERY response (the
+    # Transport contract: track is called for EVERY response (the
     # dedup is the runtime's job, not the transport's). So 2 calls.
     assert rt.track.call_count == 2
     # But the LRU contains exactly one fingerprint — that's the
@@ -261,7 +261,7 @@ class TestTrackEventFingerprint:
     transport hook firing on the same LLM call).
 
     Without ``_fingerprint`` on track_event events, the dedup LRU
-    at the track() sink does not see them as duplicates — every
+    at the track sink does not see them as duplicates — every
     track_event call goes through to /track.
     """
 
@@ -287,7 +287,7 @@ class TestTrackEventFingerprint:
 
     def test_track_event_dedups_via_lru(self):
         """Two track_event calls with identical content are collapsed
-        by the dedup LRU at the track() sink — only one /track POST
+        by the dedup LRU at the track sink — only one /track POST
         hits the wire."""
         from unittest.mock import MagicMock
 
@@ -309,7 +309,7 @@ class TestTrackEventFingerprint:
         # First observation: LRU is fresh
         fp = _fingerprint_for_event_dict(event)
         assert _fingerprint_is_seen(rt._seen_track_fingerprints, fp) is False
-        # Record it (simulating what track() does internally)
+        # Record it (simulating what track does internally)
         _fingerprint_is_seen(rt._seen_track_fingerprints, fp)
         # Second observation: LRU says "seen"
         assert _fingerprint_is_seen(rt._seen_track_fingerprints, fp) is True
@@ -318,10 +318,10 @@ class TestTrackEventFingerprint:
         """If the caller already set ``_fingerprint`` on the event
         (e.g. an upstream compute path), track_event must NOT
         overwrite it — the caller's fingerprint is authoritative."""
-        # The track_event() function in runtime.py only sets
+        # The track_event function in runtime.py only sets
         # ``_fingerprint`` if it's not already present:
-        #     if "_fingerprint" not in event:
-        #         event["_fingerprint"] = _fingerprint_for_event_dict(event)
+        # if "_fingerprint" not in event:
+        # event["_fingerprint"] = _fingerprint_for_event_dict(event)
         # This is the contract we test.
         # Build a minimal harness that exercises the same code path.
         from nullrun.instrumentation.auto import _fingerprint_for_event_dict

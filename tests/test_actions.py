@@ -255,7 +255,7 @@ class TestSnapshotAndBlock:
 # ===========================================================================
 # Sprint 1.5 (B14): unknown action type must NOT silently BLOCK
 # ===========================================================================
-# Pre-fix: an unknown action type (e.g. server schema regression,
+# Pre-fix: an unknown action type (e.g. server schema regression
 # version mismatch, or attacker-controlled input) silently degraded
 # to ``ActionType.BLOCK`` and triggered ``_default_block``, which
 # raises ``NullRunBlockedException``. That made the SDK into a DoS
@@ -271,7 +271,7 @@ class TestUnknownActionTypeFailOpen:
         """Unknown action type must not raise NullRunBlockedException.
 
         Pre-fix this raised ``NullRunBlockedException`` because
-        ``ActionType(action.lower())`` raised ``ValueError`` which
+        ``ActionType(action.lower )`` raised ``ValueError`` which
         was caught and silently fell through to ``ActionType.BLOCK``
         → ``_default_block`` → raise. Post-fix the method returns
         cleanly and the workflow continues.

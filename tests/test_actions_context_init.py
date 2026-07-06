@@ -1,5 +1,5 @@
 """
-Branch-coverage tests for ``nullrun.actions``, ``nullrun.context``,
+Branch-coverage tests for ``nullrun.actions``, ``nullrun.context``
 ``nullrun.__init__``, and the WorkflowKilledException deprecation
 warning. Together these close the last 1-2 % lines that no other
 test file exercises.
@@ -130,7 +130,7 @@ def test_handle_kill_does_not_propagate_killed_interrupt():
 
 
 def test_handle_pause_records_workflow_in_paused_dict():
-    """PAUSE handler raises WorkflowPausedException but it is swallowed;
+    """PAUSE handler raises WorkflowPausedException but it is swallowed
     the workflow_id is recorded in ``_paused_workflows`` first."""
     h = ActionHandler()
     h.handle("pause", "wf-1", reason="x")
@@ -431,7 +431,7 @@ def test_workflow_nested_restores_outer_on_exit():
 
 
 def test_span_id_in_workflow_resets_to_new_value():
-    """§7.2 #16: ``with workflow(...)`` resets ``span_id``, not only
+    """: ``with workflow(...)`` resets ``span_id``, not only
     workflow_id / trace_id, so the audit log can correctly nest the
     workflow's own span_start under the workflow_id.
     """
@@ -468,7 +468,7 @@ def test_dir_lists_only_curated_surface():
     # The 6 curated names are explicitly listed.
     for name in ("init", "protect", "track_llm", "track_tool", "track_event"):
         assert name in public
-    # Lazy exports are NOT in dir() until first access.
+    # Lazy exports are NOT in dir until first access.
     assert "SpanContext" not in public
     assert "NullRunRuntime" not in public
 

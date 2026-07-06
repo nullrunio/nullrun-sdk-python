@@ -57,10 +57,10 @@ def patch_llama_index(runtime: Any) -> bool:
             # ``model=None`` to the backend → ``unwrap_or("default")``
             # → fallback warning. Walk the same chain
             # ``_extract_model_from_response`` uses in langgraph.py:
-            #   1. ``event.response.model`` — llama-index ChatResponse
-            #   2. ``event.response.raw.model`` — OpenAI-style nested
-            #      response object on the raw attribute
-            #   3. ``usage.model`` — provider dict sometimes carries it
+            # 1. ``event.response.model`` — llama-index ChatResponse
+            # 2. ``event.response.raw.model`` — OpenAI-style nested
+            # response object on the raw attribute
+            # 3. ``usage.model`` — provider dict sometimes carries it
             # Empty / None values are dropped — only set ``model`` on
             # the event when we have a real string.
             response = event.response

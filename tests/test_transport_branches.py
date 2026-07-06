@@ -629,7 +629,7 @@ def test_refetch_credentials_missing_secret_key_logs_warning(caplog):
     assert any("secret_key" in r.getMessage() for r in caplog.records)
 
 
-# ─── InsecureTransportError on http:// non-loopback ──────────────────
+# ─── InsecureTransportError on http:/non-loopback ──────────────────
 
 
 def test_transport_rejects_insecure_http():

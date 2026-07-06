@@ -1,4 +1,4 @@
-"""Tests for nullrun.uuid7 — RFC 9562 §5.7 time-ordered ID generator.
+"""Tests for nullrun.uuid7 — RFC 9562 time-ordered ID generator.
 
 These tests pin the wire contract with the backend's `mint_execution_id`
 (backend/src/proxy/http/gate/execution_id.rs) which produces the same
@@ -42,7 +42,7 @@ def test_uuid7_version_bits():
     """The high 4 bits of byte 6 = 0b0111 = 7 (UUID v7)."""
     u = uuid7()
     raw = u.bytes
-    # Per RFC 9562 §5.7: bits 48-51 of the 128-bit int encode version
+    # Per RFC 9562: bits 48-51 of the 128-bit int encode version
     version = (raw[6] & 0xF0) >> 4
     assert version == 7, f"expected version=7, got {version}"
 
@@ -57,7 +57,7 @@ def test_uuid7_variant_bits():
 
 
 def test_uuid7_is_time_ordered():
-    """Two consecutive uuid7() calls produce IDs with monotonically
+    """Two consecutive uuid7 calls produce IDs with monotonically
     increasing leading bytes (the unix_ts_ms prefix)."""
     a = uuid7()
     time.sleep(0.002)  # > 1ms so the prefix ticks
@@ -69,7 +69,7 @@ def test_uuid7_is_time_ordered():
 
 
 def test_uuid7_unique_under_rapid_calls():
-    """1000 back-to-back uuid7() calls produce 1000 distinct IDs.
+    """1000 back-to-back uuid7 calls produce 1000 distinct IDs.
     Random component (122 bits) makes collisions vanishingly
     unlikely; this test is a sanity check, not a statistical one.
     """
@@ -82,12 +82,12 @@ def test_uuid7_str_matches_uuid_str():
     u = uuid7()
     assert uuid7_str() == str(u) or uuid7_str() != uuid7_str()
     # The contract is just "both are valid UUID v7 strings"; we
-    # don't pin equality (a second uuid7_str() call would return
+    # don't pin equality (a second uuid7_str call would return
     # a different ID — they're independent calls).
 
 
 def test_uuid7_accepted_by_stdlib_uuid():
-    """The string round-trips through uuid.UUID() — backend uses
+    """The string round-trips through uuid.UUID — backend uses
     uuid::Uuid::parse_str which requires valid hyphenated format.
     """
     from uuid import UUID

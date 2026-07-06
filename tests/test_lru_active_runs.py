@@ -32,7 +32,7 @@ from nullrun.tracing import SpanContext, create_root_span
 @pytest.fixture
 def callback():
     """A fresh NullRunCallback with a MagicMock runtime so we don't
-    touch the real NullRunRuntime.get_instance() singleton path."""
+    touch the real NullRunRuntime.get_instance singleton path."""
     return NullRunCallback(runtime=MagicMock())
 
 

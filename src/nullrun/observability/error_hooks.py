@@ -1,5 +1,5 @@
 """Layer 2 of the "give the user a chance" design — the global
-``nullrun.on_error()`` hook.
+``nullrun.on_error `` hook.
 
 Pre-Layer-2: the only signal the user got was the raised exception
 itself, with no global observability hook. To get metrics / Sentry
@@ -11,7 +11,7 @@ Post-Layer-2: every structured SDK failure fires every registered
 hook BEFORE the exception propagates. The hook sees the same
 ``NullRunError`` and an ``ErrorContext`` describing where in the
 lifecycle the error happened. Multiple hooks are supported. Hook
-exceptions are caught and logged at DEBUG (per design discussion
+exceptions are caught and logged at DEBUG (design discussion
 2026-06-24 — visible when DEBUG logging is on, silent at
 INFO/CRITICAL so a misbehaving hook does not break production).
 
@@ -22,7 +22,7 @@ What does NOT fire the hook:
   global error hook would mask the intent of
   ``except WorkflowKilledInterrupt`` / ``except BaseException``
   blocks at the top of the agent loop. See
-  ``docs/kill-contract.md`` §6.
+  ``docs/kill-contract.md``.
 * Any non-``NullRunError`` exception raised inside the SDK (e.g.
   ``httpx.ConnectError`` propagated from a code path that has
   not yet been migrated to structured errors). These are bugs
@@ -48,17 +48,17 @@ logger = logging.getLogger(__name__)
 # do not get overwhelmed. Adding a new value? Add it to the
 # STAGES docstring below so the catalogue stays discoverable.
 #
-#   init           — nullrun.init() failed (missing api_key, etc.)
-#   auth           — _authenticate() against /auth/verify
-#   policy_fetch   — GET /api/v1/orgs/{org}/policies
-#   execute        — POST /api/v1/execute (gate decision)
-#   track          — POST /api/v1/track (event ingest)
-#   gate           — POST /api/v1/gate (legacy pre-flight)
-#   check          — POST /api/v1/check (budget pre-flight)
-#   sensitive_tool — @sensitive pre-check
-#   org_status     — get_org_status()
-#   ws             — WebSocket control-plane message handling
-#   transport      — generic transport-layer raise
+# init — nullrun.init failed (missing api_key, etc.)
+# auth — _authenticate against /auth/verify
+# policy_fetch — GET /api/v1/orgs/{org}/policies
+# execute — POST /api/v1/execute (gate decision)
+# track — POST /api/v1/track (event ingest)
+# gate — POST /api/v1/gate (legacy pre-flight)
+# check — POST /api/v1/check (budget pre-flight)
+# sensitive_tool — @sensitive pre-check
+# org_status — get_org_status 
+# ws — WebSocket control-plane message handling
+# transport — generic transport-layer raise
 STAGES: tuple[str, ...] = (
     "init",
     "auth",
@@ -84,38 +84,38 @@ class ErrorContext:
     MUST tolerate missing fields.
     """
 
-    #: Short stage identifier — see STAGES above.
+    # Short stage identifier — see STAGES above.
     stage: str
 
-    #: Workflow that was active when the error fired, or ``None``
-    #: for pre-bind errors (init, policy_fetch) and SDK-internal
-    #: errors (transport).
+    # Workflow that was active when the error fired, or ``None``
+    # for pre-bind errors (init, policy_fetch) and SDK-internal
+    # errors (transport).
     workflow_id: str | None = None
 
-    #: Tool that triggered the error, or ``None`` for non-tool
-    #: errors. Set on @sensitive / @protect / track_tool raises.
+    # Tool that triggered the error, or ``None`` for non-tool
+    # errors. Set on @sensitive / @protect / track_tool raises.
     tool_name: str | None = None
 
-    #: First 10 characters of the api key in use, or ``None`` if
-    #: no key was set yet. Used for log triage — the full key
-    #: never leaves the SDK.
+    # First 10 characters of the api key in use, or ``None`` if
+    # no key was set yet. Used for log triage — the full key
+    # never leaves the SDK.
     api_key_prefix: str | None = None
 
-    #: Backend correlation id (``X-Correlation-Id`` response
-    #: header) when the error came from the backend. ``None``
-    #: for pre-bind errors and locally-detected blocks (loop /
-    #: rate). Set by the transport layer when the header is
-    #: present on a 4xx / 5xx response.
+    # Backend correlation id (``X-Correlation-Id`` response
+    # header) when the error came from the backend. ``None``
+    # for pre-bind errors and locally-detected blocks (loop /
+    # rate). Set by the transport layer when the header is
+    # present on a 4xx / 5xx response.
     correlation_id: str | None = None
 
-    #: Free-form dict for stage-specific metadata (e.g.
-    #: ``{"status_code": 503}`` for a 5xx). Kept as a dict
-    #: (not a TypedDict) so future fields can be added without
-    #: a schema migration.
+    # Free-form dict for stage-specific metadata (e.g.
+    # ``{"status_code": 503}`` for a 5xx). Kept as a dict
+    # (not a TypedDict) so future fields can be added without
+    # a schema migration.
     extra: dict[str, Any] = field(default_factory=dict)
 
-    #: Wall-clock seconds since the epoch (UTC). Useful for
-    #: correlating hook events with the SDK's own logging.
+    # Wall-clock seconds since the epoch (UTC). Useful for
+    # correlating hook events with the SDK's own logging.
     timestamp: float = field(default_factory=time.time)
 
     def __post_init__(self) -> None:
@@ -141,6 +141,14 @@ ErrorHook = Callable[["Any", ErrorContext], None]
 # Module-level registry. Thread-safe — hooks may be registered
 # from one thread and fired from another (e.g. register at app
 # startup, fire from a transport background thread).
+#
+# Phase 4 (2026-07-05): the hot path is has_hooks(), which
+# previously took an RLock.acquire on every call (100+ raises/min
+# in a busy agent is enough to show up in profiles). We now keep
+# the hook list under the same RLock but expose has_hooks()
+# as a lock-free len() check. The list itself is private;
+# callers always go through the public functions (which take
+# the lock for the read snapshot during dispatch).
 _lock = threading.RLock()
 _hooks: list[ErrorHook] = []
 
@@ -157,8 +165,8 @@ def register_hook(hook: ErrorHook) -> Callable[[], None]:
         def my_hook(err, ctx):
             log.error("NullRun %s at %s", err.error_code, ctx.stage)
         unregister = nullrun.on_error(my_hook)
-        # ... later:
-        unregister()
+        #... later:
+        unregister 
     """
     if not callable(hook):
         raise TypeError(f"on_error hook must be callable, got {type(hook).__name__}")
@@ -194,7 +202,7 @@ def emit_error(err: Any, ctx: ErrorContext) -> None:
     exception while the call stack is still live (design
     decision C, 2026-06-24).
 
-    Hook exceptions are caught and logged at DEBUG (per design
+    Hook exceptions are caught and logged at DEBUG (design
     decision 2026-06-24: silent at INFO/CRITICAL so a
     misbehaving hook does not break production, visible when
     DEBUG logging is on so debugging the hook itself is easy).
@@ -234,5 +242,12 @@ def has_hooks() -> bool:
     context is small), but the SDK init path uses it because
     the context for an ``init`` failure is large.
     """
-    with _lock:
-        return bool(_hooks)
+    # Lock-free: see the long-form comment above. The list
+    # itself is mutated under _lock, but len() on a list is
+    # atomic in CPython and the worst case is a one-step-stale
+    # read (the very next call sees the truth). For the
+    # hot-path caller this is the right trade-off — the
+    # alternative is a context-built-and-discarded on every
+    # raise, which is the very thing has_hooks() exists to
+    # avoid.
+    return bool(_hooks)

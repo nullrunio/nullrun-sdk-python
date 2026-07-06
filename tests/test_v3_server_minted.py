@@ -1,6 +1,6 @@
 """
 Contract tests for the v3 server-minted execution_id wiring
-(CLAUDE.md §24, §29).
+.
 
 Background
 ----------
@@ -12,10 +12,10 @@ to ``reservation:{execution_id}`` (TTL 300s) and surfaces on
 
   - /track had no way to find the matching reservation key →
     v3 ``consume_budget_v3`` rejected with 503
-    ``RESERVATION_NOT_FOUND`` (CLAUDE.md §33, fail-CLOSED).
+    ``RESERVATION_NOT_FOUND``.
   - /track kept using the legacy ``/api/v1/track/batch``
     path that writes to ``monthly_cost`` (drift with the
-    dashboard's period counter, see §0 G1).
+    dashboard's period counter, see G1).
 
 0.12.0 fixes this by:
 
@@ -30,7 +30,7 @@ to ``reservation:{execution_id}`` (TTL 300s) and surfaces on
 This file pins each step so a future refactor that breaks
 propagation trips CI rather than silently re-introducing
 the drift. Pattern follows
-``tests/test_v3_wire_contract.py`` — same respx-based pattern,
+``tests/test_v3_wire_contract.py`` — same respx-based pattern
 strict-URL assertions, no live backend required.
 """
 
@@ -64,7 +64,7 @@ from nullrun.runtime import (
 BASE_URL = "https://api.test.nullrun.io"
 
 # A valid server-minted uuidv7 for tests. Layout matches the
-# backend's mint_execution_id (RFC 9562 §5.7 — version nibble
+# backend's mint_execution_id (RFC 9562 — version nibble
 # in position 13 is `7`).
 SERVER_MINTED_V1 = "0190c5b5-7c9a-7def-8a1b-0123456789ab"
 SERVER_MINTED_V2 = "0190c5b5-7c9a-7def-8a1b-fedcba987654"
@@ -96,8 +96,8 @@ class TestServerMintedExecutionIdContextvar:
     """Token-based API for the server-minted execution_id contextvar.
 
     Mirrors the user-facing audit spec:
-    ``set_server_minted_execution_id(value) -> Token``,
-    ``get_server_minted_execution_id() -> str | None``,
+    ``set_server_minted_execution_id(value) -> Token``
+    ``get_server_minted_execution_id -> str | None``
     ``reset_server_minted_execution_id(token) -> None``.
     """
 
@@ -195,7 +195,7 @@ class TestCaptureServerMintedExecutionId:
         assert get_server_minted_reservation_at() > 0
 
     def test_clears_on_missing_field(self):
-        # Pre-populate to verify clear() actually clears.
+        # Pre-populate to verify clear actually clears.
         set_server_minted_execution_id(SERVER_MINTED_V1)
 
         result = _capture_server_minted_execution_id({"decision": "allow"})
@@ -238,7 +238,7 @@ class TestCaptureServerMintedExecutionId:
         assert get_server_minted_execution_id() is None
 
     def test_drops_non_string_field(self):
-        # Backend is the source of truth and only emits strings,
+        # Backend is the source of truth and only emits strings
         # but a buggy proxy could echo an int. Defensive parse.
         result = _capture_server_minted_execution_id(
             {"reservation_id": 123456}  # type: ignore[dict-item]
@@ -255,7 +255,7 @@ class TestEnrichEventServerMinted:
     """``NullRunRuntime._enrich_event`` must stamp ``execution_id``
     onto the /track payload from the contextvar (audit gap #3)
     AND drop the field when the captured reservation has aged
-    past the 300s TTL (§29).
+    past the 300s TTL.
     """
 
     def test_includes_execution_id_when_fresh(self, make_runtime):
@@ -413,7 +413,7 @@ class TestBuildV3TrackPayload:
     def test_tokens_coerced_to_int(self):
         # Defensive: SDK usually emits int but a user-supplied
         # token via the dict could be a numpy.int64 in a
-        # cookbook scenario. Force int() so wire is int.
+        # cookbook scenario. Force int so wire is int.
         out = _build_v3_track_payload(
             {"type": "llm_call", "workflow_id": "wf-1", "tokens": "100"},
             SERVER_MINTED_V1,
@@ -491,7 +491,7 @@ class TestRouteTrack:
             duration_ms=50,
         )
 
-        # track() buffers; tool_call events don't trip the v3
+        # track buffers; tool_call events don't trip the v3
         # path because they have no reservation to release. Force
         # the batch flush so respx sees the call.
         rt._transport.flush_now()
@@ -584,12 +584,12 @@ class TestEndToEndCaptureFlow:
             return_value=Response(200, json={"status": "ok"})
         )
 
-        # Drive /gate (which captures) ...
+        # Drive /gate (which captures)...
         from nullrun.context import workflow
         with workflow("wf-1"):
             rt.check_workflow_budget()
 
-            # ... then drive /track within the same scope.
+            #... then drive /track within the same scope.
             rt.track_llm(
                 input_tokens=10,
                 output_tokens=5,
@@ -635,8 +635,8 @@ class TestEndToEndCaptureFlow:
         from nullrun.context import workflow
         with workflow("wf-1"):
             # Block path raises — WorkflowKilledInterrupt is a
-            # BaseException (carries the kill signal; per CLAUDE.md
-            # §3 must propagate honestly). Catch it explicitly for
+            # BaseException (carries the kill signal
+            # must propagate honestly). Catch it explicitly for
             # this test which only wants to verify contextvar hygiene.
             try:
                 rt.check_workflow_budget()

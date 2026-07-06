@@ -6,10 +6,10 @@ server on 127.0.0.1 and exercises the full wire path:
 
   httpx.Client (auto-instrumented)
         │
-        │  POST /v1/chat/completions   ──►  mock LLM server
-        │                                  returns OpenAI-shape JSON
-        │  POST /api/v1/track/batch    ──►  mock NULLRUN backend
-        │                                  records the event in a list
+        │ POST /v1/chat/completions ──► mock LLM server
+        │ returns OpenAI-shape JSON
+        │ POST /api/v1/track/batch ──► mock NULLRUN backend
+        │ records the event in a list
 
 The contract we prove: the auto-instrumented transport actually
 delivers a track event to a real socket, the event payload contains
@@ -18,7 +18,7 @@ reaches the mock LLM intact.
 
 The server is a stdlib `http.server.ThreadingHTTPServer` — no extra
 deps. It runs in a daemon thread; port 0 picks a free port. The
-test always runs in CI; no env vars required, no real API keys,
+test always runs in CI; no env vars required, no real API keys
 no real tokens spent.
 """
 
@@ -44,8 +44,8 @@ from nullrun.instrumentation.auto import PROVIDER_EXTRACTORS, _openai_extractor
 class _MockLLMServer:
     """Threaded HTTP server with two routes:
 
-      POST /v1/chat/completions   → OpenAI-shape completion (fake usage)
-      POST /api/v1/track/batch    → append event to `received_events`
+      POST /v1/chat/completions → OpenAI-shape completion (fake usage)
+      POST /api/v1/track/batch → append event to `received_events`
 
     Both routes are reached by the test's real httpx.Client through
     the auto-instrumented transport. The test asserts on what arrived
@@ -133,7 +133,7 @@ class _MockLLMServer:
                     return
 
                 # NULLRUN auth handshake: the runtime calls /auth/verify
-                # on init() with a non-empty api_key. Return a minimal
+                # on init with a non-empty api_key. Return a minimal
                 # valid auth envelope so the runtime trusts the key and
                 # proceeds with auto-instrumentation.
                 if self.path == "/auth/verify" or self.path.endswith("/auth/verify"):
@@ -205,17 +205,17 @@ class TestRealE2EObservation:
         )
     )
     def test_httpx_call_reaches_mock_llm_and_emits_track_event(self, mock_server, monkeypatch):
-        """The real path: init() → auto-instrumented httpx → mock LLM
+        """The real path: init → auto-instrumented httpx → mock LLM
         response → auto-flushed track event arrives at the mock backend.
 
         This test never uses respx. It exercises:
           - `nullrun.init(api_url=..., api_key=...)` wiring
-          - `auto_instrument()` patching httpx.Client.__init__
+          - `auto_instrument ` patching httpx.Client.__init__
           - A real TCP connection to 127.0.0.1
           - The runtime's transport flushing the buffered track event
         """
         # Reset auto-instrumentation so a previous test that already
-        # called init() does not short-circuit the patch.
+        # called init does not short-circuit the patch.
         _auto.reset_for_tests()
 
         # Register `127.0.0.1` as a known OpenAI-shape host so the
@@ -227,7 +227,7 @@ class TestRealE2EObservation:
         PROVIDER_EXTRACTORS["127.0.0.1"] = _openai_extractor
         try:
             # 1. Init the SDK with the mock NULLRUN backend URL. The
-            #    `api_key` is non-empty so auto_instrument() runs.
+            # `api_key` is non-empty so auto_instrument runs.
             nullrun.init(
                 api_key="test-key-real-e2e",
                 api_url=f"http://127.0.0.1:{mock_server.port}",
@@ -243,10 +243,10 @@ class TestRealE2EObservation:
                 runtime._transport.config.flush_interval = 0.1
 
                 # 2. Make a real httpx call to the mock LLM. The user
-                #    typically does this via openai.OpenAI(), but raw
-                #    httpx is enough to prove the auto-instrumentation
-                #    + extractor + transport path. We avoid the openai
-                #    dep so this test runs in any environment.
+                # typically does this via openai.OpenAI, but raw
+                # httpx is enough to prove the auto-instrumentation
+                # + extractor + transport path. We avoid the openai
+                # dep so this test runs in any environment.
                 llm_url = f"http://127.0.0.1:{mock_server.port}/v1/chat/completions"
                 with httpx.Client() as client:
                     resp = client.post(
@@ -261,10 +261,10 @@ class TestRealE2EObservation:
                 assert resp.json()["usage"]["total_tokens"] == 15
 
                 # 3. Force-flush the transport. With batch_size=1, the
-                #    event was enqueued on the LLM call; flush_now()
-                #    pushes it through the circuit breaker → HTTP POST.
-                #    We poll the server with a short timeout for the
-                #    async completion of the HTTP roundtrip.
+                # event was enqueued on the LLM call; flush_now 
+                # pushes it through the circuit breaker → HTTP POST.
+                # We poll the server with a short timeout for the
+                # async completion of the HTTP roundtrip.
                 runtime._transport.flush_now()
                 deadline = time.monotonic() + 5.0
                 while time.monotonic() < deadline and not mock_server.received_events:
@@ -282,8 +282,8 @@ class TestRealE2EObservation:
                 assert llm_body["messages"] == [{"role": "user", "content": "hi"}]
 
                 # 5. The track event payload contains the expected fields.
-                #    The transport sends a `{"events": [...]}` envelope;
-                #    the runtime emits one llm_call event per LLM response.
+                # The transport sends a `{"events": [...]}` envelope
+                # the runtime emits one llm_call event per LLM response.
                 envelope = mock_server.received_events[0]
                 assert "events" in envelope, f"unexpected envelope shape: {envelope}"
                 events = envelope["events"]
@@ -297,7 +297,7 @@ class TestRealE2EObservation:
                 llm_event = llm_events[0]
 
                 # The model is the one we POSTed. The workflow_id is
-                # auto-generated because no `nullrun.workflow()` is open.
+                # auto-generated because no `nullrun.workflow ` is open.
                 assert llm_event.get("model") == "gpt-4o"
                 assert llm_event.get("workflow_id"), "workflow_id missing from event"
                 # Token counts from the mocked OpenAI-shape response.

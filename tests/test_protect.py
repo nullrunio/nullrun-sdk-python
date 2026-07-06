@@ -37,7 +37,7 @@ class _RecordingRuntime:
     call so we can assert on span_start/span_end emission without a
     real backend.
 
-    The decorator calls `check_control_plane`, `check_workflow_budget`,
+    The decorator calls `check_control_plane`, `check_workflow_budget`
     and `is_sensitive_tool` as pre-execution gates (ADR-008). The default
     no-op implementations here keep the test isolated to the
     span/track_event path; sensitive-tool gating is short-circuited
@@ -97,7 +97,7 @@ def test_protect_creates_root_span(recording_runtime):
 
 
 def test_protect_nested_creates_child_span(recording_runtime):
-    """A nested @protect call is a child of the outer one (parent_span_id set,
+    """A nested @protect call is a child of the outer one (parent_span_id set
     depth=1) AND shares the trace_id."""
 
     @nullrun.protect
@@ -123,7 +123,7 @@ def test_protect_nested_creates_child_span(recording_runtime):
 
 
 def test_protect_restores_context_after_call(recording_runtime):
-    """After @protect returns, get_current_span() goes back to whatever
+    """After @protect returns, get_current_span goes back to whatever
     was active before — usually None at the top of the test."""
 
     @nullrun.protect
@@ -251,7 +251,7 @@ async def test_protect_async_nested_child(recording_runtime):
 
 
 # ──────────────────────────────────────────────────────────────
-# Decorator shape (must work with @protect AND @protect())
+# Decorator shape (must work with @protect AND @protect )
 # ──────────────────────────────────────────────────────────────
 
 
@@ -284,7 +284,7 @@ def test_protect_preserves_function_metadata(recording_runtime):
 
 
 def test_protect_respects_externally_set_span(recording_runtime):
-    """If user code manually calls set_span(...) before @protect fires,
+    """If user code manually calls set_span(...) before @protect fires
     the new span is a child of THAT, not a root."""
     from nullrun.tracing import create_root_span as make_root
 
@@ -310,11 +310,11 @@ def test_protect_respects_externally_set_span(recording_runtime):
 
 
 def test_init_replaces_stale_decorator_runtime_cache(mock_api):
-    """`nullrun.init()` must update the @protect decorator's own
+    """`nullrun.init ` must update the @protect decorator's own
     module-level cache (`decorators._runtime`), not just the runtime
     module's cache and the class-level singleton.
 
-    Regression: the previous `init()` updated `NullRunRuntime._instance`
+    Regression: the previous `init ` updated `NullRunRuntime._instance`
     and `nullrun.runtime._runtime` but not `nullrun.decorators._runtime`.
     The decorator short-circuits on the decorator module's own slot and
     never re-resolved, so an `init → shutdown → init` cycle left the
@@ -324,8 +324,8 @@ def test_init_replaces_stale_decorator_runtime_cache(mock_api):
     matching rows in the `spans` table.
 
     Test strategy: pre-seed `decorators._runtime` with a sentinel that
-    raises on `track_event`, then call `init()`. If the fix is in place,
-    init() overwrites the slot and the sentinel is never reachable from
+    raises on `track_event`, then call `init `. If the fix is in place
+    init overwrites the slot and the sentinel is never reachable from
     a subsequent @protect call.
     """
     import nullrun.decorators as _dec
@@ -346,7 +346,7 @@ def test_init_replaces_stale_decorator_runtime_cache(mock_api):
         api_url="https://api.test.nullrun.io",
     )
     try:
-        # The fix: init() must overwrite the decorator's cache slot.
+        # The fix: init must overwrite the decorator's cache slot.
         # Without the fix, this assertion fails because the slot
         # still points at _DeadSentinel.
         assert _dec._runtime is rt, (
@@ -364,7 +364,7 @@ def test_init_replaces_stale_decorator_runtime_cache(mock_api):
 
 def test_protect_uses_new_runtime_after_reinit(mock_api):
     """End-to-end version of the regression: after `init → shutdown →
-    init`, calling @protect must emit span events to the NEW runtime,
+    init`, calling @protect must emit span events to the NEW runtime
     not the dead one.
 
     The first init's recording runtime is intentionally unreachable
@@ -410,7 +410,7 @@ def test_protect_uses_new_runtime_after_reinit(mock_api):
             return "b"
 
         assert step_b() == "b"
-        # If the regression were live, step_b() would have raised inside
+        # If the regression were live, step_b would have raised inside
         # _emit_span_start via the _DeadRuntime.track_event AssertionError.
     finally:
         _dec._runtime = None

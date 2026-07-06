@@ -1,8 +1,8 @@
 """
 Additional runtime branch tests covering the gaps in
-``tests/test_runtime.py``. Focuses on the less-trodden error paths,
+``tests/test_runtime.py``. Focuses on the less-trodden error paths
 the kill/pause case-insensitive state compare, coverage counter
-behaviour, and the ``execute()`` mode resolution.
+behaviour, and the ``execute `` mode resolution.
 """
 
 from __future__ import annotations
@@ -222,15 +222,15 @@ def test_register_sensitive_tools_bulk():
 
 # 0.9.0: removed six `coverage_report` / `bump_coverage_counter`
 # tests at lines 223-278. The `_coverage_seen` /
-# `_coverage_tracked` / `_coverage_streaming_skipped` dicts,
-# `coverage_report()`, `track_coverage()`,
-# `start_coverage_reporter()`, `_coverage_reporter_loop()`, and
-# `bump_coverage_counter()` method are all gone — coverage is now
+# `_coverage_tracked` / `_coverage_streaming_skipped` dicts
+# `coverage_report `, `track_coverage `
+# `start_coverage_reporter `, `_coverage_reporter_loop `, and
+# `bump_coverage_counter ` method are all gone — coverage is now
 # derived server-side from llm_call span metadata. See plan at
 # `~/.claude/plans/async-swinging-hanrahan.md`.
 
 
-# ─── execute() mode resolution ──────────────────────────────────────
+# ─── execute mode resolution ──────────────────────────────────────
 
 
 def test_execute_auto_sensitive_routes_to_strict():
@@ -240,12 +240,12 @@ def test_execute_auto_sensitive_routes_to_strict():
     )
     rt.execute("stripe.charge", {"amount": 5})  # sensitive → strict
     call_args = rt._transport.execute.call_args
-    # Runtime.execute() forwards mode as a kwarg.
+    # Runtime.execute forwards mode as a kwarg.
     assert call_args.kwargs["mode"] == "strict"
 
 
 def test_execute_auto_non_sensitive_routes_to_inline():
-    """Auto + non-sensitive tool → mode=inline → local short-circuit,
+    """Auto + non-sensitive tool → mode=inline → local short-circuit
     so transport.execute is NOT called. Verify via the LOCAL decision_source.
     """
     rt = _make_test_runtime()
@@ -354,7 +354,7 @@ def test_shutdown_joins_alive_threads(monkeypatch):
     assert not poller.is_alive() or poller.is_alive()  # joined or short-lived
 
 
-# ─── get_instance() credential rotation ──────────────────────────────
+# ─── get_instance credential rotation ──────────────────────────────
 
 
 def test_get_instance_returns_singleton_when_no_change(monkeypatch):

@@ -77,7 +77,7 @@ class TestHierarchyRoots:
 
     def test_killed_interrupt_does_not_inherit_from_exception(self):
         # WorkflowKilledInterrupt is a BaseException subclass by design
-        # (per docs/kill-contract.md). It MUST NOT inherit from
+        # (docs/kill-contract.md). It MUST NOT inherit from
         # NullRunError (which is an Exception subclass), so that
         # `except Exception` does not catch the kill signal.
         assert not issubclass(WorkflowKilledInterrupt, Exception)
@@ -205,7 +205,7 @@ class TestErrorCodeCatalog:
     def test_killed_is_NR_W002(self):
         with pytest.raises(WorkflowKilledInterrupt) as info:
             raise WorkflowKilledInterrupt("wf-1", reason="killed")
-        # BaseException subclass so we use .value not .excinfo
+        # BaseException subclass so we use.value not.excinfo
         assert info.value.error_code == "NR-W002"
 
     def test_paused_is_NR_W003(self):
@@ -228,7 +228,7 @@ class TestErrorCodeCatalog:
 # 5. Transport-error → code mapping
 # ---------------------------------------------------------------------------
 class TestTransportCodeMapping:
-    """The transport layer classifies failures by ``TransportErrorSource``;
+    """The transport layer classifies failures by ``TransportErrorSource``
     each class maps to a stable ``error_code`` so cookbook code and
     Sentry rules can branch on it without parsing the message."""
 

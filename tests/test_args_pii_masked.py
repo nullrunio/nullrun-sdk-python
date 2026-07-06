@@ -53,7 +53,7 @@ def test_safe_args_preserves_non_sensitive_position():
 
 def test_safe_args_masks_password_keyword_position():
     """The mask is case-insensitive (matches _safe_kwargs behaviour)
-    and matches the full SENSITIVE_ARG_KEYS set: ``password``,
+    and matches the full SENSITIVE_ARG_KEYS set: ``password``
     ``api_key``, ``token``, etc."""
 
     def login(user, password):

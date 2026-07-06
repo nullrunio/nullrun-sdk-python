@@ -57,7 +57,7 @@ def test_grandchild_chain_depth():
 
 
 def test_sibling_children_share_trace_but_diverge_in_span_id():
-    """Two children of the same parent share trace_id and parent_span_id,
+    """Two children of the same parent share trace_id and parent_span_id
     but each gets its own span_id — the tree branches at the parent."""
     root = create_root_span()
     a = create_child_span(root)
@@ -87,7 +87,7 @@ def test_set_and_reset_round_trip():
 
 
 def test_nested_set_restores_parent_after_reset():
-    """set_span inside set_span must restore the *outer* span, not None,
+    """set_span inside set_span must restore the *outer* span, not None
     when the inner token is reset."""
     outer = create_root_span()
     inner_parent = create_child_span(outer)
@@ -132,7 +132,7 @@ def test_span_context_is_immutable():
     accidentally rewrite a span's identity after it has been emitted."""
     root = create_root_span()
     with pytest.raises(Exception):
-        # Frozen dataclass raises FrozenInstanceError on attribute set;
+        # Frozen dataclass raises FrozenInstanceError on attribute set
         # the broader `Exception` is fine because exact subclass is
         # not part of the public surface.
         root.span_id = "tampered"  # type: ignore[misc]
@@ -145,7 +145,7 @@ def test_span_context_is_immutable():
 # ``TypeError: unsupported operand for None + 1`` on the
 # ``parent.depth + 1`` line. That crashed the whole
 # ``@protect`` / track_* pipeline when a caller passed ``None``
-# instead of a SpanContext (e.g. ``get_current_span()`` returns
+# instead of a SpanContext (e.g. ``get_current_span `` returns
 # ``None`` when no trace is in progress). Post-fix the function
 # raises ``ValueError`` with a clear message.
 
@@ -158,7 +158,7 @@ def test_create_child_span_rejects_none_parent():
     (``unsupported operand for None + 1``) which crashed the
     whole tracking pipeline. Now it raises ``ValueError`` with
     a message that points the caller at the right alternative
-    (``create_root_span()``).
+    (``create_root_span ``).
     """
     from nullrun.tracing import create_child_span
 

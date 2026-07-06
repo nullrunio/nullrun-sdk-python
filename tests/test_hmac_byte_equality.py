@@ -3,7 +3,7 @@ Regression tests for HMAC byte-equality fix in 0.4.0.
 
 The Rust server (`backend/src/auth/hmac.rs:466-518`) is strict: it
 recomputes `sha256(body)` from the raw wire bytes. Pre-0.4.0 the SDK
-signed `json.dumps(...)` and then sent via httpx's `json=...` kwarg,
+signed `json.dumps(...)` and then sent via httpx's `json=...` kwarg
 which re-serialises with compact separators — producing a body that
 does NOT match the body the HMAC signature was computed over. The
 signed `/gate` and `/check` calls were rejected with 401 when

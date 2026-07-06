@@ -5,7 +5,7 @@ This module ships the LangChain-compatible `NullRunCallback` —
 the low-level handler that:
 
   1. Extracts `input_tokens` / `output_tokens` from LLM responses
-     and forwards them to the runtime's `track()` method (so the
+     and forwards them to the runtime's `track ` method (so the
      backend can compute cost from the org's pricing policy).
   2. Emits `span_start` / `span_end` events for chain / tool /
      agent runs so the dashboard reconstructs the agent tree
@@ -16,8 +16,8 @@ The user-facing helper that wires this callback onto a compiled
 LangGraph app lives at `nullrun.toolbox.langgraph.wrapper` (the
 manual escape hatch). For automatic attachment, see
 `nullrun.instrumentation.auto.patch_langgraph_compiled` — that
-is what `nullrun.init()` installs when `langgraph` is importable,
-so the user does NOT need to call `wrapper()` explicitly.
+is what `nullrun.init ` installs when `langgraph` is importable
+so the user does NOT need to call `wrapper ` explicitly.
 
 Callers who want raw access to the callback can still import it
 from this module:
@@ -40,7 +40,7 @@ from nullrun.tracing import (
 
 logger = logging.getLogger(__name__)
 
-# S-9 (plan §10 P1-3): FIFO cap on NullRunCallback._active_runs.
+# S-9: FIFO cap on NullRunCallback._active_runs.
 # Pre-fix this dict grew unbounded when ``on_chain_end`` did not fire
 # (errors in the chain body). 4096 mirrors DEDUP_LRU_MAX in auto.py
 # and is enough headroom for a typical agent workload without leaking
@@ -85,7 +85,7 @@ def _get_finish_reason(response: Any) -> str | None:
 
     Different LangChain chat-model wrappers expose the same logical
     field under different names on different objects. We walk the
-    candidate sources in priority order and return the first hit;
+    candidate sources in priority order and return the first hit
     priority is "outermost first" so a top-level attribute wins over
     a response_metadata hint, and a generation-message attribute is
     consulted for the LLMResult callback path where the wrapper puts
@@ -157,7 +157,7 @@ def extract_usage_from_response(response: Any, provider: str, model: str) -> dic
     Returns raw usage dict - backend will normalize and compute cost.
     SDK does NOT compute cost - this is intentional (backend is source of truth).
 
-    Phase 4.1: also extracts cache_read_tokens, cache_write_tokens,
+    Phase 4.1: also extracts cache_read_tokens, cache_write_tokens
     reasoning_tokens, finish_reason, and tool_names so the backend's
     gate/budget/loop detection can see them as first-class columns.
     Fields are best-effort — different LangChain providers expose
@@ -326,7 +326,7 @@ def extract_usage_from_response(response: Any, provider: str, model: str) -> dic
 
     # Finish reason — read from every known source independently of the
     # token branch. The `elif`-chain above means only one branch fills
-    # raw_usage, so finish_reason must NOT depend on which branch won;
+    # raw_usage, so finish_reason must NOT depend on which branch won
     # otherwise a finish_reason sitting on response_metadata gets lost
     # whenever the tokens happened to live in usage_metadata.
     usage["finish_reason"] = _get_finish_reason(response)
@@ -376,7 +376,7 @@ def extract_usage_from_response(response: Any, provider: str, model: str) -> dic
         getattr(response, "additional_kwargs", None),
         getattr(response, "response_metadata", None),
         # LLMResult callback path — tool_calls live on the generation's
-        # AIMessage, not on the response object itself. Without this,
+        # AIMessage, not on the response object itself. Without this
         # a callback-driven LLMResult emits an empty tool_names list
         # even when the model produced several function calls.
         _safe_get_gen_message(response),
@@ -384,8 +384,16 @@ def extract_usage_from_response(response: Any, provider: str, model: str) -> dic
         collected.extend(_extract_tool_names(src))
     # De-duplicate while preserving first-seen order so a tool called
     # multiple times in one response appears once in the wire shape.
+    # The original one-liner relied on set.add() returning None, which
+    # mypy --strict correctly flags as func-returns-value. The explicit
+    # loop below is equivalent in semantics and friendlier to type-checkers.
     seen: set[str] = set()
-    usage["tool_names"] = [n for n in collected if not (n in seen or seen.add(n))]
+    unique: list[str] = []
+    for n in collected:
+        if n not in seen:
+            seen.add(n)
+            unique.append(n)
+    usage["tool_names"] = unique
 
     # Determine if we got real usage data
     usage["has_usage"] = (
@@ -420,7 +428,7 @@ class NullRunCallback(BaseCallbackHandler):
         # on_chain_end gives us the same run_id and we need to look
         # up the corresponding span to emit span_end.
         #
-        # S-9 (plan §10 P1-3): bounded to ``_ACTIVE_RUNS_MAX`` entries
+        # S-9: bounded to ``_ACTIVE_RUNS_MAX`` entries
         # with FIFO eviction. Pre-fix this dict grew without limit if
         # ``on_chain_start`` ran without a matching ``on_chain_end``
         # (error-heavy workloads: an exception in the chain body short-
@@ -471,7 +479,7 @@ class NullRunCallback(BaseCallbackHandler):
         Audit 2026-06-28 (SDK↔backend wire): the previous version pulled
         ``model_name`` exclusively from ``invocation_params`` with a
         hard fallback to the literal string ``"unknown"``. When langchain
-        1.x stopped forwarding ``invocation_params`` to ``on_llm_end``,
+        1.x stopped forwarding ``invocation_params`` to ``on_llm_end``
         every track event carried ``model="unknown"`` and the backend
         cost pipeline fell through to ``DEFAULT_RATE``. Now we try
         ``invocation_params.model_name`` first, then fall back to
@@ -482,13 +490,13 @@ class NullRunCallback(BaseCallbackHandler):
 
         Audit 2026-06-29 (ghost-event dedup): the previous version of
         this method did NOT attach a ``_fingerprint`` to the event
-        before forwarding it to ``runtime.track()``. Because the
+        before forwarding it to ``runtime.track ``. Because the
         dedup LRU only collapses events whose ``_fingerprint``
         matches, the LangChain callback emission was never deduped
         against the sibling emission from the httpx transport
         (``NullRunSyncTransport._emit``), even though both observers
         fire for the same LLM call. The net effect on a typical
-        ``app.invoke()`` with 6 LLM calls was 6-12 duplicate
+        ``app.invoke `` with 6 LLM calls was 6-12 duplicate
         ``llm_call`` events on the wire (instead of 6), plus extra
         cost-pipeline ERROR noise from ``_emit_streaming_skipped``
         for body-read failures. The fix derives a stable fingerprint
@@ -520,7 +528,7 @@ class NullRunCallback(BaseCallbackHandler):
 
             # Audit 2026-06-29 (unified fingerprint): derive the same
             # fingerprint the httpx transport computes for the same
-            # call, so the dedup LRU at runtime.track() collapses the
+            # call, so the dedup LRU at runtime.track collapses the
             # two emissions to a single wire event. Both observers feed
             # (model, provider, response_id) into
             # ``_fingerprint_for_llm_call``; the helper is
@@ -531,14 +539,14 @@ class NullRunCallback(BaseCallbackHandler):
             # the upstream provider returned. For langchain-openai 1.x
             # the chat-completion id lives in four places in priority
             # order (first hit wins):
-            #   1. ``response.llm_output["id"]`` — LLMResult wrapper
-            #      where langchain-openai puts the upstream id.
-            #   2. ``response.id`` — direct attribute on the LLMResult
-            #      or AIMessage (some versions).
-            #   3. The AIMessage inside the first generation
-            #      (``response.generations[0][0].message.id``).
-            #   4. ``response.response_metadata["id"]`` — the dict
-            #      langchain-openai populates on the AIMessage.
+            # 1. ``response.llm_output["id"]`` — LLMResult wrapper
+            # where langchain-openai puts the upstream id.
+            # 2. ``response.id`` — direct attribute on the LLMResult
+            # or AIMessage (some versions).
+            # 3. The AIMessage inside the first generation
+            # (``response.generations[0][0].message.id``).
+            # 4. ``response.response_metadata["id"]`` — the dict
+            # langchain-openai populates on the AIMessage.
             # Any of these yields the same string (``"chatcmpl-..."``
             # for OpenAI), so the fingerprint matches the httpx
             # transport's reading of ``payload["id"]`` from the body.
@@ -607,10 +615,10 @@ class NullRunCallback(BaseCallbackHandler):
                 "raw_usage": usage["raw_usage"],
                 # Audit 2026-06-29 (unified fingerprint): use the
                 # same helper the httpx transport calls so the dedup
-                # LRU at runtime.track() collapses the sibling
+                # LRU at runtime.track collapses the sibling
                 # emission for the same real LLM call. Pre-fix this
                 # used ``_fingerprint_for_event_dict({path:
-                # "langchain_callback", ...})`` which produced a key
+                # "langchain_callback",...})`` which produced a key
                 # the httpx fingerprint could never collide with —
                 # every LLM call produced two wire events.
                 "_fingerprint": _fingerprint_for_llm_call(
@@ -800,7 +808,7 @@ def _extract_node_name(serialized: Any, default: str) -> str:
 # → no row → fallback warning → DEFAULT_RATE (~$30/M).
 #
 # Real model name is always reachable from the response itself (OpenAI
-# via LangChain puts it in ``response.response_metadata['model_name']``;
+# via LangChain puts it in ``response.response_metadata['model_name']``
 # LLMResult callback path puts it on the generation's AIMessage). This
 # helper walks the same fallback chain ``_get_finish_reason`` already
 # uses, so we have a single pattern for "best-effort read from the
@@ -821,10 +829,10 @@ def _extract_model_from_response(response: Any) -> str | None:
       - promote ``response.llm_output['model_name']`` (the location
         langchain-openai 1.x uses for the date-suffixed model id
         ``gpt-4.1-mini-2025-04-14``) to step 1, ahead of the
-        ``response_metadata`` step that langchain 0.x used;
+        ``response_metadata`` step that langchain 0.x used
       - add ``response.llm_output['model']`` and a generic
         "any key containing 'model'" sweep so non-OpenAI wrappers
-        (proxies, custom chat models) still get attributed;
+        (proxies, custom chat models) still get attributed
       - log a DEBUG line on the None path so an operator who sees
         the wire warning in the backend can correlate it to the
         observation site that produced the event.
@@ -846,13 +854,13 @@ def _extract_model_from_response(response: Any) -> str | None:
        (rare, seen on some custom wrappers).
     """
     # 1. llm_output dict (langchain-openai 1.x primary location).
-    #    Promote ahead of the response_metadata step: for OpenAI via
-    #    LangChain 1.x, the LLMResult carries the model on
-    #    ``llm_output['model_name']`` (date-suffixed) while the
-    #    AIMessage inside ``generations[0][0].message`` does NOT
-    #    carry ``response_metadata`` populated — step 3 would return
-    #    None. Without promoting step 1, every OpenAI call was
-    #    silently zero-billed.
+    # Promote ahead of the response_metadata step: for OpenAI via
+    # LangChain 1.x, the LLMResult carries the model on
+    # ``llm_output['model_name']`` (date-suffixed) while the
+    # AIMessage inside ``generations[0][0].message`` does NOT
+    # carry ``response_metadata`` populated — step 3 would return
+    # None. Without promoting step 1, every OpenAI call was
+    # silently zero-billed.
     llm_out = getattr(response, "llm_output", None)
     if isinstance(llm_out, dict) and llm_out:
         # Preferred: explicit "model_name" then "model" key.
@@ -863,7 +871,7 @@ def _extract_model_from_response(response: Any) -> str | None:
         # Fallback: scan every key in llm_output for one that
         # contains "model" and holds a non-empty string. Some
         # custom chat-model wrappers / proxies put the model under
-        # less canonical keys (``"model_id"``, ``"modelName"``,
+        # less canonical keys (``"model_id"``, ``"modelName"``
         # ``"resolved_model"``).
         for key, val in llm_out.items():
             if (
@@ -875,7 +883,7 @@ def _extract_model_from_response(response: Any) -> str | None:
                 return val
 
     # 2. response_metadata on the response (langchain 0.x AIMessage
-    #    case, and any wrapper that hoists the metadata up).
+    # case, and any wrapper that hoists the metadata up).
     resp_meta = getattr(response, "response_metadata", None)
     if isinstance(resp_meta, dict):
         val = resp_meta.get("model_name") or resp_meta.get("model")
@@ -914,10 +922,10 @@ def _extract_model_from_response(response: Any) -> str | None:
     # the four fallback steps almost-but-didn't match. We now dump
     # the available keys on every relevant shape so a single
     # logcat-level filter surfaces the root cause:
-    #   - `response.llm_output` keys
-    #   - `response.response_metadata` keys
-    #   - `gen_msg.response_metadata` keys (LLMResult callback path)
-    #   - direct attrs `response.model_name` / `response.model`
+    # - `response.llm_output` keys
+    # - `response.response_metadata` keys
+    # - `gen_msg.response_metadata` keys (LLMResult callback path)
+    # - direct attrs `response.model_name` / `response.model`
     # All four dumps are guarded so a missing attribute is silent.
     try:
         response_type = type(response).__name__

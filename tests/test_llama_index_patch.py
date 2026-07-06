@@ -125,7 +125,7 @@ def test_llm_chat_end_with_dict_usage_emits_track(monkeypatch, fresh_patch_modul
     _LLM = _llm_events.LLMChatEndEvent
 
     # Fire the LLMChatEndEvent handler manually.
-    # The patch reads ``event.response.raw`` and applies ``hasattr(raw,
+    # The patch reads ``event.response.raw`` and applies ``hasattr(raw
     # "usage")`` to decide between the dict-form (raw IS the usage
     # dict) and the object-form (raw.usage is the usage dict). Most
     # llama-index responses are the dict form.
@@ -190,7 +190,7 @@ def test_llm_chat_end_response_without_raw(monkeypatch, fresh_patch_module):
 
     for cls, handler in dispatcher._captured:
         if cls is _LLM:
-            response = SimpleNamespace(model="x")  # no .raw
+            response = SimpleNamespace(model="x")  # no.raw
             handler(SimpleNamespace(response=response))
             break
 
@@ -276,7 +276,7 @@ def test_function_call_event_tool_without_name_uses_default(monkeypatch, fresh_p
 
     for cls, handler in dispatcher._captured:
         if cls is _FCE:
-            handler(SimpleNamespace(tool=SimpleNamespace()))  # no .name
+            handler(SimpleNamespace(tool=SimpleNamespace()))  # no.name
             break
 
     events = rt._captured

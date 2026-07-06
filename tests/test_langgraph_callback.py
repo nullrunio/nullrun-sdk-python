@@ -4,7 +4,7 @@ Regression tests for ``nullrun.instrumentation.langgraph``.
 Covers:
 
   - ``extract_usage_from_response`` — every branch of the usage-shape
-    fan-out (dict, object, generations, response_metadata, llm_output,
+    fan-out (dict, object, generations, response_metadata, llm_output
     streaming chunks).
   - ``NullRunCallback`` — span emission (start/end) for chains / tools /
     agents, nested parent/child via ``parent_run_id``, the

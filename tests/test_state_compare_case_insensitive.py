@@ -1,17 +1,17 @@
 """Regression tests for S-4: case-insensitive state compare in
 ``NullRunRuntime.check_control_plane``.
 
-Why this exists. Per ``analyze.md`` §11.6 the wire-format ``state``
-value can drift across backend versions — `as_pascal_case()`
+Why this exists. Per ```` the wire-format ``state``
+value can drift across backend versions — `as_pascal_case `
 emits ``"Paused"`` / ``"Killed"`` today, but a regression to
 ``"PAUSED"`` / ``"KILLED"`` (the historical UPPERCASE DB format)
 would silently bypass the SDK-side kill/pause detection. The
 pre-fix code did exact ``state == "Paused"`` / ``state == "Killed"``
 comparisons.
 
-The fix normalises ``state.lower()`` before the membership test
+The fix normalises ``state.lower `` before the membership test
 so the SDK survives any casing drift without needing a coordinated
-backend change. Backend already emits PascalCase per
+backend change. Backend already emits PascalCase
 ``handlers.rs:9258``; this is defensive.
 """
 
@@ -75,7 +75,7 @@ class TestUppercaseDrift:
 
 class TestLowercaseDrift:
     """If a backend regression emits lowercase, the SDK must still
-    raise. (Same code path as Uppercase via .lower(), but exercises
+    raise. (Same code path as Uppercase via.lower, but exercises
     a separate input variant.)"""
 
     def test_killed_lowercase_raises(self, runtime):
@@ -91,7 +91,7 @@ class TestLowercaseDrift:
 
 class TestNormalState:
     """Anything that does NOT reduce to ``paused`` / ``killed`` must
-    be a silent pass-through — including the default ``Normal``,
+    be a silent pass-through — including the default ``Normal``
     explicit ``"normal"``, ``"running"``, ``"flagged"``, etc."""
 
     def test_normal_pascal_does_not_raise(self, runtime):

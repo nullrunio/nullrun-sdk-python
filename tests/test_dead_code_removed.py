@@ -116,7 +116,7 @@ def test_workflow_contextmanager_still_works():
 
     with workflow("explicit-id") as wid:
         assert wid == "explicit-id"
-    # Phase 5 #5.6: workflow() now emits a real UUID4 (matching the
+    # Phase 5 #5.6: workflow now emits a real UUID4 (matching the
     # rest of the SDK's id generation).
     with workflow() as wid:
         _uuid.UUID(wid)  # raises ValueError if not a UUID
@@ -248,8 +248,8 @@ def test_zombie_exception_not_in_lazy_exports(name: str):
 # Sprint 2.7 (B27): dead tenant contextvars / getters
 # ===========================================================================
 # Pre-fix: ``_organization_id_var`` and ``_api_key_id_var`` were
-# defined but never written, so ``get_organization_id()`` and
-# ``get_api_key_id()`` always returned ``None``. The only consumer
+# defined but never written, so ``get_organization_id `` and
+# ``get_api_key_id `` always returned ``None``. The only consumer
 # (``observability.TenantFilter``) was removed in 0.3.1, so the
 # entire pair of contextvars + getters is dead. Post-fix they are
 # gone and these tests pin the removal.
@@ -287,13 +287,13 @@ def test_dir_size_unchanged():
 
     The curated surface is declared in ``nullrun.__all__`` (PEP 562
     via ``__dir__``) — the source of truth lives there. This test
-    pins the *contract* (no rogue globals leak into ``dir()``)
+    pins the *contract* (no rogue globals leak into ``dir ``)
     without hardcoding the count, so adding a new curated symbol
     to ``__all__`` is fine but adding one via a top-level
     import is a regression.
 
     History:
-      * Phase 3.4 — surface was 6: ``__version__``, ``init``,
+      * Phase 3.4 — surface was 6: ``__version__``, ``init``
         ``protect``, ``track_event``, ``track_llm``, ``track_tool``.
       * Layer 2 (``on_error``) and Layer 3 (``status``) — added
         because users need to know they exist (discoverability
@@ -329,7 +329,7 @@ def test_wrap_symbol_absent():
 # These were entries in `_LAZY_EXPORTS` pointing at
 # `("nullrun.instrumentation", "patch_openai")` /
 # `("nullrun.instrumentation", "unpatch_openai")` — neither attribute
-# exists on the module (the real function is `patch_openai_agents`,
+# exists on the module (the real function is `patch_openai_agents`
 # with different semantics: it patches `agents.Runner`, not the
 # `openai` SDK). Pre-fix, `from nullrun import patch_openai` raised
 # `AttributeError` at first access (a confusing runtime crash). Post
@@ -365,7 +365,7 @@ def test_lazy_exports_dict_does_not_contain_patch_openai():
     """
     import nullrun  # noqa: F401
 
-    # `globals()` of the package is the lazy-export cache; we read it
+    # `globals ` of the package is the lazy-export cache; we read it
     # via the module's __dict__ to avoid accessing the actual
     # (non-existent) attribute.
     assert "patch_openai" not in nullrun.__dict__

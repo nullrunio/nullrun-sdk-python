@@ -2,7 +2,7 @@
 Additional tests for ``nullrun.decorators`` — branch coverage for the
 ``_safe_args`` / ``_strip_details_balanced`` / ``_enforce_sensitive_tool``
 helpers, the fail-CLOSED / fail-OPEN contract, the KILL→BlockedException
-unification (Round 3), and the ``@protect()`` paren-form.
+unification (Round 3), and the ``@protect `` paren-form.
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ from nullrun.runtime import NullRunRuntime
 
 @pytest.fixture
 def test_runtime(monkeypatch):
-    """Provide a runtime in test mode so get_runtime() returns without
+    """Provide a runtime in test mode so get_runtime returns without
     authenticating against a real server.
     """
     monkeypatch.setenv("NULLRUN_API_KEY", "test-key-12345678")
@@ -45,10 +45,10 @@ def test_runtime(monkeypatch):
     rt.organization_id = "org-1"
     # Stub the transport so the network is never touched in tests.
     # - ``_do_flush`` overrides the public flush.
-    # - ``_do_flush_locked`` is what ``track()`` calls when the buffer
-    #   fills — must also be stubbed to be safe.
+    # - ``_do_flush_locked`` is what ``track `` calls when the buffer
+    # fills — must also be stubbed to be safe.
     # - ``_client`` is the httpx client — magicmock so even a stray
-    #   ``post`` raises a clean AttributeError instead of hitting the API.
+    # ``post`` raises a clean AttributeError instead of hitting the API.
     rt._transport._do_flush = lambda: None
     rt._transport._do_flush_locked = lambda: None
     rt._transport._client = MagicMock()
@@ -91,7 +91,7 @@ def test_safe_kwargs_masks_sensitive_keys(test_runtime):
     out = _safe_kwargs({"password": "p", "token": "t", "user": "alice"})
     assert out["password"] == "***"
     assert out["token"] == "***"
-    # Non-sensitive values go through _safe_repr → ``repr()``.
+    # Non-sensitive values go through _safe_repr → ``repr ``.
     assert out["user"] == "'alice'"
 
 
@@ -341,7 +341,7 @@ def test_enforce_sensitive_tool_sensitive_kwargs_masked_in_call(test_runtime):
     rt.is_sensitive_tool.return_value = True
     rt.execute.return_value = {"decision": "allow", "decision_source": "gateway"}
     _enforce_sensitive_tool(rt, lambda x: x, (), {"password": "p", "user": "alice"})
-    # ``runtime.execute`` is called positionally: ``(tool_name, input_data, ...)``.
+    # ``runtime.execute`` is called positionally: ``(tool_name, input_data,...)``.
     forwarded = rt.execute.call_args.args[1]
     assert forwarded["kwargs"]["password"] == "***"
     # Non-sensitive → safe_repr → ``"'alice'"``.
@@ -500,7 +500,7 @@ def test_sensitive_runtime_init_failure_raises(test_runtime, monkeypatch):
     assert excinfo.value.__cause__ is original_exc
 
 
-# ─── reset() ──────────────────────────────────────────────────────────
+# ─── reset ──────────────────────────────────────────────────────────
 
 
 def test_reset_clears_runtime_slot(test_runtime, monkeypatch):

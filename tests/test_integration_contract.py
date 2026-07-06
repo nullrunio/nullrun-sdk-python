@@ -32,7 +32,7 @@ from nullrun.transport_websocket import (
 
 # ─────────────────────────────────────────────────────────────────────
 # FIX-F3: every POST must carry Authorization: Bearer <api_key> so the
-# backend CSRF middleware's ``has_bearer_auth`` bypass fires. Without it,
+# backend CSRF middleware's ``has_bearer_auth`` bypass fires. Without it
 # the SDK hits the cookie-double-submit branch → 403 → SDK try/except
 # swallows → silently fail-OPEN on every SDK-side enforcement gate.
 # ─────────────────────────────────────────────────────────────────────
@@ -166,7 +166,7 @@ class TestAckUnitsContract:
 # SDK reads it from the envelope field ``api_key`` (backwards-compat:
 # pre-FIX-F4 envelopes with field name ``api_key_id`` carrying the
 # same value are still accepted). Backend signer uses
-# ``auth_context.api_key()`` — see
+# ``auth_context.api_key `` — see
 # backend/src/proxy/http/ws_control.rs:680-682 + 65-79 + auth/mod.rs.
 #
 # Pin: any drift between the two sides trips here.
@@ -174,9 +174,9 @@ class TestAckUnitsContract:
 
 
 class TestWsHmacIdentityContract:
-    """The HMAC identity for WS messages is the user-facing api_key,
+    """The HMAC identity for WS messages is the user-facing api_key
     not the internal UUID key_id. Pre-FIX-F4 the field was named
-    ``api_key_id`` on the wire but still carried the user-facing value;
+    ``api_key_id`` on the wire but still carried the user-facing value
     the rename to ``api_key`` makes the contract honest. The SDK
     accepts either field name for the rolling-deploy window."""
 
@@ -265,10 +265,10 @@ class TestWsHmacIdentityContract:
 # Canonical-bytes guard: pin the current behaviour where SDK and
 # backend serialise the same dict differently (insertion order vs.
 # sorted keys) but the divergence is harmless today because:
-#   - WS path: signed_payload bytes are sent over the wire verbatim
-#     (FIX-C in transport_websocket.py)
-#   - HTTP path: SDK sends its own bytes via content=body; the backend
-#     hashes exactly what it received (HMAC fix B6 in transport.py)
+# - WS path: signed_payload bytes are sent over the wire verbatim
+# (FIX-C in transport_websocket.py)
+# - HTTP path: SDK sends its own bytes via content=body; the backend
+# hashes exactly what it received (HMAC fix B6 in transport.py)
 #
 # If someone tries to UNIFY these by pre-computing HTTP HMAC and
 # re-canonicalising on the backend, signatures will silently diverge.
@@ -364,7 +364,7 @@ class TestSensitiveToolRoutesToExecute:
 
 # ─────────────────────────────────────────────────────────────────────
 # 0.7.0: TestPolicyFetchFailClosed was retired along with the local
-# Policy class and _fetch_policy(). The SDK no longer fetches policy
+# Policy class and _fetch_policy. The SDK no longer fetches policy
 # from the backend on init (backend owns all policy state now).
 # ─────────────────────────────────────────────────────────────────────
 
@@ -381,7 +381,7 @@ class TestOutgoingAckIsSigned:
 
     Field-name consistency matches the incoming
     ``SignedWsMessage`` envelope: ``api_key`` carries the user-
-    facing API key string (``nr_live_...``) as the HMAC identity,
+    facing API key string (``nr_live_...``) as the HMAC identity
     ``timestamp`` is unix seconds (matches the rest of the SDK —
     see FIX-F5), ``signature`` is sha256 HMAC of
     ``timestamp:api_key:sha256(body)``.
@@ -421,7 +421,7 @@ class TestOutgoingAckIsSigned:
         """Signature MUST be computed over the canonical bytes of the
         unsigned body (3 fields), NOT the signed body (6 fields).
 
-        If we naively computed the signature over the final dict,
+        If we naively computed the signature over the final dict
         the receiver's verify (which hashes the 3-field body) would
         never match — a silent auth break. This test pins the
         invariant so future refactors can't accidentally re-serialise
@@ -470,7 +470,7 @@ class TestOutgoingAckIsSigned:
 
 # ─────────────────────────────────────────────────────────────────────
 # F-R2-06 (audit 2026-06-22): the SDK must accept ALL FIVE
-# ``WsWorkflowState`` variants: Normal, Flagged, Tripped, Paused,
+# ``WsWorkflowState`` variants: Normal, Flagged, Tripped, Paused
 # Killed. Pre-fix the SDK dropped Flagged / Tripped rows on the floor
 # because the local enum was 3-variant. The frontend mirrors this
 # state union.
@@ -490,7 +490,7 @@ class TestAllFiveWorkflowStatesAccepted:
         rejected / filtered / coerced to a fallback."""
         # Pure-function check: the SDK does not maintain a hard-coded
         # list of acceptable states. The state name flows through to
-        # _remote_state_for() and back to check_control_plane() as-is.
+        # _remote_state_for and back to check_control_plane as-is.
         # If a future refactor narrows the accepted set (e.g. by
         # adding an enum with only 3 variants), this test fails.
         from nullrun.runtime import NullRunRuntime
@@ -512,11 +512,11 @@ class TestAllFiveWorkflowStatesAccepted:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# F-R2-12 (audit 2026-06-22): track_event() must register a new
+# F-R2-12 (audit 2026-06-22): track_event must register a new
 # workflow_id in _remote_states atomically against concurrent WS
 # pushes. Pre-fix the lock was held only across setdefault, leaving
 # a window where a WS push could overwrite a freshly-empty dict and
-# then the next track_event() call would create a brand-new empty
+# then the next track_event call would create a brand-new empty
 # dict again — silently losing remote KILL/PAUSE state between the
 # WS push and the next event.
 #
@@ -526,14 +526,14 @@ class TestAllFiveWorkflowStatesAccepted:
 
 
 class TestRemoteStatesAtomicRegistration:
-    """track_event() must register workflow_id atomically.
+    """track_event must register workflow_id atomically.
 
     Known flake: ``test_track_event_uses_locked_helper_for_setdefault``
     uses ``inspect.getsource(rt.track)`` which can race with a
     background flush thread that mutates ``rt._remote_states`` during
     source-string capture. The test passes 5/5 in isolation. Fails
     ~1/20 in the full suite when the timing window lines up with a
-    transport flush. Pre-existing (introduced in 0.6.0 release,
+    transport flush. Pre-existing (introduced in 0.6.0 release
     2026-06-23 14:47, commit 4610ba9 — well before Layer-1 work).
     Re-run in isolation to confirm. Fix path: replace
     ``inspect.getsource`` with a static AST check on
@@ -551,7 +551,7 @@ class TestRemoteStatesAtomicRegistration:
 
         rt = NullRunRuntime(api_key="nr_live_x", _test_mode=True)
         try:
-            # The registration site lives in track() (called from
+            # The registration site lives in track (called from
             # track_event / track_llm / track_tool). Pin it there.
             src = inspect.getsource(rt.track)
             # Pin: no bare ``self._remote_states.setdefault(...)`` calls

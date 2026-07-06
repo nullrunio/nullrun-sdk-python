@@ -5,20 +5,20 @@ distinct buffer-mutation bugs:
 
 1. **Re-binding the attribute** — `self._buffer = self._buffer[overflow:]`
    replaced the list with a new object. Any code holding a reference
-   to the old list (e.g. an in-flight `track()` call) would silently
+   to the old list (e.g. an in-flight `track ` call) would silently
    append to dead memory. The new contract uses in-place slice
    (`del self._buffer[:]`) so the attribute is never re-bound.
 
 2. **CB-OPEN re-queue was effectively a no-op** — the `available_space`
-   check ran AFTER `self._buffer.clear()`, so the buffer was always
+   check ran AFTER `self._buffer.clear `, so the buffer was always
    empty and the overflow slice was dead code. Under sustained
    backend outage, the buffer grew unboundedly. The fix checks the
    batch's own size against `max_buffer_size`.
 
 3. **No single drain point** — the buffer was read, copied, cleared
-   in three separate lines in `track()`'s body, with TOCTOU race
+   in three separate lines in `track `'s body, with TOCTOU race
    windows between copy and clear. The fix centralizes this through
-   a single `_drain_batch()` helper.
+   a single `_drain_batch ` helper.
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ from nullrun.transport import FlushConfig, Transport
 def transport():
     t = Transport(api_url="https://api.test.nullrun.io", api_key="test-key-12345678")
     # Stop the background flush thread so the fixture teardown
-    # (which calls `t.stop()`) doesn't try to send leftover events
+    # (which calls `t.stop `) doesn't try to send leftover events
     # to a real network. Each test that needs flushing must start
     # the thread explicitly OR use `_do_flush_locked` directly.
     t._running = False
@@ -51,7 +51,7 @@ def transport():
 
 class TestBufferIsInPlace:
     """`_drain_batch` must not rebind `_buffer` to a new list — that
-    breaks any in-flight `track()` call holding a reference."""
+    breaks any in-flight `track ` call holding a reference."""
 
     def test_drain_batch_returns_snapshot_and_clears(self, transport):
         for i in range(5):
@@ -86,7 +86,7 @@ class TestOverflowDropsNewest:
     batch is larger than the limit. Pre-fix this was a no-op
     (the buffer was already empty by the time the overflow check
     ran); then it dropped OLDEST, which broke monthly cost
-    rollups (plan §10 P0-4). Critical control-plane events
+    rollups. Critical control-plane events
     (state_change / kill_received / etc.) are preserved."""
 
     def test_batch_within_max_buffer_size_is_kept_verbatim(self, transport):
@@ -104,7 +104,7 @@ class TestOverflowDropsNewest:
     def test_batch_larger_than_max_buffer_drops_newest(self, transport):
         """If `len(batch) > max_buffer_size`, the NEWEST events in
         the batch are dropped before re-queuing. The survivors are
-        the FIRST events (the cost-audit invariant from plan §10
+        the FIRST events (the cost-audit invariant from plan
         P0-4: oldest events are most valuable)."""
         transport.config = FlushConfig(batch_size=200, max_buffer_size=10)
         for i in range(20):
@@ -128,7 +128,7 @@ class TestOverflowDropsNewest:
         kill_received / policy_invalidated / key_rotated events are
         kept regardless of position. The dashboard's KILL switch
         has to land even under sustained backend outage (plan
-        §11.4 P0-4 recommendation)."""
+ P0-4 recommendation)."""
         transport.config = FlushConfig(batch_size=200, max_buffer_size=4)
         # 6 llm_call + 1 state_change at the very end.
         events = [
@@ -184,9 +184,9 @@ class TestOverflowDropsNewest:
 
 
 class TestConcurrentTrackDuringFlush:
-    """A `track()` call racing with `_do_flush_locked` must not lose
+    """A `track ` call racing with `_do_flush_locked` must not lose
     events. The pre-fix code had TOCTOU windows between
-    `_buffer[:]` and `_buffer.clear()`."""
+    `_buffer[:]` and `_buffer.clear `."""
 
     def test_concurrent_track_does_not_lose_events(self, transport):
         """Spawn N threads each appending M events. After all threads
@@ -270,7 +270,7 @@ class TestCircuitOpenRedoesNotDuplicate:
         ):
             transport._do_flush_locked()
 
-        # After CB-OPEN: buffer contains the 5 re-queued events,
+        # After CB-OPEN: buffer contains the 5 re-queued events
         # none of them sent (since the send was skipped).
         assert len(transport._buffer) == 5
         assert transport._in_flight == {}
