@@ -2266,6 +2266,22 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
 
         # Strict mode or sensitive tool: call /execute endpoint
         # (no local_mode branch -- api_key is now required, see T3-S2)
+        # 2026-07-07: pass on_transport_error="raise" so a 4xx/5xx/network
+        # error surfaces immediately on the FIRST attempt rather than
+        # going through Transport.execute's 10-retry exponential backoff
+        # (default max_retries=10, base_delay=0.5, max_delay=30s = up to
+        # 181 seconds per call when the gateway is down). The retry
+        # budget is the right call for transient flakes in the SDK's
+        # optimistic / dashboard-polling path, but for sensitive tools
+        # the policy is fail-CLOSED — retrying a 4xx / ConnectError
+        # just delays the NullRunBlockedException by 3 minutes without
+        # changing its decision. Tests like
+        # test_preflight_fail_policy::test_transport_error_fails_closed
+        # were spending 3 minutes per test waiting for the retry budget
+        # to exhaust; with on_transport_error="raise" they return in
+        # <100ms. The caller-facing contract is unchanged:
+        # NullRunBlockedException is still raised with the same
+        # reason / source classification.
         result = self._transport.execute(
             organization_id=organization_id,
             execution_id=workflow_id,
@@ -2274,7 +2290,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             input_data=input_data,
             mode=mode,
             fallback_mode=self._fallback_mode,
-            on_transport_error=on_transport_error,
+            on_transport_error="raise",
         )
 
         # Update metrics (thread-safe)
