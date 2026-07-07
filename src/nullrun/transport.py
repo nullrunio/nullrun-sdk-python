@@ -339,6 +339,22 @@ def _retry_with_backoff(
 
         except Exception as exc:
             last_exc = exc
+            # Phase 5 #5.10 follow-up (2026-07-07): when the caller
+            # passes `on_transport_error="raise"`, skip the retry loop
+            # entirely. The pre-fix code only short-circuited on the
+            # three typed errors above, but httpx.ConnectError /
+            # TimeoutException / ReadTimeout are not in that tuple —
+            # they fell through here and got the full 10-retry
+            # exponential backoff (~181s) even though the caller has
+            # explicitly asked to fail-fast. With this check, callers
+            # using fail-CLOSED semantics (sensitive-tool decorator,
+            # preflight fail-policy tests) get <100ms fail-fast. The
+            # default `None` path still gets the full retry budget, so
+            # production resilience is unchanged.
+            if on_transport_error == "raise":
+                raise BreakerTransportError(
+                    f"Transport error (no retry: on_transport_error='raise'): {exc}"
+                ) from exc
             # Sprint 3 follow-up (B24): bump ``last_error`` so the
             # operator can read the most recent failure type without
             # grepping logs. The string is the exception class
