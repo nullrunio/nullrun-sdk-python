@@ -1871,8 +1871,24 @@ class Transport:
         server-side from the request auth, not supplied by the SDK.
         The docstring now matches the real wire contract.
         """
-        headers = self._build_signed_headers()
+        # 2026-07-06 (bug-fix): the previous shape called
+        # `_build_signed_headers()` *before* `_signed_request_body()`.
+        # That meant the HMAC branch in `_build_signed_headers`
+        # (gated on `body is not None`) saw `body=None` and skipped
+        # the X-Signature / X-Signature-Timestamp headers. The POST
+        # then went out unsigned; the backend's HMAC middleware
+        # (`HMAC_REQUIRED_PATHS` includes `/api/v1/track`) rejected
+        # the request with 401, the SDK raised
+        # `NullRunAuthenticationError`, the route dropped the event,
+        # and every llm_call event disappeared — leaving the
+        # dashboard stuck at $0 for every execution.
+        #
+        # Fix: build the body FIRST, then pass it to
+        # `_build_signed_headers(body=body)` so the signature is
+        # computed over the exact bytes that go on the wire
+        # (mirrors the canonical pattern in `check()` at L1530).
         body = _signed_request_body(request)
+        headers = self._build_signed_headers(body=body)
 
         try:
             response = self._client.post(
@@ -1922,8 +1938,13 @@ class Transport:
         if reason:
             request["reason"] = reason
 
-        headers = self._build_signed_headers()
+        # 2026-07-06 (bug-fix): same body-before-headers reorder as
+        # track_single above. /api/v1/cancel isn't in HMAC_REQUIRED_PATHS
+        # today, but the helper still adds X-Signature when secret_key
+        # is set, and we want the call to be consistent with the
+        # canonical pattern.
         body = _signed_request_body(request)
+        headers = self._build_signed_headers(body=body)
 
         try:
             response = self._client.post(
@@ -1969,8 +1990,10 @@ class Transport:
             "chain_id":..., "last_active": ts}``).
         """
         request = {"chain_id": chain_id}
-        headers = self._build_signed_headers()
+        # 2026-07-06 (bug-fix): same body-before-headers reorder as
+        # track_single above.
         body = _signed_request_body(request)
+        headers = self._build_signed_headers(body=body)
 
         try:
             response = self._client.post(
@@ -2034,8 +2057,11 @@ class Transport:
             # call (the server ignores it on this path).
             "execution_id": uuid.uuid4().hex,
         }
-        headers = self._build_signed_headers()
+        # 2026-07-06 (bug-fix): same body-before-headers reorder as
+        # track_single. /api/v1/gate is in HMAC_REQUIRED_PATHS so
+        # the unsigned POST would 401 with "missing signature headers".
         body = _signed_request_body(request)
+        headers = self._build_signed_headers(body=body)
 
         try:
             response = self._client.post(
