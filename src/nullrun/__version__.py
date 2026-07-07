@@ -278,5 +278,5 @@ SDK_MIN_VERSION_FOR_V3 = "0.12.0". Recommended upgrade path:
 delta is the per-file mypy table in pyproject.toml).
 """
 
-__version__ = "0.13.2"
+__version__ = "0.13.3"
 __platform_version__ = "1.0.0"
