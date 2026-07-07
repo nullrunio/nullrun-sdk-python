@@ -17,7 +17,7 @@ name = "nullrun"
 # nullrun._singleton (the metaclass-backing descriptor) and
 # nullrun._registry (the runtime registry) so runtime.py stays the
 # orchestrator only. See __version__.py for the full changelog.
-version = "0.13.2"
+version = "0.13.3"
 # Long form used by PyPI page meta-description and search snippets.
 # Kept under the 200-char preview threshold so the full line is visible
 # without an "expand" click. Keywords are matched against likely search
