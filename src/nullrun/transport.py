@@ -535,6 +535,13 @@ class Transport:
         # methods) doesn't deadlock.
         self._flush_thread: threading.Thread | None = None
         self._running = False
+        # Cancellable sleep primitive for the flush loop. ``Event.wait``
+        # returns immediately when ``set()`` is called from ``stop()``,
+        # so a teardown that hits a thread mid-``time.sleep`` no longer
+        # blocks for the full ``flush_interval`` (default 5s) before
+        # ``join`` returns. Pin contract: tests/test_transport.py::
+        # test_stop_interrupts_flush_sleep.
+        self._stop_event = threading.Event()
 
         # mTLS client certificate support
         # NULLRUN_TLS_CLIENT_CERT and NULLRUN_TLS_CLIENT_KEY env vars for client cert auth
@@ -770,6 +777,9 @@ class Transport:
         # Replay any events from WAL that were persisted due to previous crash
         self._replay_from_wal()
         self._running = True
+        # Clear the stop latch so a previous stop() does not short-circuit
+        # the new flush loop on its first sleep.
+        self._stop_event.clear()
         self._flush_thread = threading.Thread(target=self._flush_loop, daemon=True)
         self._flush_thread.start()
         logger.info("Transport flush thread started")
@@ -801,6 +811,13 @@ class Transport:
         """Stop background flush thread and flush remaining events."""
         self._running = False
         self._stopped = True  # Mark as stopped to prevent double flush
+        # Wake the flush thread out of its cancellable sleep so join()
+        # returns immediately instead of waiting out the full
+        # ``flush_interval``. Without this, a teardown that hits the
+        # thread mid-sleep pays the 5s default flush_interval per
+        # shutdown — a multiplier on every test that calls
+        # ``runtime.shutdown()``.
+        self._stop_event.set()
         if self._flush_thread:
             self._flush_thread.join(timeout=timeout)
         self._do_flush()  # Final flush
@@ -816,7 +833,14 @@ class Transport:
     def _flush_loop(self) -> None:
         """Background loop that periodically flushes."""
         while self._running:
-            time.sleep(self.config.flush_interval)
+            # ``Event.wait`` returns True when ``stop()`` sets the
+            # event — that is the cancel signal. On timeout it
+            # returns False and we fall through to a flush. Replaces
+            # a plain ``time.sleep`` that could not be interrupted
+            # early, so stop() used to block for the full interval.
+            cancelled = self._stop_event.wait(timeout=self.config.flush_interval)
+            if cancelled:
+                break
             if self._running:
                 self._do_flush()
 

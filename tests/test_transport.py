@@ -76,6 +76,41 @@ class TestTransport:
         transport.stop()
         assert route.called
 
+    def test_stop_interrupts_flush_sleep(self):
+        """stop() must wake the flush thread out of its cancellable
+        sleep instead of waiting out the full ``flush_interval``.
+
+        Regression pin for the CI-speed fix: the previous loop used a
+        bare ``time.sleep``, so a test that called ``runtime.shutdown
+        ()`` while the thread was mid-sleep blocked for the full
+        interval (default 5s). With ``Event.wait`` the join returns
+        within a few hundred ms — so the whole suite runs in tens of
+        seconds instead of 15+ minutes. Uses a deliberately long
+        ``flush_interval`` to make the regression obvious if it
+        creeps back.
+        """
+        from nullrun.transport import FlushConfig
+
+        t = Transport(
+            api_url="https://api.test.nullrun.io",
+            api_key="test-key-12345678",
+            config=FlushConfig(flush_interval=30.0),  # would be 30s pre-fix
+        )
+        t.start()
+        # Give the thread a beat to enter _flush_loop's wait.
+        time.sleep(0.05)
+        started = time.monotonic()
+        t.stop()
+        elapsed = time.monotonic() - started
+        # Allow generous headroom for CI jitter; the contract is
+        # "much less than flush_interval" — a pre-fix run would hit
+        # the full 30s and time out this assertion.
+        assert elapsed < 5.0, (
+            f"stop() took {elapsed:.2f}s; expected < 5s. The flush "
+            f"loop is sleeping in plain ``time.sleep`` again — the "
+            f"cancellable-wait fix regressed."
+        )
+
     def test_ssl_verification_enabled(self, transport):
         # httpx 0.28+ doesn't expose verify as a direct attribute
         # SSL verification is enabled by default (verify=True)
