@@ -1822,8 +1822,20 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         headers[HEADER_PROTOCOL] = _protocol_header_value()
         return headers
 
-    def shutdown(self) -> None:
-        """Shutdown runtime gracefully."""
+    def shutdown(self, flush: bool = True) -> None:
+        """Shutdown runtime gracefully.
+
+        Args:
+            flush: when True (default) the transport drains any
+                buffered events to the backend on the way out — the
+                production "send everything you have before we go"
+                contract. When False, the transport thread is
+                cancelled without a final ``_do_flush()``. Used by
+                the test conftest to teardown between tests without
+                racing the respx context exit
+                (see ``Transport.stop(flush=False)`` for the full
+                rationale; observed 9m 47s CI noise on PR #60).
+        """
         # Stop the HTTP poller (legacy path) if it was started.
         self._poll_running = False
         if self._poll_thread and self._poll_thread.is_alive():
@@ -1847,7 +1859,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             self._ws_thread.join(timeout=0.5)
 
         if self._transport:
-            self._transport.stop()
+            self._transport.stop(flush=flush)
         NullRunRuntime._instance = None
         logger.info("NullRun Runtime shutdown")
 

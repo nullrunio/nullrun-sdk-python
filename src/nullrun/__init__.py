@@ -41,7 +41,7 @@ from nullrun.decorators import protect  # the gate decorator
 from nullrun.runtime import track_event, track_llm, track_tool
 
 
-def shutdown(timeout: float = 2.0) -> None:
+def shutdown(timeout: float = 2.0, flush: bool = True) -> None:
     """Gracefully shut down the NullRun runtime.
 
     Sends a clean WebSocket close frame, drains in-flight events, and
@@ -62,6 +62,13 @@ def shutdown(timeout: float = 2.0) -> None:
             ``NullRunRuntime.shutdown `` already caps WS join at
             0.5s and the WS close at 2.0s — this parameter is
             reserved for future expansion and is currently unused.
+        flush: when True (default) the transport drains any
+            buffered events to the backend on the way out. Pass
+            False to cancel the flush thread without a final
+            network call — used by the test conftest to teardown
+            between tests without racing the respx context exit
+            (see ``NullRunRuntime.shutdown(flush=False)`` for the
+            full rationale).
 
     Example::
 
@@ -75,7 +82,7 @@ def shutdown(timeout: float = 2.0) -> None:
     runtime = NullRunRuntime._instance  # type: ignore[attr-defined]
     if runtime is None:
         return
-    runtime.shutdown()
+    runtime.shutdown(flush=flush)
 
 
 def status():

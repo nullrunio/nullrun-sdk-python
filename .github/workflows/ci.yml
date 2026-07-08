@@ -11,7 +11,11 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    # 2026-07-08: fail-fast on the first matrix failure instead of
+    # wasting runner minutes on the remaining Python versions when
+    # the suite is already red. Speed gain is per-run, not per-test.
     strategy:
+      fail-fast: true
       matrix:
         python: ["3.10", "3.11", "3.12"]
 
@@ -22,14 +26,29 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
+          # Cache pip's download cache keyed on the lock-relevant
+          # surfaces of pyproject.toml. Skips the ~60-90s cold
+          # install on warm caches; the action also reuses the
+          # cache across matrix legs when the key matches.
+          cache: "pip"
+          cache-dependency-path: pyproject.toml
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          # xdist ships in the dev tree already; pin it explicitly so
+          # a future deps churn can't drop it without breaking CI.
+          pip install -e ".[dev]" "pytest-xdist>=3.6"
 
       - name: Run tests
-        run: pytest
+        # `-n auto` lets xdist pick a worker count from the runner's
+        # CPU count. With the transport cancellable-sleep fix the
+        # 5s-per-shutdown multiplier is gone, and xdist plus the
+        # existing respx-based mocking keeps the per-test wall clock
+        # near single-thread baseline (no shared state between
+        # workers — ``reset_runtime`` autouse fixture in conftest
+        # is per-process by construction under xdist).
+        run: pytest -n auto --durations=20
 
       - name: Run ruff
         run: ruff check src/
@@ -46,8 +65,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -e ".[dev]"
-      - run: coverage run -m pytest
+          cache: "pip"
+          cache-dependency-path: pyproject.toml
+      - run: pip install -e ".[dev]" "pytest-xdist>=3.6"
+      # Single Python leg for coverage — multi-version coverage
+      # reports don't add signal and double the runner time. 3.12
+      # is the modern floor for typing-only changes.
+      - run: coverage run -m pytest -n auto
       - uses: codecov/codecov-action@v4
         if: always()
         with:
