@@ -807,8 +807,25 @@ class Transport:
         except Exception as e:  # noqa: BLE001 — best-effort on context exit
             logger.debug(f"Transport.__exit__: stop() raised: {e}")
 
-    def stop(self, timeout: float = 10.0) -> None:
-        """Stop background flush thread and flush remaining events."""
+    def stop(self, timeout: float = 10.0, flush: bool = True) -> None:
+        """Stop background flush thread and flush remaining events.
+
+        Args:
+            timeout: max seconds to wait for the flush thread to exit.
+            flush: when True (default) the final ``_do_flush()`` and
+                ``_persist_to_wal()`` run after the thread joins — the
+                production "drain on the way out" contract. When
+                False, the thread is cancelled but the buffer is left
+                alone. The test conftest uses ``flush=False`` to
+                teardown between tests without a final httpx call —
+                in tests the respx context has already exited by the
+                time the conftest's teardown runs, so a final
+                ``_do_flush()`` would race respx and trigger a
+                ``ConnectError`` retry storm
+                (observed: 9m 47s of "Request failed (attempt N/11),
+                retrying in 10s" on PR #60, dominating the
+                otherwise-fast xdist wall clock).
+        """
         self._running = False
         self._stopped = True  # Mark as stopped to prevent double flush
         # Wake the flush thread out of its cancellable sleep so join()
@@ -820,8 +837,9 @@ class Transport:
         self._stop_event.set()
         if self._flush_thread:
             self._flush_thread.join(timeout=timeout)
-        self._do_flush()  # Final flush
-        self._persist_to_wal()  # WAL any remaining events
+        if flush:
+            self._do_flush()  # Final flush
+            self._persist_to_wal()  # WAL any remaining events
         self._client.close()
         # Detach the weakref finalizer — stop is the canonical
         # "I am done" path. After this point the finalizer will

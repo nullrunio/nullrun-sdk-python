@@ -42,8 +42,24 @@ def reset_runtime():
 
     yield
 
-    # Just clear references, don't call shutdown which may try HTTP calls
-    # after respx mock context has already exited
+    # Stop any running transport flush thread BEFORE we drop the
+    # reference. Without this the thread keeps running across tests,
+    # the buffer drains through httpx with no respx context active,
+    # and the worker logs a ``ConnectError`` retry storm for the rest
+    # of the xdist session — observed 9m 47s of "Request failed
+    # (attempt N/11), retrying in 10s" on PR #60, which dwarfed the
+    # actual test time. ``flush=False`` skips the final ``_do_flush``
+    # / ``_persist_to_wal`` so the teardown is a true no-op even when
+    # the buffer still has events; the test that wrote them is
+    # responsible for asserting on what it cared about. Best-effort:
+    # the runtime may be in any state at teardown, and we don't want
+    # a flaky shutdown to mask the real test failure that just ran.
+    inst = NullRunRuntime._instance
+    if inst is not None:
+        try:
+            inst.shutdown(flush=False)
+        except Exception:
+            pass
     NullRunRuntime._instance = None
     _dec._runtime = None
     _act._action_handler = None

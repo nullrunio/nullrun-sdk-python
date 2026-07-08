@@ -111,6 +111,59 @@ class TestTransport:
             f"cancellable-wait fix regressed."
         )
 
+    def test_stop_flush_false_skips_final_flush(self):
+        """``stop(flush=False)`` cancels the thread WITHOUT a final
+        ``_do_flush()`` so the conftest can teardown between tests
+        without racing the respx context exit.
+
+        Regression pin for the second CI-noise fix (PR #60 follow-up):
+        the conftest previously nulled the runtime reference without
+        calling ``shutdown()`` so the transport flush thread kept
+        running with a non-empty buffer; on the next ``_do_flush``
+        (after respx exited) httpx hit the real network, got
+        ``ConnectError``, retried 11 times with up-to-10s backoff,
+        and dominated the xdist wall clock (9m 47s of
+        "Request failed (attempt N/11), retrying in 10s").
+
+        The contract being pinned here: with ``flush=False``,
+        ``_do_flush`` is NOT called from ``stop()`` even when the
+        buffer is non-empty. The teardown is a true no-op apart
+        from the thread join.
+        """
+        from nullrun.transport import FlushConfig
+
+        t = Transport(
+            api_url="https://api.test.nullrun.io",
+            api_key="test-key-12345678",
+            config=FlushConfig(flush_interval=30.0),
+        )
+        t.start()
+        # Buffer an event so a final _do_flush() would have something
+        # to attempt to send (and therefore would race respx).
+        t._buffer.append({"event_id": "x", "event": "test"})
+        # No respx mock active here — if stop() tries to flush, httpx
+        # will block for the 5s connect timeout per attempt and
+        # multiply by the retry budget. The whole point of
+        # ``flush=False`` is to skip that path entirely.
+        started = time.monotonic()
+        t.stop(flush=False)
+        elapsed = time.monotonic() - started
+        # Generous bound: thread join is the only blocking step. A
+        # regression to "stop() always flushes" would push this
+        # past 60s on the first failure.
+        assert elapsed < 1.0, (
+            f"stop(flush=False) took {elapsed:.2f}s; expected < 1s. "
+            f"The final _do_flush() ran despite flush=False — the "
+            f"conftest teardown is back to racing respx and the "
+            f"CI retry-storm regression is open again."
+        )
+        # And the buffer is left alone — the conftest contract is
+        # "we don't care, the test that wrote it is responsible".
+        assert len(t._buffer) == 1, (
+            f"stop(flush=False) should leave the buffer untouched; "
+            f"expected 1 event, got {len(t._buffer)}."
+        )
+
     def test_ssl_verification_enabled(self, transport):
         # httpx 0.28+ doesn't expose verify as a direct attribute
         # SSL verification is enabled by default (verify=True)

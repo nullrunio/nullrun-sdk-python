@@ -16,6 +16,7 @@ unknown-kwarg rejection (the 7-symbol surface of the SDK is
 from __future__ import annotations
 
 import threading
+import time
 
 import pytest
 
@@ -316,3 +317,57 @@ class TestInitCapabilityProbeLogging:
                 rt.shutdown()
         finally:
             _caps_mod.probe_capabilities = original_probe
+
+
+class TestShutdownFlushKwarg:
+    """Regression pin for the PR #60 follow-up: ``shutdown(flush=...)``
+    must propagate to ``Transport.stop(flush=...)`` so the test
+    conftest can teardown between tests without racing the respx
+    context exit. Pre-this-pin, the conftest's teardown just nulled
+    the runtime reference; the transport flush thread kept running
+    with a non-empty buffer, the next ``_do_flush`` raced respx and
+    hit the real network, and CI logged 9m 47s of
+    "Request failed (attempt N/11), retrying in 10s" — dominating
+    the otherwise-fast xdist wall clock.
+    """
+
+    def test_runtime_shutdown_flush_false_skips_final_flush(self, mock_api):
+        """``runtime.shutdown(flush=False)`` cancels the transport
+        thread WITHOUT triggering a final ``_do_flush()``.
+
+        We use ``_test_mode=True`` so init skips auth, then buffer
+        an event directly into the transport (bypassing
+        ``track()``'s auth path), then call ``shutdown(flush=False
+        )`` AFTER the respx context has exited. The whole call must
+        return in well under 1s; a regression to
+        ``shutdown(flush=...)`` not propagating would push the
+        assertion past the 5s connect timeout × retry budget.
+        """
+        # _test_mode skips auth but still starts the transport thread.
+        rt = NullRunRuntime(
+            api_key="test-key-12345678",
+            _test_mode=True,
+            polling=False,
+        )
+        # Buffer an event so a final _do_flush() would have
+        # something to attempt to send. mock_api is a function-
+        # scoped fixture; we drop the reference so the respx
+        # context exits before we call shutdown.
+        rt._transport._buffer.append({"event_id": "x", "event": "test"})
+
+        started = time.monotonic()
+        rt.shutdown(flush=False)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 1.0, (
+            f"shutdown(flush=False) took {elapsed:.2f}s; expected "
+            f"<1s. The flush=False kwarg did not propagate to "
+            f"Transport.stop() — the conftest teardown regression "
+            f"is back."
+        )
+        # And the buffer is left alone — the test that wrote it
+        # is responsible for asserting on what it cared about.
+        assert len(rt._transport._buffer) == 1, (
+            f"shutdown(flush=False) should leave the buffer alone; "
+            f"expected 1 event, got {len(rt._transport._buffer)}."
+        )
