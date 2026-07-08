@@ -17,7 +17,18 @@ name = "nullrun"
 # nullrun._singleton (the metaclass-backing descriptor) and
 # nullrun._registry (the runtime registry) so runtime.py stays the
 # orchestrator only. See __version__.py for the full changelog.
-version = "0.13.3"
+# 0.13.3 (2026-07-07): developer-ergonomics — `langgraph` import
+# semantics + cleanup of dead `protos/` target. See __version__.py.
+# 0.13.4 (2026-07-08): bug-fix — flatten the LangChain usage-
+# extraction elif-chain so every attribute source is read (not just
+# the first one with ``hasattr`` truthy). Pairs with PR #59.
+# 0.13.5 (2026-07-08): perf — make ``Transport._flush_loop`` sleep
+# cancellable (``threading.Event.wait`` instead of ``time.sleep``)
+# so ``runtime.shutdown()`` returns in ms instead of waiting out
+# the full ``flush_interval`` (5s default). Plus CI hygiene:
+# pip cache, ``fail-fast`` matrix, ``pytest-xdist -n auto``. No
+# on-wire change; backends on 1.0.0 keep working unchanged.
+version = "0.13.5"
 # Long form used by PyPI page meta-description and search snippets.
 # Kept under the 200-char preview threshold so the full line is visible
 # without an "expand" click. Keywords are matched against likely search
@@ -140,6 +151,14 @@ dev = [
     "ruff>=0.5",
     "coverage[toml]>=7.0",
     "httpx>=0.27.0,<1.0",
+    # xdist pins the parallel runner as a first-class dev dep so
+    # `pip install -e ".[dev]"` brings it in for local runs and
+    # CI both. The CI workflow also installs it explicitly to
+    # survive a future pyproject prune. ``-n auto`` is set in
+    # the workflow rather than ``addopts`` so single-CPU local
+    # runs (e.g. ``pytest tests/test_one.py``) don't accidentally
+    # spawn a worker pool.
+    "pytest-xdist>=3.6",
     # The SDK eagerly imports `nullrun.instrumentation.langgraph`
     # (from `nullrun.decorators`, imported by `nullrun.__init__` at
     # collection time), which itself does `from langchain_core.callbacks
@@ -477,7 +496,15 @@ ignore = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-addopts = "--tb=short -q"
+# 2026-07-08: dropped the global ``-q`` so CI logs surface the
+# full PASSED line for each test (handy when scanning a red run).
+# Per-test verbosity stays low because ``--tb=short`` keeps the
+# tracebacks compact. ``-n auto`` lives in the workflow file, not
+# here, so a developer running ``pytest tests/test_x.py`` locally
+# gets a single process — the worker pool is only worth it on
+# the full suite, and some single-file debug sessions actively
+# want serial execution.
+addopts = "--tb=short"
 # Make the tests/ directory importable as a top-level package so
 # tests can use `from tests.conftest import BASE_URL`. Without this,
 # `from tests.conftest` raises ModuleNotFoundError on Python 3.10/3.11

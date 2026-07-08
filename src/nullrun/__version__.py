@@ -300,7 +300,87 @@ test_instrumentation_phase41.py. Wire format is unchanged.
 
 Recommended upgrade path: 0.13.3 -> 0.13.4. No SDK_MIN_VERSION
 bump; backends on 1.0.0 keep working unchanged.
+
+---
+
+v3.16 / 0.13.5 (2026-07-08) — perf release: cancel the Transport
+flush-thread sleep so ``runtime.shutdown()`` returns in ms, not
+seconds. Plus CI hygiene so the freed time actually surfaces as
+faster CI.
+
+  1. ``Transport._flush_loop`` (transport.py:816) swapped its bare
+     ``time.sleep(self.config.flush_interval)`` for
+     ``self._stop_event.wait(timeout=...)``. The previous loop was
+     uncancellable — any caller of ``runtime.shutdown()`` while the
+     thread was mid-sleep blocked on ``thread.join()`` for the full
+     default 5s ``flush_interval`` before teardown could proceed.
+     With 1222 tests in the suite and many paths calling
+     ``shutdown()`` (or its fixture teardowns), that multiplied into
+     ~10-15 minutes of pure teardown wall-clock per Python in the
+     matrix. New ``threading.Event`` is set by ``stop()`` before
+     ``join()`` and cleared by ``start()`` so a restart-after-stop
+     is clean. Pin contract: ``tests/test_transport.py::
+     test_stop_interrupts_flush_sleep`` uses a 30s ``flush_interval``
+     and asserts ``stop() < 5s``; pre-fix this took 30s, post-fix
+     ~0.3s.
+
+  2. CI workflow cleanup (.github/workflows/ci.yml +
+     publish.yml + publish-test.yml):
+
+       * ``setup-python`` action now declares ``cache: pip`` with
+         ``cache-dependency-path: pyproject.toml`` so warm caches
+         skip the ~60-90s cold ``pip install -e .[dev]`` per matrix
+         leg.
+       * ``strategy.fail-fast: true`` on the test matrix so a red
+         run doesn't burn the remaining Python legs once the first
+         one fails.
+       * ``pip install "pytest-xdist>=3.6"`` + ``pytest -n auto`` so
+         the suite runs across all runner cores. ``xdist`` is also
+         added to ``[project.optional-dependencies.dev]`` so local
+         ``pip install -e .[dev]`` brings it in by default.
+       * ``coverage`` job also gets ``-n auto`` (single Python leg,
+         3.12, is unchanged).
+
+  3. ``pyproject.toml``: dropped the global ``-q`` from
+     ``addopts`` so CI logs surface the full ``PASSED`` line per
+     test. ``--tb=short`` keeps tracebacks compact. ``-n auto``
+     stays in the workflow (not in ``addopts``) so a developer
+     running ``pytest tests/test_x.py`` locally still gets a single
+     process — the worker pool is only worth it on the full
+     suite.
+
+No public API change. The default ``FlushConfig`` is unchanged
+(5s ``flush_interval``, 50 ``batch_size``); production flush cadence
+is identical. The fix only shortens the worst-case shutdown latency.
+No SDK_MIN_VERSION bump. Backends on 1.0.0 keep working unchanged.
+Recommended upgrade path: 0.13.4 -> 0.13.5.
+
+---
+
+v3.16 / 0.13.4 (2026-07-08) -- bug-fix: complete the LangChain
+usage-extraction elif-chain.
+
+Pre-fix extract_usage_from_response walked the 4 source branches
+if-hasattr-usage_metadata ... elif-hasattr-generations ...
+elif-hasattr-usage ... elif-hasattr-response_metadata. A LangChain
+AIMessage can carry token info on multiple attributes at once.
+When the first branch's hasattr returned True but the value was
+empty or 0/0/0 (streaming init state, some provider wrappers),
+every subsequent elif was skipped and the SDK shipped tokens=0
+to the backend -- making the LLM call invisible on the dashboard.
+
+Switched all 4 source branches to plain if so each one attempts
+its read; later branches naturally overwrite the zero default when
+the earlier branch value is empty. New regression test
+test_extract_usage_metadata_zero_response_metadata_real.
+
+39 tests in test_langgraph_callback.py still pass; no
+regression in test_extractors.py or
+test_instrumentation_phase41.py. Wire format is unchanged.
+
+Recommended upgrade path: 0.13.3 -> 0.13.4. No SDK_MIN_VERSION
+bump; backends on 1.0.0 keep working unchanged.
 """
 
-__version__ = "0.13.4"
+__version__ = "0.13.5"
 __platform_version__ = "1.0.0"
