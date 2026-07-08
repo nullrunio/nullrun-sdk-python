@@ -46,6 +46,37 @@ def test_extract_usage_metadata_dict_form():
     assert usage["has_usage"] is True
 
 
+def test_extract_usage_metadata_zero_response_metadata_real() -> None:
+    """2026-07-08: regression for the `elif`-chain token-extraction bug.
+
+    The pre-fix extractor walked `if hasattr(... usage_metadata): ...
+    elif hasattr(... response_metadata): ...`. If a LangChain AIMessage
+    carried an empty `usage_metadata` (0/0/0) but a populated
+    `response_metadata.token_usage` (the real numbers), the elif skipped
+    `response_metadata` and the SDK shipped `tokens=0` to the backend —
+    making the LLM call invisible on the dashboard.
+
+    After the fix, all 4 source branches are `if` (not `elif`) so the
+    populated `response_metadata` overwrites the empty `usage_metadata`.
+    The test asserts the non-zero numbers come through to the wire shape.
+    """
+    response = SimpleNamespace(
+        usage_metadata={"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+        response_metadata={
+            "token_usage": {
+                "prompt_tokens": 26,
+                "completion_tokens": 48,
+                "total_tokens": 74,
+            }
+        },
+    )
+    usage = extract_usage_from_response(response, provider="openai", model="gpt-4.1-mini")
+    assert usage["input_tokens"] == 26, f"expected 26, got {usage['input_tokens']}"
+    assert usage["output_tokens"] == 48, f"expected 48, got {usage['output_tokens']}"
+    assert usage["total_tokens"] == 74, f"expected 74, got {usage['total_tokens']}"
+    assert usage["has_usage"] is True
+
+
 def test_extract_usage_metadata_object_form():
     """Object with .input_tokens / .output_tokens / .total_tokens attrs."""
     response = SimpleNamespace(
