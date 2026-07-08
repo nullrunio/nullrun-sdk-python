@@ -211,7 +211,7 @@ def extract_usage_from_response(response: Any, provider: str, model: str) -> dic
             }
 
     # For callback-based LLMResult, check generations[0][0].message.usage_metadata
-    elif hasattr(response, 'generations') and response.generations:
+    if hasattr(response, 'generations') and response.generations:
         first_gen = response.generations[0][0] if response.generations else None
         if first_gen and hasattr(first_gen, 'message'):
             msg = first_gen.message
@@ -233,7 +233,7 @@ def extract_usage_from_response(response: Any, provider: str, model: str) -> dic
                     }
 
     # Try response.usage (Anthropic, standard OpenAI format)
-    elif hasattr(response, 'usage') and response.usage:
+    if hasattr(response, 'usage') and response.usage:
         usage_raw = response.usage
         if isinstance(usage_raw, dict):
             usage["input_tokens"] = usage_raw.get('input_tokens', 0) or 0
@@ -251,8 +251,20 @@ def extract_usage_from_response(response: Any, provider: str, model: str) -> dic
                 'total_tokens': usage["total_tokens"],
             }
 
+    # All 4 sources above are `if` (not `elif`) because the same
+    # response can carry token info on multiple attributes (e.g.
+    # `usage_metadata = {}` plus `response_metadata.token_usage =
+    # {real tokens}`). `elif` would silently drop the
+    # `response_metadata` branch whenever the previous branch's
+    # hasattr() returned True with an empty value. The first
+    # non-empty source wins; later branches may overwrite (LangChain
+    # providers in practice never put conflicting numbers on two
+    # attributes of the same response, so a "last-wins" is safe
+    # in practice; see the `_extract_usage` docstring for the
+    # priority order rationale).
+    #
     # Try response_metadata (some providers) - also check llm_output for LLMResult
-    elif hasattr(response, 'response_metadata'):
+    if hasattr(response, 'response_metadata'):
         resp_meta = response.response_metadata
         if isinstance(resp_meta, dict):
             # Some providers put token info here
@@ -269,7 +281,7 @@ def extract_usage_from_response(response: Any, provider: str, model: str) -> dic
                 usage["total_tokens"] = token_usage.get('total_tokens', 0) or 0
                 usage["raw_usage"] = dict(token_usage)
     # Check llm_output for LLMResult (callback case)
-    elif hasattr(response, 'llm_output') and response.llm_output:
+    if hasattr(response, 'llm_output') and response.llm_output:
         token_usage = response.llm_output.get('token_usage', {})
         if isinstance(token_usage, dict):
             usage["input_tokens"] = (
