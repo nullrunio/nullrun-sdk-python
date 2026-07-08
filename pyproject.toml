@@ -17,7 +17,18 @@ name = "nullrun"
 # nullrun._singleton (the metaclass-backing descriptor) and
 # nullrun._registry (the runtime registry) so runtime.py stays the
 # orchestrator only. See __version__.py for the full changelog.
-version = "0.13.4"
+# 0.13.3 (2026-07-07): developer-ergonomics — `langgraph` import
+# semantics + cleanup of dead `protos/` target. See __version__.py.
+# 0.13.4 (2026-07-08): bug-fix — flatten the LangChain usage-
+# extraction elif-chain so every attribute source is read (not just
+# the first one with ``hasattr`` truthy). Pairs with PR #59.
+# 0.13.5 (2026-07-08): perf — make ``Transport._flush_loop`` sleep
+# cancellable (``threading.Event.wait`` instead of ``time.sleep``)
+# so ``runtime.shutdown()`` returns in ms instead of waiting out
+# the full ``flush_interval`` (5s default). Plus CI hygiene:
+# pip cache, ``fail-fast`` matrix, ``pytest-xdist -n auto``. No
+# on-wire change; backends on 1.0.0 keep working unchanged.
+version = "0.13.5"
 # Long form used by PyPI page meta-description and search snippets.
 # Kept under the 200-char preview threshold so the full line is visible
 # without an "expand" click. Keywords are matched against likely search
