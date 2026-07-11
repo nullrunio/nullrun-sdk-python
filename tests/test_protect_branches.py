@@ -35,11 +35,20 @@ from nullrun.runtime import NullRunRuntime
 
 
 @pytest.fixture
-def test_runtime(monkeypatch):
+def test_runtime(monkeypatch, tmp_path):
     """Provide a runtime in test mode so get_runtime returns without
     authenticating against a real server.
+
+    Replays any WAL left over from previous test runs in a
+    tmp_path-scoped WAL file so the constructor's
+    ``_replay_from_wal`` never reads ``~/.nullrun/sdk.wal`` and
+    flushes real on-disk events to a live API. This avoids the
+    cross-Python-version flake seen on CI in 2026-07-11 where
+    3.11 picked up a stale WAL from a 3.10/3.12 worker that
+    finished without explicitly clearing it.
     """
     monkeypatch.setenv("NULLRUN_API_KEY", "test-key-12345678")
+    monkeypatch.setenv("NULLRUN_WAL_PATH", str(tmp_path / "sdk.wal"))
     NullRunRuntime.reset_instance()
     rt = NullRunRuntime(api_key="test-key-12345678", _test_mode=True)
     rt.organization_id = "org-1"
