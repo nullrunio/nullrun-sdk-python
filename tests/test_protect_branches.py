@@ -446,13 +446,13 @@ def test_protect_sync_pause_raises_NullRunBlockedException(test_runtime):
 
 
 @pytest.mark.asyncio
-async def test_protect_async_kill_re_raises_WorkflowKilledInterrupt():
+async def test_protect_async_kill_re_raises_WorkflowKilledInterrupt(make_test_runtime):
     """Async wrapper does NOT unify — kill signal propagates as-is so
     async frameworks can interrupt the event loop cleanly.
     """
     from nullrun import decorators as dec_mod
 
-    rt = NullRunRuntime(api_key="test-key-12345678", _test_mode=True)
+    rt = make_test_runtime()
     rt.track_event = MagicMock()
     rt.check_control_plane = MagicMock(
         side_effect=WorkflowKilledInterrupt(workflow_id="wf-1", reason="x")
@@ -551,12 +551,12 @@ def test_get_protected_runtime_returns_runtime(test_runtime):
     assert decorators.get_protected_runtime() is rt
 
 
-def test_get_protected_runtime_falls_back_to_get_runtime(test_runtime, monkeypatch):
+def test_get_protected_runtime_falls_back_to_get_runtime(monkeypatch, make_test_runtime):
     """When the decorator slot is empty, fall back to the global singleton."""
     from nullrun import decorators
 
     decorators._runtime = None
-    NullRunRuntime._instance = NullRunRuntime(api_key="test-key-12345678", _test_mode=True)
+    NullRunRuntime._instance = make_test_runtime()
     try:
         out = decorators.get_protected_runtime()
         assert out is NullRunRuntime._instance
