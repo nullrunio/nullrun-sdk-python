@@ -415,31 +415,6 @@ is identical. The fix only shortens the worst-case shutdown latency.
 No SDK_MIN_VERSION bump. Backends on 1.0.0 keep working unchanged.
 Recommended upgrade path: 0.13.4 -> 0.13.5.
 
----
-
-v3.16 / 0.13.4 (2026-07-08) -- bug-fix: complete the LangChain
-usage-extraction elif-chain.
-
-Pre-fix extract_usage_from_response walked the 4 source branches
-if-hasattr-usage_metadata ... elif-hasattr-generations ...
-elif-hasattr-usage ... elif-hasattr-response_metadata. A LangChain
-AIMessage can carry token info on multiple attributes at once.
-When the first branch's hasattr returned True but the value was
-empty or 0/0/0 (streaming init state, some provider wrappers),
-every subsequent elif was skipped and the SDK shipped tokens=0
-to the backend -- making the LLM call invisible on the dashboard.
-
-Switched all 4 source branches to plain if so each one attempts
-its read; later branches naturally overwrite the zero default when
-the earlier branch value is empty. New regression test
-test_extract_usage_metadata_zero_response_metadata_real.
-
-39 tests in test_langgraph_callback.py still pass; no
-regression in test_extractors.py or
-test_instrumentation_phase41.py. Wire format is unchanged.
-
-Recommended upgrade path: 0.13.3 -> 0.13.4. No SDK_MIN_VERSION
-bump; backends on 1.0.0 keep working unchanged.
 """
 
 __version__ = "0.13.6"
