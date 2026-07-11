@@ -168,3 +168,44 @@ def make_runtime(mock_api):
         return rt
 
     return _make
+
+@pytest.fixture
+def make_test_runtime(monkeypatch, tmp_path):
+    """Factory for tests that build a real ``NullRunRuntime`` inline
+    (no ``mock_api`` indirection).
+
+    Pins ``NULLRUN_WAL_PATH`` to a tmp_path-scoped file so the
+    constructor's ``Transport._replay_from_wal`` never reads the
+    default ``tempfile.gettempdir()/nullrun.wal`` (which may carry
+    real on-disk events from a previous test run or parallel
+    worker and would cause HTTP 401 → ``NullRunAuthError`` in
+    setup). Mirrors the ``test_runtime`` fixture in
+    ``test_protect_branches.py`` so all tests that build a runtime
+    directly get the same isolation.
+
+    Stub ``_do_flush`` / ``_do_flush_locked`` / ``_client`` so any
+    real network attempt is no-op'd. Reset singleton around the
+    factory so test ordering is independent.
+    """
+    from unittest.mock import MagicMock
+    from nullrun.runtime import NullRunRuntime
+
+    NullRunRuntime.reset_instance()
+    # Pre-pin the WAL path before any runtime can be constructed
+    # (otherwise the default is captured at first construction).
+    monkeypatch.setenv("NULLRUN_WAL_PATH", str(tmp_path / "sdk.wal"))
+
+    def _factory(**overrides):
+        api_key = overrides.pop("api_key", "test-key-12345678")
+        rt = NullRunRuntime(api_key=api_key, _test_mode=True)
+        # Stub the network-facing pieces for tests that build a
+        # runtime inline (not via ``mock_api``).
+        rt._transport._do_flush = lambda: None
+        rt._transport._do_flush_locked = lambda: None
+        rt._transport._client = MagicMock()
+        for k, v in overrides.items():
+            setattr(rt, k, v)
+        return rt
+
+    yield _factory
+    NullRunRuntime.reset_instance()

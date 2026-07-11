@@ -15,10 +15,18 @@ from nullrun.toolbox.langgraph import wrapper
 
 
 @pytest.fixture(autouse=True)
-def _test_runtime(monkeypatch):
+def _test_runtime(monkeypatch, tmp_path):
     """Provide a runtime in test mode so get_runtime returns without
-    authenticating against a real server."""
+    authenticating against a real server.
+
+    Pins ``NULLRUN_WAL_PATH`` to a tmp_path-scoped file so the
+    constructor's ``Transport._replay_from_wal`` never picks up
+    a stale WAL left over from a previous test run (which would
+    replay real events to a live API and cause HTTP 401 in
+    setup). Mirrors ``conftest::make_test_runtime``.
+    """
     monkeypatch.setenv("NULLRUN_API_KEY", "test-key-12345678")
+    monkeypatch.setenv("NULLRUN_WAL_PATH", str(tmp_path / "sdk.wal"))
     NullRunRuntime.reset_instance()
     # Pre-build a test-mode singleton so get_runtime returns it without
     # hitting the network. Construct directly and store on the singleton
