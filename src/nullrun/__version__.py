@@ -1,5 +1,65 @@
 """NullRun Platform SDK.
 
+v3.21 / 0.13.6 (2026-07-11) — multi-agent span attachment (parent_trace_id).
+
+Pre-fix the langgraph callback's on_llm_start/on_llm_end handlers
+captured the LLM call under a fresh trace_id whenever no
+@protect contextvar was active. The backend's unified SELECT
+JOINed on traces.trace_id == cost_events.trace_id and missed
+every LLM call inside a chain / multi-agent flow — leaving the
+"Recent executions" panel on the workflow detail page with
+empty Model / Tokens / Cost on 4 of 5 rows.
+
+SDK changes:
+  1. on_llm_start opens a child span off the parent
+     LangChain run via NullRunCallback._begin_run (parent_run_id
+     or set_span contextvar). The child SpanContext inherits
+     trace_id from the parent chain / agent per the existing
+     SpanContext invariant — so a multi-span run shares one
+     trace_id and the parent_span_id walks the agent tree.
+  2. on_llm_end looks that child SpanContext up in
+     _active_runs[llm_run_id] and passes trace_id / span_id /
+     parent_span_id explicitly into runtime.track_event, so
+     _enrich_event forwards them on the wire (alongside
+     parent_trace_id, the new field).
+  3. runtime._enrich_event now sets parent_trace_id = the
+     child span's trace_id (which equals the parent chain's
+     trace_id by invariant) on llm_call cost events. The
+     backend's cost_events.parent_trace_id column (migration
+     217, nullable UUID) persists it; the unified SELECT
+     third JOIN arm (`cs.join_kind = 'parent_trace_id'`)
+     picks it up and surfaces the LLM model / tokens / cost
+     on the orchestration row that owns the call.
+  4. The new field is wire-additive: legacy backends that
+     don't read it still receive /track payloads and store
+     them (the field is dropped on the SQL bind if the column
+     is absent, but the migration is shipped in lockstep
+     with this SDK release so production environments have
+     it). On legacy SDKs that don't set parent_trace_id the
+     column stays NULL and the unified SELECT falls through
+     to the existing execution_id / trace_id arms (no
+     regression).
+
+Tests:
+  * tests/test_langgraph_callback.py:
+      - test_on_llm_start_then_end_attaches_parent_chain_trace_id
+      - test_on_llm_end_outside_active_chain_still_emits_event
+      - test_on_llm_end_runtime_failure_is_swallowed
+  * 39 pre-existing tests in test_langgraph_callback.py still
+    pass; no regression in test_extractors.py,
+    test_instrumentation_phase41.py, or the wider suite.
+
+Wire format: backward-compatible. The new field is serde(default)
+absent on older SDKs and ignored by older backends. Operators
+upgrading from 0.13.5 must upgrade both sides together (SDK to
+0.13.6 + backend with migration 217); the SDK alone still works
+on 1.0.0 backends (the field is just dropped at the SQL bind).
+
+No SDK_MIN_VERSION bump. Recommended upgrade path: 0.13.5 ->
+0.13.6.
+
+---
+
 v3.12 / 0.12.0 (2026-07-03) — server-minted execution_id default ON.
 
 The backend `gate_reserve_v3` now mints a uuidv7 execution_id
@@ -355,32 +415,7 @@ is identical. The fix only shortens the worst-case shutdown latency.
 No SDK_MIN_VERSION bump. Backends on 1.0.0 keep working unchanged.
 Recommended upgrade path: 0.13.4 -> 0.13.5.
 
----
-
-v3.16 / 0.13.4 (2026-07-08) -- bug-fix: complete the LangChain
-usage-extraction elif-chain.
-
-Pre-fix extract_usage_from_response walked the 4 source branches
-if-hasattr-usage_metadata ... elif-hasattr-generations ...
-elif-hasattr-usage ... elif-hasattr-response_metadata. A LangChain
-AIMessage can carry token info on multiple attributes at once.
-When the first branch's hasattr returned True but the value was
-empty or 0/0/0 (streaming init state, some provider wrappers),
-every subsequent elif was skipped and the SDK shipped tokens=0
-to the backend -- making the LLM call invisible on the dashboard.
-
-Switched all 4 source branches to plain if so each one attempts
-its read; later branches naturally overwrite the zero default when
-the earlier branch value is empty. New regression test
-test_extract_usage_metadata_zero_response_metadata_real.
-
-39 tests in test_langgraph_callback.py still pass; no
-regression in test_extractors.py or
-test_instrumentation_phase41.py. Wire format is unchanged.
-
-Recommended upgrade path: 0.13.3 -> 0.13.4. No SDK_MIN_VERSION
-bump; backends on 1.0.0 keep working unchanged.
 """
 
-__version__ = "0.13.5"
+__version__ = "0.13.6"
 __platform_version__ = "1.0.0"
