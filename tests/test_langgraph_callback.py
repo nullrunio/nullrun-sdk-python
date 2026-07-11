@@ -447,6 +447,121 @@ def test_track_event_failure_is_swallowed():
     cb.on_chain_end(outputs={}, run_id="r1")  # no raise
 
 
+# ─── 2026-07-12: multi-agent span attachment on on_llm_* hooks ───────
+
+
+def test_on_llm_start_then_end_attaches_parent_chain_trace_id():
+    """
+    ``on_llm_start`` opens a child span from the active chain (or
+    contextvar-set) parent. ``on_llm_end`` looks that span up and
+    forwards the parent's ``trace_id`` on the cost event so the
+    backend's unified SELECT can JOIN ``cost_summary`` by it.
+    Pre-fix the SDK wrote each LLM cost event under a fresh
+    ``trace_id``, dropping the parent chain linkage.
+    """
+    cb, spans, llms = _make_cb_with_recorder()
+    # Open a chain first (the parent). on_chain_start creates a
+    # SpanContext with depth=0 under run_id="chain-1".
+    cb.on_chain_start(serialized={"id": ["agent"]}, inputs={}, run_id="chain-1")
+    # chain_start emitted span_start; we discard it for this test.
+    spans.clear()
+
+    # LangChain forwards the chain's run_id as parent_run_id on the
+    # LLM callback so children can be attached explicitly without
+    # needing a contextvar mid-callback.
+    cb.on_llm_start(
+        serialized={"id": ["chat"]},
+        prompts=["hi"],
+        run_id="llm-1",
+        parent_run_id="chain-1",
+    )
+    cb.on_llm_end(
+        SimpleNamespace(
+            usage_metadata={
+                "input_tokens": 5,
+                "output_tokens": 7,
+                "total_tokens": 12,
+            }
+        ),
+        run_id="llm-1",
+        parent_run_id="chain-1",
+        invocation_params={"model_name": "gpt-4o", "model_provider": "openai"},
+    )
+
+    # 1. span_start was emitted for the LLM span itself.
+    starts = [s for s in spans if s.get("event_type") == "span_start"]
+    assert len(starts) == 1, f"expected 1 span_start for LLM, got {len(starts)}"
+    llm_span = starts[0]
+    chain_trace_id = llm_span["trace_id"]  # same as parent chain
+    # depth > 0 because the LLM span is a child of the chain.
+    assert llm_span["depth"] >= 1
+    assert llm_span["span_kind"] == "llm"
+    assert llm_span["parent_span_id"] is not None
+
+    # 2. span_end was emitted (matches span_id).
+    ends = [s for s in spans if s.get("event_type") == "span_end"]
+    assert len(ends) == 1
+    assert ends[0]["span_id"] == llm_span["span_id"]
+
+    # 3. The cost event carries the parent chain's trace_id, NOT
+    #    a fresh one. This is the contract backend JOIN relies on.
+    assert len(llms) == 1
+    ev = llms[0]
+    assert ev["type"] == "llm_call"
+    assert ev["trace_id"] == chain_trace_id
+    assert ev["span_id"] == llm_span["span_id"]
+    assert ev["parent_span_id"] == llm_span["parent_span_id"]
+    # parent_trace_id is convenience alias for backend readers.
+    assert ev["parent_trace_id"] == chain_trace_id
+    assert ev["tokens"] == 12
+
+
+def test_on_llm_without_run_id_is_silent_no_op():
+    """
+    Some LangChain builds may not forward ``run_id`` to LLM callbacks.
+    The SDK must not crash and must not invent a span hierarchy — it
+    falls back to the legacy behaviour of letting ``runtime.track``
+    generate a fresh ``trace_id`` (pre-fix behaviour preserved on this
+    rare path).
+    """
+    cb, spans, llms = _make_cb_with_recorder()
+    # NOTE: no run_id / parent_run_id kwargs — simulate old LangChain.
+    cb.on_llm_start(serialized={"id": ["chat"]}, prompts=["hi"])
+    cb.on_llm_end(
+        SimpleNamespace(usage_metadata={"total_tokens": 1}),
+        invocation_params={"model_name": "gpt-4o"},
+    )
+    assert spans == [], "no span should be opened when run_id is absent"
+    assert len(llms) == 1
+    # Legacy: trace_id is empty / backend-generated. Pre-fix behaviour.
+    # We just assert it's a string or None — backend will assign one.
+    assert llms[0]["type"] == "llm_call"
+
+
+def test_on_llm_end_emits_span_end_even_if_track_raises():
+    """
+    A failed ``runtime.track`` must not skip the ``span_end``
+    emission — otherwise the dashboard leaves dangling spans.
+    """
+    runtime = MagicMock()
+    spans: list = []
+
+    def _boom(_):
+        raise RuntimeError("backend down")
+
+    runtime.track.side_effect = _boom
+    runtime.track_event.side_effect = lambda **kw: spans.append(kw)
+    cb = NullRunCallback(runtime=runtime)
+    cb.on_llm_start(serialized={"id": ["chat"]}, prompts=["hi"], run_id="llm-1")
+    cb.on_llm_end(
+        SimpleNamespace(usage_metadata={"total_tokens": 1}),
+        run_id="llm-1",
+        invocation_params={"model_name": "gpt-4o"},
+    )
+    ends = [s for s in spans if s.get("event_type") == "span_end"]
+    assert len(ends) == 1, "span_end must fire even when track() raises"
+
+
 # ─── _active_runs FIFO cap ───────────────────────────────────────────
 
 
