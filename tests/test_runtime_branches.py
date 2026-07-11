@@ -30,7 +30,21 @@ def _reset_singleton():
 def _make_test_runtime() -> NullRunRuntime:
     """Build a runtime that skips network I/O and returns from
     ``_authenticate`` with a stub organisation id.
+
+    Pins ``NULLRUN_WAL_PATH`` to a per-call tmp dir so the
+    constructor's ``Transport._replay_from_wal`` never picks up a
+    stale WAL from a previous test run (which would replay real
+    events to a live API and cause HTTP 401 in setup). See
+    ``conftest::make_test_runtime`` for the fixture equivalent.
     """
+    # Per-call isolation: each helper invocation owns its WAL.
+    # ``setdefault`` so an outer session-level pinning (from
+    # ``make_test_runtime`` fixture) is preserved if already set.
+    import os
+    import tempfile
+    if not os.environ.get("NULLRUN_WAL_PATH"):
+        wal_dir = tempfile.mkdtemp(prefix="nullrun-test-wal-")
+        os.environ["NULLRUN_WAL_PATH"] = os.path.join(wal_dir, "sdk.wal")
     rt = NullRunRuntime(api_key="test-key-12345678", _test_mode=True)
     rt.organization_id = "org-1"
     rt.workflow_id = "wf-1"
@@ -357,8 +371,9 @@ def test_shutdown_joins_alive_threads(monkeypatch):
 # ─── get_instance credential rotation ──────────────────────────────
 
 
-def test_get_instance_returns_singleton_when_no_change(monkeypatch):
+def test_get_instance_returns_singleton_when_no_change(monkeypatch, tmp_path):
     monkeypatch.setenv("NULLRUN_API_KEY", "test-key-12345678")
+    monkeypatch.setenv("NULLRUN_WAL_PATH", str(tmp_path / "sdk.wal"))
     NullRunRuntime.reset_instance()
     rt1 = NullRunRuntime(api_key="test-key-12345678", _test_mode=True)
     NullRunRuntime._instance = rt1
@@ -372,7 +387,16 @@ def test_get_instance_returns_singleton_when_no_change(monkeypatch):
 def _make_runtime_with_mocked_auth() -> NullRunRuntime:
     """Build a test-mode runtime and stub the transport client.post
     so we can drive ``_authenticate`` deterministically.
+
+    Pins ``NULLRUN_WAL_PATH`` per call so we never read a stale
+    WAL from a previous run. ``setdefault`` preserves any
+    outer-session pinning set by a fixture.
     """
+    import os
+    import tempfile
+    if not os.environ.get("NULLRUN_WAL_PATH"):
+        wal_dir = tempfile.mkdtemp(prefix="nullrun-test-wal-")
+        os.environ["NULLRUN_WAL_PATH"] = os.path.join(wal_dir, "sdk.wal")
     rt = NullRunRuntime(api_key="test-key-12345678", _test_mode=True)
     rt._transport._client = MagicMock()
     rt._fetch_policy = MagicMock()

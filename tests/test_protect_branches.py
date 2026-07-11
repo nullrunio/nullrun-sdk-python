@@ -35,11 +35,20 @@ from nullrun.runtime import NullRunRuntime
 
 
 @pytest.fixture
-def test_runtime(monkeypatch):
+def test_runtime(monkeypatch, tmp_path):
     """Provide a runtime in test mode so get_runtime returns without
     authenticating against a real server.
+
+    Replays any WAL left over from previous test runs in a
+    tmp_path-scoped WAL file so the constructor's
+    ``_replay_from_wal`` never reads ``~/.nullrun/sdk.wal`` and
+    flushes real on-disk events to a live API. This avoids the
+    cross-Python-version flake seen on CI in 2026-07-11 where
+    3.11 picked up a stale WAL from a 3.10/3.12 worker that
+    finished without explicitly clearing it.
     """
     monkeypatch.setenv("NULLRUN_API_KEY", "test-key-12345678")
+    monkeypatch.setenv("NULLRUN_WAL_PATH", str(tmp_path / "sdk.wal"))
     NullRunRuntime.reset_instance()
     rt = NullRunRuntime(api_key="test-key-12345678", _test_mode=True)
     rt.organization_id = "org-1"
@@ -437,13 +446,13 @@ def test_protect_sync_pause_raises_NullRunBlockedException(test_runtime):
 
 
 @pytest.mark.asyncio
-async def test_protect_async_kill_re_raises_WorkflowKilledInterrupt():
+async def test_protect_async_kill_re_raises_WorkflowKilledInterrupt(make_test_runtime):
     """Async wrapper does NOT unify — kill signal propagates as-is so
     async frameworks can interrupt the event loop cleanly.
     """
     from nullrun import decorators as dec_mod
 
-    rt = NullRunRuntime(api_key="test-key-12345678", _test_mode=True)
+    rt = make_test_runtime()
     rt.track_event = MagicMock()
     rt.check_control_plane = MagicMock(
         side_effect=WorkflowKilledInterrupt(workflow_id="wf-1", reason="x")
@@ -542,12 +551,12 @@ def test_get_protected_runtime_returns_runtime(test_runtime):
     assert decorators.get_protected_runtime() is rt
 
 
-def test_get_protected_runtime_falls_back_to_get_runtime(test_runtime, monkeypatch):
+def test_get_protected_runtime_falls_back_to_get_runtime(monkeypatch, make_test_runtime):
     """When the decorator slot is empty, fall back to the global singleton."""
     from nullrun import decorators
 
     decorators._runtime = None
-    NullRunRuntime._instance = NullRunRuntime(api_key="test-key-12345678", _test_mode=True)
+    NullRunRuntime._instance = make_test_runtime()
     try:
         out = decorators.get_protected_runtime()
         assert out is NullRunRuntime._instance
