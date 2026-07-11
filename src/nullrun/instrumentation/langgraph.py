@@ -478,8 +478,61 @@ class NullRunCallback(BaseCallbackHandler):
     # ------------------------------------------------------------------
 
     def on_llm_start(self, serialized: Any, prompts: Any, **kwargs: Any) -> None:
-        """Called when LLM call starts."""
-        logger.debug(f"LLM start: {kwargs.get('invocation_params', {})}")
+        """
+        Called when LLM call starts.
+
+        2026-07-12 (multi-agent span attachment): open a child span
+        for the LLM call so the cost event emitted by ``on_llm_end``
+        carries the parent chain's ``trace_id``. Pre-fix this hook
+        was a no-op — ``on_llm_end`` then fell through to
+        ``runtime.track()`` which generates a fresh ``trace_id`` per
+        event, breaking the parent-child span hierarchy on the
+        server side. The frontend "Recent executions" panel then
+        showed 4/5 rows with ``cost_cents=0 / tokens=0`` because the
+        per-row unified SELECT keyed the JOIN on a per-call fresh
+        ``trace_id`` that no other row in the workflow had.
+
+        Behaviour: create a child span from the active framework
+        span (``@protect``-set via `set_span` or a higher-level
+        ``on_chain_start`` via `_active_runs[parent_run_id]`).
+        Record the SpanContext under the LangChain ``run_id`` key so
+        ``on_llm_end`` can look it up. The ``run_id`` callback kwargs
+        are present on langchain >= 0.1; missing run_id is logged
+        and we fall back to creating a synthetic root (best-effort,
+        matches the legacy behaviour so we never throw out of the
+        LangChain callback chain).
+        """
+        run_id = kwargs.get("run_id")
+        parent_run_id = kwargs.get("parent_run_id")
+        if run_id is None:
+            # Defensive: same pattern as on_chain_start. We can't
+            # emit an end that closes a span we never opened.
+            logger.debug("on_llm_start without run_id — skipping span attachment")
+            self._llm_fallback_token = None
+            return
+
+        parent_ctx: SpanContext | None = None
+        if parent_run_id:
+            parent_ctx = self._active_runs.get(str(parent_run_id))
+        if parent_ctx is None:
+            parent_ctx = get_current_span()
+        if parent_ctx is not None:
+            ctx = create_child_span(parent_ctx)
+        else:
+            ctx = create_root_span()
+        self._register_active_run(str(run_id), ctx)
+        try:
+            self.runtime.track_event(
+                event_type="span_start",
+                trace_id=ctx.trace_id,
+                span_id=ctx.span_id,
+                parent_span_id=ctx.parent_span_id,
+                depth=ctx.depth,
+                fn_name="llm_call",
+                span_kind="llm",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"llm span_start emission failed: {exc}")
 
     def on_llm_end(self, response: Any, **kwargs: Any) -> None:
         """
@@ -641,6 +694,37 @@ class NullRunCallback(BaseCallbackHandler):
             }
 
             logger.info(f"NullRun track event: {event}")
+
+            # 2026-07-12 (multi-agent span attachment): the per-LLM-call
+            # cost event must carry the parent chain's `trace_id` so the
+            # backend's unified SELECT can JOIN `cost_summary` by it.
+            # `on_llm_start` already stored the SpanContext under the
+            # LangChain `run_id` key, so we look it up now and forward
+            # `trace_id` / `span_id` / `parent_trace_id` / `depth` as
+            # first-class fields on the event — `_enrich_event` keeps
+            # explicit values (its `if "trace_id" not in enriched`
+            # check leaves already-set fields alone).
+            #
+            # SpanContext invariant (see `tracing.SpanContext`): a
+            # child span inherits `trace_id` from its parent and only
+            # gets its own `span_id`, so `parent_trace_id` on the
+            # wire would be redundant — we always send `trace_id`.
+            # We send it under both keys for clarity: backend readers
+            # can use `trace_id` (matches the spans table) and
+            # `parent_trace_id` is kept for forward-compat with the
+            # upcoming tree-renderer that wants to walk children by
+            # the parent's trace bucket.
+            llm_run_id = kwargs.get("run_id")
+            llm_ctx = (
+                self._active_runs.get(str(llm_run_id)) if llm_run_id else None
+            )
+            if llm_ctx is not None:
+                event["trace_id"] = llm_ctx.trace_id
+                event["span_id"] = llm_ctx.span_id
+                event["parent_span_id"] = llm_ctx.parent_span_id
+                event["depth"] = llm_ctx.depth
+                event["parent_trace_id"] = llm_ctx.trace_id
+
             self.runtime.track(event)
 
             if usage["has_usage"]:
@@ -654,6 +738,21 @@ class NullRunCallback(BaseCallbackHandler):
 
         except Exception as e:
             logger.warning(f"Failed to track LLM event: {e}")
+        finally:
+            # Close the LLM span regardless of how the cost event
+            # path went — `on_llm_end` is the natural close site, and
+            # a missed span_end leaves an open trace in the dashboard
+            # tree. `_end_run` is a no-op if no run_id, so this is
+            # safe even on the rare path where `on_llm_start`
+            # returned early.
+            llm_run_id = kwargs.get("run_id")
+            if llm_run_id is not None:
+                # `_end_run` only emits span_end — it does NOT
+                # remove the contextvar, which is correct: the
+                # parent chain span should already be the active
+                # span (set by `on_chain_start`) and we don't want
+                # to clobber it from inside a callback.
+                self._end_run(llm_run_id)
 
     # ------------------------------------------------------------------
     # Chain / tool / agent hooks — emit span events
