@@ -491,5 +491,5 @@ Recommended upgrade path: 0.13.4 -> 0.13.5.
 
 """
 
-__version__ = "0.13.7"
+__version__ = "0.13.8"
 __platform_version__ = "1.0.0"

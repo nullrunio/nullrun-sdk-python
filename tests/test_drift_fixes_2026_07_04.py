@@ -268,20 +268,41 @@ class TestIdempotencyKeyOnTrackPayload:
         finally:
             clear_trace_id()
 
-    def test_enrich_event_preserves_caller_set_parent_trace_id(self):
-        """If the caller already set ``parent_trace_id`` (the
-        langgraph callback path), ``_enrich_event`` MUST keep their
-        value rather than overwrite with the contextvar. The
-        callback may sit inside a deeper span than the contextvar
-        exposes, so the explicit value wins.
+    def test_enrich_event_contextvar_overrides_caller_set_parent_trace_id(self):
+        """Hotfix #2 (2026-07-12): chain contextvar ALWAYS wins
+        over caller-set parent_trace_id.
+
+        Why override: the pre-hotfix code only filled the field
+        when it was absent from the event dict, which broke when
+        ``langgraph.py::on_llm_end``'s ``_active_runs[run_id]``
+        lookup missed (run_id drift between the auto-injected
+        chat_model callback and an explicit user-supplied one,
+        or no matching ``on_llm_start`` because the user wrapped
+        the LLM call in a non-langgraph stack). In that case
+        ``on_llm_end`` leaves the field absent, the ``trace_id``
+        fallback (line 2422) overwrites the event with the chain
+        contextvar, but ``parent_trace_id`` stayed NULL because
+        the previous condition was skipped.
+
+        Override semantics: the chain contextvar is the single
+        source of truth for "what chain does this event belong
+        to". Both the langgraph callback's caller-set value AND
+        a non-langgraph caller's absence resolve to the same
+        contextvar; preferring the contextvar when present is
+        idempotent for the happy path AND closes the drift in
+        the unhappy path.
+
+        See PR #64 hotfix #2 / diagnostic run 2026-07-12 08:51
+        for the full regression context (sdk_diag.py output:
+        trace_id=cccccccc-... parent_trace_id=NULL on backend
+        cost_events).
         """
         from nullrun.context import set_trace_id, clear_trace_id
         from nullrun.runtime import NullRunRuntime
 
-        # Contextvar holds the OUTER chain's trace; the langgraph
-        # callback already stamped the CHILD span's trace (which
-        # equals the chain trace by SpanContext invariant, but
-        # ``_enrich_event`` is not supposed to second-guess this).
+        # Contextvar holds the chain's trace. Even though the
+        # event dict has a caller-set parent_trace_id, the
+        # hotfix overrides it with the contextvar.
         set_trace_id("55555555-6666-7777-8888-999999999999")
         try:
             rt = NullRunRuntime(api_key="test-key-12345678", _test_mode=True)
@@ -293,7 +314,14 @@ class TestIdempotencyKeyOnTrackPayload:
                     "parent_trace_id": "explicit-from-callback",
                 }
             )
-            assert enriched["parent_trace_id"] == "explicit-from-callback"
+            # Contextvar WINS over caller-set (hotfix #2).
+            assert (
+                enriched["parent_trace_id"]
+                == "55555555-6666-7777-8888-999999999999"
+            ), (
+                f"contextvar must override caller-set parent_trace_id "
+                f"(hotfix #2): got {enriched['parent_trace_id']!r}"
+            )
         finally:
             clear_trace_id()
 
@@ -472,6 +500,80 @@ class TestStatusCodeOnExceptions:
 # ---------------------------------------------------------------------------
 # F3: fail-CLOSED / fail-OPEN honesty
 # ---------------------------------------------------------------------------
+
+
+class TestEnrichEventParentTraceOverride:
+    """Hotfix #2: the chain contextvar ALWAYS wins over caller-set
+    parent_trace_id. Regression coverage for the drift bug where
+    cost_events.parent_trace_id stayed NULL even though
+    cost_events.trace_id carried the chain contextvar (chain
+    contextvar was honored for trace_id via the fallback at line
+    2422, but parent_trace_id's "if not in enriched" condition was
+    skipped when the event arrived without the field set).
+    """
+
+    def test_enrich_event_sets_parent_trace_id_when_chain_contextvar_set(self):
+        """Real-world drift scenario: SDK runtime.track() called
+        with no parent_trace_id field, chain contextvar set.
+        Pre-hotfix: parent_trace_id stays absent. Post-hotfix: it
+        is set to the chain contextvar.
+
+        This is the path that produced trace_id=cccccccc-... /
+        parent_trace_id=NULL on the prod VPS during the diagnostic
+        run on 2026-07-12 08:51 UTC.
+        """
+        from nullrun.context import set_trace_id, clear_trace_id
+        from nullrun.runtime import NullRunRuntime
+        set_trace_id("cccccccc-1111-2222-3333-444444444444")
+        try:
+            rt = NullRunRuntime(api_key="test-key-12345678", _test_mode=True)
+            # Event WITHOUT parent_trace_id field at all.
+            enriched = rt._enrich_event(
+                {
+                    "type": "llm_call",
+                    "model": "gpt-4",
+                    "tokens": 100,
+                }
+            )
+            assert (
+                enriched["parent_trace_id"]
+                == "cccccccc-1111-2222-3333-444444444444"
+            ), (
+                f"parent_trace_id MUST be stamped from chain contextvar "
+                f"even when caller did not set it: got "
+                f"{enriched.get('parent_trace_id')!r}"
+            )
+            # Sanity: trace_id also comes from the same contextvar.
+            assert enriched["trace_id"] == "cccccccc-1111-2222-3333-444444444444"
+        finally:
+            clear_trace_id()
+
+    def test_enrich_event_parent_trace_id_matches_trace_id_in_chain_mode(self):
+        """SpanContext invariant: parent_trace_id == trace_id when
+        the event sits inside the chain contextvar (chain trace
+        spans share the same trace_id across child spans).
+        """
+        from nullrun.context import set_trace_id, clear_trace_id
+        from nullrun.runtime import NullRunRuntime
+        set_trace_id("99999999-aaaa-bbbb-cccc-000000000000")
+        try:
+            rt = NullRunRuntime(api_key="test-key-12345678", _test_mode=True)
+            enriched = rt._enrich_event(
+                {
+                    "type": "llm_call",
+                    "model": "gpt-4",
+                    "tokens": 100,
+                }
+            )
+            assert enriched["parent_trace_id"] == enriched["trace_id"], (
+                f"parent_trace_id should equal trace_id when chain "
+                f"contextvar is the source: parent={enriched.get('parent_trace_id')!r}, "
+                f"trace={enriched.get('trace_id')!r}"
+            )
+        finally:
+            clear_trace_id()
+
+
 
 class TestFailClosedHonesty:
     """F3: the SDK reads backend enforcement
