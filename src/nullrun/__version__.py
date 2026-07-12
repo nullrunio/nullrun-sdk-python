@@ -1,5 +1,79 @@
 """NullRun Platform SDK.
 
+v3.22 / 0.13.7 (2026-07-12) — wire ``parent_trace_id`` end-to-end on
+``/track`` (v3 + legacy batch).
+
+Pre-fix (0.13.6): ``langgraph.py::on_llm_end`` set
+``event["parent_trace_id"]`` on the llm_call cost event when an
+LLM call sat inside a chain / agent, but two leaks dropped the
+field on the wire:
+
+  1. ``runtime._enrich_event`` never stamped ``parent_trace_id``
+     from the active span contextvar, so non-langgraph integrations
+     (crewai, autogen, llama_index, plain httpx transport) emitted
+     the field as ``None``.
+  2. ``runtime._build_v3_track_payload`` did NOT map
+     ``parent_trace_id`` onto the v3 ``/track`` payload, so even
+     when the langgraph callback set it, the field dropped at the
+     SDK wire boundary.
+
+Result on production (VPS Postgres after deploy 2026-07-11):
+
+  SELECT count(*), count(parent_trace_id)
+  FROM cost_events WHERE created_at > '2026-07-11 17:54:00';
+  -- 28 | 0
+
+Zero rows carried the parent trace — the backend's unified
+SELECT third JOIN arm (``cs.join_kind = 'parent_trace_id'``) never
+matched, and the workflow detail "Recent executions" panel showed
+empty Model / Tokens / Cost on every orchestration row that owned
+an LLM call.
+
+Fix (no public API change, no wire-format change — the field
+was always wire-additive; just stop dropping it on the SDK side):
+
+  1. ``runtime._enrich_event``: stamp ``parent_trace_id`` from
+     ``get_trace_id()`` contextvar when the caller did NOT set it
+     explicitly. The langgraph callback's explicit value wins (no
+     second-guessing), preserving the existing contract.
+
+  2. ``runtime._build_v3_track_payload``: map ``parent_trace_id``
+     from ``wire_event`` onto the v3 ``/track`` body, mirroring
+     the existing ``trace_id`` / ``span_id`` handling.
+
+  3. ``nullrun.context``: add ``set_trace_id`` /
+     ``reset_trace_id`` / ``clear_trace_id`` helpers. Tests that
+     pin the trace contextvar (mimicking ``@protect`` blocks)
+     need a way to set + restore. Matches the existing pattern
+     of ``set_/get_/clear_server_minted_execution_id``.
+
+Tests (7 new in ``test_drift_fixes_2026_07_04.py``, all passing):
+
+  - ``test_build_v3_track_payload_includes_parent_trace_id``
+  - ``test_build_v3_track_payload_omits_parent_trace_id_when_absent``
+  - ``test_enrich_event_stamps_parent_trace_id_from_contextvar``
+  - ``test_enrich_event_preserves_caller_set_parent_trace_id``
+  - ``test_enrich_event_leaves_parent_trace_id_blank_when_no_contextvar``
+  - ``test_enrich_event_omits_empty_string_parent_trace_id``
+  - ``test_enrich_event_parent_trace_id_matches_existing_trace_id_field``
+
+Verification locally:
+
+  - ``pytest tests/test_drift_fixes_2026_07_04.py`` — 22/22 passed.
+  - ``pytest tests/ -n auto -q`` — 1142 passed, 1 pre-existing flake
+    (``test_is_paused_respects_cooldown``, NOT introduced by this
+    release).
+  - ``ruff check src/`` — All checks passed.
+  - ``mypy src/`` — Success: no issues found in 34 source files.
+
+No public API change. No ``SDK_MIN_VERSION`` bump. Backends on
+1.0.0 keep working unchanged. Recommended: 0.13.6 → 0.13.7
+(patch). Required: backend must have ``cost_events.parent_trace_id``
+column from migration 217 (already deployed on prod as of
+2026-07-11 12:52 UTC).
+
+---
+
 v3.21 / 0.13.6 (2026-07-11) — multi-agent span attachment (parent_trace_id).
 
 Pre-fix the langgraph callback's on_llm_start/on_llm_end handlers
@@ -417,5 +491,5 @@ Recommended upgrade path: 0.13.4 -> 0.13.5.
 
 """
 
-__version__ = "0.13.6"
+__version__ = "0.13.7"
 __platform_version__ = "1.0.0"

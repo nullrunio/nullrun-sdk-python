@@ -2507,6 +2507,33 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             if idem_key:
                 enriched["idempotency_key"] = idem_key
 
+        # 2026-07-12 (multi-agent span attachment — SDK counterpart at
+        # nullrun-sdk-python release/0.13.5 commit efff530):
+        # ``langgraph.py::on_llm_end`` may have already stamped
+        # ``parent_trace_id`` when an LLM call sits inside a
+        # chain / agent (we set it from the child SpanContext there).
+        # When the caller passed a span via ``runtime.track_event``
+        # (without going through the langgraph callback) the field is
+        # absent — fall back to the contextvar so non-langgraph
+        # integrations (crewai, autogen, llama_index, plain httpx
+        # transport) get the same wire shape. The backend's
+        # ``cost_events.parent_trace_id`` column + unified SELECT
+        # third JOIN arm (``cs.join_kind = 'parent_trace_id'``) both
+        # depend on this being present whenever a parent span exists
+        # in scope; without it the dashboard falls back to the
+        # weaker ``trace_id`` arm and LLM rows show empty
+        # Model / Tokens / Cost on the orchestration row that owns
+        # the call.
+        if "parent_trace_id" not in enriched:
+            # Re-import to mirror the local-import pattern used
+            # for get_server_minted_execution_id above — keeps
+            # the runtime module's eager import graph stable.
+            from nullrun.context import get_trace_id as _get_trace_id
+
+            parent_trace_id = _get_trace_id()
+            if parent_trace_id:
+                enriched["parent_trace_id"] = parent_trace_id
+
         # Add type if not present
         if "type" not in enriched:
             enriched["type"] = "event"
@@ -3034,6 +3061,18 @@ def _build_v3_track_payload(
         payload["trace_id"] = wire_event["trace_id"]
     if "span_id" in wire_event and wire_event["span_id"]:
         payload["span_id"] = wire_event["span_id"]
+    # 2026-07-12 (multi-agent span attachment): the orchestration
+    # trace that owns this LLM call. Stamped by ``_enrich_event``
+    # from the active span contextvar (or earlier by
+    # ``langgraph.py::on_llm_end`` when the call sits inside a chain
+    # / agent). Backend persists it on ``cost_events.parent_trace_id``
+    # and the unified SELECT joins ``traces.trace_id`` directly via
+    # this column so the workflow detail "Recent executions" panel
+    # surfaces Model / Tokens / Cost on the orchestration row that
+    # owns the LLM call. Without this, the dashboard's 4/5-row
+    # empty-cells problem returns for every multi-agent workflow.
+    if "parent_trace_id" in wire_event and wire_event["parent_trace_id"]:
+        payload["parent_trace_id"] = wire_event["parent_trace_id"]
 
     # Optional downstream fields preserved verbatim (workflow-level
     # cost attribution, agent_id, etc.). Backend ignores unknown

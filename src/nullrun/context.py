@@ -74,6 +74,40 @@ def get_trace_id() -> str | None:
     return _trace_id_var.get()
 
 
+def set_trace_id(trace_id: str | None) -> object:
+    """Pin the current trace_id on the context.
+
+    Used by ``@protect`` blocks and by the langgraph callback
+    during ``on_chain_start`` to give downstream cost events a
+    stable parent-trace reference. Returns a token that the caller
+    passes to :func:`reset_trace_id` to restore the previous value
+    — this is the ``ContextVar`` contract, see
+    https://docs.python.org/3/library/contextvars.html#contextvars.ContextVar.set.
+
+    Passing ``None`` clears the field. Tests should pair this with
+    a try/finally ``reset_trace_id`` to avoid bleeding state into
+    the next test (we observed this as the root cause of the
+    2026-07-11 cross-test WAL-replay flake).
+    """
+    return _trace_id_var.set(trace_id)
+
+
+def reset_trace_id(token: object) -> None:
+    """Restore the previous trace_id state from a ``set_trace_id``
+    token. See :func:`set_trace_id`."""
+    _trace_id_var.reset(token)  # type: ignore[arg-type]
+
+
+def clear_trace_id() -> None:
+    """Clear the trace_id contextvar to its default (None).
+
+    Convenience for tests + teardown paths that do not need to
+    capture the previous value. Equivalent to
+    ``set_trace_id(None)`` but with no return token to manage.
+    """
+    _trace_id_var.set(None)
+
+
 def get_span_id() -> str | None:
     """Get current span ID from context."""
     return _span_id_var.get()

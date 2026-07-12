@@ -192,6 +192,185 @@ class TestIdempotencyKeyOnTrackPayload:
         assert payload is not None
         assert "idempotency_key" not in payload
 
+    def test_build_v3_track_payload_includes_parent_trace_id(self):
+        """2026-07-12 (multi-agent span attachment): the v3 /track
+        payload mapper must surface ``parent_trace_id`` on the wire
+        when the enriched event carries it. Without this the backend's
+        ``cost_events.parent_trace_id`` column stays NULL and the
+        unified SELECT's third JOIN arm (``cs.join_kind =
+        'parent_trace_id'``) misses the row — the dashboard falls
+        back to the weaker ``trace_id`` arm and the workflow detail
+        "Recent executions" panel shows empty Model / Tokens / Cost
+        on the orchestration row that owns the LLM call.
+        """
+        from nullrun.runtime import _build_v3_track_payload
+
+        payload = _build_v3_track_payload(
+            {
+                "workflow_id": "wf-123",
+                "tokens": 100,
+                "trace_id": "11111111-2222-3333-4444-555555555555",
+                "span_id": "22222222-3333-4444-5555-666666666666",
+                "parent_trace_id": "33333333-4444-5555-6666-777777777777",
+            },
+            "01926e7a-3b3b-7ddd-9bdd-7f0d3b3b7b3b",
+        )
+
+        assert payload is not None
+        assert payload["parent_trace_id"] == "33333333-4444-5555-6666-777777777777"
+        # Sanity: existing fields still surface.
+        assert payload["trace_id"] == "11111111-2222-3333-4444-555555555555"
+        assert payload["span_id"] == "22222222-3333-4444-5555-666666666666"
+
+    def test_build_v3_track_payload_omits_parent_trace_id_when_absent(self):
+        """Backward compat: when no parent chain / agent context is
+        active (single-shot /track outside @protect), the field must
+        be absent — not an empty string. Backend stores ``None`` /
+        missing-field identically, so the omission is the right
+        shape for the "no parent" case.
+        """
+        from nullrun.runtime import _build_v3_track_payload
+
+        payload = _build_v3_track_payload(
+            {
+                "workflow_id": "wf-123",
+                "tokens": 100,
+                "trace_id": "11111111-2222-3333-4444-555555555555",
+            },
+            "01926e7a-3b3b-7ddd-9bdd-7f0d3b3b7b3b",
+        )
+
+        assert payload is not None
+        assert "parent_trace_id" not in payload
+        assert payload["trace_id"] == "11111111-2222-3333-4444-555555555555"
+
+    def test_enrich_event_stamps_parent_trace_id_from_contextvar(self):
+        """When the caller did not pass ``parent_trace_id`` explicitly
+        on the event dict (e.g. plain httpx transport that does NOT
+        go through ``langgraph.py::on_llm_end``), ``_enrich_event``
+        must stamp the field from the active span contextvar so the
+        wire shape is consistent regardless of caller integration.
+        """
+        from nullrun.context import set_trace_id, clear_trace_id
+        from nullrun.runtime import NullRunRuntime
+
+        # Pin the trace contextvar to a known value (mimics
+        # ``@protect`` block / chain mode).
+        set_trace_id("44444444-5555-6666-7777-888888888888")
+        try:
+            rt = NullRunRuntime(api_key="test-key-12345678", _test_mode=True)
+            enriched = rt._enrich_event(
+                {"type": "llm_call", "model": "gpt-4", "tokens": 100}
+            )
+            assert enriched["parent_trace_id"] == (
+                "44444444-5555-6666-7777-888888888888"
+            )
+        finally:
+            clear_trace_id()
+
+    def test_enrich_event_preserves_caller_set_parent_trace_id(self):
+        """If the caller already set ``parent_trace_id`` (the
+        langgraph callback path), ``_enrich_event`` MUST keep their
+        value rather than overwrite with the contextvar. The
+        callback may sit inside a deeper span than the contextvar
+        exposes, so the explicit value wins.
+        """
+        from nullrun.context import set_trace_id, clear_trace_id
+        from nullrun.runtime import NullRunRuntime
+
+        # Contextvar holds the OUTER chain's trace; the langgraph
+        # callback already stamped the CHILD span's trace (which
+        # equals the chain trace by SpanContext invariant, but
+        # ``_enrich_event`` is not supposed to second-guess this).
+        set_trace_id("55555555-6666-7777-8888-999999999999")
+        try:
+            rt = NullRunRuntime(api_key="test-key-12345678", _test_mode=True)
+            enriched = rt._enrich_event(
+                {
+                    "type": "llm_call",
+                    "model": "gpt-4",
+                    "tokens": 100,
+                    "parent_trace_id": "explicit-from-callback",
+                }
+            )
+            assert enriched["parent_trace_id"] == "explicit-from-callback"
+        finally:
+            clear_trace_id()
+
+    def test_enrich_event_leaves_parent_trace_id_blank_when_no_contextvar(
+        self,
+    ):
+        """Backward compat: legacy / pre-0.13.6 callers run with no
+        ``@protect`` block and no chain contextvar set. In that case
+        ``parent_trace_id`` MUST stay absent — never pick up a stale
+        value from a previous test, never default to ``trace_id``
+        (the backend's JOIN keys off the explicit value, not the
+        trace_id column).
+        """
+        from nullrun.context import clear_trace_id, set_trace_id
+        from nullrun.runtime import NullRunRuntime
+
+        clear_trace_id()  # belt + braces
+        try:
+            set_trace_id(None)
+        except Exception:
+            pass
+        try:
+            clear_trace_id()
+        except Exception:
+            pass
+
+        rt = NullRunRuntime(api_key="test-key-12345678", _test_mode=True)
+        enriched = rt._enrich_event(
+            {"type": "llm_call", "model": "gpt-4", "tokens": 100}
+        )
+        assert "parent_trace_id" not in enriched
+
+    def test_enrich_event_omits_empty_string_parent_trace_id(self):
+        """Empty string ``""`` is a falsy ``parent_trace_id``. Treat
+        it like None so the wire payload stays clean (backend
+        parser would otherwise reject the field or store empty
+        string in a UUID column, depending on path).
+        """
+        from nullrun.context import set_trace_id, clear_trace_id
+        from nullrun.runtime import NullRunRuntime
+
+        set_trace_id("")  # boundary value
+        try:
+            rt = NullRunRuntime(api_key="test-key-12345678", _test_mode=True)
+            enriched = rt._enrich_event(
+                {"type": "llm_call", "model": "gpt-4", "tokens": 100}
+            )
+            # The contextvar was set to empty string; ``_enrich_event``
+            # branches on truthy value, so the field is absent
+            # (not propagated as empty string).
+            assert "parent_trace_id" not in enriched
+        finally:
+            clear_trace_id()
+
+    def test_enrich_event_parent_trace_id_matches_existing_trace_id_field(
+        self,
+    ):
+        """Invariant (see SpanContext): a child span inherits
+        ``trace_id`` from its parent and only differs in
+        ``span_id``. When the contextvar is set, ``parent_trace_id``
+        and ``trace_id`` MUST point at the same value. This protects
+        the backend's JOIN from drifting — see
+        ``db/mod.rs::get_execution_records_for_workflow``.
+        """
+        from nullrun.context import set_trace_id, clear_trace_id
+        from nullrun.runtime import NullRunRuntime
+
+        set_trace_id("77777777-8888-9999-aaaa-bbbbbbbbbbbb")
+        try:
+            rt = NullRunRuntime(api_key="test-key-12345678", _test_mode=True)
+            enriched = rt._enrich_event(
+                {"type": "llm_call", "model": "gpt-4", "tokens": 100}
+            )
+            assert enriched["trace_id"] == enriched["parent_trace_id"]
+        finally:
+            clear_trace_id()
+
 
 # ---------------------------------------------------------------------------
 # F2: HTTP status_code on every decision exception
