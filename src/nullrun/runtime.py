@@ -2512,27 +2512,43 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # ``langgraph.py::on_llm_end`` may have already stamped
         # ``parent_trace_id`` when an LLM call sits inside a
         # chain / agent (we set it from the child SpanContext there).
-        # When the caller passed a span via ``runtime.track_event``
-        # (without going through the langgraph callback) the field is
-        # absent — fall back to the contextvar so non-langgraph
-        # integrations (crewai, autogen, llama_index, plain httpx
-        # transport) get the same wire shape. The backend's
-        # ``cost_events.parent_trace_id`` column + unified SELECT
-        # third JOIN arm (``cs.join_kind = 'parent_trace_id'``) both
-        # depend on this being present whenever a parent span exists
-        # in scope; without it the dashboard falls back to the
-        # weaker ``trace_id`` arm and LLM rows show empty
-        # Model / Tokens / Cost on the orchestration row that owns
-        # the call.
-        if "parent_trace_id" not in enriched:
-            # Re-import to mirror the local-import pattern used
-            # for get_server_minted_execution_id above — keeps
-            # the runtime module's eager import graph stable.
-            from nullrun.context import get_trace_id as _get_trace_id
+        #
+        # 2026-07-12 hotfix #2: ALWAYS override from the chain
+        # contextvar when one is in scope. The pre-hotfix code only
+        # filled the field when it was absent from the event dict,
+        # which broke when ``on_llm_end``'s ``_active_runs[run_id]``
+        # lookup missed (run_id drift between the auto-injected
+        # chat_model callback and an explicit user-supplied one,
+        # or no matching on_llm_start because the user wrapped the
+        # LLM call in a non-langgraph stack). In that case
+        # ``on_llm_end`` leaves the field absent, our ``trace_id``
+        # fallback (line 2422) overwrites the event with the chain
+        # contextvar, but ``parent_trace_id`` stays NULL because the
+        # previous condition was skipped. The drift was
+        # investigated via a synthetic diagnostic script
+        # (``sdk_diag.py``) running on SDK 0.13.7 — cost_events
+        # received the chain trace_id but not parent_trace_id.
+        #
+        # Override semantics: the chain contextvar is the single
+        # source of truth for "what chain does this event belong
+        # to". Both ``langgraph.py::on_llm_end``'s caller-set value
+        # AND a non-langgraph caller's absence resolve to the same
+        # contextvar. So preferring the contextvar when present is
+        # idempotent for the happy path AND closes the drift in the
+        # unhappy path.
+        #
+        # The backend's ``cost_events.parent_trace_id`` column +
+        # unified SELECT third JOIN arm
+        # (``cs.join_kind = 'parent_trace_id'``) both depend on
+        # this being present whenever a chain is in scope; without
+        # it the dashboard falls back to the weaker ``trace_id``
+        # arm and LLM rows show empty Model / Tokens / Cost on the
+        # orchestration row that owns the call.
+        from nullrun.context import get_trace_id as _get_trace_id
 
-            parent_trace_id = _get_trace_id()
-            if parent_trace_id:
-                enriched["parent_trace_id"] = parent_trace_id
+        chain_trace_id = _get_trace_id()
+        if chain_trace_id:
+            enriched["parent_trace_id"] = chain_trace_id
 
         # Add type if not present
         if "type" not in enriched:
