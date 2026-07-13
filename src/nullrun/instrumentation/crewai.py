@@ -36,6 +36,8 @@ logger = logging.getLogger(__name__)
 
 _crewai_patched = False
 _event_listener_handle: Any = None
+_orig_kickoff: Callable[..., Any] | None = None
+_orig_kickoff_async: Callable[..., Any] | None = None
 
 
 def _emit_usage_metrics(runtime: Any, crew: Any) -> None:
@@ -225,11 +227,13 @@ def patch_crewai(runtime: Any) -> bool:
     _orig_kickoff_async = getattr(Crew, "kickoff_async", None)
 
     def _wrap_kickoff(self: Any, inputs: Any = None, **kwargs: Any) -> Any:
+        global _orig_kickoff
         result = _orig_kickoff(self, inputs=inputs, **kwargs)
         _emit_usage_metrics(runtime, self)
         return result
 
     async def _wrap_kickoff_async(self: Any, inputs: Any = None, **kwargs: Any) -> Any:
+        global _orig_kickoff_async
         if _orig_kickoff_async is None:
             return _wrap_kickoff(self, inputs=inputs, **kwargs)
         result = await _orig_kickoff_async(self, inputs=inputs, **kwargs)
@@ -254,6 +258,7 @@ def unpatch_crewai() -> None:
     method-replacement layer only).
     """
     global _crewai_patched
+    global _orig_kickoff, _orig_kickoff_async
     if not _crewai_patched:
         return
     try:
