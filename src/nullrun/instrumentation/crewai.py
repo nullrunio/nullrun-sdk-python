@@ -185,7 +185,9 @@ def patch_crewai(runtime: Any) -> bool:
 
     try:
         from crewai.events import crewai_event_bus  # type: ignore[import-not-found]
-        from crewai.events.event_bus import EventBusListener  # type: ignore[import-not-found,attr-defined]
+        from crewai.events.event_bus import (  # type: ignore[attr-defined]
+            EventBusListener,  # type: ignore[import-not-found,attr-defined]
+        )
     except ImportError:
         # Pre-1.15 crewai lacks the event bus. Fall through to the
         # legacy callback injection so old versions still get
