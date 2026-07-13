@@ -183,7 +183,7 @@ def patch_crewai(runtime: Any) -> bool:
 
     try:
         from crewai.events import crewai_event_bus  # type: ignore[import-not-found]
-        from crewai.events.event_bus import EventBusListener  # type: ignore[import-not-found]
+        from crewai.events.event_bus import EventBusListener  # type: ignore[import-not-found,attr-defined]
     except ImportError:
         # Pre-1.15 crewai lacks the event bus. Fall through to the
         # legacy callback injection so old versions still get
@@ -203,7 +203,7 @@ def patch_crewai(runtime: Any) -> bool:
         bridge.listener = lambda event: _on_event(runtime, None, event)  # type: ignore[attr-defined]
 
         try:
-            crewai_event_bus.scoped_listener(bridge)
+            crewai_event_bus.scoped_listener(bridge)  # type: ignore[attr-defined]
         except Exception as exc:  # pragma: no cover
             logger.debug("crewai event_bus registration failed: %s", exc)
             return False
