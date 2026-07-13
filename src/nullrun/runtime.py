@@ -1483,7 +1483,19 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 # Cache hit within TTL — reuse the response without a
                 # network roundtrip. The server's cumulative-spend
                 # tracking is the source of truth; this is a debounce.
+                #
+                # 2026-07-13 (P0 SDK fix): we MUST still capture the
+                # server-minted ``reservation_id`` / ``operation_id``
+                # from the cached response — otherwise the cached
+                # response's ids stay pinned to the *first* call in
+                # the chain, and every subsequent /track inside the
+                # 5s TTL window ships the same idempotency_key with
+                # different request bodies → backend returns 409
+                # ``idempotency_key hash mismatch`` and the SDK drops
+                # the event (runtime.py:2649). Re-running the
+                # capture here is the missing piece.
                 response = cached[1]
+                _capture_server_minted_execution_id(response)
             else:
                 # Cache miss or expired — go to the server, then store.
                 try:

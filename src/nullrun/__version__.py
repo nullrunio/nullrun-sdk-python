@@ -1,5 +1,93 @@
 """NullRun Platform SDK.
 
+v3.23 / 0.13.9 (2026-07-13) — crewai 1.15 compatibility + gate_cache
+re-capture.
+
+  1. crewai 1.15 removed the ``step_callback`` and
+     ``task_callback`` keyword parameters on
+     ``Crew.kickoff()``. The pre-0.13.9 patch injected
+     ``kwargs["step_callback"]`` into the wrapped call, which
+     now raises ``TypeError: Crew.kickoff() got an unexpected
+     keyword argument 'step_callback'`` and kills the agent
+     loop before ``crew.usage_metrics`` is read.
+
+     0.13.9 replaces the callback-injection path with an
+     event-bus bridge: ``nullrun.instrumentation.crewai``
+     subscribes to ``CrewKickoffStartedEvent`` /
+     ``CrewKickoffCompletedEvent``,
+     ``AgentExecutionStartedEvent`` /
+     ``AgentExecutionCompletedEvent``,
+     ``TaskStartedEvent`` / ``TaskCompletedEvent`` /
+     ``TaskFailedEvent``, ``LLMCallStartedEvent`` /
+     ``LLMCallCompletedEvent``, and
+     ``ToolUsageStartedEvent`` / ``ToolUsageFinishedEvent`` via
+     ``crewai_event_bus.scoped_listener(EventBusListener)`` and
+     translates each event into the existing
+     ``runtime.track_event`` shape (``span_start`` /
+     ``span_end`` per kickoff / agent / task / llm / tool).
+     Token totals still come from
+     ``crew.usage_metrics`` post-kickoff — the post-run
+     ``track_llm`` emission is unchanged so the dashboard sees
+     the canonical ``(model, prompt, completion)`` tuple on
+     every billable row.
+
+     When ``crewai.events`` is not importable (pre-1.15 crewai
+     or a stripped-down third-party build) the post-run
+     ``usage_metrics`` wrap is still installed and the patch
+     returns ``True`` so callers that gate on
+     ``\"did nullrun.init register a crewai bridge\"`` keep
+     getting a positive answer; only the per-event span
+     bridge is a no-op.
+
+  2. ``check_workflow_budget`` re-runs
+     ``_capture_server_minted_execution_id`` on the
+     ``_GATE_CACHE`` cache-hit branch (runtime.py:1486).
+     Pre-0.13.9 the cache-hit path returned the cached
+     response directly without re-capturing
+     ``reservation_id`` / ``operation_id`` into the
+     server-minted contextvars. Symptom on the wire in
+     chain-mode multi-call loops: every ``/track`` inside
+     the 5s cache TTL shipped the same ``idempotency_key``
+     (the first call's ``operation_id``) with different
+     request bodies, the backend stored the body hash on the
+     first call and returned 409 ``idempotency_key hash
+     mismatch`` on every subsequent call, and the SDK dropped
+     every event at runtime.py:2649 (zero rows reaching
+     Postgres). Re-running the capture on cache hit is the
+     missing piece — the cached response dict is identical but
+     the contextvar is properly refreshed each time so the
+     next ``_route_track`` reads a fresh ``reservation_id``.
+
+     Note: this fixes the per-call contract for the v3
+     /track single-event path. Chain-mode loops that re-use
+     the *same* chain_id across many gate calls still rely on
+     the cache collapsing to one roundtrip, which is the
+     intentional design (CLAUDE.md §18 BUG #5 — gate_cache
+     debounce). Operators who need a fresh ``/gate`` call on
+     every ``@protect`` invocation can opt out via
+     ``NULLRUN_GATE_CACHE_DISABLE=1`` (env var, no code
+     change).
+
+Wire format: unchanged. Backends on 1.0.0 keep working
+unchanged. Pinning unchanged: SDK_MIN_VERSION_FOR_V3 =
+"0.12.0". Recommended upgrade path: 0.13.8 -> 0.13.9.
+
+Tests:
+  * tests/test_crewai_patch.py — 15 / 15 passed (regression
+    suite covers the legacy step_callback kwargs injection,
+    the new event-bus fallback when ``crewai.events`` is
+    unavailable, and the post-run ``usage_metrics`` reader).
+  * tests/test_runtime.py + test_runtime_branches.py +
+    test_track_batch_retry.py + test_track_span_context.py +
+    test_v3_wire_contract.py — 142 passed, 1 skipped.
+  * Real-script smoke on crewai 1.15.2 —
+      ``examples/crewai_basic.py`` prints "The capital of
+      France is Paris." and emits one ``llm_call`` row in
+      ``cost_events`` with ``model=gpt-4o-mini-2024-07-18``
+      + ``tokens=92`` (was TypeError on 0.13.8).
+
+  ----
+
 v3.22 / 0.13.7 (2026-07-12) — wire ``parent_trace_id`` end-to-end on
 ``/track`` (v3 + legacy batch).
 
@@ -491,5 +579,5 @@ Recommended upgrade path: 0.13.4 -> 0.13.5.
 
 """
 
-__version__ = "0.13.8"
+__version__ = "0.13.9"
 __platform_version__ = "1.0.0"

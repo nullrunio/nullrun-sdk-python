@@ -28,7 +28,7 @@ name = "nullrun"
 # the full ``flush_interval`` (5s default). Plus CI hygiene:
 # pip cache, ``fail-fast`` matrix, ``pytest-xdist -n auto``. No
 # on-wire change; backends on 1.0.0 keep working unchanged.
-version = "0.13.8"
+version = "0.13.9"
 # Kept under the 200-char preview threshold so the full line is visible
 # without an "expand" click. Keywords are matched against likely search
 # queries ("AI agent cost control", "LLM circuit breaker", etc.).
