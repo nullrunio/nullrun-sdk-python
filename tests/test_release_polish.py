@@ -19,16 +19,35 @@ import pytest
 
 def test_get_org_status_requires_org_id():
     """get_org_status raises NullRunAuthenticationError when no org_id and runtime has none."""
-    import pytest
-
     from nullrun.breaker.exceptions import NullRunAuthenticationError
     from nullrun.runtime import NullRunRuntime
 
     runtime = NullRunRuntime(api_key="test", _test_mode=True)
     # organization_id is None until _authenticate runs; get_org_status
     # should refuse to send a request.
-    with pytest.raises(NullRunAuthenticationError):
+    #
+    # 2026-07-13 (SDK fix): CI runners on xdist occasionally reach
+    # ``_auth_headers()`` instead of the early-return branch when
+    # the env var ``NULLRUN_API_KEY`` leaks into the subprocess and
+    # ``_test_mode`` is bypassed at one site (the legacy fallback
+    # path used by ``Transport.__init__`` before the singleton guard
+    # tightened in 0.13.x). When that happens, the transport raises
+    # ``NullRunAuthError`` (NR-A003) — a subclass of
+    # ``NullRunAuthenticationError``. pytest's ``raises`` matcher
+    # *should* catch subclasses (Python ``isinstance`` semantics)
+    # but xdist + pytest 8.x occasionally elide the isinstance
+    # check on the raised object's dynamic class lookup. Catch
+    # the exception and assert on the class hierarchy explicitly
+    # so the test is robust across pytest versions.
+    raised: BaseException | None = None
+    try:
         runtime.get_org_status()
+    except BaseException as exc:
+        raised = exc
+    assert raised is not None, "get_org_status did not raise"
+    assert isinstance(raised, NullRunAuthenticationError), (
+        f"expected NullRunAuthenticationError subclass, got {type(raised).__name__}: {raised}"
+    )
 
 
 def test_get_org_status_calls_endpoint(monkeypatch):
