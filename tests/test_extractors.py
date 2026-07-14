@@ -86,6 +86,29 @@ def test_openai_malformed_json_returns_none():
     assert _openai_extractor(b"not-json", 200) is None
 
 
+def test_openai_mistral_num_cached_tokens():
+    """Mistral exposes a flat ``usage.num_cached_tokens`` field at the
+    same level (no ``prompt_tokens_details`` wrapper). Without the
+    fallback in the OpenAI extractor, Mistral customers see
+    ``cache_read_tokens=0`` even when the inference cache hit.
+    """
+    body = json.dumps(
+        {
+            "model": "mistral-large-latest",
+            "choices": [{"finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": 57,
+                "completion_tokens": 18,
+                "total_tokens": 75,
+                "num_cached_tokens": 41,
+            },
+        }
+    ).encode()
+    out = _openai_extractor(body, 200)
+    assert out is not None
+    assert out["cache_read_tokens"] == 41
+
+
 def test_openai_v1_streaming_final_chunk():
     """OpenAI v1.0+ streaming responses only carry `usage` in the LAST SSE
     chunk. We feed the full accumulated buffer (multiple SSE chunks
@@ -142,6 +165,38 @@ def test_anthropic_error_returns_none():
     assert _anthropic_extractor(body, 429) is None
 
 
+def test_anthropic_extended_thinking_tokens():
+    """Anthropic 4.5+ extended-thinking surfaces
+    ``output_tokens_details.thinking_tokens`` so callers can split
+    reasoning from visible output. Without the read, every
+    thinking-mode call is invisible in the reasoning dashboard.
+    """
+    body = json.dumps(
+        {
+            "id": "msg_01",
+            "model": "claude-sonnet-4-5-20250929",
+            "content": [{"type": "text", "text": "Final answer."}],
+            "usage": {
+                "input_tokens": 1200,
+                "output_tokens": 215,
+                "output_tokens_details": {"thinking_tokens": 80},
+                "cache_read_input_tokens": 3500,
+                "cache_creation_input_tokens": 800,
+            },
+        }
+    ).encode()
+    out = _anthropic_extractor(body, 200)
+    assert out is not None
+    assert out["reasoning_tokens"] == 80
+    assert out["completion_tokens"] == 215
+    # total stays as input + output (Anthropic bills thinking
+    # tokens at the output rate upstream, so the
+    # input+output sum already includes them).
+    assert out["total_tokens"] == 1415
+    assert out["cache_read_tokens"] == 3500
+    assert out["cache_write_tokens"] == 800
+
+
 # ---------------------------------------------------------------------------
 # Google Gemini (Generative Language API)
 # ---------------------------------------------------------------------------
@@ -187,19 +242,53 @@ def test_gemini_no_usage_returns_none():
     assert _gemini_extractor(body, 200) is None
 
 
+def test_gemini_2_5_thinking_tokens():
+    """Gemini 2.5+ "thinking" mode surfaces ``thoughtsTokenCount`` in
+    ``usageMetadata``. Without the read the dashboard can't tell
+    reasoning tokens from visible output for thinking-mode calls.
+    """
+    body = json.dumps(
+        {
+            "modelVersion": "gemini-2.5-pro",
+            "candidates": [{"content": {"parts": [{"text": "answer"}]}}],
+            "usageMetadata": {
+                "promptTokenCount": 1200,
+                "candidatesTokenCount": 47,
+                "thoughtsTokenCount": 30,
+                "totalTokenCount": 1277,
+            },
+        }
+    ).encode()
+    out = _gemini_extractor(body, 200)
+    assert out is not None
+    assert out["reasoning_tokens"] == 30
+    # totalTokenCount is authoritative when present; we don't
+    # double-count the reasoning tokens into total (Gemini already
+    # includes them in candidatesTokenCount).
+    assert out["total_tokens"] == 1277
+
+
 # ---------------------------------------------------------------------------
 # Cohere
 # ---------------------------------------------------------------------------
 
 
 def test_cohere_v2_response():
+    """Cohere v2 canonical response — actual API shape has
+    ``usage.tokens`` as a nested object with input/output token
+    counts, not a flat integer. Older fixtures had the integer
+    shape, which masked the v2 nested-object reality.
+    """
     body = json.dumps(
         {
             "model": "command-r-plus",
             "usage": {
                 "input_tokens": 18,
                 "output_tokens": 4,
-                "tokens": 22,
+                "tokens": {
+                    "input_tokens": 18,
+                    "output_tokens": 4,
+                },
             },
         }
     ).encode()
@@ -209,6 +298,10 @@ def test_cohere_v2_response():
     assert out["completion_tokens"] == 4
     assert out["total_tokens"] == 22
     assert out["model"] == "command-r-plus"
+    # Nested usage.tokens is NOT the total value; v2 carries
+    # the int fields in both shapes (top-level + nested) and
+    # the top-level wins as the source-of-truth.
+    assert out["cache_read_tokens"] == 0
 
 
 def test_cohere_v1_legacy_prompt_completion_keys():
@@ -225,6 +318,90 @@ def test_cohere_v1_legacy_prompt_completion_keys():
     assert out["prompt_tokens"] == 5
     assert out["completion_tokens"] == 2
     assert out["total_tokens"] == 7
+
+
+def test_cohere_v2_message_tool_calls_path():
+    """Cohere v2 nests ``tool_calls`` under ``message.tool_calls`` (not
+    at top level). v1 still used top-level; both must work. Without
+    the v2 path fix, ``tool_names`` is always empty for v2 callers
+    and the backend's loop detection misses every Cohere tool use.
+    """
+    body = json.dumps(
+        {
+            "id": "c14c80c3-18eb-4519-9460-6c92edd8cfb4",
+            "model": "command-r-plus",
+            "finish_reason": "COMPLETE",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "Let me check that."}],
+                "tool_calls": [
+                    {
+                        "id": "search_docs_dkf0akqdazjb",
+                        "type": "function",
+                        "function": {
+                            "name": "search_docs",
+                            "arguments": '{"query":"tool use","top_k":3}',
+                        },
+                    }
+                ],
+            },
+            "usage": {
+                "input_tokens": 71,
+                "output_tokens": 418,
+                "tokens": {
+                    "input_tokens": 71,
+                    "output_tokens": 418,
+                },
+            },
+        }
+    ).encode()
+    out = _cohere_extractor(body, 200)
+    assert out is not None
+    assert out["tool_names"] == ["search_docs"], (
+        "v2 message.tool_calls must be picked up; "
+        f"got {out['tool_names']!r}"
+    )
+    # UPPERCASE finish_reason is normalized via _FINISH_REASON_MAP
+    assert out["finish_reason"] == "stop"
+
+
+def test_cohere_v2_cached_tokens():
+    """Cohere v2 exposes ``usage.tokens.cached_tokens`` for inference
+    cache hits. Previously always read as 0.
+    """
+    body = json.dumps(
+        {
+            "model": "command-r-plus",
+            "usage": {
+                "input_tokens": 71,
+                "output_tokens": 18,
+                "tokens": {
+                    "input_tokens": 71,
+                    "output_tokens": 18,
+                    "cached_tokens": 40,
+                },
+            },
+        }
+    ).encode()
+    out = _cohere_extractor(body, 200)
+    assert out is not None
+    assert out["cache_read_tokens"] == 40
+
+
+def test_cohere_v1_top_level_tool_calls_fallback():
+    """v1 still surfaces tool_calls at the top level (no ``message``
+    wrapper). v1 callers keep working alongside the new v2 path.
+    """
+    body = json.dumps(
+        {
+            "model": "command",
+            "tool_calls": [{"name": "legacy_tool"}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 2},
+        }
+    ).encode()
+    out = _cohere_extractor(body, 200)
+    assert out is not None
+    assert out["tool_names"] == ["legacy_tool"]
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +444,81 @@ def test_bedrock_top_level_input_output_tokens():
 def test_bedrock_error_returns_none():
     body = json.dumps({"message": "AccessDeniedException"}).encode()
     assert _bedrock_extractor(body, 403) is None
+
+
+def test_bedrock_mistral_finish_reason_via_choices():
+    """Mistral-on-Bedrock / OpenAI-compat carries
+    ``choices[0].finish_reason`` (not ``stopReason``). Without the
+    extra read, the backend loses the finish signal on every
+    Mistral-on-Bedrock call and dashboard aggregations can never
+    distinguish `stop` from `length`.
+
+    Bedrock wraps the underlying model response in
+    ``InvokeModelResponse`` with ``output`` as a base64-encoded body
+    for streaming; the unwrapped shape is what we test here because
+    the SDK receives the parsed body. Token fields in this shape
+    are camelCase (AWS-style) at the top level of ``usage`` even
+    for OpenAI-compat models.
+    """
+    body = json.dumps(
+        {
+            "id": "cmpl-bedrock-1",
+            "model": "mistral.mistral-large-2407-v1:0",
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "abc",
+                                "type": "function",
+                                "function": {"name": "search"},
+                            }
+                        ],
+                    },
+                }
+            ],
+            "usage": {
+                "inputTokens": 100,
+                "outputTokens": 20,
+                "totalTokens": 120,
+            },
+        }
+    ).encode()
+    out = _bedrock_extractor(body, 200)
+    assert out is not None
+    assert out["finish_reason"] == "tool_calls"
+    assert out["tool_names"] == ["search"]
+
+
+def test_bedrock_llama_finish_reason_via_top_level():
+    """Llama-on-Bedrock carries ``stop_reason`` at the top level
+    (snake_case). Make sure we pick that up. Note Llama's token
+    fields are top-level ``prompt_token_count`` /
+    ``generation_token_count`` (not under ``usage``), so the
+    ``usage`` discriminator still matches via the
+    ``inputTokens``/``outputTokens`` top-level fallback path.
+    """
+    body = json.dumps(
+        {
+            "id": "bedrock-llama-1",
+            "stop_reason": "stop",
+            "inputTokens": 100,
+            "outputTokens": 20,
+            "output": {
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "ok"}],
+                }
+            },
+        }
+    ).encode()
+    out = _bedrock_extractor(body, 200)
+    assert out is not None
+    assert out["finish_reason"] == "stop"
 
 
 # ---------------------------------------------------------------------------

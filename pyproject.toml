@@ -28,7 +28,37 @@ name = "nullrun"
 # the full ``flush_interval`` (5s default). Plus CI hygiene:
 # pip cache, ``fail-fast`` matrix, ``pytest-xdist -n auto``. No
 # on-wire change; backends on 1.0.0 keep working unchanged.
-version = "0.13.9"
+# 0.13.6 (2026-07-11): multi-agent span attachment (parent_trace_id)
+# on the langgraph callback; new cost_events.parent_trace_id column
+# (backend migration 217). Wire-additive — legacy backends ignore
+# the field. Pairs with PR #61.
+# 0.13.7 (2026-07-12): wire ``parent_trace_id`` end-to-end on
+# ``/track`` (v3 single-event + legacy /track/batch). Pre-fix the
+# SDK stamped the field in the langgraph callback but dropped it
+# at the runtime._enrich_event / _build_v3_track_payload layers.
+# No on-wire change for legacy backends; new column required on
+# the v3 path. Pairs with PR #64.
+# 0.13.8 (2026-07-12): hotfix #2 for parent_trace_id — the
+# runtime._enrich_event parent_trace_id fallback used an
+# "if not in enriched" guard that missed whenever langgraph.py
+# callback's _active_runs lookup missed (run_id drift between
+# auto-injected and user-supplied callbacks, or non-langgraph
+# stacks). Switched to override semantics: the chain contextvar
+# is the single source of truth; both caller-set and
+# contextvar-fallback resolve to the same value (idempotent for
+# the happy path, closes the drift in the unhappy path).
+# Pairs with PR #66.
+# 0.13.9 (2026-07-13): crewai 1.15 compatibility — replace
+# step_callback kwargs injection (removed upstream) with a
+# crewai_event_bus bridge; gate_cache re-capture for fresh
+# server-minted execution_id on cache-hit. Pairs with PR #67.
+# 0.13.10 (2026-07-13): close 5 vendor extractor edge cases
+# missed in the 0.13.9 audit — Cohere v2 nested tool_calls +
+# cached_tokens + UPPERCASE finish_reason; Mistral flat
+# num_cached_tokens fallback; Gemini 2.5+ thoughtsTokenCount;
+# Anthropic 4.5+ extended-thinking tokens; Bedrock Mistral/Llama
+# finish_reason paths. No on-wire change; no SDK_MIN_VERSION bump.
+version = "0.13.10"
 # Kept under the 200-char preview threshold so the full line is visible
 # without an "expand" click. Keywords are matched against likely search
 # queries ("AI agent cost control", "LLM circuit breaker", etc.).

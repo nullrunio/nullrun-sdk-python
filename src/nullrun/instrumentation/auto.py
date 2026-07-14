@@ -147,6 +147,9 @@ def _openai_extractor(body: bytes, status: int) -> ExtractedUsage | None:
 
     # Optional nested usage detail blocks. OpenAI added these in 2024
     # to expose cache hits (prompt caching) and reasoning tokens (o1).
+    # Mistral exposes a flat ``num_cached_tokens`` field at the same
+    # level (no ``prompt_tokens_details`` wrapper); the chained
+    # ``or`` reads either shape.
     prompt_details = usage.get("prompt_tokens_details") or {}
     completion_details = usage.get("completion_tokens_details") or {}
 
@@ -182,7 +185,16 @@ def _openai_extractor(body: bytes, status: int) -> ExtractedUsage | None:
         # Previously these were reachable only via raw_usage (now
         # stripped at the wire boundary). Backend gate/budget/loop
         # detection now sees them as first-class columns.
-        "cache_read_tokens": int(prompt_details.get("cached_tokens", 0) or 0),
+        # OpenAI nests cache hits under ``prompt_tokens_details.cached_tokens``;
+        # Mistral exposes ``usage.num_cached_tokens`` at the same level
+        # (no nested object). Read either shape so cache-savings metrics
+        # work for both providers. Mistral also does not have a write
+        # side, so cache_write_tokens stays 0.
+        "cache_read_tokens": int(
+            prompt_details.get("cached_tokens", 0)
+            or usage.get("num_cached_tokens", 0)
+            or 0
+        ),
         "cache_write_tokens": 0,  # OpenAI does not expose cache creation
         "reasoning_tokens": int(completion_details.get("reasoning_tokens", 0) or 0),
         "finish_reason": _normalize_finish_reason(raw_finish),
@@ -304,10 +316,19 @@ def _anthropic_extractor(body: bytes, status: int) -> ExtractedUsage | None:
         "id": payload.get("id"),
         "cache_read_tokens": int(usage.get("cache_read_input_tokens", 0) or 0),
         "cache_write_tokens": int(usage.get("cache_creation_input_tokens", 0) or 0),
-        # Anthropic reasoning tokens are part of output_tokens (they're
-        # billed at the output rate). Surface 0 here so the backend
-        # can detect providers that report them separately.
-        "reasoning_tokens": 0,
+        # Anthropic 4.5+ extended-thinking surfaces
+        # ``output_tokens_details.thinking_tokens`` so callers can
+        # split reasoning from visible output for billing and
+        # latency dashboards. Native Messages API keeps
+        # thinking tokens rolled into ``output_tokens`` upstream
+        # (they're billed at the output rate), so the total
+        # stays correct without any adjustment; we only surface
+        # the breakdown.
+        "reasoning_tokens": int(
+            (usage.get("output_tokens_details") or {}).get(
+                "thinking_tokens", 0
+            ) or 0
+        ),
         "finish_reason": _normalize_finish_reason(payload.get("stop_reason")),
         "tool_names": tool_names,
     }
@@ -362,7 +383,13 @@ def _gemini_extractor(body: bytes, status: int) -> ExtractedUsage | None:
         "id": payload.get("responseId") or payload.get("id"),
         "cache_read_tokens": int(usage.get("cachedContentTokenCount", 0) or 0),
         "cache_write_tokens": 0,
-        "reasoning_tokens": 0,
+        # Gemini 2.5+ "thinking" models surface
+        # ``usageMetadata.thoughtsTokenCount`` (reasoning tokens
+        # are part of ``candidatesTokenCount`` upstream but Gemini
+        # splits them out for billing/dashboards). Without this
+        # read the dashboard can't distinguish reasoning vs
+        # visible output for thinking-mode Gemini calls.
+        "reasoning_tokens": int(usage.get("thoughtsTokenCount", 0) or 0),
         "finish_reason": _normalize_finish_reason(raw_finish),
         "tool_names": tool_names,
     }
@@ -374,6 +401,25 @@ def _cohere_extractor(body: bytes, status: int) -> ExtractedUsage | None:
     response.usage.{tokens, input_tokens, output_tokens}.
     Note: Cohere streaming has no usage in stream — only non-streaming
     responses carry it. Documented in the plan.
+
+    2026-07-13 (drift fix #N): v2 has THREE schema changes the SDK
+    silently missed:
+
+      1. ``tool_calls`` live under ``message.tool_calls`` (not at
+         the top level). v1 still used top-level ``tool_calls``;
+         v2 moved them into the assistant message envelope. The
+         top-level path is preserved as a fallback for v1 + the
+         rare v2 adapter that lifts the field back up, so neither
+         version is broken by the new primary path.
+
+      2. ``usage.tokens.cached_tokens`` is the v2 cache hit counter
+         (Cohere's inference cache). Previously always read as 0.
+
+      3. ``finish_reason`` values are UPPERCASE
+         (``COMPLETE | MAX_TOKENS | STOP_SEQUENCE | TOOL_CALL |
+         ERROR | TIMEOUT``); the v1 vocabulary was lowercase. The
+         ``_normalize_finish_reason`` helper lower-cases before
+         mapping so both vocabularies work.
     """
     if status >= 400 or not body:
         return None
@@ -385,28 +431,52 @@ def _cohere_extractor(body: bytes, status: int) -> ExtractedUsage | None:
     if not isinstance(usage, dict):
         return None
     # v2 uses input_tokens/output_tokens; v1 used prompt_tokens/completion_tokens.
+    # ``usage.tokens`` in v2 is a nested object (not an int) so we cannot
+    # use it as the ``total`` value here — that path was wrong in v1 and
+    # silently crashes on v2. Compute total from the actual int fields
+    # below; the ``tokens`` nested object is only consulted for the
+    # ``cached_tokens`` field (its only int it carries in v2).
     inp = int(
         usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0) or 0
     )
     out = int(
         usage.get("output_tokens", 0) or usage.get("completion_tokens", 0) or 0
     )
-    total = int(usage.get("tokens", 0) or 0) or (inp + out)
-    if total == 0 and inp == 0 and out == 0:
+    if inp == 0 and out == 0:
         return None
+    total = inp + out
 
-    # Cohere tool_calls are top-level (not under choices[]). The
-    # schema varies: v2 uses {id, type: "function", function: {name
-    # arguments}}; some adapters use {name, parameters}. We accept
-    # both shapes.
+    # Cache reads — v2 exposes ``usage.tokens.cached_tokens``; v1
+    # had no cache concept. The nested path is the new primary;
+    # the top-level fallback covers a future v1.1 re-introduction.
+    cache_read = int(
+        (usage.get("tokens") or {}).get("cached_tokens", 0)
+        or usage.get("cached_tokens", 0)
+        or 0
+    )
+
+    # Cohere tool_calls are top-level (v1) OR under
+    # ``message.tool_calls`` (v2). v2 path is primary because
+    # current Cohere SDK always puts the field there; the
+    # top-level path remains so v1 callers keep working.
     tool_names: list[str] = []
-    for tc in payload.get("tool_calls") or []:
-        if not isinstance(tc, dict):
-            continue
-        if isinstance(tc.get("function"), dict) and tc["function"].get("name"):
-            tool_names.append(tc["function"]["name"])
-        elif tc.get("name"):
-            tool_names.append(tc["name"])
+    message = payload.get("message") if isinstance(payload, dict) else None
+    if isinstance(message, dict):
+        for tc in message.get("tool_calls") or []:
+            if not isinstance(tc, dict):
+                continue
+            if isinstance(tc.get("function"), dict) and tc["function"].get("name"):
+                tool_names.append(tc["function"]["name"])
+            elif tc.get("name"):
+                tool_names.append(tc["name"])
+    if not tool_names:
+        for tc in payload.get("tool_calls") or []:
+            if not isinstance(tc, dict):
+                continue
+            if isinstance(tc.get("function"), dict) and tc["function"].get("name"):
+                tool_names.append(tc["function"]["name"])
+            elif tc.get("name"):
+                tool_names.append(tc["name"])
 
     return {
         "prompt_tokens": inp,
@@ -417,9 +487,13 @@ def _cohere_extractor(body: bytes, status: int) -> ExtractedUsage | None:
         # surface a stable response id at the top level; rely on
         # model+provider for disambiguation. See _openai_extractor.
         "id": payload.get("id") or payload.get("generation_id"),
-        "cache_read_tokens": 0,
+        "cache_read_tokens": cache_read,
         "cache_write_tokens": 0,
         "reasoning_tokens": 0,
+        # _normalize_finish_reason lower-cases before mapping so
+        # both v1 ("stop"/"length"/"tool_calls") and v2
+        # ("COMPLETE"/"MAX_TOKENS"/"TOOL_CALL") are normalized
+        # to the backend's canonical vocabulary.
         "finish_reason": _normalize_finish_reason(payload.get("finish_reason")),
         "tool_names": tool_names,
     }
@@ -543,6 +617,23 @@ def _bedrock_extractor(body: bytes, status: int) -> ExtractedUsage | None:
         or 0
     )
 
+    # Finish reason — shape depends on the underlying model.
+    # Anthropic-on-Bedrock / native Anthropic: top-level
+    # ``stopReason`` (camelCase, AWS-style). Llama-on-Bedrock:
+    # top-level ``stop_reason`` (snake_case). Mistral-on-Bedrock
+    # / OpenAI-compat: ``choices[0].finish_reason`` (per the
+    # OpenAI shape) — the ``matched_shape`` discriminator we
+    # already track above tells us which body the response used.
+    # We capture from all three sources in priority order so the
+    # backend always sees a finish_reason on Mistral / Llama
+    # Bedrock calls, not just on Anthropic.
+    raw_finish: str | None = payload.get("stopReason") or payload.get("stop_reason")
+    if raw_finish is None and matched_shape == "openai_choices":
+        for choice in payload.get("choices") or []:
+            if isinstance(choice, dict) and choice.get("finish_reason"):
+                raw_finish = choice["finish_reason"]
+                break
+
     return {
         "prompt_tokens": inp,
         "completion_tokens": out,
@@ -558,7 +649,7 @@ def _bedrock_extractor(body: bytes, status: int) -> ExtractedUsage | None:
         "cache_read_tokens": cache_read,
         "cache_write_tokens": cache_write,
         "reasoning_tokens": 0,
-        "finish_reason": _normalize_finish_reason(payload.get("stopReason") or payload.get("stop_reason")),
+        "finish_reason": _normalize_finish_reason(raw_finish),
         "tool_names": tool_names,
     }
 

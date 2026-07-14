@@ -1,5 +1,120 @@
 """NullRun Platform SDK.
 
+v3.24 / 0.13.10 (2026-07-13) — close 5 vendor extractor edge cases
+missed in the 0.13.9 audit.
+
+  1. Cohere v2 tool_calls path: the pre-0.13.10 extractor read
+     top-level payload["tool_calls"], but Cohere v2 nests the field
+     under message.tool_calls (OpenAI shape). Every v2 Cohere call
+     shipped with tool_names=[] and the backend's loop detection
+     could not see Cohere tool use. Fix walks both v1 (top-level)
+     and v2 (message.tool_calls) paths. Same patch adds
+     usage.tokens.cached_tokens (cache-hit read was always 0) and
+     the UPPERCASE finish_reason vocabulary
+     (COMPLETE | MAX_TOKENS | TOOL_CALL) — the _FINISH_REASON_MAP
+     already lower-cased both vocabularies; the missing piece was
+     the test snapshot.
+
+  2. Mistral num_cached_tokens (flat field on usage, not nested
+     under prompt_tokens_details.cached_tokens like OpenAI's). The
+     OpenAI extractor only read the nested shape, so Mistral
+     customers always saw cache_read_tokens=0 even when the
+     inference cache hit. Fix reads the Mistral flat field as a
+     fallback inside the same chain. The _openai_extractor host
+     map (line 567) already covers Mistral so no host-routing
+     change was needed.
+
+  3. Gemini 2.5+ thoughtsTokenCount (reasoning tokens in
+     usageMetadata) — was hard-coded to 0, so thinking-mode Gemini
+     calls had no visible reasoning column on the dashboard.
+     Surfaced as reasoning_tokens while the total stays at
+     totalTokenCount (reasoning tokens are part of
+     candidatesTokenCount upstream).
+
+  4. Anthropic 4.5+ output_tokens_details.thinking_tokens
+     (extended-thinking mode) — was hard-coded to 0 for the same
+     reason. The pre-0.13.10 comment ("reasoning tokens are part
+     of output_tokens") was correct for the non-thinking baseline,
+     but the thinking-mode field was still readable and was being
+     dropped. Now we read the breakdown while keeping the total at
+     input+output (Anthropic bills thinking tokens at the output
+     rate upstream).
+
+  5. AWS Bedrock finish_reason for the Mistral-on-Bedrock /
+     OpenAI-compat and Llama-on-Bedrock adapter shapes. The
+     pre-0.13.10 extractor only read top-level stopReason /
+     stop_reason (Anthropic + Llama top-level). Mistral's
+     OpenAI-compat shape puts the field under
+     choices[0].finish_reason and was always None. The
+     matched_shape discriminator (already tracked in the
+     tool-detection block) tells us which body to read from and
+     the new branch picks choices[0].finish_reason when
+     matched_shape == 'openai_choices'.
+
+The same audit identified the following as should-fix but
+deferred to a follow-up PR (none is a billing gap; all are
+visibility / observability gaps):
+
+  - Anthropic cache_creation.ephemeral_{1h,5m}_input_tokens
+    TTL breakdown (different billing rates; Bedrock does not
+    yet expose the breakdown as of 2026-Q3).
+  - Anthropic server_tool_use.{web_search_requests,
+    web_fetch_requests} — server-side tool invocations not
+    visible to loop detection.
+  - Gemini multimodal *TokensDetails[] (TEXT vs IMAGE vs
+    AUDIO) — image-heavy calls mask the real cost driver.
+  - Cohere billed_units.{search_units, classifications} for
+    RAG / classify workloads.
+  - Cohere reasoning models (command-a-reasoning-*).
+  - Bedrock Converse API (separate envelope from InvokeModel).
+
+Wire format: unchanged. Backends on 1.0.0 keep working
+unchanged. Pinning unchanged: SDK_MIN_VERSION_FOR_V3 =
+"0.12.0". Recommended upgrade path: 0.13.9 -> 0.13.10.
+
+Tests (8 new in tests/test_extractors.py):
+
+  - test_cohere_v2_message_tool_calls_path — v2 nested
+    message.tool_calls returns the right tool_names.
+  - test_cohere_v2_cached_tokens — tokens.cached_tokens
+    surfaces as cache_read_tokens.
+  - test_cohere_v1_top_level_tool_calls_fallback — v1
+    callers (legacy top-level tool_calls) keep working.
+  - test_openai_mistral_num_cached_tokens — Mistral
+    usage.num_cached_tokens fallback in the OpenAI extractor.
+  - test_gemini_2_5_thinking_tokens — thoughtsTokenCount
+    surfaces as reasoning_tokens while the total stays at
+    totalTokenCount.
+  - test_anthropic_extended_thinking_tokens —
+    output_tokens_details.thinking_tokens surfaces
+    alongside cache_read_input_tokens /
+    cache_creation_input_tokens already extracted.
+  - test_bedrock_mistral_finish_reason_via_choices —
+    Mistral-on-Bedrock OpenAI-compat finish_reason is now
+    captured.
+  - test_bedrock_llama_finish_reason_via_top_level —
+    Llama-on-Bedrock stop_reason snake_case is captured
+    (already worked, but had no test snapshot before).
+
+Verification locally (origin/master + this commit on top):
+
+  * pytest tests/test_extractors.py tests/test_crewai_patch.py
+    tests/test_runtime.py tests/test_runtime_branches.py
+    tests/test_track_batch_retry.py
+    tests/test_track_span_context.py
+    tests/test_v3_wire_contract.py tests/test_release_polish.py
+    — 185 passed, 1 skipped (8 new tests net-new from this
+    commit; no regression on the 177 tests that were green
+    on master).
+  * ruff check src/ — "All checks passed!".
+  * mypy src/ — 11 pre-existing errors (langgraph overload
+    mismatches at lines 1818, 1821, 1827; same count as
+    origin/master). No new mypy findings from this release.
+
+No public API change. No SDK_MIN_VERSION bump.
+
+---
+
 v3.23 / 0.13.9 (2026-07-13) — crewai 1.15 compatibility + gate_cache
 re-capture.
 
@@ -579,5 +694,5 @@ Recommended upgrade path: 0.13.4 -> 0.13.5.
 
 """
 
-__version__ = "0.13.9"
+__version__ = "0.13.10"
 __platform_version__ = "1.0.0"
