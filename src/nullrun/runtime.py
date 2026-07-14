@@ -3116,6 +3116,33 @@ def _build_v3_track_payload(
         if k in wire_event and wire_event[k] is not None:
             payload[k] = wire_event[k]
 
+    # 2026-07-13 (vendor-extractor edge cases, SDK counterpart at
+    # nullrun-sdk-python release/0.13.9): the 5 wire fields
+    # surfaced by the vendor-specific extractors (Cohere v2
+    # tool_calls, Mistral num_cached_tokens, Gemini
+    # thoughtsTokenCount, Anthropic 4.5+ extended-thinking,
+    # Bedrock Mistral/Llama finish_reason) must ride through the
+    # v3 /track payload so the backend's `TrackRequestRaw` /
+    # `TrackRequest` / `QueuedEvent` constructors persist them on
+    # the migration-220 columns. The legacy `/track/batch` path
+    # already preserves them (it serializes `wire_event` as-is),
+    # but the v3 mapper builds an explicit payload dict, so we
+    # have to opt each field in by name.
+    #
+    # The backend defaults all five to `None` on missing keys, so
+    # a legacy event that lands on the v3 path without these
+    # fields still parses cleanly (matches the legacy v1/v2
+    # behaviour). We forward only non-None values here.
+    for k in (
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "reasoning_tokens",
+        "finish_reason",
+        "tool_names",
+    ):
+        if k in wire_event and wire_event[k] is not None:
+            payload[k] = wire_event[k]
+
     # Wire idempotency_key: the
     # backend's /track handler (``handlers.rs:4654-4725``) accepts
     # ``idempotency_key: Option<String>`` and, on hit of the same
