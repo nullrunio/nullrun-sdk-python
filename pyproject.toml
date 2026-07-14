@@ -58,7 +58,13 @@ name = "nullrun"
 # num_cached_tokens fallback; Gemini 2.5+ thoughtsTokenCount;
 # Anthropic 4.5+ extended-thinking tokens; Bedrock Mistral/Llama
 # finish_reason paths. No on-wire change; no SDK_MIN_VERSION bump.
-version = "0.13.10"
+# 0.13.11 (2026-07-14): forward the five vendor-extractor fields
+# (cache_read_tokens / cache_write_tokens / reasoning_tokens /
+# finish_reason / tool_names) through the v3 /track single-event
+# payload — pre-fix the v3 mapper dropped them on the SDK wire
+# boundary even though the extractors (0.13.10) populated them on
+# wire_event. Pairs with backend migration 220.
+version = "0.13.11"
 # Kept under the 200-char preview threshold so the full line is visible
 # without an "expand" click. Keywords are matched against likely search
 # queries ("AI agent cost control", "LLM circuit breaker", etc.).
