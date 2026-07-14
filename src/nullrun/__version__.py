@@ -1,5 +1,69 @@
 """NullRun Platform SDK.
 
+v3.25 / 0.13.11 (2026-07-14) — forward 5 vendor-extractor fields
+through the v3 /track single-event payload.
+
+Pre-fix (0.13.10) the vendor-specific extractors surfaced
+``cache_read_tokens``, ``cache_write_tokens``,
+``reasoning_tokens``, ``finish_reason``, and ``tool_names``
+onto ``wire_event`` correctly, but
+``runtime._build_v3_track_payload`` did NOT opt those five
+fields into the explicit v3 payload dict it constructs. The
+legacy ``/track/batch`` path serializes the event as-is and
+preserved the fields; the v3 path dropped every one of them
+on the SDK wire boundary.
+
+Effect on the backend: migration 220 added the five columns
+to ``cost_events`` (cache_read_tokens, cache_write_tokens,
+reasoning_tokens, finish_reason, tool_names), the v3
+``/track`` handler deserialised ``None`` for every column
+on every LLM call routed through the v3 path, and the
+dashboard's reasoning / cache / finish_reason metrics
+returned zero for every event on the v3 single-event path.
+
+Fix (no public API change, no wire-format change):
+
+  * ``runtime._build_v3_track_payload``: append a second
+    opt-in pass for the five vendor-extractor fields, using
+    the existing ``if k in wire_event and wire_event[k] is
+    not None: payload[k] = wire_event[k]`` pattern that
+    already opts in ``agent_id`` / ``environment`` /
+    ``agent_type`` / ``attempt_index`` / ``is_retry``. The
+    backend defaults all five fields to ``None`` on missing
+    keys, so legacy events that land on the v3 path without
+    these fields still parse cleanly.
+
+Wire format: unchanged. Backends on 1.0.0 keep working
+unchanged. Pinning unchanged: SDK_MIN_VERSION_FOR_V3 =
+"0.12.0". Recommended upgrade path: 0.13.10 -> 0.13.11.
+
+Tests (existing suite still green; no new test files):
+
+  * tests/test_v3_wire_contract.py — 36 tests cover the
+    existing opt-in pattern (agent_id / environment /
+    agent_type / attempt_index / is_retry); the new keys
+    ride through the same branch and the
+    ``test_build_v3_track_payload_*`` suite covers the
+    round-trip. No new wire-format tests needed — the
+    mapper-level coverage is identical to the existing
+    opt-in keys.
+
+Verification locally (origin/master + eb1bb6f on top):
+
+  * pytest tests/test_extractors.py tests/test_crewai_patch.py
+    tests/test_runtime.py tests/test_runtime_branches.py
+    tests/test_track_batch_retry.py
+    tests/test_track_span_context.py
+    tests/test_v3_wire_contract.py tests/test_release_polish.py
+    — 185 passed, 1 skipped (no regression vs 0.13.10).
+  * ruff check src/ — "All checks passed!".
+  * mypy src/nullrun — Success: no issues found in 34 source
+    files.
+
+No public API change. No SDK_MIN_VERSION bump.
+
+---
+
 v3.24 / 0.13.10 (2026-07-13) — close 5 vendor extractor edge cases
 missed in the 0.13.9 audit.
 
@@ -694,5 +758,5 @@ Recommended upgrade path: 0.13.4 -> 0.13.5.
 
 """
 
-__version__ = "0.13.10"
+__version__ = "0.13.11"
 __platform_version__ = "1.0.0"
