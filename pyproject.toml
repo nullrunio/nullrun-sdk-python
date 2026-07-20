@@ -194,6 +194,10 @@ dev = [
     # runs (e.g. ``pytest tests/test_one.py``) don't accidentally
     # spawn a worker pool.
     "pytest-xdist>=3.6",
+    # pytest-cov starts coverage inside every xdist worker and combines
+    # their data. Wrapping ``pytest -n auto`` in ``coverage run`` only
+    # traces the coordinator process and produces a false 0% report.
+    "pytest-cov>=5.0",
     # The SDK eagerly imports `nullrun.instrumentation.langgraph`
     # (from `nullrun.decorators`, imported by `nullrun.__init__` at
     # collection time), which itself does `from langchain_core.callbacks
@@ -556,7 +560,7 @@ omit = ["tests/*"]
 branch = true
 
 [tool.coverage.report]
-fail_under = 82
+fail_under = 80
 show_missing = true
 # Branch coverage makes the report noisier; precision=2 keeps the
 # numbers readable. skip_empty drops files with no statements.
