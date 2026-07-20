@@ -550,6 +550,13 @@ addopts = "--tb=short"
 # because pytest's rootdir discovery lands on the repo root rather
 # than the tests/ directory.
 pythonpath = ["."]
+# Sprint 0 (coverage): ``slow_sleep`` opts a test out of the
+# conftest autouse ``_fast_sleep`` cap so it can use the real wall
+# clock (e.g. for thread-scheduler iterations). Tests that need
+# the cap disabled mark themselves with ``@pytest.mark.slow_sleep``.
+markers = [
+    "slow_sleep: opt out of the conftest autouse time.sleep cap",
+]
 
 [tool.coverage.run]
 source = ["src/nullrun"]
