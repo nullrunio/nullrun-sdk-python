@@ -16,7 +16,7 @@
 #    release whose diff is dominated by contract-pinning tests)
 #
 # Coverage gate at the project level is also enforced by pyproject.toml's
-# `tool.coverage.report.fail_under = 82`; this file is purely about the
+# `tool.coverage.report.fail_under = 80`; this file is purely about the
 # GitHub-check status that Codecov posts to PRs.
 
 coverage:

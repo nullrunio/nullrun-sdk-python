@@ -9,7 +9,7 @@
     src="https://img.shields.io/pypi/l/nullrun?style=flat"
     alt="License"/></a>
   <a href="https://pypi.org/project/nullrun/"><img
-    src="https://img.shields.io/pypi/dt/nullrun?style=flat&color=blue"
+    src="https://img.shields.io/pypi/dm/nullrun?style=flat&color=blue"
     alt="Downloads"/></a>
 </p>
 
