@@ -275,3 +275,34 @@ def _fast_sleep(monkeypatch, request):
     except Exception:
         pass
     yield
+
+
+
+@pytest.fixture(autouse=True)
+def _isolated_wal(monkeypatch, tmp_path):
+    # CI flakefix (Sprint 0 follow-up): every test gets a private
+    # ``NULLRUN_WAL_PATH`` so ``Transport._replay_from_wal`` cannot
+    # replay events from a previous run / parallel xdist worker /
+    # failed teardown against the real backend.
+    #
+    # Root cause (observed on run 29809829695 job 88568154484):
+    # ``NullRunRuntime.__init__`` calls ``self._transport.start()``
+    # which calls ``_replay_from_wal()``. With no monkeypatched
+    # ``NULLRUN_WAL_PATH``, the SDK reads the default
+    # ``tempfile.gettempdir()/nullrun.wal`` and tries to drain any
+    # events found there against the real ``api_url``. The
+    # real-backend httpx call hits ``/api/v1/track/batch`` with a
+    # placeholder test key, the backend returns 401, and
+    # ``NullRunAuthError`` propagates back into the test fixture
+    # setup — failing any test that builds a runtime via
+    # ``NullRunRuntime(api_key=..., _test_mode=True)`` without the
+    # ``make_test_runtime`` fixture. CI 3.12 hits this race more
+    # often than 3.10/3.11 due to thread-scheduling differences
+    # in ``Transport.start()``.
+    #
+    # ``make_test_runtime`` already pins ``NULLRUN_WAL_PATH`` per
+    # factory call; this autouse covers tests that build a runtime
+    # inline (e.g. ``test_state_compare_case_insensitive.py:28``
+    # and ``test_v3_wire_contract.py::TestPingChainScheduler``).
+    monkeypatch.setenv("NULLRUN_WAL_PATH", str(tmp_path / "sdk.wal"))
+    yield
