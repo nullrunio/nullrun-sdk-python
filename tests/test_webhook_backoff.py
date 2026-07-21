@@ -8,6 +8,22 @@ per minute = 1000 spinning threads hammering the dead endpoint.
 
 Post-fix the schedule is ``0.5 * 2**attempt`` capped at 30s:
 0.5s, 1.0s, 2.0s, 4.0s, 8.0s, 16.0s, 30.0s (cap).
+
+These tests mock ``nullrun.actions.time.sleep`` directly via
+``unittest.mock.patch``. The conftest autouse ``_fast_sleep``
+fixture caps test-code ``time.sleep`` at 1ms, which does NOT
+interfere with the per-test ``patch`` (the patch goes through
+``unittest.mock`` and replaces the sleep function inside
+``with``; the autouse cap is active outside the ``with`` block).
+However, the singleton ``_action_handler`` module-level
+webhook-delivery thread started by another test in the same
+process may call ``time.sleep(0.5)`` (its idle poll) at exactly
+the moment this test enters the assertion — and on Python 3.11
+under xdist the singleton's ``sleeps`` collection was visible
+on the assertion path in CI run 29814323742. Marking the whole
+module ``@pytest.mark.slow_sleep`` opts out of the autouse
+cap so the sleep calls in the test body and the singleton
+idle poll use real wall-clock sleeps.
 """
 
 import time
@@ -16,6 +32,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from nullrun.actions import ActionHandler, WebhookConfig
+
+
+pytestmark = pytest.mark.slow_sleep
 
 
 def _make_handler_with_webhook(retries: int = 7) -> ActionHandler:
