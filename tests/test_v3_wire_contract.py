@@ -631,6 +631,7 @@ class TestChainContextHelpers:
 # ─────────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.slow_sleep
 class TestPingChainScheduler:
     """NullRunRuntime.ping_chain sends time-based heartbeats."""
 
@@ -641,6 +642,13 @@ class TestPingChainScheduler:
         # so each scheduler iteration takes ~50ms instead of the
         # real 10s interval — turns a 10s test into a sub-second one
         # without changing the production scheduler code.
+        #
+        # Sprint 0 (coverage): this test depends on the real
+        # wall clock to accumulate scheduler iterations within the
+        # 500ms ``time.sleep`` window. ``@pytest.mark.slow_sleep``
+        # on the enclosing class opts out of the conftest autouse
+        # ``_fast_sleep`` cap so the scheduler thread sees a real
+        # sleep.
         import threading as _threading
 
         from nullrun.runtime import NullRunRuntime

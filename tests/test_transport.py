@@ -27,6 +27,27 @@ def cb():
     return CircuitBreaker(failure_threshold=3, recovery_timeout=1.0)
 
 
+def _advance_clock(monkeypatch, seconds: float) -> None:
+    """Move ``time.monotonic()`` forward by ``seconds`` so CB state
+    transitions that depend on the recovery window can be observed
+    without a real wall-clock sleep.
+
+    Patches the module-level ``time`` reference on
+    ``nullrun.breaker.circuit_breaker`` because the CB stores
+    ``_last_failure_time`` from that exact import. Tests that need
+    a real wall-clock pause can opt out via the conftest
+    ``NULLRUN_FAST_SLEEP=0`` env var; this helper only patches
+    monotonic, so it composes cleanly with the autouse sleep cap.
+    """
+    import time as _time
+
+    base = _time.monotonic()
+    monkeypatch.setattr(
+        "nullrun.breaker.circuit_breaker.time.monotonic",
+        lambda: base + seconds,
+    )
+
+
 class TestTransport:
     @respx.mock
     def test_send_batch_success(self, transport):
@@ -346,7 +367,7 @@ class TestCircuitBreaker:
         with pytest.raises(BreakerTransportError, match="Circuit breaker OPEN"):
             cb.call(lambda: "ok")
 
-    def test_open_transitions_to_half_open_after_timeout(self, cb):
+    def test_open_transitions_to_half_open_after_timeout(self, cb, monkeypatch):
         def fail():
             raise RuntimeError("boom")
 
@@ -355,10 +376,14 @@ class TestCircuitBreaker:
                 cb.call(fail)
 
         assert cb.state == CBState.OPEN
-        time.sleep(1.1)
+        # Advance the wall clock past the 1s recovery_timeout without
+        # sleeping. ``time.sleep`` is already capped at 1ms by the
+        # conftest autouse fixture; without moving monotonic the
+        # ``_last_failure_time`` is still inside the recovery window.
+        _advance_clock(monkeypatch, seconds=2.0)
         assert cb.state == CBState.HALF_OPEN
 
-    def test_half_open_success_closes(self, cb):
+    def test_half_open_success_closes(self, cb, monkeypatch):
         def fail():
             raise RuntimeError("boom")
 
@@ -366,11 +391,11 @@ class TestCircuitBreaker:
             with pytest.raises(RuntimeError):
                 cb.call(fail)
 
-        time.sleep(1.1)
+        _advance_clock(monkeypatch, seconds=2.0)
         cb.call(lambda: "ok")
         assert cb.state == CBState.CLOSED
 
-    def test_half_open_failure_reopens(self, cb):
+    def test_half_open_failure_reopens(self, cb, monkeypatch):
         def fail():
             raise RuntimeError("boom")
 
@@ -378,7 +403,7 @@ class TestCircuitBreaker:
             with pytest.raises(RuntimeError):
                 cb.call(fail)
 
-        time.sleep(1.1)
+        _advance_clock(monkeypatch, seconds=2.0)
         assert cb.state == CBState.HALF_OPEN
 
         with pytest.raises(RuntimeError):
