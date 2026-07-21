@@ -1227,17 +1227,31 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         approval_id: str,
         workflow_id: str,
         execution_id: str,
+        timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
-        """Drift section 7 (2026-07-06): block the calling thread
-        until the WS approval push arrives (or the per-approval
-        timeout elapses). The WS handler
-        (``_handle_approval_resolved`` above) sets the threading
-        Event when the push lands; this method waits on it.
+        """Drift section 7 (2026-07-06) + Разрыв 1c (2026-07-21):
+        block the calling thread until the WS approval push
+        arrives (or the per-approval timeout elapses). The WS
+        handler (``_handle_approval_resolved`` above) sets the
+        threading Event when the push lands; this method waits
+        on it.
 
         Args:
             approval_id: The approval id from the /gate response.
             workflow_id: Workflow the approval gates.
             execution_id: Execution the approval gates.
+            timeout_seconds: Server-authoritative wait duration
+                from the /gate response field
+                ``approval_timeout_seconds`` (added in Разрыв 1c,
+                2026-07-21). When set, this overrides
+                ``self._approval_timeout_seconds`` (the
+                ``NULLRUN_APPROVAL_TIMEOUT_SECONDS`` env
+                default) so the SDK can never silently desync
+                from the backend row's actual expiry. When
+                ``None`` (legacy backend without Разрыв 1c
+                field, or malformed response), falls back to the
+                env-derived default — same behavior as pre-Разрыв
+                1c SDKs.
 
         Returns:
             The entry dict, with ``outcome`` populated (either
@@ -1252,24 +1266,55 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             (raise WorkflowKilledInterrupt on denied, resume on
             approved, fall back to poll on timeout).
         """
+        # Per-approval timeout resolution (Разрыв 1c, 2026-07-21):
+        # prefer the server-authoritative value from the /gate
+        # response so the SDK never times out before the
+        # backend's expiry sweeper (Разрыв 3 class of bug).
+        # Fall back to the env default only on missing or
+        # non-positive value — both signal "backend didn't send
+        # the field" and we preserve the pre-Разрыв 1c behaviour.
+        effective_timeout = (
+            timeout_seconds
+            if (timeout_seconds is not None and timeout_seconds > 0)
+            else self._approval_timeout_seconds
+        )
+        if (
+            timeout_seconds is not None
+            and timeout_seconds > 0
+            and timeout_seconds != self._approval_timeout_seconds
+        ):
+            # Log when the server value diverges from the env
+            # default so an operator inspecting logs can see
+            # which value actually drove the wait — useful for
+            # diagnosing "why did this approval time out
+            # earlier than I configured" tickets.
+            logger.debug(
+                "approval %s: using server timeout=%.1fs "
+                "(env default would have been %.1fs)",
+                approval_id,
+                effective_timeout,
+                self._approval_timeout_seconds,
+            )
+
         event = threading.Event()
         entry: dict[str, Any] = {
             "approval_id": approval_id,
             "workflow_id": workflow_id,
             "execution_id": execution_id,
             "event": event,
+            "timeout_seconds": effective_timeout,
         }
         with self._approval_lock:
             self._approval_pending[approval_id] = entry
 
         try:
-            signaled = event.wait(timeout=self._approval_timeout_seconds)
+            signaled = event.wait(timeout=effective_timeout)
             if not signaled:
                 logger.warning(
                     "approval %s: WS push silent for %.1fs -- "
                     "falling back to /status poll",
                     approval_id,
-                    self._approval_timeout_seconds,
+                    effective_timeout,
                 )
                 with self._approval_lock:
                     self._approval_pending.pop(approval_id, None)
@@ -1609,16 +1654,26 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             )
 
         if decision == "require_approval":
-            # Drift section 7 (2026-07-06): the gate requires a
-            # human-approval before the call may proceed. Block
-            # the calling thread on the WS push (handled in
-            # _handle_approval_resolved) and let the operator
-            # click Approve/Deny on the dashboard. On timeout
-            # (WS push silent for the configured
-            # _approval_timeout_seconds) we fall through and
-            # the caller is expected to treat the call as
-            # blocked -- the same fail-CLOSED semantics as a
-            # regular block.
+            # Drift section 7 (2026-07-06) + Разрыв 1c (2026-07-21):
+            # the gate requires a human-approval before the call
+            # may proceed. Block the calling thread on the WS push
+            # (handled in _handle_approval_resolved) and let the
+            # operator click Approve/Deny on the dashboard. On
+            # timeout (WS push silent for the configured duration)
+            # we fall through and the caller is expected to treat
+            # the call as blocked — the same fail-CLOSED semantics
+            # as a regular block.
+            #
+            # Разрыв 1c: prefer the server-authoritative
+            # `approval_timeout_seconds` value from the response
+            # (added in commit 0ad03b9) over the env default
+            # `NULLRUN_APPROVAL_TIMEOUT_SECONDS`. This prevents the
+            # SDK/backend desync that the Разрыв 3 sweeper was
+            # written to fix on the backend side. We fall back to
+            # the env default only when the field is missing or
+            # non-positive — both signal "backend without Разрыв 1c
+            # field" and we preserve the pre-Разрыв 1c behaviour
+            # for those callers.
             approval_id = response.get("approval_id", "") or ""
             if not approval_id:
                 logger.warning(
@@ -1628,13 +1683,43 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                     workflow_id=workflow_id,
                     reason="approval_id missing in require_approval response",
                 )
+            # Read the per-approval timeout from the response. Both
+            # `approval_timeout_seconds` (i64) and
+            # `approval_expires_at` (ISO8601 string) are exposed;
+            # we prefer the integer field because it's directly
+            # usable in `event.wait(timeout=...)`. If the backend
+            # only sent the ISO8601 string (e.g. older Разрыв 1c
+            # draft or proxy rewriting the field), fall through to
+            # the env default rather than try to parse it inline —
+            # the field is documented as informational for UI/logs
+            # and isn't required for the SDK's wait math.
+            server_timeout = response.get("approval_timeout_seconds")
+            if server_timeout is not None:
+                try:
+                    server_timeout = float(server_timeout)
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "check_workflow_budget: approval_timeout_seconds=%r "
+                        "is not a number; falling back to env default",
+                        response.get("approval_timeout_seconds"),
+                    )
+                    server_timeout = None
+            if server_timeout is not None and server_timeout <= 0:
+                logger.warning(
+                    "check_workflow_budget: approval_timeout_seconds=%r "
+                    "is non-positive; falling back to env default",
+                    server_timeout,
+                )
+                server_timeout = None
             logger.info(
-                f"check_workflow_budget: require_approval id={approval_id} -- waiting for WS push"
+                f"check_workflow_budget: require_approval id={approval_id} -- "
+                f"waiting for WS push (timeout={server_timeout if server_timeout is not None else 'env-default'})"
             )
             result = self._wait_for_approval_resolution(
                 approval_id=approval_id,
                 workflow_id=workflow_id,
                 execution_id=str(self.organization_id or "local"),
+                timeout_seconds=server_timeout,
             )
             outcome = (result.get("outcome") or "").lower()
             if outcome == "approved":
