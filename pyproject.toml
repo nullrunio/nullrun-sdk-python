@@ -64,7 +64,18 @@ name = "nullrun"
 # payload — pre-fix the v3 mapper dropped them on the SDK wire
 # boundary even though the extractors (0.13.10) populated them on
 # wire_event. Pairs with backend migration 220.
-version = "0.13.11"
+# 0.13.12 (2026-07-20): CI / coverage-testability — neutralise
+# `time.sleep` in the pytest suite via a conftest autouse fixture
+# (`_fast_sleep`) capped at 1ms with two opt-out paths
+# (``@pytest.mark.slow_sleep`` marker and ``NULLRUN_FAST_SLEEP=0``
+# env var). Replaces bare `time.sleep(1.1)` in the three
+# `TestCircuitBreaker` half-open tests with a `_advance_clock`
+# helper that patches `time.monotonic` instead. CI scope only:
+# the local `pyproject.toml` floor (``tool.coverage.report.fail_under``)
+# is unchanged, the gate stays at 80% per `.codecov.yml`, the Codecov
+# badge in ``README.md`` now reports the real hit rate instead of 0%.
+# No on-wire change, no SDK_MIN_VERSION bump, no public API change.
+version = "0.13.12"
 # Kept under the 200-char preview threshold so the full line is visible
 # without an "expand" click. Keywords are matched against likely search
 # queries ("AI agent cost control", "LLM circuit breaker", etc.).
