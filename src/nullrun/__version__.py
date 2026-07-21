@@ -1,5 +1,76 @@
 """NullRun Platform SDK.
 
+v3.27 / 0.13.13 (2026-07-21) — Разрыв 1c SDK sync.
+
+Backend commit ``0ad03b9`` (Разрыв 1c, gate hot-path trigger)
+added ``approval_timeout_seconds: Option<i64>`` and
+``approval_expires_at: Option<String>`` to the GateResponse
+wire format. Before this SDK fix, the approval wait path used
+``NULLRUN_APPROVAL_TIMEOUT_SECONDS`` env default (default
+300s) as the ONLY source of wait duration — which is exactly
+the Разрыв 3 class of bug that the backend sweeper was written
+to prevent on the backend side.
+
+Concretely: a backend approval rule configured with
+``expires_in_seconds=20`` (short-approval use case) would
+have the backend's expiry sweeper close the row at 20s, but the
+SDK would have timed out the parked gate call at 300s — a
+silent desync. The 300s/300s coincidence worked only because
+no UI-1 yet exists to set non-default expirations, and because
+the env default matched the backend default.
+
+Fix (no on-wire change, backward-compatible API):
+
+  * ``runtime._wait_for_approval_resolution``: new optional
+    kwarg ``timeout_seconds: float | None = None``. When set
+    to a positive number, used as the event.wait() timeout
+    (server-authoritative, takes precedence over the env
+    default). When ``None`` (legacy backend without Разрыв 1c
+    field, or malformed response), falls back to
+    ``self._approval_timeout_seconds`` (env default) —
+    pre-Разрыв 1c behaviour preserved. When set to a
+    non-positive number (0 or negative), also falls back to
+    env default; we explicitly reject these because
+    ``event.wait(timeout=0)`` deadlocks on the very first call.
+
+  * ``runtime.check_workflow_budget``: reads
+    ``response["approval_timeout_seconds"]`` (server value),
+    validates the type (must be a number) and sign (must be
+    positive), and falls back to ``None`` on any validation
+    failure. ``approval_expires_at`` is intentionally not
+    parsed in the SDK (informational only; the SDK's wait math
+    doesn't need it).
+
+  * When the server value diverges from the env default, a
+    DEBUG log line is emitted ("approval {id}: using server
+    timeout={X}s (env default would have been {Y}s)") for
+    diagnostic visibility.
+
+Tests (existing suite still green; new tests in
+``tests/test_approval_timeout_field.py``):
+
+  * 6 new tests cover server-timeout-used, env-fallback on
+    missing/zero/negative/non-numeric values, sentinel-
+    returned-when-no-ws-push, and diverging-server-value
+    log line. Pairs with backend commit ``0ad03b9``.
+
+Verification:
+
+  * ``pytest tests/test_approval_timeout_field.py`` —
+    6 passed.
+  * ``pytest -n auto --cov=src/nullrun --cov-branch
+    --cov-report=xml --cov-fail-under=0`` —
+    1243 passed, 7 skipped, 28 warnings in 34.44s
+    (coverage 80.92%).
+  * ``ruff check src/ tests/`` — All checks passed.
+  * ``mypy src/`` — Success: no issues found in 34 source
+    files.
+
+Backward-compatible public API change. No SDK_MIN_VERSION bump.
+No on-wire change.
+
+---
+
 v3.26 / 0.13.12 (2026-07-20) — CI / coverage-testability release.
 
 The pytest suite now runs a `_fast_sleep` autouse fixture in
