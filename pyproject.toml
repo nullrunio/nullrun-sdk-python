@@ -75,7 +75,23 @@ name = "nullrun"
 # is unchanged, the gate stays at 80% per `.codecov.yml`, the Codecov
 # badge in ``README.md`` now reports the real hit rate instead of 0%.
 # No on-wire change, no SDK_MIN_VERSION bump, no public API change.
-version = "0.13.12"
+# 0.13.13 (2026-07-21): Разрыв 1c SDK sync — read the server-
+# authoritative ``approval_timeout_seconds`` from the /gate
+# response when present and falls back to
+# ``NULLRUN_APPROVAL_TIMEOUT_SECONDS`` env default only on
+# missing/non-positive/non-numeric values. Pairs with backend
+# commit ``0ad03b9`` which added ``approval_timeout_seconds:
+# Option<i64>`` and ``approval_expires_at: Option<String>`` to
+# the GateResponse wire. Pre-fix, a backend approval rule
+# configured with ``expires_in_seconds=20`` (short-approval use
+# case) would have the backend's expiry sweeper close the row
+# at 20s, but the SDK would have timed out the parked gate call
+# at the env default 300s — a silent desync. New optional kwarg
+# ``timeout_seconds: float | None = None`` on
+# ``_wait_for_approval_resolution`` for explicit per-call
+# control. Public API backward compatible (existing callers
+# unaffected). No SDK_MIN_VERSION bump. No on-wire change.
+version = "0.13.13"
 # Kept under the 200-char preview threshold so the full line is visible
 # without an "expand" click. Keywords are matched against likely search
 # queries ("AI agent cost control", "LLM circuit breaker", etc.).

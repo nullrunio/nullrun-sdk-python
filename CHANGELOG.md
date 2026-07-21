@@ -7,6 +7,28 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [0.13.13] - 2026-07-21
+
+Approval-wait SDK sync with backend commit `0ad03b9` ("\u0420\u0430\u0437\u0440\u044b\u0432 1c", gate hot-path trigger). The backend now sends `approval_timeout_seconds: Option<i64>` and `approval_expires_at: Option<String>` on every `/gate` response so a backend approval rule can set a non-default short timeout. Pre-fix, the SDK only consulted `NULLRUN_APPROVAL_TIMEOUT_SECONDS` (env default 300s), which silently desynced from a 20s backend expiry sweeper. No public API change. No SDK_MIN_VERSION bump. No on-wire change.
+
+### Fixed
+
+- **Approval wait uses server-authoritative `approval_timeout_seconds` when present** \u2014 new optional kwarg `timeout_seconds: float | None = None` on `_wait_for_approval_resolution`. When the gate response carries a positive integer, that value drives the parked `event.wait`; when the field is absent, non-positive, or non-numeric, the SDK falls back to the env default (pre-0.13.13 behaviour preserved). Explicit zero/negative values are rejected because `event.wait(timeout=0)` deadlocks on the very first call.
+- **`check_workflow_budget` reads `response["approval_timeout_seconds"]`** with type and sign validation. Malformed values fall through to the env default path. `approval_expires_at` is documented as informational (UI/logs) and intentionally not parsed by the SDK.
+- **Diverging server vs env default emits a DEBUG log line** ("approval {id}: using server timeout={X}s (env default would have been {Y}s)") so an operator inspecting logs can see which value actually drove the wait \u2014 useful for diagnosing "why did this approval time out earlier than I configured" tickets.
+
+### Tests
+
+- `tests/test_approval_timeout_field.py` \u2014 6 new tests: server timeout used when response has valid value, env fallback when response omits the field, env fallback when server value is zero/negative, env fallback when server value is non-numeric, timeout sentinel returned when no ws push, diverging server value logs at debug.
+
+### Compatibility
+
+- The new `timeout_seconds` kwarg is optional with a `None` default, so existing callers are unaffected.
+- Legacy backends without the \u0420\u0430\u0437\u0440\u0438\u0432 1c field fall through to the env default \u2014 exactly as before.
+- The SDK is a passive consumer of the new optional fields; no wire-format change.
+
+---
+
 ## [0.13.12] - 2026-07-20
 
 CI / coverage-testability release. No on-wire change, no SDK_MIN_VERSION bump, no public API change. Backends on `1.0.0` keep working unchanged.
