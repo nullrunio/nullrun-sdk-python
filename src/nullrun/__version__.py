@@ -1,5 +1,33 @@
 """NullRun Platform SDK.
 
+v3.26 / 0.13.12 (2026-07-20) — CI / coverage-testability release.
+
+The pytest suite now runs a `_fast_sleep` autouse fixture in
+``tests/conftest.py`` that caps test-code ``time.sleep`` calls at
+1ms, with two opt-out paths: ``@pytest.mark.slow_sleep`` on a
+test/class (e.g. ``TestPingChainScheduler``) or the
+``NULLRUN_FAST_SLEEP=0`` env var. The three
+``TestCircuitBreaker`` half-open tests that previously used a
+bare ``time.sleep(1.1)`` to wait out the 1.0s recovery_timeout
+now drive the wall clock via a ``_advance_clock(monkeypatch)``
+helper that patches ``time.monotonic`` instead — deterministic
+across xdist workers and zero wall-clock cost.
+
+Net effect: ``pytest -n auto`` coverage on master dropped the
+3.3-second per-test wall-clock tax on ``TestCircuitBreaker``
+(only on Windows where xdist is single-worker-bound) and the
+suite goes from "almost-hangs" to ~35s end-to-end. CI scope only;
+no on-wire change, no SDK_MIN_VERSION bump, no public API
+change.
+
+Coverage report (local): 80.79% combined (master 29caae9 was
+reported as 79.26% by Codecov because the pre-fix CI uploaded a
+coordinator-only 0% report; this release keeps the 80% floor in
+``.codecov.yml`` and the new combined report is what the
+Codecov badge will render against the master branch).
+
+---
+
 v3.25 / 0.13.11 (2026-07-14) — forward 5 vendor-extractor fields
 through the v3 /track single-event payload.
 

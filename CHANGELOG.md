@@ -7,6 +7,33 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [0.13.12] - 2026-07-20
+
+CI / coverage-testability release. No on-wire change, no SDK_MIN_VERSION bump, no public API change. Backends on `1.0.0` keep working unchanged.
+
+### Changed
+
+- **`pytest` suite is now CI-fast on Windows + xdist** — a new `_fast_sleep` autouse fixture in `tests/conftest.py` caps test-code `time.sleep` calls at 1ms, with two opt-out paths (`@pytest.mark.slow_sleep` and `NULLRUN_FAST_SLEEP=0` env var). The fixture also patches `nullrun.transport.time.sleep` and `nullrun.breaker.circuit_breaker.time.sleep` so the `time.sleep(...)` calls captured in those modules at import time still hit the cap. End-to-end suite time on a single xdist worker: ~35s (was previously gated on a 3.3s per-test wall-clock tax in the `TestCircuitBreaker` half-open tests).
+- **`TestCircuitBreaker` half-open tests no longer sleep the wall clock** — `test_open_transitions_to_half_open_after_timeout`, `test_half_open_success_closes`, and `test_half_open_failure_reopens` now use a new `_advance_clock(monkeypatch, seconds=...)` helper that patches `nullrun.breaker.circuit_breaker.time.monotonic` to the wall clock `+N`. The CB's `_last_failure_time` invariant is preserved (line 243 of `circuit_breaker.py`) without a real wait.
+- **`TestPingChainScheduler` opts out of the cap via marker** — the new `@pytest.mark.slow_sleep` marker on the class lets `test_ping_chain_emits_heartbeats_on_time_schedule` keep the real wall clock; the scheduler thread inside `ping_chain` needs the real sleep to accumulate iterations within the 500ms the test gives it. The marker is registered in `pyproject.toml` under `[tool.pytest.ini_options].markers`.
+
+### Tests
+
+- The `_advance_clock` helper lives in `tests/test_transport.py` and is module-private to the CB tests for now. If a future test needs the same wall-clock advancement (e.g. a new CB recovery test), move it to `tests/conftest.py` — that promotion is out of scope for this release.
+- `tests/test_v3_wire_contract.py::TestPingChainScheduler::test_ping_chain_emits_heartbeats_on_time_schedule` continues to take ~1s end-to-end (real scheduler iterates inside the 500ms wall-clock window). The 0.13.11 release had the same wall-clock cost; Sprint 0 simply stops the `_fast_sleep` cap from collapsing the scheduler's internal `Event.wait` to 1ms and starving the iteration loop.
+- Sprint 0 reproducibly runs `1237 passed, 7 skipped, 29 warnings` on the full suite under `pytest -n auto --cov=src/nullrun --cov-branch --cov-report=xml:coverage.xml --cov-fail-under=0`. The pre-Sprint-0 baseline (master `29caae9`) was structurally identical at the assertion level; the change is timing-only.
+
+### CI
+
+- `pyproject.toml` — new `markers = ["slow_sleep: opt out of the conftest autouse time.sleep cap"]` entry under `[tool.pytest.ini_options]`. Prevents the `PytestUnknownMarkWarning` that would otherwise surface when `tests/test_v3_wire_contract.py` decorates `TestPingChainScheduler` with `@pytest.mark.slow_sleep`.
+- The Codecov badge in `README.md` will now report the real combined coverage on master. Pre-Sprint-0 the badge was stuck at 0% because `coverage run -m pytest -n auto` ran coverage in the coordinator process only; the Sprint 0 PR (#70) already fixed that half of the bug, this release carries the same `pytest-cov` configuration forward in `ci.yml` (`--cov=src/nullrun --cov-branch --cov-report=xml:coverage.xml --cov-report=term`). Codecov's per-commit 0.13.12 patch coverage should land above the `.codecov.yml` 70% patch target.
+
+### Audit
+
+- No SDK public API change. No wire-format change. No backend migration required. The release is purely a CI-tooling improvement that future coverage audits (Sprints 1-5) will land on top of.
+- Pre-Sprint-0 instability under `pytest-cov + xdist`: `test_status.py::TestRecentErrors` and `TestTransport::test_stop_flush_false_skips_final_flush` were observed to flake ~1/3 of the runs in the local environment (passing in isolation, passing in `pytest -n 0`, passing in `pytest -n 2`, occasionally failing in `pytest -n auto`). Sprint 0 did not introduce the flake and did not fix it — tracked as a separate cleanup item outside this release.
+
+---
 
 ## [0.13.0] - 2026-07-04
 
