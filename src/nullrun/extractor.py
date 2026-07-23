@@ -10,8 +10,9 @@ that:
    invocations look identical.
 2. Pulls the named argument off the bound args.
 3. Validates and converts the value to integer minor units
-   using the ``units`` discriminator and the ISO-4217 minor-unit
-   exponent for the currency.
+   using the ``units`` discriminator, the ISO-4217 minor-unit
+   exponent for the currency, and the per-currency business cap
+   for agent safety.
 4. Validates and builds a ``MoneyImpact``.
 5. Computes the byte-identical ``action_digest`` the backend
    expects (see ``nullrun.business_impact.compute_action_digest``).
@@ -98,6 +99,20 @@ the converted value against this limit and raises
 uses ``int`` post-conversion so the operator sees the
 offending amount, not just "too large".
 
+## Business cap is bounded
+
+The wire-format ``i64`` limit is a few hundred quadrillion
+dollars, which is well above any sensible per-call debit. The
+business cap (``_BUSINESS_CAP_MINOR`` table) is a much smaller
+per-currency limit chosen so that any amount above the cap
+goes through a separate risk path rather than being treated
+as a normal call. The cap is policy, not correctness: a $1M
+USD debit is technically valid on the wire, but for an agent
+running a refund tool it almost certainly warrants a human
+review. The cap is enforced as ``InvalidMoneyAmountError(reason="excessive")``
+with a clear "above the per-call business cap" message; the
+``@protect`` wrapper upgrades the error to fail-CLOSED.
+
 ## Float and ``bool`` are rejected
 
 ``float`` is rejected because IEEE-754 surprises are the entire
@@ -106,15 +121,37 @@ is a subclass of ``int`` in Python; without the explicit check,
 ``refund(amount=True)`` would silently treat ``True`` as
 ``1`` cent.
 
-## Unknown currency codes are documented as opt-in
+## Currency is validated (whitelist + case)
 
-``currency_minor_digits`` falls back to ``2`` for unknown
-currencies. The fallback is conservative: an unknown code
-gets the USD-style 2-digit validation, which means a
-``Decimal("1.234")`` call for an unknown code would raise
-``InvalidMoneyPrecisionError``. The operator adds the new
-code to ``_CURRENCY_MINOR_DIGITS`` to opt in; the SDK never
-silently rounds.
+ISO-4217 minor-unit exponent lookup covers a small set of
+codes by design. The ``normalize_currency`` helper rejects any
+input that is not a 3-letter uppercase ISO-4217 code (e.g.
+``"usd"``, ``"Usd"``, ``"USDX"``, ``""`` raise
+``InvalidCurrencyError``). The SDK does NOT silently
+upper-case the input because:
+
+- it would hide typos (``"usd"`` vs ``"USD"`` vs ``"Usd"``
+  would all normalize to ``"USD"``, masking a typo in the
+  call site);
+- ISO-4217 is a closed set of 3-letter uppercase codes,
+  anything else is wrong by definition;
+- the error message names the offending input so the operator
+  can fix the call site.
+
+The whitelist is consulted by ``currency_minor_digits`` and
+``business_cap_minor``; unknown codes are rejected with
+``InvalidCurrencyError`` instead of falling back to a default.
+This closes the conservative-fallback gap from the previous
+hardening pass (``UNKNOWN`` was allowed but the operator
+might never notice the typo).
+
+## Currency case rejection is enforced at construction time
+
+The ``MoneyImpactExtractor.__init__`` validates the currency
+via ``normalize_currency``. Passing ``"usd"`` raises
+``InvalidCurrencyError`` at decorator-application time, before
+the tool is ever called. This is fail-CLOSED: a misconfigured
+decorator never reaches runtime.
 """
 
 from __future__ import annotations
@@ -169,10 +206,9 @@ UNITS = (UNIT_MINOR, UNIT_MAJOR)
 # Coverage is small by design: the SDK only enforces precision
 # for currencies the form / wire shape already understands
 # (USD/EUR/GBP/CHF/CAD/AUD = 2 fractional digits, JPY = 0,
-# KWD/BHD/OMR = 3). An unknown currency falls back to 2 (the
-# historical default) so a future addition does not silently
-# round; the operator adds the new code to
-# ``_CURRENCY_MINOR_DIGITS`` to opt in.
+# KWD/BHD/OMR = 3). Adding a new currency to the wire contract
+# is a one-line change in ``_CURRENCY_MINOR_DIGITS`` *and*
+# ``_BUSINESS_CAP_MINOR``.
 _CURRENCY_MINOR_DIGITS = {
     # 2 fractional digits (cents, pence, centimes)
     "USD": 2,
@@ -189,24 +225,40 @@ _CURRENCY_MINOR_DIGITS = {
     "OMR": 3,
 }
 
-DEFAULT_MINOR_DIGITS = 2
 
-
-def currency_minor_digits(currency: str) -> int:
-    """Return the number of fractional digits for ``currency``.
-
-    ISO-4217 minor-unit exponent: ``2`` for USD/EUR/GBP, ``0``
-    for JPY, ``3`` for KWD/BHD/OMR. Unknown codes fall back
-    to ``DEFAULT_MINOR_DIGITS = 2`` so a future addition does
-    not silently round.
-
-    The fallback is conservative: an unknown currency is
-    validated as if it had 2 fractional digits, which means a
-    future ``Decimal("1.234")`` call for an unknown code
-    would raise ``InvalidMoneyPrecisionError``. The operator
-    adds the new code to ``_CURRENCY_MINOR_DIGITS`` to opt in.
-    """
-    return _CURRENCY_MINOR_DIGITS.get(currency, DEFAULT_MINOR_DIGITS)
+# Per-currency business cap (in minor units). Above this
+# threshold the extractor raises ``InvalidMoneyAmountError``
+# with ``reason="excessive"`` so the call goes through a
+# separate risk path rather than being treated as a normal
+# call. The cap is policy, not correctness: a $1M USD debit
+# is technically valid on the wire (well within ``i64``), but
+# for an agent running a refund tool it almost certainly
+# warrants a human review.
+#
+# Caps are chosen as round numbers above any plausible single
+# transaction but well below the wire-format ``i64`` limit so
+# the ``@protect`` wrapper can branch on
+# ``reason="excessive"`` without confusing it with
+# ``reason="overflow"`` (a real wire-format overflow).
+#
+# To opt out of the cap on a per-extractor basis, set
+# ``enforce_business_cap=False`` in ``MoneyImpactExtractor.__init__``.
+_BUSINESS_CAP_MINOR = {
+    # $1,000,000.00 USD per call (one million dollars)
+    "USD": 100_000_000,
+    "EUR": 100_000_000,
+    "GBP": 100_000_000,
+    "CHF": 100_000_000,
+    "CAD": 100_000_000,
+    "AUD": 100_000_000,
+    # 100,000,000 JPY (one hundred million yen)
+    "JPY": 100_000_000,
+    # 100,000.000 KWD / BHD / OMR (one hundred thousand, three
+    # decimal digits each)
+    "KWD": 100_000_000,
+    "BHD": 100_000_000,
+    "OMR": 100_000_000,
+}
 
 
 # Hard upper bound for the converted ``amount_minor``. The
@@ -226,13 +278,20 @@ _I64_MAX = (1 << 63) - 1
 #   harness can format a specific message.
 #
 # ``InvalidMoneyAmountError`` -- generic money-amount
-#   invariant violation: negative amounts, overflow, non-finite
-#   Decimals. The error carries ``currency`` (when known) and
-#   ``reason`` (a string discriminator).
+#   invariant violation: negative amounts, overflow,
+#   non-finite Decimals, or amounts above the per-currency
+#   business cap. The error carries ``currency`` (when known)
+#   and ``reason`` (a string discriminator).
 #
-# Both inherit from ``ValueError`` so the existing ``except
-# ValueError`` callers in ``runtime.py`` continue to work; the
-# subclass lets a careful caller branch on the type.
+# ``InvalidCurrencyError`` -- the supplied currency is not a
+#   3-letter uppercase ISO-4217 code the SDK supports. The
+#   error carries the offending input so the operator can fix
+#   the call site.
+#
+# All three inherit from ``ValueError`` so the existing
+# ``except ValueError`` callers in ``runtime.py`` continue to
+# work; the subclasses let a careful caller branch on the
+# type.
 
 
 class InvalidMoneyPrecisionError(ValueError):
@@ -279,8 +338,9 @@ class InvalidMoneyAmountError(ValueError):
             with (may be empty if the error happened before
             currency dispatch).
         reason: short string discriminator (``"negative"``,
-            ``"overflow"``, ``"non_finite"``). Lets a UI or
-            test harness branch without parsing the message.
+            ``"overflow"``, ``"non_finite"``, ``"excessive"``).
+            Lets a UI or test harness branch without parsing
+            the message.
     """
 
     def __init__(
@@ -295,6 +355,90 @@ class InvalidMoneyAmountError(ValueError):
         super().__init__(msg)
 
 
+class InvalidCurrencyError(ValueError):
+    """The supplied currency is not a 3-letter uppercase
+    ISO-4217 code the SDK supports.
+
+    Attributes:
+        received: the offending currency string (so the
+            operator sees exactly what was passed).
+    """
+
+    def __init__(self, received: str, detail: str) -> None:
+        self.received = received
+        msg = f"currency={received!r}: {detail}"
+        super().__init__(msg)
+
+
+def normalize_currency(currency: str) -> str:
+    """Validate and return the ISO-4217 currency code.
+
+    The SDK does NOT silently upper-case the input because:
+
+    - it would hide typos (``"usd"`` vs ``"USD"`` vs ``"Usd"``
+      would all normalize to ``"USD"``, masking a typo in the
+      call site);
+    - ISO-4217 is a closed set of 3-letter uppercase codes,
+      anything else is wrong by definition;
+    - the error message names the offending input so the
+      operator can fix the call site.
+
+    Raises ``InvalidCurrencyError`` for any input that is not
+    a 3-letter uppercase ISO-4217 code the SDK supports.
+    """
+    if not isinstance(currency, str):
+        raise InvalidCurrencyError(
+            str(currency),
+            "currency must be a string",
+        )
+    if len(currency) != 3:
+        raise InvalidCurrencyError(
+            currency,
+            f"currency must be a 3-letter ISO-4217 code; got length {len(currency)}",
+        )
+    if not currency.isupper() or not currency.isalpha():
+        raise InvalidCurrencyError(
+            currency,
+            "currency must be 3 uppercase ASCII letters (ISO-4217)",
+        )
+    if currency not in _CURRENCY_MINOR_DIGITS:
+        raise InvalidCurrencyError(
+            currency,
+            f"currency is not in the supported ISO-4217 whitelist "
+            f"(supported: {sorted(_CURRENCY_MINOR_DIGITS.keys())})",
+        )
+    return currency
+
+
+def currency_minor_digits(currency: str) -> int:
+    """Return the number of fractional digits for ``currency``.
+
+    Calls ``normalize_currency`` so the caller cannot pass an
+    unknown code; previously this function silently fell back
+    to 2 digits for unknown codes, which masked typos like
+    ``"USDX"`` or ``"usd"``.
+
+    Raises ``InvalidCurrencyError`` for any input that is not
+    in the whitelist.
+    """
+    return _CURRENCY_MINOR_DIGITS[normalize_currency(currency)]
+
+
+def business_cap_minor(currency: str) -> int:
+    """Return the per-call business cap (in minor units) for ``currency``.
+
+    The cap is policy, not correctness: a debit at the cap is
+    technically valid on the wire but should go through a
+    separate risk path. Callers that need to opt out (e.g.
+    batch settlement tools) can pass
+    ``enforce_business_cap=False`` to ``MoneyImpactExtractor``.
+
+    Raises ``InvalidCurrencyError`` for any input that is not
+    in the whitelist.
+    """
+    return _BUSINESS_CAP_MINOR[normalize_currency(currency)]
+
+
 def _decimal_has_more_fractional_digits(
     value: Decimal, allowed: int
 ) -> bool:
@@ -307,40 +451,17 @@ def _decimal_has_more_fractional_digits(
     integer-valued decimal with zero effective fractional
     digits. ``Decimal("50.005")`` has a non-zero fractional
     part and is rejected.
-
-    This is the precision contract that replaced banker's
-    rounding: the caller must supply a value whose fractional
-    part fits within the currency's ISO-4217 minor-unit
-    exponent. ``Decimal("50.00")`` for USD is fine because
-    the fractional part is zero; ``Decimal("50.005")`` for
-    USD is not fine because the fractional part exceeds the
-    2-digit limit.
-
-    The check is purely structural (``% 1`` and integer
-    comparison) and does NOT do any rounding, so the SDK never
-    silently drops precision.
     """
     if allowed < 0:
         raise ValueError(f"allowed fractional digits must be >= 0, got {allowed}")
     if not value.is_finite():
-        # ``Infinity`` / ``NaN`` are not money values; the
-        # downstream ``_to_minor_units`` would raise on
-        # ``int(...)`` anyway. We surface a cleaner error
-        # here so the caller sees ``ValueError`` instead of
-        # ``InvalidOperation``.
         raise InvalidMoneyAmountError(
             reason="non_finite",
             detail=f"Decimal must be finite, got {value}",
         )
     fractional = value - value.to_integral_value(rounding="ROUND_DOWN")
     if fractional == 0:
-        # Integer-valued decimals (``50``, ``50.00``,
-        # ``50.0000``) all reduce to ``Decimal("0")`` for the
-        # fractional part and pass any allowed limit.
         return False
-    # Non-zero fractional part: count the digits after the
-    # decimal point. ``Decimal("0.005")`` has ``as_tuple()``
-    # exponent ``-3`` and we report 3 fractional digits.
     exponent = value.as_tuple().exponent
     if isinstance(exponent, int):
         return abs(exponent) > allowed
@@ -348,12 +469,7 @@ def _decimal_has_more_fractional_digits(
 
 
 def _count_fractional_digits(value: Decimal) -> int:
-    """Return the number of fractional digits in ``value``.
-
-    Used by the ``InvalidMoneyPrecisionError`` constructor so
-    the operator sees the offending precision, not just a
-    generic "too many digits" error.
-    """
+    """Return the number of fractional digits in ``value``."""
     exponent = value.as_tuple().exponent
     if isinstance(exponent, int):
         return max(0, abs(exponent))
@@ -363,9 +479,6 @@ def _count_fractional_digits(value: Decimal) -> int:
 def _check_overflow(amount_minor: int, currency: str) -> None:
     """Raise ``InvalidMoneyAmountError`` if ``amount_minor``
     exceeds the wire-format ``i64`` upper bound.
-
-    The check is post-conversion so the operator sees the
-    actual integer that would overflow, not just "too large".
     """
     if amount_minor > _I64_MAX:
         raise InvalidMoneyAmountError(
@@ -379,36 +492,45 @@ def _check_overflow(amount_minor: int, currency: str) -> None:
         )
 
 
+def _check_business_cap(
+    amount_minor: int, currency: str, enforce: bool
+) -> None:
+    """Raise ``InvalidMoneyAmountError`` if ``amount_minor``
+    exceeds the per-currency business cap.
+
+    The cap is policy, not correctness: a debit at the cap is
+    technically valid on the wire but should go through a
+    separate risk path. ``enforce=False`` skips the check for
+    callers that need to opt out (e.g. batch settlement tools
+    that already have a human-in-the-loop approval flow).
+    """
+    if not enforce:
+        return
+    cap = _BUSINESS_CAP_MINOR[currency]
+    if amount_minor > cap:
+        raise InvalidMoneyAmountError(
+            reason="excessive",
+            currency=currency,
+            detail=(
+                f"amount_minor={amount_minor} exceeds the per-call "
+                f"business cap={cap} minor units for {currency}; "
+                f"send the call through the explicit human-approval "
+                f"path instead of the auto-decision flow."
+            ),
+        )
+
+
 def _to_minor_units(
-    value: Union[int, Decimal], units: str, currency: str
+    value: Union[int, Decimal], units: str, currency: str,
+    enforce_business_cap: bool = True,
 ) -> int:
     """Convert a Decimal-or-int value to integer minor units.
 
-    ``units="minor"``: ``value`` is already in minor units (cents).
-    The function accepts ``int`` for the legacy Phase 0 path; a
-    ``Decimal`` here means the caller already pre-quantized, and
-    the SDK refuses to silently round a fractional value
-    (``Decimal("0.05")`` with ``units="minor"`` is a unit-confusion
-    bug and the SDK surfaces it as a TypeError, not a silent
-    ``int(0.05) == 0`` truncation).
-
-    ``units="major"``: ``value`` is a major-unit Decimal (dollars).
-    The function rejects ``int`` outright because a bare ``int``
-    in major units is exactly the silent bug class the explicit
-    discriminator is designed to prevent. The SDK validates the
-    precision of the Decimal against the ISO-4217 minor-unit
-    exponent for ``currency``: ``Decimal("50.005")`` for USD
-    (``minor_digits = 2``) raises ``InvalidMoneyPrecisionError``
-    rather than silently rounding.
-
-    Sign is validated: a negative value for either direction is
-    rejected because ``{"direction":"outflow",
-    "amount_minor":-5000}`` silently falls through every
-    ``op=gt`` predicate (``-5000 > 5000`` is always False).
-
-    Overflow is checked after conversion: the converted
-    ``amount_minor`` must fit in ``i64`` or the wire format
-    overflows.
+    See module docstring for the full contract. The
+    ``enforce_business_cap`` flag is passed through from
+    ``MoneyImpactExtractor`` so callers that need to opt out
+    (batch settlement) can do so without bypassing the rest
+    of the validation.
     """
     if units == UNIT_MINOR:
         if isinstance(value, bool) or not isinstance(value, int):
@@ -416,18 +538,13 @@ def _to_minor_units(
                 # Caller has already pre-quantized; the SDK does
                 # not change the value. If the Decimal has a
                 # fractional part (e.g. ``0.05``) we surface a
-                # TypeError rather than silently truncate, so the
-                # operator catches the unit confusion.
+                # TypeError rather than silently truncate.
                 if _decimal_has_more_fractional_digits(value, 0):
                     raise TypeError(
                         f"money_outflow(argument={value!r}, units='minor'): "
                         f"refusing to round {value!r} to integer minor units; "
                         f"either pass an int (e.g. int({value!r})) or set units='major'."
                     )
-                # Normalise: ``Decimal("50")`` and
-                # ``Decimal("50.00")`` both reduce to ``int(50)``,
-                # so the wire format is stable across
-                # representations.
                 converted = int(value)
             else:
                 raise TypeError(
@@ -436,7 +553,6 @@ def _to_minor_units(
                 )
         else:
             converted = value
-        # Sign + overflow checks apply to both paths.
         if converted < 0:
             raise InvalidMoneyAmountError(
                 reason="negative",
@@ -449,6 +565,7 @@ def _to_minor_units(
                 ),
             )
         _check_overflow(converted, currency)
+        _check_business_cap(converted, currency, enforce_business_cap)
         return converted
 
     if units == UNIT_MAJOR:
@@ -459,8 +576,6 @@ def _to_minor_units(
                 f"For int minor units, set units='minor' or use money_inflow(...) "
                 f"with units='minor'."
             )
-        # Sign check (before precision check so the operator
-        # sees the most specific error first).
         if value < 0:
             raise InvalidMoneyAmountError(
                 reason="negative",
@@ -472,11 +587,6 @@ def _to_minor_units(
                     f"because negative < positive is always False."
                 ),
             )
-        # Precision validation: refuse a Decimal with more
-        # fractional digits than the currency supports. This
-        # is the production-grade contract: precision must be
-        # supplied correctly by the caller; the SDK never
-        # rounds silently.
         allowed = currency_minor_digits(currency)
         if _decimal_has_more_fractional_digits(value, allowed):
             raise InvalidMoneyPrecisionError(
@@ -485,20 +595,11 @@ def _to_minor_units(
                 received=str(value),
                 received_digits=_count_fractional_digits(value),
             )
-        # Conversion is exact because precision was validated
-        # above. No rounding. No truncation. No silent loss.
-        # ``int(...)`` on a Decimal still raises
-        # ``OverflowError`` for values larger than ``i64``
-        # range, so the explicit overflow check after
-        # conversion is the safety net rather than the
-        # primary path.
         converted = int(value * (Decimal(10) ** allowed))
         _check_overflow(converted, currency)
+        _check_business_cap(converted, currency, enforce_business_cap)
         return converted
 
-    # Defensive: ``__init__`` validates ``units`` at construction
-    # time, so this branch is unreachable. If a future refactor
-    # breaks the validation, we still fail closed here.
     raise ValueError(
         f"unknown units={units!r}; expected one of: {UNITS}"
     )
@@ -509,18 +610,21 @@ class MoneyImpactExtractor:
 
     ``units`` discriminator semantics (Phase 1.1 / UX follow-up):
 
-    - ``units="minor"`` (default for backward compatibility):
-      the bound argument is already in minor units. ``int`` is
-      the canonical type; ``Decimal`` is accepted if it is
-      already integer-valued. ``float`` is rejected outright.
+    - ``units="minor"`` (default): the bound argument is
+      already in minor units. ``int`` is the canonical type;
+      ``Decimal`` is accepted if it is already integer-valued.
+      ``float`` is rejected outright.
     - ``units="major"``: the bound argument is a Decimal in
       major units. The SDK converts to minor units via
       ``Decimal * 10**currency_minor_digits(currency)`` after
       validating that the Decimal's precision matches the
       currency's ISO-4217 minor-unit exponent. ``float`` and
-      ``int`` are rejected outright (the only reason to use
-      ``major`` is precision; an ``int`` in major units is
-      almost always a unit-confusion bug).
+      ``int`` are rejected outright.
+
+    The ``enforce_business_cap`` flag (default ``True``) gates
+    the per-currency cap. Set to ``False`` for batch settlement
+    tools that already have a human-in-the-loop approval flow
+    and need to bypass the cap.
 
     The discriminator is **explicit** rather than implicit from
     the type. A future signature refactor (``int`` -> ``Decimal``
@@ -537,6 +641,7 @@ class MoneyImpactExtractor:
         units: str = UNIT_MINOR,
         extractor_id: str = "nullrun.money.path",
         extractor_version: str = "1",
+        enforce_business_cap: bool = True,
     ) -> None:
         if direction not in (OUTFLOW, INFLOW):
             raise ValueError(
@@ -547,12 +652,19 @@ class MoneyImpactExtractor:
             raise ValueError(
                 f"units must be one of {UNITS}, got {units!r}"
             )
+        # ``normalize_currency`` raises ``InvalidCurrencyError``
+        # if the input is not a 3-letter uppercase ISO-4217
+        # code in the whitelist. The constructor fails-CLOSED:
+        # a misconfigured decorator (``currency="usd"`` typo)
+        # never reaches runtime.
+        currency = normalize_currency(currency)
         self.argument = argument
         self.direction = direction
         self.currency = currency
         self.units = units
         self.extractor_id = extractor_id
         self.extractor_version = extractor_version
+        self.enforce_business_cap = enforce_business_cap
 
     def impact_for(
         self,
@@ -562,39 +674,19 @@ class MoneyImpactExtractor:
     ) -> BusinessImpact:
         """Bind the call and pull ``self.argument`` out of the bound args.
 
-        The unit discriminator (``self.units``) decides whether
-        the value is treated as already-minor-units
-        (``int`` passes through) or as a major-unit Decimal
-        (``Decimal * 10**currency_minor_digits`` after precision
-        validation).
-
-        The bool check is explicit because ``bool`` is a
-        subclass of ``int`` in Python — without the explicit
-        check, ``refund(amount=True)`` would silently treat
-        ``True`` as ``1`` cent.
-
         Raises:
             TypeError: when ``self.argument`` is not a named
                 parameter, or when the supplied value is not a
                 Decimal / int in the unit discriminator the
-                constructor was called with. The ``@protect``
-                wrapper upgrades TypeError to
-                ``NullRunBlockedException`` (fail-CLOSED) — a
-                malicious or buggy SDK must never fall back to
-                "no impact was extracted" implicitly.
+                constructor was called with.
             InvalidMoneyPrecisionError: when ``units="major"``
                 and the supplied Decimal has more fractional
-                digits than the currency supports (e.g.
-                ``Decimal("50.005")`` for USD).
+                digits than the currency supports.
             InvalidMoneyAmountError: when the supplied amount
-                is negative, non-finite (``NaN`` / ``Inf``), or
-                exceeds the wire-format ``i64`` upper bound
-                after conversion.
+                is negative, non-finite, exceeds the wire-format
+                ``i64`` upper bound, or exceeds the per-currency
+                business cap.
         """
-        # `inspect.signature(...).bind` normalizes positional +
-        # keyword into a single dict, so the extractor does not
-        # care whether the call was `refund(Decimal("50.99"))`
-        # or `refund(amount=Decimal("50.99"))`.
         sig = inspect.signature(fn)
         try:
             bound = sig.bind(*args, **kwargs)
@@ -611,12 +703,11 @@ class MoneyImpactExtractor:
             )
         value = bound.arguments[self.argument]
 
-        # Phase 1.1 hardening: convert via the unit
-        # discriminator. ``float`` is rejected before this
-        # point; precision, sign, and overflow are validated
-        # inside ``_to_minor_units``.
         amount_minor = _to_minor_units(
-            value, units=self.units, currency=self.currency
+            value,
+            units=self.units,
+            currency=self.currency,
+            enforce_business_cap=self.enforce_business_cap,
         )
 
         impact = MoneyImpact(
@@ -626,19 +717,12 @@ class MoneyImpactExtractor:
             extractor_id=self.extractor_id,
             extractor_version=self.extractor_version,
         )
-        # `MoneyImpact.validate` enforces direction/currency shape;
-        # convert to BusinessImpact only after that succeeds so the
-        # backend sees a fully-validated payload.
         impact.validate()
         return BusinessImpact(impact=impact)
 
 
 @functools.lru_cache(maxsize=128)
 def _cached_signature(fn_id: int) -> Optional[inspect.Signature]:
-    # lookup by id() is fragile across reloads but workable for the
-    # single-process SDK lifetime. We hold the signature object so
-    # repeated calls on the same function skip the cost of
-    # `inspect.signature(...)`.
     for obj in gc_get_objects():  # type: ignore[name-defined]
         if id(obj) == fn_id:
             try:
@@ -654,20 +738,24 @@ def money_outflow(
     units: str = UNIT_MINOR,
     extractor_id: str = "nullrun.money.path",
     extractor_version: str = "1",
+    enforce_business_cap: bool = True,
 ) -> MoneyImpactExtractor:
     """Shorthand constructor used by ``@sensitive(impact=money_outflow(...))``.
+
+    ``currency`` must be a 3-letter uppercase ISO-4217 code in
+    the whitelist (USD/EUR/GBP/CHF/CAD/AUD/JPY/KWD/BHD/OMR).
+    ``"usd"``, ``"Usd"``, ``"USDX"`` all raise
+    ``InvalidCurrencyError`` at decorator-application time.
 
     ``units`` defaults to ``"minor"`` for backward compatibility
     with the Phase 0 / pre-Decimal path. New code that
     passes Decimal amounts in major units should pass
-    ``units="major"`` explicitly so the SDK multiplies by
-    ``10**currency_minor_digits(currency)`` after validating
-    precision.
+    ``units="major"`` explicitly.
 
-    ``direction`` is fixed to ``OUTFLOW`` because that is the
-    only direction the backend's MVP-1.0 rules fire on. Inflow
-    rules will land in a later MVP; the constructor is open to
-    accepting ``direction=INFLOW`` then without an API break.
+    ``enforce_business_cap`` defaults to ``True`` so any debit
+    above the per-currency cap goes through the explicit
+    human-approval path. Set to ``False`` for batch settlement
+    tools that already have a human-in-the-loop approval flow.
     """
     return MoneyImpactExtractor(
         argument=argument,
@@ -676,24 +764,15 @@ def money_outflow(
         units=units,
         extractor_id=extractor_id,
         extractor_version=extractor_version,
+        enforce_business_cap=enforce_business_cap,
     )
 
 
 def compute_impact_digest(impact: BusinessImpact) -> str:
-    """Thin alias re-exported for call-site readability.
-
-    Some SDK callers prefer ``compute_impact_digest(impact)`` over
-    the lower-level ``compute_action_digest(impact)`` because the
-    name reinforces the side-channel-of-truth (digest is a
-    security primitive, not a content hash).
-    """
+    """Thin alias re-exported for call-site readability."""
     return compute_action_digest(impact)
 
 
-# ``gc_get_objects`` is an implementation helper the existing
-# module imported under that name; preserved here for
-# ``_cached_signature`` without dragging the ``gc`` import into
-# the public surface.
 def gc_get_objects():
     import gc
     return gc.get_objects()

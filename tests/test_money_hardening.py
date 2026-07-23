@@ -43,13 +43,16 @@ from decimal import Decimal
 import pytest
 
 from nullrun.extractor import (
+    InvalidCurrencyError,
     InvalidMoneyAmountError,
     InvalidMoneyPrecisionError,
     UNIT_MAJOR,
     UNIT_MINOR,
     _to_minor_units,
+    business_cap_minor,
     currency_minor_digits,
     money_outflow,
+    normalize_currency,
 )
 from nullrun.business_impact import (
     BusinessImpact,
@@ -178,34 +181,80 @@ class TestOverflowGuard:
     must be rejected; silently wrapping would corrupt the
     digest and the approval binding."""
 
-    def test_i64_max_minus_one_accepted(self) -> None:
-        # Just below the limit.
-        big = (1 << 63) - 1
-        assert _to_minor_units(big, UNIT_MINOR, "USD") == big
+    def test_below_business_cap_accepted(self) -> None:
+        # The per-currency business cap (USD=$1M = 100_000_000
+        # minor units) is below ``i64::MAX``; values within
+        # the cap are accepted.
+        assert _to_minor_units(99_999_999, UNIT_MINOR, "USD") == 99_999_999
 
-    def test_i64_max_rejected(self) -> None:
-        # Exactly at the limit -- rejected (the check is
-        # ``> _I64_MAX``, so the limit itself is out of bounds
-        # to leave headroom for downstream adjustments).
+    def test_business_cap_rejected_with_reason_excessive(self) -> None:
+        # ``$1,000,000.01 USD = 100_000_001 minor units`` is
+        # above the per-call business cap. The error reason
+        # is ``"excessive"`` (separate from the wire-format
+        # overflow which is ``"overflow"``).
         with pytest.raises(InvalidMoneyAmountError) as info:
-            _to_minor_units((1 << 63), UNIT_MINOR, "USD")
-        assert info.value.reason == "overflow"
+            _to_minor_units(100_000_001, UNIT_MINOR, "USD")
+        assert info.value.reason == "excessive"
+        assert info.value.currency == "USD"
 
-    def test_major_units_overflow_rejected(self) -> None:
-        # ``Decimal("1e30")`` for USD = ``1e32`` minor units,
-        # way past i64::MAX. ``int(...)`` on the multiplied
-        # value raises ``OverflowError`` first, but the SDK
-        # should still produce a clean ``InvalidMoneyAmountError``
-        # so the ``@protect`` wrapper can fail-CLOSED.
-        with pytest.raises((InvalidMoneyAmountError, OverflowError)):
-            _to_minor_units(Decimal("1e30"), UNIT_MAJOR, "USD")
+    def test_business_cap_message_names_cap(self) -> None:
+        with pytest.raises(InvalidMoneyAmountError) as info:
+            _to_minor_units(100_000_001, UNIT_MINOR, "USD")
+        # The error message names the cap so the operator
+        # knows the threshold, not just "too large".
+        assert "100000000" in str(info.value) or "100_000_000" in str(info.value)
+
+    def test_business_cap_opt_out_via_enforce_false(self) -> None:
+        # Batch settlement tools that already have a
+        # human-in-the-loop approval flow can bypass the cap.
+        assert (
+            _to_minor_units(
+                100_000_001, UNIT_MINOR, "USD",
+                enforce_business_cap=False,
+            )
+            == 100_000_001
+        )
+
+    def test_wire_format_overflow_distinct_from_business_cap(self) -> None:
+        # ``i64::MAX = 9_223_372_036_854_775_807`` exceeds both
+        # the per-currency business cap AND the wire-format
+        # ``i64`` upper bound. The business-cap check fires
+        # first because it is the lower threshold; the error
+        # reason is ``"excessive"`` (not ``"overflow"``).
+        # This separation lets the ``@protect`` wrapper route
+        # the call to the right policy: a ``"excessive"``
+        # debit goes to the explicit human-approval path; a
+        # ``"overflow"`` would indicate a wire-format bug.
+        with pytest.raises(InvalidMoneyAmountError) as info:
+            _to_minor_units((1 << 63) - 1, UNIT_MINOR, "USD")
+        assert info.value.reason == "excessive"
+
+    def test_wire_format_overflow_only_when_above_business_cap(
+        self
+    ) -> None:
+        # With ``enforce_business_cap=False``, a value at
+        # ``i64::MAX - 1`` is accepted (it is below
+        # ``i64::MAX``) but ``i64::MAX`` raises ``overflow``.
+        assert (
+            _to_minor_units(
+                (1 << 63) - 1, UNIT_MINOR, "USD",
+                enforce_business_cap=False,
+            )
+            == (1 << 63) - 1
+        )
+        with pytest.raises(InvalidMoneyAmountError) as info:
+            _to_minor_units(
+                (1 << 63), UNIT_MINOR, "USD",
+                enforce_business_cap=False,
+            )
+        assert info.value.reason == "overflow"
 
     def test_overflow_message_names_i64_max(self) -> None:
         with pytest.raises(InvalidMoneyAmountError) as info:
-            _to_minor_units((1 << 63), UNIT_MINOR, "USD")
-        # The error mentions the i64 upper bound so the
-        # operator knows it is a wire-format limit, not a
-        # currency arithmetic limit.
+            _to_minor_units(
+                (1 << 63), UNIT_MINOR, "USD",
+                enforce_business_cap=False,
+            )
         assert "i64" in str(info.value) or "9223372036854775807" in str(info.value)
 
 
@@ -214,40 +263,80 @@ class TestOverflowGuard:
 # ---------------------------------------------------------------------------
 
 
-class TestUnsupportedCurrencyFallback:
-    """Unknown ISO-4217 codes fall back to 2 fractional digits
-    (USD-style validation). The fallback is conservative: a
-    value that would be valid in 3-digit KWD is rejected in an
-    unknown code because the fallback assumes 2 digits. The
-    operator adds the new code to ``_CURRENCY_MINOR_DIGITS``
-    to opt in."""
+class TestCurrencyWhitelist:
+    """The ISO-4217 whitelist is enforced at extractor
+    construction time and at every per-currency lookup.
+    Unknown codes raise ``InvalidCurrencyError`` rather than
+    falling back to a default; this closes the conservative-
+    fallback gap that masked typos like ``"usd"`` or ``"USDX"``.
+
+    Case is also enforced: ISO-4217 codes are 3-letter
+    uppercase ASCII letters, anything else is wrong by
+    definition. The SDK does NOT silently upper-case the
+    input.
+    """
 
     def test_known_currency_exact(self) -> None:
+        from nullrun.extractor import normalize_currency
+        for code in ("USD", "EUR", "JPY", "KWD", "BHD", "OMR",
+                     "GBP", "CHF", "CAD", "AUD"):
+            assert normalize_currency(code) == code
+
+    def test_lowercase_currency_rejected(self) -> None:
+        from nullrun.extractor import normalize_currency
+        with pytest.raises(InvalidCurrencyError) as info:
+            normalize_currency("usd")
+        assert info.value.received == "usd"
+        assert "uppercase" in str(info.value)
+
+    def test_mixed_case_currency_rejected(self) -> None:
+        from nullrun.extractor import normalize_currency
+        with pytest.raises(InvalidCurrencyError) as info:
+            normalize_currency("Usd")
+        assert info.value.received == "Usd"
+
+    def test_four_letter_currency_rejected(self) -> None:
+        from nullrun.extractor import normalize_currency
+        with pytest.raises(InvalidCurrencyError) as info:
+            normalize_currency("USDX")
+        assert "length 4" in str(info.value) or "3-letter" in str(info.value)
+
+    def test_empty_currency_rejected(self) -> None:
+        from nullrun.extractor import normalize_currency
+        with pytest.raises(InvalidCurrencyError):
+            normalize_currency("")
+
+    def test_digits_in_currency_rejected(self) -> None:
+        from nullrun.extractor import normalize_currency
+        with pytest.raises(InvalidCurrencyError):
+            normalize_currency("US1")
+
+    def test_constructor_rejects_lowercase_at_decoration_time(self) -> None:
+        # ``money_outflow(currency="usd")`` raises at
+        # decorator-application time, never reaches runtime.
+        with pytest.raises(InvalidCurrencyError):
+            money_outflow(argument="amount", currency="usd")
+
+    def test_currency_minor_digits_propagates_currency_error(self) -> None:
+        with pytest.raises(InvalidCurrencyError):
+            currency_minor_digits("XYZ")
+
+    def test_currency_minor_digits_known_value_exact(self) -> None:
         assert currency_minor_digits("USD") == 2
         assert currency_minor_digits("EUR") == 2
         assert currency_minor_digits("JPY") == 0
         assert currency_minor_digits("KWD") == 3
 
-    def test_unknown_currency_falls_back_to_two(self) -> None:
-        # The fallback is 2 (USD-style). An unknown currency
-        # with 3-digit precision gets rejected, not silently
-        # rounded.
-        assert currency_minor_digits("XYZ") == 2
-        assert currency_minor_digits("") == 2
+    def test_business_cap_lookup_propagates_currency_error(self) -> None:
+        from nullrun.extractor import business_cap_minor
+        with pytest.raises(InvalidCurrencyError):
+            business_cap_minor("XYZ")
 
-    def test_unknown_currency_rejects_three_digit_decimal(self) -> None:
-        with pytest.raises(InvalidMoneyPrecisionError) as info:
-            _to_minor_units(Decimal("1.234"), UNIT_MAJOR, "XYZ")
-        # The error names the (unknown) currency so the
-        # operator can see that they forgot to add XYZ to
-        # ``_CURRENCY_MINOR_DIGITS``.
-        assert info.value.currency == "XYZ"
-        assert info.value.allowed == 2
-
-    def test_unknown_currency_accepts_two_digit_decimal(self) -> None:
-        # Conservative fallback accepts the same shape USD
-        # accepts, so unknown codes work the way USD does.
-        assert _to_minor_units(Decimal("1.23"), UNIT_MAJOR, "XYZ") == 123
+    def test_business_cap_known_value_exact(self) -> None:
+        from nullrun.extractor import business_cap_minor
+        assert business_cap_minor("USD") == 100_000_000
+        assert business_cap_minor("JPY") == 100_000_000
+        assert business_cap_minor("KWD") == 100_000_000
 
 
 # ---------------------------------------------------------------------------
