@@ -2408,6 +2408,8 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         input_data: dict[str, Any],
         mode: str = "auto",
         on_transport_error: Callable[[Exception], dict[str, Any]] | None = None,
+        business_impact: dict[str, Any] | None = None,
+        action_digest: str | None = None,
     ) -> dict[str, Any]:
         """
         Pre-execution policy evaluation via /execute endpoint.
@@ -2420,8 +2422,21 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             input_data: Tool input parameters
             mode: Execution mode ("auto", "inline", "strict")
                 - "auto": auto-select based on tool risk
-                - "inline": force fast path (non-sensitive tools only)
-                - "strict": force gateway roundtrip
+            on_transport_error: Optional callback for transport-error
+                handling (legacy); prefer the typed exception path.
+            business_impact: Phase 1 / MVP 1.0 typed action payload
+                (Money impact for now). When supplied, the backend
+                uses it to evaluate rule predicates AND stamps the
+                approval row's `action_digest` so the post-approval
+                /execute re-check can refuse tampered payloads.
+            action_digest: SHA-256 hex of the canonicalised impact
+                JSON. Computed client-side (Python helper in
+                ``nullrun.business_impact.compute_action_digest``)
+                because the SDK has the function arguments in scope;
+                the backend verifies it on the re-check. When
+                supplied alongside ``business_impact``, the
+                grant is digest-bound; without it, the backend
+                falls back to approval_id-only grant consume.
 
         Returns:
             Dict with:
@@ -2429,7 +2444,11 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 - decision_source: "gateway" | "cached" | "fallback"
                 - explanation: Human-readable explanation
                 - policy_version: Policy version used
-                - decision_context: Context used for the decision (for decision-history audit)
+                - decision_context: Context used for the decision
+
+            Mode values:
+                - "inline": force fast path (non-sensitive tools only)
+                - "strict": force gateway roundtrip
 
         Raises:
             NullRunBlockedException: If decision is "block"
@@ -2474,6 +2493,17 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             "operation_id": operation_id,
             "on_transport_error": on_transport_error,
         }
+        # Phase 1 / MVP 1.0: digest-bound approval. Forward the
+        # typed impact + digest to the wire when supplied. The
+        # backend stamps the approval row with the digest and
+        # verifies it on the post-approval re-check. When the
+        # caller did NOT supply them (legacy Phase 0 path), the
+        # fields are absent from the wire; the backend falls
+        # back to approval_id-only grant consume.
+        if business_impact is not None:
+            execute_kwargs["business_impact"] = business_impact
+        if action_digest is not None:
+            execute_kwargs["action_digest"] = action_digest
         result = self._transport.execute(**execute_kwargs)
 
         # Update metrics (thread-safe)

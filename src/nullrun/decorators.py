@@ -617,6 +617,69 @@ def _enforce_sensitive_tool(
     # the /execute payload that lands in the audit log.
     masked_args = _safe_args(fn, args)
 
+    # Phase 1 / MVP 1.0: if the wrapped function carries an
+    # ``_nullrun_extractor`` attribute (set by the @sensitive
+    # decorator's ``impact=money_outflow(...)`` argument), extract
+    # the typed action impact from the live args before sending
+    # /execute. The extractor returns a fully-validated
+    # BusinessImpact; we then compute its action_digest and pass
+    # both onto the wire so the backend can stamp the approval row
+    # AND verify the digest on the post-approval re-check.
+    #
+    # If the extractor raises (bad arg name, wrong type, negative
+    # amount, etc.), we fail-CLOSED per ADR-008: a sensitive tool
+    # whose impact cannot be extracted MUST NOT run. The exception
+    # is converted to NullRunTransportError so the outer
+    # try/except below wraps it as NullRunBlockedException.
+    business_impact_dict: dict[str, Any] | None = None
+    action_digest_hex: str | None = None
+    extractor = getattr(fn, "_nullrun_extractor", None)
+    if extractor is not None:
+        try:
+            from nullrun.business_impact import compute_action_digest
+            from nullrun.extractor import MoneyImpactExtractor
+
+            if isinstance(extractor, MoneyImpactExtractor):
+                impact = extractor.impact_for(fn, args, kwargs)
+                business_impact_dict = impact.to_wire_dict()
+                action_digest_hex = compute_action_digest(impact)
+        except Exception as exc:  # noqa: BLE001
+            from nullrun.breaker.exceptions import (
+                NullRunBlockedException,
+                NullRunTransportError,
+                TransportErrorSource,
+            )
+
+            workflow_id = get_workflow_id() or UNKNOWN_WORKFLOW_ID
+            err = NullRunBlockedException(
+                workflow_id=workflow_id,
+                reason=(
+                    f"failed to extract business_impact for sensitive "
+                    f"tool {fn.__name__!r}: {exc}"
+                ),
+                tool_name=fn.__name__,
+                error_code="NR-B003",
+                user_action=(
+                    f"The @sensitive decorator on {fn.__name__!r} "
+                    f"could not extract a MoneyImpact from the live "
+                    f"arguments. Check that the function declares the "
+                    f"argument named in `impact=money_outflow(...)`."
+                ),
+            )
+            runtime._emit_sdk_error(
+                err,
+                stage="sensitive_tool_extract",
+                workflow_id=workflow_id,
+                tool_name=fn.__name__,
+            )
+            raise NullRunBlockedException(
+                workflow_id=workflow_id,
+                reason=err.reason,
+                tool_name=fn.__name__,
+                error_code="NR-B003",
+                user_action=err.user_action,
+            ) from exc
+
     # ADR-008: prefer `on_transport_error` (raise classified
     # NullRunTransportError); fall back to legacy `fallback_mode` for
     # older runtimes that pre-date the rename.
@@ -636,10 +699,18 @@ def _enforce_sensitive_tool(
         # below converts the typed error into NullRunBlockedException
         # so the caller's `except NullRunBlockedException` catches it
         # uniformly.
+        #
+        # Phase 1 / MVP 1.0: thread the typed impact + digest
+        # through. When the decorator did NOT see an extractor, both
+        # are None and the runtime.execute() drops them from the
+        # payload; the backend then uses the approval_id-only
+        # grant consume (Phase 0 fallback).
         result = runtime.execute(
             fn.__name__,
             {"args": masked_args, "kwargs": masked},
             on_transport_error="raise",
+            business_impact=business_impact_dict,
+            action_digest=action_digest_hex,
         )
     except NullRunBlockedException:
         # Real policy-block decision from the gateway — propagate as-is.
@@ -792,7 +863,11 @@ def _enforce_sensitive_tool(
     # (the happy path) just falls through and the body runs.
 
 
-def sensitive(fn: F) -> F:
+def sensitive(
+    fn: F | None = None,
+    *,
+    impact: Any = None,
+) -> F:
     """
     Mark a function as sensitive. `@protect` will pre-check
     `runtime.execute(...)` before the body runs.
@@ -806,12 +881,59 @@ def sensitive(fn: F) -> F:
         @nullrun.sensitive
         @nullrun.protect
         def charge_card(amount: int) -> str:
-...
+            ...
+
+    Phase 1 / MVP 1.0: ``@sensitive(impact=money_outflow(...))``
+    attaches a typed ``MoneyImpactExtractor`` to the function via
+    the ``_nullrun_extractor`` attribute. The wrapper reads it
+    inside ``_enforce_sensitive_tool`` to extract a typed
+    ``BusinessImpact`` + ``action_digest`` from the live call
+    arguments and forward them to /execute, so the backend can
+    stamp the approval row with the digest and refuse tampered
+    payloads on the post-approval re-check.
+
+        @nullrun.sensitive(impact=money_outflow(argument="amount_cents"))
+        @nullrun.protect
+        def refund_customer(amount_cents: int, customer_id: str):
+            ...
+
+    Args:
+        fn: the function to decorate. May be None when used with
+            keyword arguments (the ``@sensitive(impact=...)`` form).
+        impact: Phase 1 typed action extractor. Currently only
+            ``MoneyImpactExtractor`` (returned by
+            ``money_outflow(argument=...)``) is supported.
+
+    Two forms are accepted:
+      - bare: ``@sensitive`` — fn must be the function being decorated.
+      - factory: ``@sensitive(impact=...)`` — fn is None, returns a
+        decorator that closes over ``impact``.
+
+    Both forms register the tool as sensitive in the runtime so the
+    ``_enforce_sensitive_tool`` pre-check fires.
     """
+    # Factory form: @sensitive(impact=...) returns a decorator that
+    # closes over the impact extractor. We stamp the extractor onto
+    # the function later (when the decorator is invoked) so users
+    # can mix @sensitive(impact=...) with @protect in any order.
+    if fn is None:
+        def _attach_decorator(_fn: F) -> F:
+            if impact is not None:
+                setattr(_fn, "_nullrun_extractor", impact)
+            return _do_sensitive_register(_fn)
+        return _attach_decorator  # type: ignore[return-value]
+
+    # Bare form: @sensitive.
+    if impact is not None:
+        setattr(fn, "_nullrun_extractor", impact)
+    return _do_sensitive_register(fn)
+
+
+def _do_sensitive_register(fn: F) -> F:
     try:
         # Use the same slot the @protect wrapper uses so the
         # registration lands on the same runtime instance the
-        # wrapper will consult. Falling back to get_runtime 
+        # wrapper will consult. Falling back to get_runtime
         # would hit a different singleton and silently no-op in
         # tests that build a custom runtime.
         rt = _get_or_create_runtime()
