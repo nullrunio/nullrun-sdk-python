@@ -242,9 +242,15 @@ class TestSensitiveExtractorWirePayload:
         with pytest.raises(NullRunBlockedException) as exc_info:
             _enforce_sensitive_tool(captured_runtime, fn, (-1,), {"customer_id": "c-1"})
         assert exc_info.value.error_code == "NR-B003"
-        # The TypeError from MoneyImpactExtractor says "must be
-        # non-negative, got -1".
-        assert "non-negative" in exc_info.value.reason
+        # Phase 1.1 hardening: the negative-amount guard now
+        # lives in ``_to_minor_units`` (not in
+        # ``MoneyImpact.validate``), so the reason text
+        # matches the new "rejected negative" message. The
+        # legacy "non-negative" wording remains for
+        # backward-compatible callers via
+        # ``MoneyImpact.validate`` when an amount is somehow
+        # negative on the wire (defense-in-depth).
+        assert "rejected negative" in exc_info.value.reason
 
     def test_decorator_factory_form_attaches_extractor(
         self, captured_payload: _PayloadCapture, captured_runtime: NullRunRuntime

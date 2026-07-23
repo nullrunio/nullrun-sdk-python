@@ -248,7 +248,10 @@ class TestExtractorFailureModes:
 
     def test_negative_amount_raises_value_error(self) -> None:
         ext = money_outflow(argument="amount_cents")
-        with pytest.raises(ValueError, match="non-negative"):
+        # Phase 1.1: hardening pass added ``InvalidMoneyAmountError``
+        # which subclasses ``ValueError``; the legacy matcher
+        # still works for ``except ValueError`` callers.
+        with pytest.raises(ValueError, match="rejected negative"):
             ext.impact_for(_refund_customer_func, (-1,), {"customer_id": "c-1"})
 
     def test_non_int_amount_raises_type_error(self) -> None:

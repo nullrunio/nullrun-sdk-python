@@ -9,12 +9,9 @@ that:
    ``inspect.signature(...).bind(...)`` so positional and keyword
    invocations look identical.
 2. Pulls the named argument off the bound args.
-3. Converts the value to integer minor units (cents) using the
-   ``units`` discriminator — ``units="minor"`` passes int
-   values through verbatim; ``units="major"`` validates the
-   precision of a ``Decimal`` against the ISO-4217 minor-unit
-   exponent for the currency, then multiplies by
-   ``10**currency_digits``. ``float`` is rejected outright.
+3. Validates and converts the value to integer minor units
+   using the ``units`` discriminator and the ISO-4217 minor-unit
+   exponent for the currency.
 4. Validates and builds a ``MoneyImpact``.
 5. Computes the byte-identical ``action_digest`` the backend
    expects (see ``nullrun.business_impact.compute_action_digest``).
@@ -58,7 +55,7 @@ signature refactor does not flip the meaning.
 ``Decimal`` exists precisely so that money code does not have
 to deal with binary-floating-point surprises (``0.1 + 0.2 !=
 0.3`` in IEEE-754). The extractor therefore refuses ``float``
-values at the input level. The TypeError includes a pointer to
+values at the input level. The error includes a pointer to
 the right alternative (``Decimal`` for major, ``int`` for minor)
 so the operator can fix the call site without guessing.
 
@@ -72,18 +69,59 @@ banker's rounding silently drops sub-cent precision
 is the exact bug class the explicit ``units`` discriminator
 is designed to prevent. The current contract validates the
 precision of the ``Decimal`` against the ISO-4217 minor-unit
-exponent for the currency and raises ``ValueError`` if the
-caller supplied more precision than the currency supports.
-The caller can explicitly truncate with
+exponent for the currency and raises ``InvalidMoneyPrecisionError``
+if the caller supplied more precision than the currency
+supports. The caller can explicitly truncate with
 ``value.quantize(Decimal('1E-N'))`` to opt in to rounding; the
 SDK never rounds silently.
+
+## Sign is validated
+
+A negative amount for either ``money_outflow`` (debit) or
+``money_inflow`` (credit) is semantically incoherent. The
+review pointed out that ``{"direction":"outflow",
+"amount_minor":-5000}`` would silently fall through every
+``op=gt`` predicate because ``-5000 > 5000`` is always False,
+and the operator would never see a block. The current contract
+rejects negative amounts with ``InvalidMoneyAmountError`` so the
+``@protect`` wrapper can fail-CLOSED on the call site. If a
+future variant needs negative amounts (e.g. refunds as negative
+outflows) it can opt in via a future ``units="signed"``
+discriminator.
+
+## Overflow is bounded
+
+``i64`` can hold up to ``2**63 - 1 = 9_223_372_036_854_775_807``
+minor units (about $9.2 \u00d7 10\u00b9\u2076 for USD). The extractor checks
+the converted value against this limit and raises
+``InvalidMoneyAmountError`` if it would overflow. The check
+uses ``int`` post-conversion so the operator sees the
+offending amount, not just "too large".
+
+## Float and ``bool`` are rejected
+
+``float`` is rejected because IEEE-754 surprises are the entire
+reason ``Decimal`` exists. ``bool`` is rejected because ``bool``
+is a subclass of ``int`` in Python; without the explicit check,
+``refund(amount=True)`` would silently treat ``True`` as
+``1`` cent.
+
+## Unknown currency codes are documented as opt-in
+
+``currency_minor_digits`` falls back to ``2`` for unknown
+currencies. The fallback is conservative: an unknown code
+gets the USD-style 2-digit validation, which means a
+``Decimal("1.234")`` call for an unknown code would raise
+``InvalidMoneyPrecisionError``. The operator adds the new
+code to ``_CURRENCY_MINOR_DIGITS`` to opt in; the SDK never
+silently rounds.
 """
 
 from __future__ import annotations
 
 import functools
 import inspect
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Optional, Union
 
 from nullrun.business_impact import (
@@ -124,15 +162,17 @@ UNITS = (UNIT_MINOR, UNIT_MAJOR)
 # ``_to_minor_units`` to validate the precision of a
 # ``Decimal`` in ``units="major"`` mode; a value with more
 # fractional digits than the currency supports is a bug, not
-# a rounding opportunity, and the SDK surfaces it as a
-# ``ValueError`` so the operator can decide explicitly.
+# a rounding opportunity, and the SDK surfaces it as an
+# ``InvalidMoneyPrecisionError`` so the operator can decide
+# explicitly.
 #
 # Coverage is small by design: the SDK only enforces precision
 # for currencies the form / wire shape already understands
 # (USD/EUR/GBP/CHF/CAD/AUD = 2 fractional digits, JPY = 0,
 # KWD/BHD/OMR = 3). An unknown currency falls back to 2 (the
 # historical default) so a future addition does not silently
-# round.
+# round; the operator adds the new code to
+# ``_CURRENCY_MINOR_DIGITS`` to opt in.
 _CURRENCY_MINOR_DIGITS = {
     # 2 fractional digits (cents, pence, centimes)
     "USD": 2,
@@ -163,10 +203,96 @@ def currency_minor_digits(currency: str) -> int:
     The fallback is conservative: an unknown currency is
     validated as if it had 2 fractional digits, which means a
     future ``Decimal("1.234")`` call for an unknown code
-    would raise ``ValueError``. The operator adds the new
-    code to ``_CURRENCY_MINOR_DIGITS`` to opt in.
+    would raise ``InvalidMoneyPrecisionError``. The operator
+    adds the new code to ``_CURRENCY_MINOR_DIGITS`` to opt in.
     """
     return _CURRENCY_MINOR_DIGITS.get(currency, DEFAULT_MINOR_DIGITS)
+
+
+# Hard upper bound for the converted ``amount_minor``. The
+# wire format is ``i64``; values exceeding ``2**63 - 1`` would
+# silently overflow on the backend side. The constant is
+# checked AFTER conversion so the operator sees the offending
+# amount, not just "too large".
+_I64_MAX = (1 << 63) - 1
+
+
+# ----- Dedicated error types --------------------------------------
+#
+# ``InvalidMoneyPrecisionError`` -- the caller supplied more
+#   fractional digits than the currency supports (e.g.
+#   ``Decimal("50.005")`` for USD). The error carries
+#   ``currency``, ``allowed``, ``received`` so a UI or test
+#   harness can format a specific message.
+#
+# ``InvalidMoneyAmountError`` -- generic money-amount
+#   invariant violation: negative amounts, overflow, non-finite
+#   Decimals. The error carries ``currency`` (when known) and
+#   ``reason`` (a string discriminator).
+#
+# Both inherit from ``ValueError`` so the existing ``except
+# ValueError`` callers in ``runtime.py`` continue to work; the
+# subclass lets a careful caller branch on the type.
+
+
+class InvalidMoneyPrecisionError(ValueError):
+    """Sub-precision rejected: the supplied Decimal has more
+    fractional digits than the currency supports.
+
+    Attributes:
+        currency: the ISO-4217 code the extractor was called
+            with.
+        allowed: the number of fractional digits the currency
+            supports (e.g. 2 for USD).
+        received: the offending Decimal as a string (so the
+            caller sees exactly what was passed).
+        received_digits: the number of fractional digits the
+            offending Decimal actually had.
+    """
+
+    def __init__(
+        self,
+        currency: str,
+        allowed: int,
+        received: str,
+        received_digits: int,
+    ) -> None:
+        self.currency = currency
+        self.allowed = allowed
+        self.received = received
+        self.received_digits = received_digits
+        msg = (
+            f"{currency} supports at most {allowed} fractional "
+            f"digit(s); got {received} ({received_digits}). "
+            f"Either truncate explicitly with "
+            f"``value.quantize(Decimal('1E-{allowed}'))`` "
+            f"before passing to money_outflow, or change currency."
+        )
+        super().__init__(msg)
+
+
+class InvalidMoneyAmountError(ValueError):
+    """Generic money-amount invariant violation.
+
+    Attributes:
+        currency: the ISO-4217 code the extractor was called
+            with (may be empty if the error happened before
+            currency dispatch).
+        reason: short string discriminator (``"negative"``,
+            ``"overflow"``, ``"non_finite"``). Lets a UI or
+            test harness branch without parsing the message.
+    """
+
+    def __init__(
+        self,
+        reason: str,
+        detail: str,
+        currency: str = "",
+    ) -> None:
+        self.reason = reason
+        self.currency = currency
+        msg = detail if not currency else f"[{currency}] {detail}"
+        super().__init__(msg)
 
 
 def _decimal_has_more_fractional_digits(
@@ -191,8 +317,8 @@ def _decimal_has_more_fractional_digits(
     2-digit limit.
 
     The check is purely structural (``% 1`` and integer
-    comparison) and does NOT do any rounding, so the SDK
-    never silently drops precision.
+    comparison) and does NOT do any rounding, so the SDK never
+    silently drops precision.
     """
     if allowed < 0:
         raise ValueError(f"allowed fractional digits must be >= 0, got {allowed}")
@@ -202,7 +328,10 @@ def _decimal_has_more_fractional_digits(
         # ``int(...)`` anyway. We surface a cleaner error
         # here so the caller sees ``ValueError`` instead of
         # ``InvalidOperation``.
-        raise ValueError(f"Decimal must be finite, got {value}")
+        raise InvalidMoneyAmountError(
+            reason="non_finite",
+            detail=f"Decimal must be finite, got {value}",
+        )
     fractional = value - value.to_integral_value(rounding="ROUND_DOWN")
     if fractional == 0:
         # Integer-valued decimals (``50``, ``50.00``,
@@ -221,14 +350,33 @@ def _decimal_has_more_fractional_digits(
 def _count_fractional_digits(value: Decimal) -> int:
     """Return the number of fractional digits in ``value``.
 
-    Used by the ``ValueError`` message in
-    ``_to_minor_units`` so the operator sees the offending
-    precision, not just a generic "too many digits" error.
+    Used by the ``InvalidMoneyPrecisionError`` constructor so
+    the operator sees the offending precision, not just a
+    generic "too many digits" error.
     """
     exponent = value.as_tuple().exponent
     if isinstance(exponent, int):
         return max(0, abs(exponent))
     return 0
+
+
+def _check_overflow(amount_minor: int, currency: str) -> None:
+    """Raise ``InvalidMoneyAmountError`` if ``amount_minor``
+    exceeds the wire-format ``i64`` upper bound.
+
+    The check is post-conversion so the operator sees the
+    actual integer that would overflow, not just "too large".
+    """
+    if amount_minor > _I64_MAX:
+        raise InvalidMoneyAmountError(
+            reason="overflow",
+            currency=currency,
+            detail=(
+                f"amount_minor={amount_minor} exceeds i64::MAX={_I64_MAX}; "
+                f"either the input amount is too large for the wire "
+                f"format or the currency conversion factor is wrong."
+            ),
+        )
 
 
 def _to_minor_units(
@@ -250,32 +398,59 @@ def _to_minor_units(
     discriminator is designed to prevent. The SDK validates the
     precision of the Decimal against the ISO-4217 minor-unit
     exponent for ``currency``: ``Decimal("50.005")`` for USD
-    (``minor_digits = 2``) raises ``ValueError("USD supports at
-    most 2 fractional digits; got 50.005")`` rather than silently
-    rounding. This is the production-grade contract: precision
-    must be supplied correctly by the caller; the SDK never
-    rounds silently.
+    (``minor_digits = 2``) raises ``InvalidMoneyPrecisionError``
+    rather than silently rounding.
+
+    Sign is validated: a negative value for either direction is
+    rejected because ``{"direction":"outflow",
+    "amount_minor":-5000}`` silently falls through every
+    ``op=gt`` predicate (``-5000 > 5000`` is always False).
+
+    Overflow is checked after conversion: the converted
+    ``amount_minor`` must fit in ``i64`` or the wire format
+    overflows.
     """
     if units == UNIT_MINOR:
-        if isinstance(value, int) and not isinstance(value, bool):
-            return value
-        if isinstance(value, Decimal) and not isinstance(value, bool):
-            # Caller has already pre-quantized; the SDK does
-            # not change the value. If the Decimal has a
-            # fractional part (e.g. ``0.05``) we surface a
-            # TypeError rather than silently truncate, so the
-            # operator catches the unit confusion.
-            if _decimal_has_more_fractional_digits(value, 0):
+        if isinstance(value, bool) or not isinstance(value, int):
+            if isinstance(value, Decimal) and not isinstance(value, bool):
+                # Caller has already pre-quantized; the SDK does
+                # not change the value. If the Decimal has a
+                # fractional part (e.g. ``0.05``) we surface a
+                # TypeError rather than silently truncate, so the
+                # operator catches the unit confusion.
+                if _decimal_has_more_fractional_digits(value, 0):
+                    raise TypeError(
+                        f"money_outflow(argument={value!r}, units='minor'): "
+                        f"refusing to round {value!r} to integer minor units; "
+                        f"either pass an int (e.g. int({value!r})) or set units='major'."
+                    )
+                # Normalise: ``Decimal("50")`` and
+                # ``Decimal("50.00")`` both reduce to ``int(50)``,
+                # so the wire format is stable across
+                # representations.
+                converted = int(value)
+            else:
                 raise TypeError(
-                    f"money_outflow(argument={value!r}, units='minor'): "
-                    f"refusing to round {value!r} to integer minor units; "
-                    f"either pass an int (e.g. int({value!r})) or set units='major'."
+                    f"money_outflow(units='minor') requires int or Decimal; "
+                    f"got {type(value).__name__}: {value!r}"
                 )
-            return int(value)
-        raise TypeError(
-            f"money_outflow(units='minor') requires int or Decimal; "
-            f"got {type(value).__name__}: {value!r}"
-        )
+        else:
+            converted = value
+        # Sign + overflow checks apply to both paths.
+        if converted < 0:
+            raise InvalidMoneyAmountError(
+                reason="negative",
+                currency=currency,
+                detail=(
+                    f"money_outflow(units='minor') rejected negative "
+                    f"amount {converted!r}; a negative amount would "
+                    f"silently fall through every op=gt predicate "
+                    f"because negative < positive is always False."
+                ),
+            )
+        _check_overflow(converted, currency)
+        return converted
+
     if units == UNIT_MAJOR:
         if isinstance(value, bool) or not isinstance(value, Decimal):
             raise TypeError(
@@ -284,27 +459,43 @@ def _to_minor_units(
                 f"For int minor units, set units='minor' or use money_inflow(...) "
                 f"with units='minor'."
             )
+        # Sign check (before precision check so the operator
+        # sees the most specific error first).
+        if value < 0:
+            raise InvalidMoneyAmountError(
+                reason="negative",
+                currency=currency,
+                detail=(
+                    f"money_outflow(units='major') rejected negative "
+                    f"amount {value!r}; a negative amount would "
+                    f"silently fall through every op=gt predicate "
+                    f"because negative < positive is always False."
+                ),
+            )
         # Precision validation: refuse a Decimal with more
         # fractional digits than the currency supports. This
         # is the production-grade contract: precision must be
         # supplied correctly by the caller; the SDK never
-        # rounds silently. Banker's rounding was rejected in
-        # review because ``Decimal("50.005")`` for USD would
-        # silently drop to ``5000`` and surprise the operator;
-        # a ``ValueError`` is unambiguous and matches the
-        # payment-system convention.
+        # rounds silently.
         allowed = currency_minor_digits(currency)
         if _decimal_has_more_fractional_digits(value, allowed):
-            raise ValueError(
-                f"{currency} supports at most {allowed} fractional "
-                f"digit(s); got {value} ({_count_fractional_digits(value)}). "
-                f"Either truncate explicitly with "
-                f"``value.quantize(Decimal('1E-{allowed}'))`` "
-                f"before passing to money_outflow, or change currency."
+            raise InvalidMoneyPrecisionError(
+                currency=currency,
+                allowed=allowed,
+                received=str(value),
+                received_digits=_count_fractional_digits(value),
             )
         # Conversion is exact because precision was validated
         # above. No rounding. No truncation. No silent loss.
-        return int(value * (Decimal(10) ** allowed))
+        # ``int(...)`` on a Decimal still raises
+        # ``OverflowError`` for values larger than ``i64``
+        # range, so the explicit overflow check after
+        # conversion is the safety net rather than the
+        # primary path.
+        converted = int(value * (Decimal(10) ** allowed))
+        _check_overflow(converted, currency)
+        return converted
+
     # Defensive: ``__init__`` validates ``units`` at construction
     # time, so this branch is unreachable. If a future refactor
     # breaks the validation, we still fail closed here.
@@ -391,10 +582,14 @@ class MoneyImpactExtractor:
                 ``NullRunBlockedException`` (fail-CLOSED) — a
                 malicious or buggy SDK must never fall back to
                 "no impact was extracted" implicitly.
-            ValueError: when ``units="major"`` and the
-                supplied Decimal has more fractional digits than
-                the currency supports (e.g.
+            InvalidMoneyPrecisionError: when ``units="major"``
+                and the supplied Decimal has more fractional
+                digits than the currency supports (e.g.
                 ``Decimal("50.005")`` for USD).
+            InvalidMoneyAmountError: when the supplied amount
+                is negative, non-finite (``NaN`` / ``Inf``), or
+                exceeds the wire-format ``i64`` upper bound
+                after conversion.
         """
         # `inspect.signature(...).bind` normalizes positional +
         # keyword into a single dict, so the extractor does not
@@ -416,8 +611,10 @@ class MoneyImpactExtractor:
             )
         value = bound.arguments[self.argument]
 
-        # Phase 1.1: convert via the unit discriminator. ``float``
-        # is rejected before this point; see ``_to_minor_units``.
+        # Phase 1.1 hardening: convert via the unit
+        # discriminator. ``float`` is rejected before this
+        # point; precision, sign, and overflow are validated
+        # inside ``_to_minor_units``.
         amount_minor = _to_minor_units(
             value, units=self.units, currency=self.currency
         )
