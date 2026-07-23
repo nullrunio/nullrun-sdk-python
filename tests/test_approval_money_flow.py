@@ -274,15 +274,24 @@ class TestExtractor:
             ex.impact_for(_refund_call, (1_000,), {})
 
     def test_extractor_rejects_wrong_type(self, extractor_factory):
+        # Phase 1.1 (Decimal support): a string is not a Decimal
+        # and not an int, so the discriminator rejects it. The
+        # exact error message names the unit discriminator so the
+        # operator can fix the call site.
         ex = extractor_factory("amount_cents")
-        with pytest.raises(TypeError, match="to be int"):
+        with pytest.raises(TypeError, match="requires int or Decimal"):
             ex.impact_for(
                 _refund_call, ("not_an_int",), {}
             )
 
     def test_extractor_rejects_bool_amount(self, extractor_factory):
+        # Phase 1.1 (Decimal support): ``bool`` is a subclass
+        # of ``int`` in Python; the discriminator explicitly
+        # rejects ``bool`` so a hostile caller can't smuggle
+        # ``True`` as ``amount=1`` cent. The unit-discriminator
+        # error message names the discriminator.
         ex = extractor_factory("amount_cents")
-        with pytest.raises(TypeError, match="to be int"):
+        with pytest.raises(TypeError, match="requires int or Decimal"):
             ex.impact_for(_refund_call, (True,), {})
 
 
