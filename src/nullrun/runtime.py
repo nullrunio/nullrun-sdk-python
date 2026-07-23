@@ -2374,20 +2374,82 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             }
 
         # Strict mode or sensitive tool: call /execute endpoint
-        # (no local_mode branch -- api_key is now required, see T3-S2)
-        result = self._transport.execute(
-            organization_id=organization_id,
-            execution_id=workflow_id,
-            trace_id=trace_id,
-            tool=tool_name,
-            input_data=input_data,
-            mode=mode,
-            fallback_mode=self._fallback_mode,
-            on_transport_error=on_transport_error,
-        )
+        # (no local_mode branch -- api_key is now required, see T3-S2).
+        # Keep one operation_id across the initial request and the
+        # post-approval re-check so the backend can bind both requests
+        # to the same logical action.
+        operation_id = str(uuid.uuid4())
+        execute_kwargs: dict[str, Any] = {
+            "organization_id": organization_id,
+            "execution_id": workflow_id,
+            "trace_id": trace_id,
+            "tool": tool_name,
+            "input_data": input_data,
+            "mode": mode,
+            "fallback_mode": self._fallback_mode,
+            "operation_id": operation_id,
+            "on_transport_error": on_transport_error,
+        }
+        result = self._transport.execute(**execute_kwargs)
 
         # Update metrics (thread-safe)
         metrics.inc_runtime("execute_calls")
+
+        if result.get("decision") == "require_approval":
+            approval_id = result.get("approval_id") or ""
+            if not approval_id:
+                metrics.inc_runtime("execute_blocked")
+                raise NullRunBlockedException(
+                    workflow_id=workflow_id or UNKNOWN_WORKFLOW_ID,
+                    reason="approval_id missing in require_approval response",
+                    tool_name=tool_name,
+                    error_code="NR-A004",
+                )
+
+            server_timeout = result.get("approval_timeout_seconds")
+            if server_timeout is not None:
+                try:
+                    server_timeout = float(server_timeout)
+                except (TypeError, ValueError):
+                    server_timeout = None
+            if server_timeout is not None and server_timeout <= 0:
+                server_timeout = None
+
+            approval_result = self._wait_for_approval_resolution(
+                approval_id=str(approval_id),
+                workflow_id=workflow_id or UNKNOWN_WORKFLOW_ID,
+                execution_id=str(workflow_id or UNKNOWN_WORKFLOW_ID),
+                timeout_seconds=server_timeout,
+            )
+            outcome = str(approval_result.get("outcome") or "").lower()
+            if outcome != "approved":
+                metrics.inc_runtime("execute_blocked")
+                reason = (
+                    f"approval denied: {approval_result.get('note') or 'operator denied'}"
+                    if outcome == "denied"
+                    else f"approval {approval_id} timeout"
+                )
+                raise NullRunBlockedException(
+                    workflow_id=workflow_id or UNKNOWN_WORKFLOW_ID,
+                    reason=reason,
+                    tool_name=tool_name,
+                    error_code="NR-A004",
+                )
+
+            # Re-check the same action. The backend must verify that
+            # approval_id is APPROVED and bound to this execution/action
+            # before returning allow. Never execute directly from the WS
+            # outcome alone.
+            execute_kwargs["approval_id"] = str(approval_id)
+            result = self._transport.execute(**execute_kwargs)
+            if result.get("decision") == "require_approval":
+                metrics.inc_runtime("execute_blocked")
+                raise NullRunBlockedException(
+                    workflow_id=workflow_id or UNKNOWN_WORKFLOW_ID,
+                    reason="approved action was not accepted on re-check",
+                    tool_name=tool_name,
+                    error_code="NR-A004",
+                )
 
         # Check if execution is allowed
         if result.get("decision") == "block":
