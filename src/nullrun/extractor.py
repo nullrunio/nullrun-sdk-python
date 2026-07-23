@@ -11,10 +11,10 @@ that:
 2. Pulls the named argument off the bound args.
 3. Converts the value to integer minor units (cents) using the
    ``units`` discriminator — ``units="minor"`` passes int
-   values through verbatim; ``units="major"`` multiplies a
-   ``Decimal`` by 100 with banker's rounding. ``float`` is
-   rejected outright because it is exactly the silent bug
-   class this module is designed to prevent.
+   values through verbatim; ``units="major"`` validates the
+   precision of a ``Decimal`` against the ISO-4217 minor-unit
+   exponent for the currency, then multiplies by
+   ``10**currency_digits``. ``float`` is rejected outright.
 4. Validates and builds a ``MoneyImpact``.
 5. Computes the byte-identical ``action_digest`` the backend
    expects (see ``nullrun.business_impact.compute_action_digest``).
@@ -61,6 +61,22 @@ to deal with binary-floating-point surprises (``0.1 + 0.2 !=
 values at the input level. The TypeError includes a pointer to
 the right alternative (``Decimal`` for major, ``int`` for minor)
 so the operator can fix the call site without guessing.
+
+## Major-unit precision is validated, never rounded
+
+The first version of this module used banker's rounding
+(``ROUND_HALF_EVEN``) to convert ``Decimal("50.99")`` to
+``5099`` minor units. That decision was rejected in review:
+banker's rounding silently drops sub-cent precision
+(``Decimal("50.005")`` becomes ``5000`` minor units), which
+is the exact bug class the explicit ``units`` discriminator
+is designed to prevent. The current contract validates the
+precision of the ``Decimal`` against the ISO-4217 minor-unit
+exponent for the currency and raises ``ValueError`` if the
+caller supplied more precision than the currency supports.
+The caller can explicitly truncate with
+``value.quantize(Decimal('1E-N'))`` to opt in to rounding; the
+SDK never rounds silently.
 """
 
 from __future__ import annotations
@@ -89,11 +105,11 @@ from nullrun.business_impact import (
 # shape does not change.
 #
 # ``major`` = the value is in major units (dollars, pounds, etc.)
-# and the SDK converts to minor units via ``Decimal * 100`` with
-# banker's rounding. The ``MoneyImpact`` struct stores the
-# result in minor units so the wire shape and the backend
-# ``action_predicate`` shape are identical between the two
-# paths.
+# and the SDK converts to minor units via ``Decimal * 10**N``
+# where ``N = currency_minor_digits(currency)``. The
+# ``MoneyImpact`` struct stores the result in minor units so
+# the wire shape and the backend ``action_predicate`` shape
+# are identical between the two paths.
 #
 # The discriminator is **explicit** in the decorator (not
 # implicit from the type) so the unit semantics survive a
@@ -101,6 +117,118 @@ from nullrun.business_impact import (
 UNIT_MINOR = "minor"
 UNIT_MAJOR = "major"
 UNITS = (UNIT_MINOR, UNIT_MAJOR)
+
+
+# ISO-4217 minor-unit exponents for the currencies the SDK
+# supports out of the box. The lookup is consulted by
+# ``_to_minor_units`` to validate the precision of a
+# ``Decimal`` in ``units="major"`` mode; a value with more
+# fractional digits than the currency supports is a bug, not
+# a rounding opportunity, and the SDK surfaces it as a
+# ``ValueError`` so the operator can decide explicitly.
+#
+# Coverage is small by design: the SDK only enforces precision
+# for currencies the form / wire shape already understands
+# (USD/EUR/GBP/CHF/CAD/AUD = 2 fractional digits, JPY = 0,
+# KWD/BHD/OMR = 3). An unknown currency falls back to 2 (the
+# historical default) so a future addition does not silently
+# round.
+_CURRENCY_MINOR_DIGITS = {
+    # 2 fractional digits (cents, pence, centimes)
+    "USD": 2,
+    "EUR": 2,
+    "GBP": 2,
+    "CHF": 2,
+    "CAD": 2,
+    "AUD": 2,
+    # 0 fractional digits (yen)
+    "JPY": 0,
+    # 3 fractional digits (fils)
+    "KWD": 3,
+    "BHD": 3,
+    "OMR": 3,
+}
+
+DEFAULT_MINOR_DIGITS = 2
+
+
+def currency_minor_digits(currency: str) -> int:
+    """Return the number of fractional digits for ``currency``.
+
+    ISO-4217 minor-unit exponent: ``2`` for USD/EUR/GBP, ``0``
+    for JPY, ``3`` for KWD/BHD/OMR. Unknown codes fall back
+    to ``DEFAULT_MINOR_DIGITS = 2`` so a future addition does
+    not silently round.
+
+    The fallback is conservative: an unknown currency is
+    validated as if it had 2 fractional digits, which means a
+    future ``Decimal("1.234")`` call for an unknown code
+    would raise ``ValueError``. The operator adds the new
+    code to ``_CURRENCY_MINOR_DIGITS`` to opt in.
+    """
+    return _CURRENCY_MINOR_DIGITS.get(currency, DEFAULT_MINOR_DIGITS)
+
+
+def _decimal_has_more_fractional_digits(
+    value: Decimal, allowed: int
+) -> bool:
+    """Return True iff ``value`` has more fractional digits than
+    ``allowed``.
+
+    The check uses ``value % 1`` so that a value like
+    ``Decimal("50.00")`` (which ``as_tuple()`` reports as having
+    two fractional digits) is correctly classified as an
+    integer-valued decimal with zero effective fractional
+    digits. ``Decimal("50.005")`` has a non-zero fractional
+    part and is rejected.
+
+    This is the precision contract that replaced banker's
+    rounding: the caller must supply a value whose fractional
+    part fits within the currency's ISO-4217 minor-unit
+    exponent. ``Decimal("50.00")`` for USD is fine because
+    the fractional part is zero; ``Decimal("50.005")`` for
+    USD is not fine because the fractional part exceeds the
+    2-digit limit.
+
+    The check is purely structural (``% 1`` and integer
+    comparison) and does NOT do any rounding, so the SDK
+    never silently drops precision.
+    """
+    if allowed < 0:
+        raise ValueError(f"allowed fractional digits must be >= 0, got {allowed}")
+    if not value.is_finite():
+        # ``Infinity`` / ``NaN`` are not money values; the
+        # downstream ``_to_minor_units`` would raise on
+        # ``int(...)`` anyway. We surface a cleaner error
+        # here so the caller sees ``ValueError`` instead of
+        # ``InvalidOperation``.
+        raise ValueError(f"Decimal must be finite, got {value}")
+    fractional = value - value.to_integral_value(rounding="ROUND_DOWN")
+    if fractional == 0:
+        # Integer-valued decimals (``50``, ``50.00``,
+        # ``50.0000``) all reduce to ``Decimal("0")`` for the
+        # fractional part and pass any allowed limit.
+        return False
+    # Non-zero fractional part: count the digits after the
+    # decimal point. ``Decimal("0.005")`` has ``as_tuple()``
+    # exponent ``-3`` and we report 3 fractional digits.
+    exponent = value.as_tuple().exponent
+    if isinstance(exponent, int):
+        return abs(exponent) > allowed
+    return False
+
+
+def _count_fractional_digits(value: Decimal) -> int:
+    """Return the number of fractional digits in ``value``.
+
+    Used by the ``ValueError`` message in
+    ``_to_minor_units`` so the operator sees the offending
+    precision, not just a generic "too many digits" error.
+    """
+    exponent = value.as_tuple().exponent
+    if isinstance(exponent, int):
+        return max(0, abs(exponent))
+    return 0
 
 
 def _to_minor_units(
@@ -119,14 +247,14 @@ def _to_minor_units(
     ``units="major"``: ``value`` is a major-unit Decimal (dollars).
     The function rejects ``int`` outright because a bare ``int``
     in major units is exactly the silent bug class the explicit
-    discriminator is designed to prevent.
-
-    The major-unit default uses ``ROUND_HALF_EVEN`` (banker's
-    rounding) because it is the IEEE-754 default and matches
-    Postgres ``numeric`` arithmetic; a value like
-    ``Decimal("0.005")`` rounds to ``0`` instead of ``1`` so
-    refunds sum to ``0.00`` rather than triggering a sub-cent
-    rounding drift over many operations.
+    discriminator is designed to prevent. The SDK validates the
+    precision of the Decimal against the ISO-4217 minor-unit
+    exponent for ``currency``: ``Decimal("50.005")`` for USD
+    (``minor_digits = 2``) raises ``ValueError("USD supports at
+    most 2 fractional digits; got 50.005")`` rather than silently
+    rounding. This is the production-grade contract: precision
+    must be supplied correctly by the caller; the SDK never
+    rounds silently.
     """
     if units == UNIT_MINOR:
         if isinstance(value, int) and not isinstance(value, bool):
@@ -137,14 +265,13 @@ def _to_minor_units(
             # fractional part (e.g. ``0.05``) we surface a
             # TypeError rather than silently truncate, so the
             # operator catches the unit confusion.
-            quantized = value.quantize(Decimal("1"))
-            if quantized != value:
+            if _decimal_has_more_fractional_digits(value, 0):
                 raise TypeError(
                     f"money_outflow(argument={value!r}, units='minor'): "
                     f"refusing to round {value!r} to integer minor units; "
                     f"either pass an int (e.g. int({value!r})) or set units='major'."
                 )
-            return int(quantized)
+            return int(value)
         raise TypeError(
             f"money_outflow(units='minor') requires int or Decimal; "
             f"got {type(value).__name__}: {value!r}"
@@ -157,13 +284,27 @@ def _to_minor_units(
                 f"For int minor units, set units='minor' or use money_inflow(...) "
                 f"with units='minor'."
             )
-        # Round half-even (banker's rounding). This matches the
-        # Postgres ``numeric`` default so a sum of 100 refunds
-        # of $0.005 each totals $0.50 (not $0.51, not $0.49).
-        quantized = (value * Decimal(100)).quantize(
-            Decimal("1"), rounding="ROUND_HALF_EVEN"
-        )
-        return int(quantized)
+        # Precision validation: refuse a Decimal with more
+        # fractional digits than the currency supports. This
+        # is the production-grade contract: precision must be
+        # supplied correctly by the caller; the SDK never
+        # rounds silently. Banker's rounding was rejected in
+        # review because ``Decimal("50.005")`` for USD would
+        # silently drop to ``5000`` and surprise the operator;
+        # a ``ValueError`` is unambiguous and matches the
+        # payment-system convention.
+        allowed = currency_minor_digits(currency)
+        if _decimal_has_more_fractional_digits(value, allowed):
+            raise ValueError(
+                f"{currency} supports at most {allowed} fractional "
+                f"digit(s); got {value} ({_count_fractional_digits(value)}). "
+                f"Either truncate explicitly with "
+                f"``value.quantize(Decimal('1E-{allowed}'))`` "
+                f"before passing to money_outflow, or change currency."
+            )
+        # Conversion is exact because precision was validated
+        # above. No rounding. No truncation. No silent loss.
+        return int(value * (Decimal(10) ** allowed))
     # Defensive: ``__init__`` validates ``units`` at construction
     # time, so this branch is unreachable. If a future refactor
     # breaks the validation, we still fail closed here.
@@ -183,7 +324,9 @@ class MoneyImpactExtractor:
       already integer-valued. ``float`` is rejected outright.
     - ``units="major"``: the bound argument is a Decimal in
       major units. The SDK converts to minor units via
-      ``Decimal * 100`` with banker's rounding. ``float`` and
+      ``Decimal * 10**currency_minor_digits(currency)`` after
+      validating that the Decimal's precision matches the
+      currency's ISO-4217 minor-unit exponent. ``float`` and
       ``int`` are rejected outright (the only reason to use
       ``major`` is precision; an ``int`` in major units is
       almost always a unit-confusion bug).
@@ -231,7 +374,8 @@ class MoneyImpactExtractor:
         The unit discriminator (``self.units``) decides whether
         the value is treated as already-minor-units
         (``int`` passes through) or as a major-unit Decimal
-        (``Decimal * 100`` with banker's rounding).
+        (``Decimal * 10**currency_minor_digits`` after precision
+        validation).
 
         The bool check is explicit because ``bool`` is a
         subclass of ``int`` in Python — without the explicit
@@ -247,6 +391,10 @@ class MoneyImpactExtractor:
                 ``NullRunBlockedException`` (fail-CLOSED) — a
                 malicious or buggy SDK must never fall back to
                 "no impact was extracted" implicitly.
+            ValueError: when ``units="major"`` and the
+                supplied Decimal has more fractional digits than
+                the currency supports (e.g.
+                ``Decimal("50.005")`` for USD).
         """
         # `inspect.signature(...).bind` normalizes positional +
         # keyword into a single dict, so the extractor does not
@@ -315,8 +463,9 @@ def money_outflow(
     ``units`` defaults to ``"minor"`` for backward compatibility
     with the Phase 0 / pre-Decimal path. New code that
     passes Decimal amounts in major units should pass
-    ``units="major"`` explicitly so the SDK multiplies by 100
-    with banker's rounding.
+    ``units="major"`` explicitly so the SDK multiplies by
+    ``10**currency_minor_digits(currency)`` after validating
+    precision.
 
     ``direction`` is fixed to ``OUTFLOW`` because that is the
     only direction the backend's MVP-1.0 rules fire on. Inflow

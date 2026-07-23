@@ -86,31 +86,106 @@ class TestMajorUnitsDecimalConversion:
         impact = ext.impact_for(_refund_dollars, (Decimal("50"),), {})
         assert impact.impact.amount_minor == 5_000
 
-    def test_decimal_0_005_banker_rounding_to_zero(self) -> None:
-        # Banker's rounding: 0.005 -> 0 (round half-even). The
-        # sum of 100 refunds of $0.005 each totals $0.50
-        # (not $0.51, not $0.49), which matches the Postgres
-        # ``numeric`` default.
+    def test_decimal_50_005_rejected_for_usd(self) -> None:
+        # Phase 1.1 production-grade contract: precision must be
+        # supplied correctly by the caller. ``Decimal("50.005")``
+        # is a sub-cent precision that USD does not support, so
+        # the SDK raises ``ValueError`` rather than silently
+        # rounding (no banker's rounding; no ROUND_HALF_UP; the
+        # previous "drop half-cent silently" behaviour is the
+        # exact bug class this contract prevents).
         ext = money_outflow(
             argument="amount",
             currency="USD",
             units=UNIT_MAJOR,
         )
-        impact = ext.impact_for(_refund_dollars, (Decimal("0.005"),), {})
-        assert impact.impact.amount_minor == 0
+        with pytest.raises(ValueError, match="USD supports at most 2"):
+            ext.impact_for(_refund_dollars, (Decimal("50.005"),), {})
 
-    def test_decimal_0_015_banker_rounding_to_2(self) -> None:
-        # Banker's rounding: 0.015 -> 2 (round half-even). The
-        # first dropped fraction (0.005) is 0 (round to even),
-        # the second is 1 (round to even), the third is 2 (round
-        # to even). Final result is 2.
+    def test_decimal_50_999_rejected_for_usd(self) -> None:
         ext = money_outflow(
             argument="amount",
             currency="USD",
             units=UNIT_MAJOR,
         )
-        impact = ext.impact_for(_refund_dollars, (Decimal("0.015"),), {})
-        assert impact.impact.amount_minor == 2
+        with pytest.raises(ValueError, match="USD supports at most 2"):
+            ext.impact_for(_refund_dollars, (Decimal("50.999"),), {})
+
+    def test_decimal_0_005_rejected_for_usd(self) -> None:
+        # Sub-cent precision for any USD amount is rejected.
+        ext = money_outflow(
+            argument="amount",
+            currency="USD",
+            units=UNIT_MAJOR,
+        )
+        with pytest.raises(ValueError, match="USD supports at most 2"):
+            ext.impact_for(_refund_dollars, (Decimal("0.005"),), {})
+
+    def test_decimal_0_01_accepted_for_usd(self) -> None:
+        # The boundary: 0.01 has exactly 2 fractional digits.
+        ext = money_outflow(
+            argument="amount",
+            currency="USD",
+            units=UNIT_MAJOR,
+        )
+        impact = ext.impact_for(_refund_dollars, (Decimal("0.01"),), {})
+        assert impact.impact.amount_minor == 1
+
+    def test_jpy_decimal_with_fractional_digits_rejected(self) -> None:
+        # JPY has 0 fractional digits (yen). ``Decimal("100.5")``
+        # is rejected because the caller has supplied sub-yen
+        # precision.
+        def _refund_jpy(amount: Decimal) -> dict:
+            return {"a": amount}
+
+        ext = money_outflow(
+            argument="amount",
+            currency="JPY",
+            units=UNIT_MAJOR,
+        )
+        with pytest.raises(ValueError, match="JPY supports at most 0"):
+            ext.impact_for(_refund_jpy, (Decimal("100.5"),), {})
+
+    def test_jpy_decimal_integer_accepted(self) -> None:
+        def _refund_jpy(amount: Decimal) -> dict:
+            return {"a": amount}
+
+        ext = money_outflow(
+            argument="amount",
+            currency="JPY",
+            units=UNIT_MAJOR,
+        )
+        impact = ext.impact_for(_refund_jpy, (Decimal("1000"),), {})
+        # JPY has 0 fractional digits, so the wire stores the
+        # same integer; no conversion needed.
+        assert impact.impact.amount_minor == 1000
+
+    def test_kwd_three_fractional_digits_accepted(self) -> None:
+        # KWD has 3 fractional digits (fils). ``Decimal("1.234")``
+        # is exactly within the supported precision.
+        def _refund_kwd(amount: Decimal) -> dict:
+            return {"a": amount}
+
+        ext = money_outflow(
+            argument="amount",
+            currency="KWD",
+            units=UNIT_MAJOR,
+        )
+        impact = ext.impact_for(_refund_kwd, (Decimal("1.234"),), {})
+        assert impact.impact.amount_minor == 1_234
+
+    def test_kwd_four_fractional_digits_rejected(self) -> None:
+        # ``Decimal("1.2345")`` is sub-fil precision for KWD.
+        def _refund_kwd(amount: Decimal) -> dict:
+            return {"a": amount}
+
+        ext = money_outflow(
+            argument="amount",
+            currency="KWD",
+            units=UNIT_MAJOR,
+        )
+        with pytest.raises(ValueError, match="KWD supports at most 3"):
+            ext.impact_for(_refund_kwd, (Decimal("1.2345"),), {})
 
     def test_int_rejected_in_major_units(self) -> None:
         # A bare int in major units is the silent bug class
@@ -347,12 +422,31 @@ class TestToMinorUnitsHelper:
         assert _to_minor_units(Decimal("50.99"), UNIT_MAJOR, "USD") == 5_099
         assert _to_minor_units(Decimal("1000.00"), UNIT_MAJOR, "USD") == 100_000
 
-    def test_major_decimal_rounds_half_even(self) -> None:
-        # Banker's rounding: 0.005 rounds to 0; 0.015 rounds
-        # to 2; 0.025 rounds to 2 (round half-even).
-        assert _to_minor_units(Decimal("0.005"), UNIT_MAJOR, "USD") == 0
-        assert _to_minor_units(Decimal("0.015"), UNIT_MAJOR, "USD") == 2
-        assert _to_minor_units(Decimal("0.025"), UNIT_MAJOR, "USD") == 2
+    def test_major_decimal_rejects_sub_cent_precision(self) -> None:
+        # ``Decimal("0.005")`` for USD has 3 fractional digits
+        # but USD supports 2; the helper raises ``ValueError``
+        # rather than silently rounding. This is the
+        # production-grade contract that replaced banker's
+        # rounding.
+        with pytest.raises(ValueError, match="USD supports at most 2"):
+            _to_minor_units(Decimal("0.005"), UNIT_MAJOR, "USD")
+        with pytest.raises(ValueError, match="USD supports at most 2"):
+            _to_minor_units(Decimal("50.005"), UNIT_MAJOR, "USD")
+        with pytest.raises(ValueError, match="USD supports at most 2"):
+            _to_minor_units(Decimal("0.999"), UNIT_MAJOR, "USD")
+
+    def test_major_decimal_rejects_sub_yen_precision(self) -> None:
+        with pytest.raises(ValueError, match="JPY supports at most 0"):
+            _to_minor_units(Decimal("100.5"), UNIT_MAJOR, "JPY")
+
+    def test_major_decimal_accepts_three_digit_kwd(self) -> None:
+        # KWD has 3 fractional digits; ``Decimal("1.234")`` is
+        # accepted.
+        assert _to_minor_units(Decimal("1.234"), UNIT_MAJOR, "KWD") == 1_234
+
+    def test_major_decimal_rejects_four_digit_kwd(self) -> None:
+        with pytest.raises(ValueError, match="KWD supports at most 3"):
+            _to_minor_units(Decimal("1.2345"), UNIT_MAJOR, "KWD")
 
     def test_major_rejects_int(self) -> None:
         with pytest.raises(TypeError, match="requires Decimal"):
