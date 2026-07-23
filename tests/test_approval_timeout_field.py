@@ -232,27 +232,36 @@ class TestApprovalTimeoutResolution:
         hits the timeout and returns the ``{outcome: 'timeout',
         timed_out: True}`` sentinel — NOT raise, NOT block
         forever. The test verifies that with a small
-        server_timeout (0.1s) and NO release, the function
-        returns the sentinel within ~0.1s + overhead. Note that
-        the timeout sentinel does NOT carry `timeout_seconds`
-        (it's a fresh dict, not the entry) — only `outcome`,
+        server_timeout and NO release, the function returns the
+        sentinel within that timeout + overhead. Note that the
+        timeout sentinel does NOT carry `timeout_seconds` (it's
+        a fresh dict, not the entry) — only `outcome`,
         `timed_out`, `approval_id`.
+
+        Phase 0 review (2026-07-23): the test used
+        `timeout_seconds=0.1` to keep the suite fast. After the
+        clamp to `[MIN_APPROVAL_TIMEOUT_SECONDS=1,
+        MAX_APPROVAL_TIMEOUT_SECONDS=3600]`, sub-1s values now
+        fall back to the env default 300s. The test instead
+        pins a 1.5s timeout (in-range) and a 5s upper bound on
+        the elapsed wait. Production coverage of the validator
+        itself lives in `test_validate_approval_timeout_*`.
         """
         rt = _make_runtime(env_timeout=300.0)
         try:
             result_box = _run_wait_and_timeout(
-                rt, "appr-silent", timeout_seconds=0.1,
+                rt, "appr-silent", timeout_seconds=1.5,
             )
             assert result_box.get("result") is not None
             assert result_box["result"]["outcome"] == "timeout"
             assert result_box["result"]["timed_out"] is True
             assert result_box["result"]["approval_id"] == "appr-silent"
-            # Sanity: the wait elapsed near the configured 0.1s,
-            # not the env default 300s — proving the server
-            # timeout was the one passed to event.wait().
-            assert 0.05 < result_box["elapsed"] < 1.0, (
+            # Sanity: the wait elapsed near 1.5s (the new minimum
+            # in-range timeout that the validator accepts), not the
+            # env default 300s.
+            assert 1.0 < result_box["elapsed"] < 5.0, (
                 f"timeout took {result_box['elapsed']:.2f}s; "
-                "expected near 0.1s (server timeout), not 300s (env)"
+                "expected near 1.5s (in-range server timeout), not 300s (env)"
             )
         finally:
             rt.shutdown(flush=False)
@@ -280,3 +289,51 @@ class TestApprovalTimeoutResolution:
             )
         finally:
             rt.shutdown(flush=False)
+
+
+# ---------------------------------------------------------------------------
+# Phase 0 review (2026-07-23): server-timeout clamp to
+# [MIN_APPROVAL_TIMEOUT_SECONDS, MAX_APPROVAL_TIMEOUT_SECONDS].
+# Pre-fix only `> 0` was rejected, so a server advertising
+# 1e9 seconds would lock the calling thread for years. The
+# helper now refuses any out-of-range value.
+# ---------------------------------------------------------------------------
+
+
+def _validate_approval_timeout(value, log_prefix):
+    """Mirror the runtime.py helper for direct unit testing."""
+    from nullrun.runtime import _validate_approval_timeout as helper
+
+    return helper(value, log_prefix)
+
+
+def test_validate_approval_timeout_accepts_in_range_value():
+    from nullrun.runtime import MAX_APPROVAL_TIMEOUT_SECONDS, MIN_APPROVAL_TIMEOUT_SECONDS
+
+    for in_range in (1.0, 5.0, 60.0, 3600.0, MAX_APPROVAL_TIMEOUT_SECONDS):
+        assert _validate_approval_timeout(in_range, "t") == in_range
+    for in_range in (1, 60, 3600):
+        # ints must coerce to float
+        assert _validate_approval_timeout(in_range, "t") == float(in_range)
+
+
+def test_validate_approval_timeout_rejects_below_min():
+    for below in (0, 0.0, -1, -100.0, 0.99):
+        assert _validate_approval_timeout(below, "t") is None
+
+
+def test_validate_approval_timeout_rejects_above_max():
+    from nullrun.runtime import MAX_APPROVAL_TIMEOUT_SECONDS
+
+    for above in (MAX_APPROVAL_TIMEOUT_SECONDS + 1, 1e9, 10_000_000.0):
+        assert _validate_approval_timeout(above, "t") is None
+
+
+def test_validate_approval_timeout_rejects_non_numeric():
+    for bad in ("abc", "5x", [], {}, [1, 2, 3]):
+        assert _validate_approval_timeout(bad, "t") is None
+
+
+def test_validate_approval_timeout_rejects_none():
+    assert _validate_approval_timeout(None, "t") is None
+

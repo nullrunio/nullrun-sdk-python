@@ -141,6 +141,68 @@ _GATE_CACHE_TTL_SECONDS: float = 5.0
 # worth the simplicity of a hard-coded threshold).
 SERVER_MINTED_RESERVATION_MAX_AGE_SECONDS: float = 295.0
 
+# Phase 0 review (2026-07-23): hard cap on server-supplied
+# approval_timeout_seconds. The backend is authoritative for the
+# approval window, but a misconfigured backend (or a malicious
+# proxy in front of one) could advertise an absurdly long
+# timeout (e.g. 1e9 seconds) and lock the calling thread
+# indefinitely. We clamp the server value to this ceiling as
+# the maximum time we'll ever wait for an operator click.
+# The env default `NULLRUN_APPROVAL_TIMEOUT_SECONDS` is also
+# clamped — see check_workflow_budget / runtime.execute for the
+# exact clamp call.
+MAX_APPROVAL_TIMEOUT_SECONDS: float = 3600.0
+
+# Symmetric floor: a 0-second or negative timeout would
+# deadlock the very first event.wait() call. The server is
+# allowed to advertise any value in `[1, MAX]`; out-of-range
+# values fall back to the env default.
+MIN_APPROVAL_TIMEOUT_SECONDS: float = 1.0
+
+
+def _validate_approval_timeout(value: object, log_prefix: str) -> float | None:
+    """Validate and clamp a server-supplied approval_timeout_seconds.
+
+    Phase 0 review (2026-07-23): the server is authoritative for the
+    approval window, but it could advertise 0 (deadlock), 1e9 (lock the
+    thread for years), a non-numeric string, or `None`. We refuse to
+    forward anything outside `[MIN_APPROVAL_TIMEOUT_SECONDS,
+    MAX_APPROVAL_TIMEOUT_SECONDS]` and return `None` so the caller
+    falls back to `_approval_timeout_seconds` (the env default).
+
+    Args:
+        value: the raw `approval_timeout_seconds` field from the
+            server's wire response (may be int, float, str, None,
+            or anything else if a future backend drifts).
+        log_prefix: short caller name for the WARN log (e.g.
+            "check_workflow_budget" or "runtime.execute").
+
+    Returns:
+        A positive float in `[MIN, MAX]`, or `None` to signal
+        "fall back to the env default".
+    """
+    if value is None:
+        return None
+    try:
+        candidate = float(value)
+    except (TypeError, ValueError):
+        logger.warning(
+            "%s: approval_timeout_seconds=%r is not a number; falling back to env default",
+            log_prefix,
+            value,
+        )
+        return None
+    if candidate < MIN_APPROVAL_TIMEOUT_SECONDS or candidate > MAX_APPROVAL_TIMEOUT_SECONDS:
+        logger.warning(
+            "%s: approval_timeout_seconds=%.1fs out of range [%.1f, %.1f]; falling back to env default",
+            log_prefix,
+            candidate,
+            MIN_APPROVAL_TIMEOUT_SECONDS,
+            MAX_APPROVAL_TIMEOUT_SECONDS,
+        )
+        return None
+    return candidate
+
 # Phase 4.1: privacy boundary. Fields that MUST NOT leave the SDK on
 # the wire. The transport layer (POST /api/v1/track/batch) reads
 # whatever is in the event dict, so anything not allowlisted ends up
@@ -1256,23 +1318,59 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         Returns:
             The entry dict, with ``outcome`` populated (either
             ``"approved"`` or ``"denied"``). On timeout, returns
-            a sentinel ``{"outcome": "timeout", "timed_out": True}``
-            and the caller is expected to fall back to the
-            legacy /status poll path.
+            a sentinel ``{"outcome": "timeout", "timed_out": True}``.
+
+            **The caller is expected to fail-CLOSED on timeout** —
+            raise ``WorkflowKilledInterrupt``. The Разрыв 1c
+            contract deliberately rejected a `/status` poll
+            fallback here (per `references/razriv1c-approval-flow.md`,
+            Phase 4 H4): a silent timeout must not silently
+            approve a privileged action. The legacy docstring
+            "fall back to legacy /status poll path" was incorrect
+            and is removed as part of the 2026-07-23 review.
 
         Raises:
             Nothing. Approval timeouts are returned, not raised,
             so the caller can choose the right recovery action
-            (raise WorkflowKilledInterrupt on denied, resume on
-            approved, fall back to poll on timeout).
+            (raise WorkflowKilledInterrupt on denied OR on
+            timeout, resume on approved).
         """
         # Per-approval timeout resolution (Разрыв 1c, 2026-07-21):
         # prefer the server-authoritative value from the /gate
         # response so the SDK never times out before the
         # backend's expiry sweeper (Разрыв 3 class of bug).
         # Fall back to the env default only on missing or
-        # non-positive value — both signal "backend didn't send
-        # the field" and we preserve the pre-Разрыв 1c behaviour.
+        # out-of-range value — both signal "backend didn't send a
+        # sane value" and we preserve the pre-Разрыв 1c behaviour.
+        #
+        # Phase 0 review (2026-07-23): we clamp the server value
+        # to `[MIN, MAX]`. A misconfigured backend advertising
+        # 0 (deadlock), 1e9 (lock the thread for years), or any
+        # other garbage value will not stall the agent loop —
+        # we fall back to the env default instead.
+        if timeout_seconds is not None:
+            try:
+                candidate = float(timeout_seconds)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "approval %s: server timeout=%r is not a number; falling back to env default",
+                    approval_id,
+                    timeout_seconds,
+                )
+                candidate = None
+            if candidate is not None and (
+                candidate < MIN_APPROVAL_TIMEOUT_SECONDS
+                or candidate > MAX_APPROVAL_TIMEOUT_SECONDS
+            ):
+                logger.warning(
+                    "approval %s: server timeout=%.1fs out of range [%.1f, %.1f]; falling back to env default",
+                    approval_id,
+                    candidate,
+                    MIN_APPROVAL_TIMEOUT_SECONDS,
+                    MAX_APPROVAL_TIMEOUT_SECONDS,
+                )
+                candidate = None
+            timeout_seconds = candidate
         effective_timeout = (
             timeout_seconds
             if (timeout_seconds is not None and timeout_seconds > 0)
@@ -1693,24 +1791,10 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             # the env default rather than try to parse it inline —
             # the field is documented as informational for UI/logs
             # and isn't required for the SDK's wait math.
-            server_timeout = response.get("approval_timeout_seconds")
-            if server_timeout is not None:
-                try:
-                    server_timeout = float(server_timeout)
-                except (TypeError, ValueError):
-                    logger.warning(
-                        "check_workflow_budget: approval_timeout_seconds=%r "
-                        "is not a number; falling back to env default",
-                        response.get("approval_timeout_seconds"),
-                    )
-                    server_timeout = None
-            if server_timeout is not None and server_timeout <= 0:
-                logger.warning(
-                    "check_workflow_budget: approval_timeout_seconds=%r "
-                    "is non-positive; falling back to env default",
-                    server_timeout,
-                )
-                server_timeout = None
+            server_timeout = _validate_approval_timeout(
+                response.get("approval_timeout_seconds"),
+                log_prefix="check_workflow_budget",
+            )
             logger.info(
                 f"check_workflow_budget: require_approval id={approval_id} -- "
                 f"waiting for WS push (timeout={server_timeout if server_timeout is not None else 'env-default'})"
@@ -2406,14 +2490,10 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                     error_code="NR-A004",
                 )
 
-            server_timeout = result.get("approval_timeout_seconds")
-            if server_timeout is not None:
-                try:
-                    server_timeout = float(server_timeout)
-                except (TypeError, ValueError):
-                    server_timeout = None
-            if server_timeout is not None and server_timeout <= 0:
-                server_timeout = None
+            server_timeout = _validate_approval_timeout(
+                result.get("approval_timeout_seconds"),
+                log_prefix="runtime.execute",
+            )
 
             approval_result = self._wait_for_approval_resolution(
                 approval_id=str(approval_id),
