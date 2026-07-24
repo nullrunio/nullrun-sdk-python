@@ -1157,6 +1157,12 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         try:
             if conn._receive_task is not None:  # type: ignore[attr-defined]
                 await conn._receive_task  # type: ignore[attr-defined]
+        except asyncio.CancelledError:
+            # ``WebSocketConnection.close()`` cancels the receive task to
+            # unblock this waiter during normal shutdown. In Python 3.11+
+            # CancelledError derives from BaseException, so the generic
+            # ``except Exception`` below does not catch it.
+            pass
         except Exception as e:
             logger.debug(f"WS receive loop ended: {e}")
         finally:

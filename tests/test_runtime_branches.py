@@ -332,6 +332,42 @@ def test_stop_recording_returns_none():
 # ─── shutdown ────────────────────────────────────────────────────────
 
 
+def test_ws_connect_and_serve_treats_receive_cancellation_as_clean_shutdown():
+    """An expected receive-task cancellation must not escape the WS thread."""
+    import asyncio
+
+    rt = _make_test_runtime()
+
+    class _CancelledConnection:
+        def __init__(self):
+            async def _cancelled_receive():
+                raise asyncio.CancelledError
+
+            self._receive_task = asyncio.create_task(_cancelled_receive())
+            self.closed = False
+
+        async def close(self):
+            self.closed = True
+            try:
+                await self._receive_task
+            except asyncio.CancelledError:
+                pass
+
+    connection = None
+
+    async def _connect_websocket(**_kwargs):
+        nonlocal connection
+        connection = _CancelledConnection()
+        return connection
+
+    rt._transport.connect_websocket = _connect_websocket
+    asyncio.run(rt._ws_connect_and_serve())
+
+    assert connection is not None
+    assert connection.closed is True
+    assert rt._ws_connection is None
+
+
 def test_shutdown_when_polling_disabled(monkeypatch):
     rt = _make_test_runtime()
     rt._poll_running = False
