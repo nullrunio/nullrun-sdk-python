@@ -39,10 +39,10 @@ from typing import Any, Optional
 import pytest
 
 from nullrun.business_impact import (
-    BusinessImpact,
-    MoneyImpact,
     INFLOW,
     OUTFLOW,
+    BusinessImpact,
+    MoneyImpact,
     compute_action_digest,
 )
 from nullrun.extractor import (
@@ -71,15 +71,15 @@ class ApprovalSimulator:
     backend's `gate_internal` output for the same inputs.
     """
 
-    def __init__(self, *, stored_digest: Optional[str], expires_in: int = 600,
+    def __init__(self, *, stored_digest: str | None, expires_in: int = 600,
                  consumed: bool = False, status: str = "APPROVED") -> None:
         self.stored_digest = stored_digest
         self.expires_at = time.monotonic() + expires_in
         self.consumed = consumed
         self.status = status
-        self.last_decision: Optional[str] = None
+        self.last_decision: str | None = None
 
-    def decide(self, business_impact: Optional[BusinessImpact]) -> str:
+    def decide(self, business_impact: BusinessImpact | None) -> str:
         """Mirror `gate_internal` grant-consume path.
 
         Returns the wire-level decision: "allow", "block:..." or

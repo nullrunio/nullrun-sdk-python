@@ -35,7 +35,6 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-
 DIGEST_PREFIX = b"nullrun/v1/business_impact:"
 
 
@@ -130,7 +129,7 @@ class MoneyImpact:
         }
 
 
-def business_impact_to_dict(impact: "BusinessImpact") -> dict[str, Any]:
+def business_impact_to_dict(impact: BusinessImpact) -> dict[str, Any]:
     """Top-level wire dict for `GateRequest.business_impact`.
 
     Returns an empty string key discriminator for the backend's
@@ -173,7 +172,7 @@ class BusinessImpact:
         direction: str,
         amount_minor: int,
         currency: str = "USD",
-    ) -> "BusinessImpact":
+    ) -> BusinessImpact:
         m = MoneyImpact(
             direction=direction,
             amount_minor=amount_minor,

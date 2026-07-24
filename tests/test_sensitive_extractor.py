@@ -22,16 +22,15 @@ from typing import Any
 
 import pytest
 
+from nullrun._registry import get_registry
 from nullrun.business_impact import (
-    BusinessImpact,
     OUTFLOW,
+    BusinessImpact,
     compute_action_digest,
 )
-from nullrun.extractor import money_outflow
 from nullrun.decorators import _enforce_sensitive_tool
+from nullrun.extractor import money_outflow
 from nullrun.runtime import NullRunRuntime
-from nullrun._registry import get_registry
-
 
 # ---------------------------------------------------------------------------
 # Wire payload capture

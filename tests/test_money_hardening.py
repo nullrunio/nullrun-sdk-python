@@ -42,24 +42,23 @@ from decimal import Decimal
 
 import pytest
 
+from nullrun.business_impact import (
+    OUTFLOW,
+    BusinessImpact,
+    compute_action_digest,
+)
 from nullrun.extractor import (
+    UNIT_MAJOR,
+    UNIT_MINOR,
     InvalidCurrencyError,
     InvalidMoneyAmountError,
     InvalidMoneyPrecisionError,
-    UNIT_MAJOR,
-    UNIT_MINOR,
     _to_minor_units,
     business_cap_minor,
     currency_minor_digits,
     money_outflow,
     normalize_currency,
 )
-from nullrun.business_impact import (
-    BusinessImpact,
-    OUTFLOW,
-    compute_action_digest,
-)
-
 
 GOLDEN_HEX_USD_50_DOLLARS_OUTFLOW = (
     "dfc96387ca539b7130caebe705e042f2e34e52ab44352ae5e527bcef64f0df27"
@@ -277,37 +276,31 @@ class TestCurrencyWhitelist:
     """
 
     def test_known_currency_exact(self) -> None:
-        from nullrun.extractor import normalize_currency
         for code in ("USD", "EUR", "JPY", "KWD", "BHD", "OMR",
                      "GBP", "CHF", "CAD", "AUD"):
             assert normalize_currency(code) == code
 
     def test_lowercase_currency_rejected(self) -> None:
-        from nullrun.extractor import normalize_currency
         with pytest.raises(InvalidCurrencyError) as info:
             normalize_currency("usd")
         assert info.value.received == "usd"
         assert "uppercase" in str(info.value)
 
     def test_mixed_case_currency_rejected(self) -> None:
-        from nullrun.extractor import normalize_currency
         with pytest.raises(InvalidCurrencyError) as info:
             normalize_currency("Usd")
         assert info.value.received == "Usd"
 
     def test_four_letter_currency_rejected(self) -> None:
-        from nullrun.extractor import normalize_currency
         with pytest.raises(InvalidCurrencyError) as info:
             normalize_currency("USDX")
         assert "length 4" in str(info.value) or "3-letter" in str(info.value)
 
     def test_empty_currency_rejected(self) -> None:
-        from nullrun.extractor import normalize_currency
         with pytest.raises(InvalidCurrencyError):
             normalize_currency("")
 
     def test_digits_in_currency_rejected(self) -> None:
-        from nullrun.extractor import normalize_currency
         with pytest.raises(InvalidCurrencyError):
             normalize_currency("US1")
 
@@ -328,12 +321,10 @@ class TestCurrencyWhitelist:
         assert currency_minor_digits("KWD") == 3
 
     def test_business_cap_lookup_propagates_currency_error(self) -> None:
-        from nullrun.extractor import business_cap_minor
         with pytest.raises(InvalidCurrencyError):
             business_cap_minor("XYZ")
 
     def test_business_cap_known_value_exact(self) -> None:
-        from nullrun.extractor import business_cap_minor
         assert business_cap_minor("USD") == 100_000_000
         assert business_cap_minor("JPY") == 100_000_000
         assert business_cap_minor("KWD") == 100_000_000

@@ -30,14 +30,13 @@ from decimal import Decimal
 
 import pytest
 
+from nullrun.business_impact import INFLOW, OUTFLOW, BusinessImpact
 from nullrun.extractor import (
     UNIT_MAJOR,
     UNIT_MINOR,
     _to_minor_units,
     money_outflow,
 )
-from nullrun.business_impact import BusinessImpact, OUTFLOW, INFLOW
-
 
 # Golden cross-language pin shared with the backend's golden
 # test (and pinned in tests/test_business_impact.py). The wire

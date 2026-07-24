@@ -40,15 +40,14 @@ import inspect
 import pytest
 
 from nullrun.business_impact import (
-    BusinessImpact,
     INFLOW,
-    MoneyImpact,
     OUTFLOW,
+    BusinessImpact,
+    MoneyImpact,
     business_impact_to_dict,
     compute_action_digest,
 )
 from nullrun.extractor import money_outflow
-
 
 # Canonical pin shared with the backend's golden test. Any
 # change to the canonical-JSON algorithm on either side breaks
