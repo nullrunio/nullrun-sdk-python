@@ -228,6 +228,12 @@ all = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    # Sprint 0 (coverage): ``pytest-rerunfailures`` is used on a
+    # single rare-flaky test under pytest-xdist on linux. Pin the
+    # lower bound at the version that confirmed working with the
+    # ``max_retries`` keyword (>=14.0) and the upper bound below
+    # the next major (16.x).
+    "pytest-rerunfailures>=14.0,<16.0",
     "respx>=0.21",
     "mypy>=1.10",
     "ruff>=0.5",

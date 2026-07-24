@@ -38,7 +38,11 @@ jobs:
           python -m pip install --upgrade pip
           # xdist ships in the dev tree already; pin it explicitly so
           # a future deps churn can't drop it without breaking CI.
-          pip install -e ".[dev]" "pytest-xdist>=3.6"
+          # ``pytest-rerunfailures`` is used by Sprint 0 (coverage) on
+          # a single rare-flaky test under pytest-xdist on linux
+          # (thread-scheduling race in the approval-wait fixture);
+          # pin it for the same reason.
+          pip install -e ".[dev]" "pytest-xdist>=3.6" "pytest-rerunfailures>=14.0,<16.0"
 
       - name: Run tests
         # `-n auto` lets xdist pick a worker count from the runner's
