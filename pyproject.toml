@@ -111,7 +111,26 @@ name = "nullrun"
 # adds new optional kwarg + new public class, but every existing
 # call site is unchanged on the happy path. No SDK_MIN_VERSION
 # bump. No on-wire change.
-version = "0.14.0"
+# 0.14.1 (2026-07-24): patch release — fix(sdk) Decimal JSON
+# serialization in ``_signed_request_body``. Pre-fix, a
+# ``track_tool`` event payload containing a Decimal (e.g.
+# ``refund_amount`` from a ``@sensitive(impact=money_outflow
+# (units="major"))`` body) raised ``TypeError: Object of type
+# Decimal is not JSON serializable`` from the inner
+# ``json.dumps`` call. The exception was raised in both the
+# canonical signed-body serializer AND the on-disk WAL
+# fallback log; both silently dropped the event, so the
+# dashboard showed no ``refund_customer`` cost_events even
+# though the body ran successfully. Fix adds ``default=str``
+# to both call sites. Decimal now serialises as its lossless
+# string representation (``"50.99"`` on the wire); bytes /
+# datetime / UUID get the same ``str()`` fallback so a single
+# encoder pass handles them all. The wire-shape guarantee
+# from 0.14.0 is preserved: pre-fix events that serialised
+# cleanly still serialise to the same bytes because
+# ``default=`` is only consulted when the default encoder
+# fails. No SDK_MIN_VERSION bump. No public API change.
+version = "0.14.1"
 # Kept under the 200-char preview threshold so the full line is visible
 # without an "expand" click. Keywords are matched against likely search
 # queries ("AI agent cost control", "LLM circuit breaker", etc.).
