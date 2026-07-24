@@ -1335,6 +1335,18 @@ class Transport:
         fallback_mode: str = FallbackMode.PERMISSIVE,
         operation_id: str | None = None,
         approval_id: str | None = None,
+        # Phase 1 / MVP 1.0: typed-impact + digest-bound approval.
+        # The runtime.execute() helper builds these kwargs and the
+        # transport includes them on the wire so the backend can
+        # stamp the approval row with the digest and verify it on
+        # the post-approval re-check. Pre-fix these kwargs were
+        # constructed in runtime.execute but never accepted by
+        # Transport.execute (which raised TypeError and was
+        # classified as a transport error by the on_transport_error
+        # arm below — the body was blocked even though no real
+        # policy violation happened).
+        business_impact: dict[str, Any] | None = None,
+        action_digest: str | None = None,
         on_transport_error: Callable[[Exception], dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """
@@ -1395,6 +1407,17 @@ class Transport:
         }
         if approval_id is not None:
             gate_request["approval_id"] = approval_id
+        # Phase 1 / MVP 1.0: typed-impact + digest-bound approval.
+        # Forward both fields on the wire when supplied. The backend
+        # stamps the approval row with the digest and verifies it on
+        # the post-approval re-check. The keys are only included
+        # when the runtime layer actually built them (i.e. when
+        # ``@sensitive(impact=...)`` was applied) so the wire stays
+        # quiet for legacy Phase 0 callers.
+        if business_impact is not None:
+            gate_request["business_impact"] = business_impact
+        if action_digest is not None:
+            gate_request["action_digest"] = action_digest
 
         # 2026-07-02 (v0.11.0 refactor): route through the canonical
         # signed-headers helper — produces Content-Type + X-API-Key +

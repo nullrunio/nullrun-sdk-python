@@ -608,7 +608,31 @@ def _enforce_sensitive_tool(
     case; a real `decision=block` from the gateway is still honored
     and still raises `NullRunBlockedException`.
     """
-    if not runtime.is_sensitive_tool(fn.__name__):
+    # 2026-07-24 (Root-cause fix): the previous code used
+    # ``is_sensitive_tool(fn.__name__)`` as the single source of
+    # truth. That looked up the name in ``runtime._sensitive_tools``,
+    # which is populated by the ``@sensitive`` decorator at
+    # *decoration time*. If the user calls ``init_or_die()`` (or any
+    # other runtime singleton reinit path) AFTER the module-level
+    # decorators run — which is the common pattern in the
+    # examples — the registration lands on the OLD runtime, the
+    # new runtime has an empty ``_sensitive_tools`` set, and this
+    # gate returns early before reading ``_nullrun_extractor``.
+    # The function carries the typed impact extractor as an
+    # attribute on the callable itself, so use the presence of
+    # the extractor as a second source of truth: if either the
+    # runtime registry knows the name OR the function carries
+    # ``_nullrun_extractor``, this is a sensitive tool and the
+    # gate must run. This avoids the four-cell state space
+    # (extractor × registered) collapsing to the silent-skip
+    # "your bug" cell.
+    #
+    # The ``@sensitive`` decorator now stamps the attribute on the
+    # innermost callable (via ``_stamp_extractor_on_innermost``),
+    # so the bare ``fn`` parameter here carries it directly and a
+    # single ``getattr`` is enough.
+    extractor = getattr(fn, "_nullrun_extractor", None)
+    if not runtime.is_sensitive_tool(fn.__name__) and extractor is None:
         return
     masked = _safe_kwargs(kwargs)
     # P0-1: positional args are masked the same way as kwargs. Without
@@ -633,7 +657,10 @@ def _enforce_sensitive_tool(
     # try/except below wraps it as NullRunBlockedException.
     business_impact_dict: dict[str, Any] | None = None
     action_digest_hex: str | None = None
-    extractor = getattr(fn, "_nullrun_extractor", None)
+    # ``extractor`` was already resolved at the top of this
+    # function (line 626) for the gate-skip check; reuse the
+    # binding here so we do not pay for a second ``getattr`` and
+    # so a future change to that lookup applies to both sites.
     if extractor is not None:
         try:
             from nullrun.business_impact import compute_action_digest
@@ -916,20 +943,67 @@ def sensitive(
     # closes over the impact extractor. We stamp the extractor onto
     # the function later (when the decorator is invoked) so users
     # can mix @sensitive(impact=...) with @protect in any order.
+    #
+    # 2026-07-24 (Root-cause fix): the user-typical spelling is
+    #
+    #     @sensitive(impact=money_outflow(...))
+    #     @protect
+    #     def refund_customer(...):
+    #         ...
+    #
+    # Python applies decorators bottom-up, so @protect runs first
+    # and ``_attach_decorator`` receives the @protect-wrapped
+    # function. The pre-fix code stamped ``_nullrun_extractor`` on
+    # the wrapper (``_fn``) directly, so the gate later saw the
+    # extractor on the @protect wrapper but not on the bare
+    # user function that ``@protect`` captured as ``fn``. The
+    # gate's ``_enforce_sensitive_tool`` therefore found no
+    # extractor on ``fn``, returned early, and never built the
+    # typed ``business_impact`` for the /execute payload. To fix
+    # the root cause, walk ``__wrapped__`` (set on the @protect
+    # wrapper by ``functools.wraps``) to find the innermost
+    # user function and stamp the attribute there. This way the
+    # gate can find the extractor via a single ``getattr`` on
+    # the bare function — no chain walk needed at gate time.
     if fn is None:
         def _attach_decorator(_fn: F) -> F:
             if impact is not None:
-                # `setattr` keeps mypy happy without a TYPE_CHECKING
-                # forward-reference declaration; ruff B010 is a
-                # stylistic preference (no functional risk here).
-                setattr(_fn, "_nullrun_extractor", impact)  # noqa: B010
+                _stamp_extractor_on_innermost(_fn, impact)
             return _do_sensitive_register(_fn)
         return _attach_decorator  # type: ignore[return-value]
 
     # Bare form: @sensitive.
     if impact is not None:
-        setattr(fn, "_nullrun_extractor", impact)  # noqa: B010
+        _stamp_extractor_on_innermost(fn, impact)
     return _do_sensitive_register(fn)
+
+
+def _stamp_extractor_on_innermost(fn: F, impact: Any) -> None:
+    """Stamp ``_nullrun_extractor`` on the innermost callable.
+
+    Walks the ``__wrapped__`` chain (set by ``functools.wraps``)
+    to find the deepest user function. Falls back to ``fn``
+    itself if no chain is present. Setting the attribute on the
+    innermost callable means the gate's ``_enforce_sensitive_tool``
+    can read it from the bare user function via a single
+    ``getattr`` call — no chain walk needed.
+    """
+    # `setattr` keeps mypy happy without a TYPE_CHECKING
+    # forward-reference declaration; ruff B010 is a stylistic
+    # preference (no functional risk here).
+    seen: set[int] = set()
+    current: Any = fn
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        next_current = getattr(current, "__wrapped__", None)
+        if next_current is None:
+            setattr(current, "_nullrun_extractor", impact)  # noqa: B010
+            return
+        current = next_current
+    # Fallback: chain exhausted without finding a leaf. Stamp
+    # on the input itself so the attribute is at least present
+    # on the outermost wrapper @protect captured.
+    setattr(fn, "_nullrun_extractor", impact)  # noqa: B010
 
 
 def _do_sensitive_register(fn: F) -> F:
@@ -941,6 +1015,23 @@ def _do_sensitive_register(fn: F) -> F:
         # tests that build a custom runtime.
         rt = _get_or_create_runtime()
         rt.add_sensitive_tool(fn.__name__)
+        # 2026-07-24 (Root-cause fix): the runtime singleton
+        # above is the one that was active at *decoration time*.
+        # If the user calls ``init_or_die()`` (or any other
+        # runtime reinit path) after the module-level
+        # decorators run — which is the common pattern in the
+        # examples — the new runtime starts with an empty
+        # ``_sensitive_tools`` set and the previous
+        # registration is lost. Stamping the tool name in
+        # the module-level ``_STRICT_MODE_FORCED`` set as well
+        # gives ``runtime.execute`` a second source of truth
+        # that survives the singleton churn. Importing here
+        # rather than at module top so this module stays
+        # import-cycle-free against ``nullrun.decorators`` (the
+        # only legitimate consumer is itself).
+        from nullrun.runtime import register_strict_mode_forced
+
+        register_strict_mode_forced(fn.__name__)
     except Exception as exc:
         # Sensitive tool registration is part of the fail-CLOSED contract
         # (ADR-008 / sensitive-tool-fail-closed memory). If we
