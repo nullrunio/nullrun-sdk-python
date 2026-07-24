@@ -467,7 +467,12 @@ def protect(fn: F | None = None) -> F | Callable[[F], F]:
                 # on transport error (see _enforce_sensitive_tool).
                 _enforce_sensitive_tool(runtime, fn, args, kwargs)
 
-                return await fn(*args, **kwargs)
+                result = await fn(*args, **kwargs)
+                runtime.track_tool(
+                    fn.__name__,
+                    metadata={"arguments": _safe_kwargs(kwargs)},
+                )
+                return result
             except BaseException as exc:  # noqa: BLE001
                 # Capture the error so we can include it in span_end
                 # *after* the contextvar is reset. Re-raise so the
@@ -513,7 +518,12 @@ def protect(fn: F | None = None) -> F | Callable[[F], F]:
             # on transport error (see _enforce_sensitive_tool).
             _enforce_sensitive_tool(runtime, fn, args, kwargs)
 
-            return fn(*args, **kwargs)
+            result = fn(*args, **kwargs)
+            runtime.track_tool(
+                fn.__name__,
+                metadata={"arguments": _safe_kwargs(kwargs)},
+            )
+            return result
         except BaseException as exc:  # noqa: BLE001
             error = exc
             # Round 3 (Phase 0.4.0): unify the "blocked" signal at

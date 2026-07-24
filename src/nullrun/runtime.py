@@ -2158,6 +2158,9 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
 
         # Enrich event with context
         enriched = self._enrich_event(event)
+        # Backend's SdkTrackRequest requires tokens for every event type,
+        # including span lifecycle and protected-tool telemetry.
+        enriched.setdefault("tokens", 0)
         logger.debug(
             "Event enriched: workflow_id=%s, tokens=%s",
             enriched.get("workflow_id"),
@@ -2542,7 +2545,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         operation_id = str(uuid.uuid4())
         execute_kwargs: dict[str, Any] = {
             "organization_id": organization_id,
-            "execution_id": workflow_id,
+            "execution_id": uuid7_str(),
             "trace_id": trace_id,
             "tool": tool_name,
             "input_data": input_data,
@@ -3074,6 +3077,8 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         event: dict[str, Any] = {
             "type": "tool_call",
             "tool_name": tool_name,
+            "tokens": 0,
+            "execution_id": uuid7_str(),
             "is_retry": is_retry,
         }
         if duration_ms is not None:
@@ -3106,11 +3111,6 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             Track result dict
         """
         event = {"type": event_type, **kwargs}
-        # Backend's SdkTrackRequest requires `tokens: u64` (non-Optional).
-        # Span-lifecycle events (span_start / span_end) don't have a
-        # token count -- they're bookkeeping, not consumption. Default
-        # to 0 so the deserializer accepts the event; the cost
-        # computation in the handler treats 0 tokens as no-op.
         event.setdefault("tokens", 0)
         # Phase 3: emit a stable fingerprint so the dedup LRU at
         # the track sink can collapse repeat emissions of the
