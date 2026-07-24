@@ -1754,12 +1754,14 @@ class Transport:
                 on_key_rotated(ws_id, key_id, new_version)
 
         # Wrap the approval-resolved callback. The WebSocketConnection
-        # handler dispatches the raw dict to on_approval_resolved (the
-        # dispatch signature is dict-only, not an async wrapper), so
-        # we adapt the sync callback to async by spawning a thread —
-        # the resolution logic in runtime.py is short-lived and not
-        # coroutine-bound (it touches a threading.Event).
-        async def wrapped_approval_resolved(payload: dict[str, Any]) -> None:
+        # handler dispatches the raw dict to on_approval_resolved as a
+        # plain function (the dispatch signature is dict-only, not
+        # awaitable), so a synchronous adapter is enough — declaring
+        # this `async def` would produce a coroutine that the
+        # handler ignores, and runtime.py's pending Event would never
+        # be set. Caught 2026-07-24 with the demo's first approval
+        # resolution.
+        def wrapped_approval_resolved(payload: dict[str, Any]) -> None:
             if on_approval_resolved:
                 on_approval_resolved(payload)
 
