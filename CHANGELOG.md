@@ -7,6 +7,28 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [0.14.1] - 2026-07-24
+
+Decimal JSON serialization patch. `track_tool` event payloads that contain a `Decimal` value (e.g. `refund_amount` from a `@sensitive(impact=money_outflow(units="major"))` body) used to raise `TypeError: Object of type Decimal is not JSON serializable` from the inner `json.dumps` call. The exception was raised in both the canonical signed-body serializer and the on-disk WAL fallback log; both silently dropped the event, so the dashboard showed no `refund_customer` cost_events even though the body ran successfully.
+
+### Fixed
+
+- **`_signed_request_body` Decimal serialization** — `transport.py:251` now passes `default=str` to `json.dumps(payload, separators=(",", ":"), default=str)`. Decimal serialises as its lossless string representation (`"50.99"` on the wire), and the backend's pricing math runs on the same string. Pre-fix events that serialised cleanly still serialise to the same bytes because `default=` is only consulted when the default encoder fails. Other non-JSON-native types (`bytes`, `datetime`, `UUID`) get the same `str()` fallback so a single encoder pass handles them all.
+- **WAL fallback `default=str`** — `transport.py:711` `_signed_request_body` WAL fallback (`f.write(json.dumps(event) + "\n")`) also gets `default=str` for consistency. The on-disk fallback log is read by ops only when the backend is unreachable, so the wire-format guarantee does not apply here.
+
+### Tests
+
+- `tests/test_sensitive_extractor.py` — 5/5 pass (the wire-format bytes match for any payload without `Decimal`).
+- `tests/test_approval_money_flow.py` — 18/18 pass.
+- Full suite — `pytest -n auto --cov=src/nullrun --cov-branch --cov-report=xml --cov-fail-under=0` → 1367 passed, 7 skipped, 29 warnings in 33.24s, coverage 81.49%.
+
+### Compatibility
+
+- **Backward-compatible bug fix**. No SDK_MIN_VERSION bump. No public API change.
+- The wire shape is preserved for every pre-fix event (a non-Decimal payload serialises to the same bytes); the Decimal serialisation is a strict superset.
+
+---
+
 ## [0.14.0] - 2026-07-23
 
 

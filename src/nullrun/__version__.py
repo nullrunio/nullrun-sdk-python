@@ -1,5 +1,60 @@
 """NullRun Platform SDK.
 
+v3.29 / 0.14.1 (2026-07-24) — Decimal JSON serialization patch.
+
+Pre-fix 0.14.0, a ``track_tool`` event payload containing a
+``Decimal`` (e.g. ``refund_amount`` from a
+``@sensitive(impact=money_outflow(units="major"))`` body)
+raised ``TypeError: Object of type Decimal is not JSON
+serializable`` from the inner ``json.dumps`` call. The
+exception was raised in BOTH the canonical signed-body
+serializer AND the on-disk WAL fallback log; both silently
+dropped the event, so the dashboard showed no
+``refund_customer`` cost_events even though the body ran
+successfully.
+
+Fix (one-liner on each call site):
+
+  * ``transport.py:251`` ``_signed_request_body(payload)`` now
+    calls ``json.dumps(payload, separators=(",", ":"),
+    default=str)``. Pre-fix events that serialised cleanly
+    still serialise to the same bytes because ``default=`` is
+    only consulted when the default encoder fails.
+  * ``transport.py:711`` WAL fallback ``f.write(json.dumps
+    (event) + "\n")`` also gets ``default=str`` for
+    consistency. The on-disk fallback log is read by ops only
+    when the backend is unreachable, so the wire-format
+    guarantee does not apply here.
+
+Decimal is now serialised as its lossless string
+representation (``"50.99"`` on the wire), and the backend's
+pricing math runs on the same string. Other non-JSON-native
+types (``bytes``, ``datetime``, ``UUID``) get the same
+``str()`` fallback so a single encoder pass handles them
+all.
+
+Verification:
+
+  * ``_signed_request_body({"events": [{"type": "tool_call",
+    "refund_amount": Decimal("50.99"), ...}]})`` returns a
+    140-byte payload with ``"refund_amount":"50.99"`` on the
+    wire. Pre-fix code raised ``TypeError`` at the same call
+    site.
+  * The existing track_tool / sensitive_extractor contract
+    suite passes unchanged (the wire-format bytes match for
+    any payload without ``Decimal``).
+  * ``pytest tests/test_sensitive_extractor.py`` -> 5/5 pass.
+  * ``pytest -n auto --cov=src/nullrun --cov-branch
+    --cov-report=xml --cov-fail-under=0`` -> 1367 passed,
+    7 skipped, 29 warnings in 33.24s, cov 81.49%.
+
+Backward-compatible bug fix. No SDK_MIN_VERSION bump. No
+public API change. The wire shape is preserved for every
+pre-fix event (a non-Decimal payload serialises to the same
+bytes); the Decimal serialisation is a strict superset.
+
+---
+
 v3.28 / 0.14.0 (2026-07-23) — hardening pass on the money contract.
 
 Closes the four review gaps from the Phase 1.1 / UX follow-up:
