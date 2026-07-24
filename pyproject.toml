@@ -603,6 +603,14 @@ pythonpath = ["."]
 # the cap disabled mark themselves with ``@pytest.mark.slow_sleep``.
 markers = [
     "slow_sleep: opt out of the conftest autouse time.sleep cap",
+    # Sprint 0 (coverage): marks a single test as rare-flaky on
+    # pytest-xdist on CI (linux, Python 3.12) — typically a
+    # thread-scheduling race between pytest-xdist worker
+    # collection and the test's own background thread. The
+    # ``pytest-rerunfailures`` plugin (already in dev-deps via the
+    # pip install line in ci.yml) retries up to ``max_retries``
+    # times. Local pytest on Windows is unaffected.
+    "rerunfailures: opt a test into automatic retry via pytest-rerunfailures",
 ]
 
 [tool.coverage.run]
