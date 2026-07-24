@@ -158,17 +158,17 @@ from __future__ import annotations
 
 import functools
 import inspect
+from collections.abc import Callable
 from decimal import Decimal, InvalidOperation
-from typing import Any, Callable, Optional, Union
+from typing import Any, Optional, Union
 
 from nullrun.business_impact import (
-    BusinessImpact,
-    MoneyImpact,
     INFLOW,
     OUTFLOW,
+    BusinessImpact,
+    MoneyImpact,
     compute_action_digest,
 )
-
 
 # Unit discriminators for the typed impact payload.
 #
@@ -521,7 +521,7 @@ def _check_business_cap(
 
 
 def _to_minor_units(
-    value: Union[int, Decimal], units: str, currency: str,
+    value: int | Decimal, units: str, currency: str,
     enforce_business_cap: bool = True,
 ) -> int:
     """Convert a Decimal-or-int value to integer minor units.
@@ -669,8 +669,8 @@ class MoneyImpactExtractor:
     def impact_for(
         self,
         fn: Callable[..., Any],
-        args: tuple,
-        kwargs: dict,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
     ) -> BusinessImpact:
         """Bind the call and pull ``self.argument`` out of the bound args.
 
@@ -722,8 +722,8 @@ class MoneyImpactExtractor:
 
 
 @functools.lru_cache(maxsize=128)
-def _cached_signature(fn_id: int) -> Optional[inspect.Signature]:
-    for obj in gc_get_objects():  # type: ignore[name-defined]
+def _cached_signature(fn_id: int) -> inspect.Signature | None:
+    for obj in gc_get_objects():
         if id(obj) == fn_id:
             try:
                 return inspect.signature(obj)
@@ -773,6 +773,6 @@ def compute_impact_digest(impact: BusinessImpact) -> str:
     return compute_action_digest(impact)
 
 
-def gc_get_objects():
+def gc_get_objects() -> list[Any]:
     import gc
     return gc.get_objects()

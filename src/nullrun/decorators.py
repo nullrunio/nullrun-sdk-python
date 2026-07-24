@@ -919,13 +919,16 @@ def sensitive(
     if fn is None:
         def _attach_decorator(_fn: F) -> F:
             if impact is not None:
-                setattr(_fn, "_nullrun_extractor", impact)
+                # `setattr` keeps mypy happy without a TYPE_CHECKING
+                # forward-reference declaration; ruff B010 is a
+                # stylistic preference (no functional risk here).
+                setattr(_fn, "_nullrun_extractor", impact)  # noqa: B010
             return _do_sensitive_register(_fn)
         return _attach_decorator  # type: ignore[return-value]
 
     # Bare form: @sensitive.
     if impact is not None:
-        setattr(fn, "_nullrun_extractor", impact)
+        setattr(fn, "_nullrun_extractor", impact)  # noqa: B010
     return _do_sensitive_register(fn)
 
 

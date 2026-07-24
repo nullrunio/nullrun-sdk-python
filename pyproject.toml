@@ -91,7 +91,27 @@ name = "nullrun"
 # ``_wait_for_approval_resolution`` for explicit per-call
 # control. Public API backward compatible (existing callers
 # unaffected). No SDK_MIN_VERSION bump. No on-wire change.
-version = "0.13.13"
+# 0.14.0 (2026-07-23): hardening pass on the money contract —
+# closes the four review gaps from the Phase 1.1 / UX follow-up.
+# (1) ``InvalidMoneyPrecisionError`` / ``InvalidMoneyAmountError``
+# dedicated ``ValueError`` subclasses with structured
+# discriminators (``reason="negative"|"overflow"|"non_finite"``,
+# ``currency`` / ``allowed`` / ``received`` / ``received_digits``).
+# (2) Negative ``amount_minor`` now rejected on both unit paths
+# (was silently falling through ``op=gt`` predicates because
+# ``negative < positive`` is always False).
+# (3) Sub-precision Decimals rejected instead of silently
+# rounding away the high-order digits a user explicitly typed.
+# (4) Explicit ``units`` discriminator + ``Decimal`` support on
+# sensitive-call metadata, with a new ``BusinessImpact`` /
+# ``MoneyImpactExtractor`` and ``@sensitive(impact=...)`` wiring.
+# The /execute handler now re-checks with ``approval_id`` and
+# the server's ``approval_timeout`` is clamped to ``[1, 3600]s``
+# (defence against malformed / overshooting backends). Behaviour
+# adds new optional kwarg + new public class, but every existing
+# call site is unchanged on the happy path. No SDK_MIN_VERSION
+# bump. No on-wire change.
+version = "0.14.0"
 # Kept under the 200-char preview threshold so the full line is visible
 # without an "expand" click. Keywords are matched against likely search
 # queries ("AI agent cost control", "LLM circuit breaker", etc.).
