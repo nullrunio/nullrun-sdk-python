@@ -1310,6 +1310,7 @@ class Transport:
         mode: str = "auto",
         fallback_mode: str = FallbackMode.PERMISSIVE,
         operation_id: str | None = None,
+        approval_id: str | None = None,
         on_transport_error: Callable[[Exception], dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """
@@ -1368,6 +1369,8 @@ class Transport:
             "mode": mode,
             "operation_id": operation_id or str(uuid.uuid4()),
         }
+        if approval_id is not None:
+            gate_request["approval_id"] = approval_id
 
         # 2026-07-02 (v0.11.0 refactor): route through the canonical
         # signed-headers helper — produces Content-Type + X-API-Key +

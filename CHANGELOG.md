@@ -7,6 +7,42 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [0.14.0] - 2026-07-23
+
+
+### Added
+
+- **`InvalidMoneyPrecisionError`** and **`InvalidMoneyAmountError`** — dedicated `ValueError` subclasses with structured fields. The amount variant carries a `reason` discriminator (`"negative"` / `"overflow"` / `"non_finite"`); the precision variant carries `currency` / `allowed` / `received` / `received_digits`. Legacy `except ValueError:` blocks still catch them.
+- **`BusinessImpact`** model (`dataclass(frozen=True)`) with explicit `currency` / `units` / `amount_minor` fields. `details` dict is still accepted on the legacy path.
+- **`@sensitive(impact=BusinessImpact(...))`** — new decorator kwarg that emits a structured `business_impact` envelope on the `/track` event. Existing `@sensitive(details=...)` / `@sensitive(amount_minor=..., currency=...)` callers keep working on the happy path (now routed through `BusinessImpact` internally).
+- **`MoneyImpactExtractor`** — new helper that normalises `Decimal` / `int` / `float` / str into `BusinessImpact` minor-units, raising `InvalidMoneyAmountError` / `InvalidMoneyPrecisionError` on the audit gaps above.
+
+### Changed
+
+- **Negative `amount_minor` rejected** on both unit paths. A negative value would silently fall through every `op=gt` predicate (`negative < positive` is always False) — pre-fix a $-50 refund could be wired through without the backend catching it. `0` is still accepted (legitimate $0.00 refund).
+- **Sub-precision Decimal rejected** — `Decimal("1.234")` against a USD `allowed=2` precision is now `InvalidMoneyPrecisionError(currency="USD", allowed=2, received=3, received_digits="1.234")` instead of a silent round to `1.23` that drops the high-order digit the user explicitly typed. `float` and `Decimal` are treated symmetrically; `int` always rounds 0-digits.
+- **`/execute` handles `require_approval` correctly** — re-checks with the `approval_id` returned by the backend (was dropping the approval handshake on round-trips).
+- **Server `approval_timeout` clamped to `[1, 3600]s`** on the SDK side as defence against a malformed / overshooting backend that returns `0` or `2147483647` in the Разрыв 1c field.
+
+### Tests
+
+- `tests/test_money_hardening.py` — 5 Definition-of-Done scenarios (negative amount, sub-precision Decimal, overflow, non-finite, `0` accepted).
+- `tests/test_business_impact.py` — `BusinessImpact` model contract + integration with the wire envelope.
+- `tests/test_units_discriminator.py` — `USD` vs `USDT` collision caught at the `BusinessImpact` boundary, not on the backend at `/track` time.
+- `tests/test_sensitive_extractor.py` — `@sensitive(impact=...)` round-trip + legacy `details=` backward-compat.
+- `tests/test_approval_money_flow.py` — 5 contract tests covering the `MoneyImpactExtractor` path end-to-end.
+- `tests/test_execute_approval_flow.py` — `/execute` round-trip with stub backend exercising the `require_approval` + `approval_id` re-check path.
+
+### Compatibility
+
+- **Backward compatible** on the happy path. Every existing call site keeps working; the new errors are `ValueError` subclasses; the new `BusinessImpact` decorator kwarg is optional.
+- **No SDK_MIN_VERSION bump** — legacy backends without the Разрыв 1c field fall through to the env default (see 0.13.13 release notes).
+- **No on-wire change** — envelope shape preserved; new fields are additive on the SDK side and ignored by older backends.
+
+---
+
+---
+
 ## [0.13.13] - 2026-07-21
 
 Approval-wait SDK sync with backend commit `0ad03b9` ("\u0420\u0430\u0437\u0440\u044b\u0432 1c", gate hot-path trigger). The backend now sends `approval_timeout_seconds: Option<i64>` and `approval_expires_at: Option<String>` on every `/gate` response so a backend approval rule can set a non-default short timeout. Pre-fix, the SDK only consulted `NULLRUN_APPROVAL_TIMEOUT_SECONDS` (env default 300s), which silently desynced from a 20s backend expiry sweeper. No public API change. No SDK_MIN_VERSION bump. No on-wire change.

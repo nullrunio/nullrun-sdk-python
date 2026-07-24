@@ -33,7 +33,6 @@ import pytest
 
 from nullrun.actions import ActionHandler, WebhookConfig
 
-
 pytestmark = pytest.mark.slow_sleep
 
 

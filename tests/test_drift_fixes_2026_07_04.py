@@ -251,7 +251,7 @@ class TestIdempotencyKeyOnTrackPayload:
         must stamp the field from the active span contextvar so the
         wire shape is consistent regardless of caller integration.
         """
-        from nullrun.context import set_trace_id, clear_trace_id
+        from nullrun.context import clear_trace_id, set_trace_id
         from nullrun.runtime import NullRunRuntime
 
         # Pin the trace contextvar to a known value (mimics
@@ -297,7 +297,7 @@ class TestIdempotencyKeyOnTrackPayload:
         trace_id=cccccccc-... parent_trace_id=NULL on backend
         cost_events).
         """
-        from nullrun.context import set_trace_id, clear_trace_id
+        from nullrun.context import clear_trace_id, set_trace_id
         from nullrun.runtime import NullRunRuntime
 
         # Contextvar holds the chain's trace. Even though the
@@ -360,7 +360,7 @@ class TestIdempotencyKeyOnTrackPayload:
         parser would otherwise reject the field or store empty
         string in a UUID column, depending on path).
         """
-        from nullrun.context import set_trace_id, clear_trace_id
+        from nullrun.context import clear_trace_id, set_trace_id
         from nullrun.runtime import NullRunRuntime
 
         set_trace_id("")  # boundary value
@@ -386,7 +386,7 @@ class TestIdempotencyKeyOnTrackPayload:
         the backend's JOIN from drifting — see
         ``db/mod.rs::get_execution_records_for_workflow``.
         """
-        from nullrun.context import set_trace_id, clear_trace_id
+        from nullrun.context import clear_trace_id, set_trace_id
         from nullrun.runtime import NullRunRuntime
 
         set_trace_id("77777777-8888-9999-aaaa-bbbbbbbbbbbb")
@@ -522,7 +522,7 @@ class TestEnrichEventParentTraceOverride:
         parent_trace_id=NULL on the prod VPS during the diagnostic
         run on 2026-07-12 08:51 UTC.
         """
-        from nullrun.context import set_trace_id, clear_trace_id
+        from nullrun.context import clear_trace_id, set_trace_id
         from nullrun.runtime import NullRunRuntime
         set_trace_id("cccccccc-1111-2222-3333-444444444444")
         try:
@@ -553,7 +553,7 @@ class TestEnrichEventParentTraceOverride:
         the event sits inside the chain contextvar (chain trace
         spans share the same trace_id across child spans).
         """
-        from nullrun.context import set_trace_id, clear_trace_id
+        from nullrun.context import clear_trace_id, set_trace_id
         from nullrun.runtime import NullRunRuntime
         set_trace_id("99999999-aaaa-bbbb-cccc-000000000000")
         try:

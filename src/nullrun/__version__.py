@@ -1,5 +1,110 @@
 """NullRun Platform SDK.
 
+v3.28 / 0.14.0 (2026-07-23) — hardening pass on the money contract.
+
+Closes the four review gaps from the Phase 1.1 / UX follow-up:
+
+  1. **Dedicated error types** -- ``InvalidMoneyPrecisionError``
+     and ``InvalidMoneyAmountError`` (both subclass
+     ``ValueError`` for backward compat). The ``amount`` variant
+     carries a ``reason`` discriminator (``"negative"`` /
+     ``"overflow"`` / ``"non_finite"``) so a UI or test harness
+     can branch on type without parsing the message. The
+     ``precision`` variant carries ``currency`` / ``allowed`` /
+     ``received`` / ``received_digits`` so the error message
+     names the offending currency and precision.
+
+  2. **Negative amount rejection** -- a negative ``amount_minor``
+     would silently fall through every ``op=gt`` predicate
+     (``negative < positive`` is always False), so the SDK
+     rejects ``Decimal("-50.00")`` / ``int(-5000)`` /
+     ``Decimal("-5000")`` on both unit paths with
+     ``InvalidMoneyAmountError(reason="negative", ...)``. ``0``
+     is accepted (legitimate $0.00 refund).
+
+  3. **Sub-precision Decimal rejection** -- ``Decimal("1.234")``
+     against a USD ``allowed=2`` precision is now
+     ``InvalidMoneyPrecisionError(currency="USD", allowed=2,
+     received=3, received_digits="1.234")`` instead of a silent
+     round to ``1.23`` that drops the high-order digit the user
+     explicitly typed. ``float`` and ``Decimal`` are treated
+     symmetrically; ``int`` always rounds 0-digits.
+
+  4. **Explicit ``units`` discriminator + ``Decimal`` support**
+     -- a new ``BusinessImpact`` model + ``MoneyImpactExtractor``
+     + ``@sensitive(impact=...)`` decorator wiring allows the
+     caller to declare the impact currency / units on
+     ``@sensitive``-decorated functions and have the SDK emit
+     a structured ``business_impact`` envelope on the
+     ``/track`` event, replacing the previous free-form
+     ``details`` blob. ``Decimal`` values are accepted and
+     normalised to ``Decimal`` minor-units on the wire.
+
+Side fixes (covered by the same audit pass):
+
+  * ``/execute`` now handles ``require_approval`` correctly
+    and re-checks with the ``approval_id`` returned by the
+    backend (was dropping the approval handshake on
+    round-trips).
+  * Server's ``approval_timeout`` is clamped to ``[1, 3600]s``
+    on the SDK side as defence against a malformed /
+    overshooting backend that returns ``0`` or ``2147483647``
+    in the Разрыв 1c field.
+
+Public API change (additive only, backward-compatible):
+
+  * ``InvalidMoneyPrecisionError``, ``InvalidMoneyAmountError``
+    -- new ``ValueError`` subclasses with structured fields.
+  * ``BusinessImpact`` -- new ``dataclass(frozen=True)`` model
+    with explicit ``currency`` / ``units`` / ``amount_minor``
+    fields. ``details`` dict is still accepted (legacy path).
+  * ``@sensitive(impact=BusinessImpact(...))`` -- new
+    decorator kwarg. Existing ``@sensitive(details=...)`` /
+    ``@sensitive(amount_minor=..., currency=...)`` callers keep
+    working on the happy path (now routed through
+    ``BusinessImpact`` internally).
+
+Tests (existing suite still green; new test modules land in
+``tests/test_business_impact.py`` /
+``tests/test_units_discriminator.py`` /
+``tests/test_money_hardening.py`` /
+``tests/test_sensitive_extractor.py`` /
+``tests/test_approval_money_flow.py`` /
+``tests/test_execute_approval_flow.py``):
+
+  * 5 Definition-of-Done scenarios cover negative-amount
+    rejection, sub-precision Decimal rejection, overflow
+    rejection, non-finite rejection, ``0`` accepted.
+  * Units discriminator test: ``USD`` vs ``USDT`` collision is
+    now caught at the ``BusinessImpact`` boundary, not on the
+    backend at ``/track`` time.
+  * ``/execute`` round-trip test exercises the
+    ``require_approval`` + ``approval_id`` re-check path with a
+    stub backend.
+  * Server ``approval_timeout`` clamp test verifies
+    ``[1, 3600]s`` boundary.
+  * 5 contract tests cover the ``MoneyImpactExtractor`` path
+    end-to-end.
+
+Verification (local):
+
+  * ``pytest tests/test_money_hardening.py
+    tests/test_business_impact.py tests/test_units_discriminator.py
+    tests/test_sensitive_extractor.py
+    tests/test_approval_money_flow.py
+    tests/test_execute_approval_flow.py`` -- all new tests
+    pass; no regressions in the existing suite.
+  * ``ruff check src/ tests/`` -- All checks passed.
+  * ``mypy src/`` -- Success: no issues found in 34 source
+    files.
+
+No SDK_MIN_VERSION bump (legacy backends unaffected). No on-wire
+change (envelope shape preserved). New errors are ``ValueError``
+subclasses, so legacy ``except ValueError:`` blocks still catch
+them.
+
+---
+
 v3.27 / 0.13.13 (2026-07-21) — Разрыв 1c SDK sync.
 
 Backend commit ``0ad03b9`` (Разрыв 1c, gate hot-path trigger)
