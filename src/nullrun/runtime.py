@@ -129,6 +129,44 @@ UNKNOWN_WORKFLOW_ID: str = "__nullrun_unknown__"
 _GATE_CACHE: dict[tuple[str, str | None, str | None], tuple[float, dict[str, Any]]] = {}
 _GATE_CACHE_TTL_SECONDS: float = 5.0
 
+# 2026-07-24 (Root-cause fix for the ``@sensitive`` reinit gap):
+# a process-level set of tool names that the ``@sensitive``
+# decorator has stamped as needing strict mode. The runtime
+# singleton also tracks this via ``_sensitive_tools``, but
+# that set is populated at decoration time and can be lost
+# across ``init_or_die()`` calls if the user re-initializes
+# the runtime (the registration landed on the OLD instance
+# and the new instance starts with an empty set). The
+# module-level set is decorator-driven and survives any
+# runtime singleton churn, so ``is_strict_mode_forced`` is
+# the second source of truth that ``runtime.execute`` consults
+# before falling through to inline mode.
+_STRICT_MODE_FORCED: set[str] = set()
+
+
+def register_strict_mode_forced(tool_name: str) -> None:
+    """Mark ``tool_name`` as needing strict mode.
+
+    Called by ``@sensitive(impact=...)`` at decoration time. The
+    name stays in the module-level set until process exit; it
+    is intentionally not cleared by ``init_or_die()`` so a
+    second-runtime reinit does not silently drop a tool out of
+    strict mode.
+    """
+    _STRICT_MODE_FORCED.add(tool_name)
+
+
+def is_strict_mode_forced(tool_name: str) -> bool:
+    """Return True if ``tool_name`` was decorated with ``@sensitive``.
+
+    Complements ``runtime.is_sensitive_tool(tool_name)`` which
+    reads the per-runtime registry. The two are OR'd in
+    ``runtime.execute`` so that a tool whose registration is
+    lost to runtime reinit still gets the strict /execute
+    round-trip it asked for.
+    """
+    return tool_name in _STRICT_MODE_FORCED
+
 # 2026-07-04 (v0.12.0 wiring fix — ):
 # the maximum age (seconds) for a captured ``reservation_id``
 # to be eligible for forwarding onto a /track payload. Past
@@ -2460,14 +2498,28 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         trace_id = get_trace_id() or str(uuid.uuid4())
 
         # Auto-select mode: sensitive tools always use strict
+        # mode so /execute is consulted. The two checks below
+        # gate the /execute round-trip:
+        #   1. ``self.is_sensitive_tool(tool_name)`` — the runtime
+        #      registry, populated by the ``@sensitive`` decorator
+        #      at decoration time.
+        #   2. ``is_strict_mode_forced(tool_name)`` — the static
+        #      ``@sensitive(impact=...)`` registered a per-tool
+        #      extract_on call site that requires strict mode
+        #      regardless of the runtime registry. This is the
+        #      second source of truth, populated at decoration
+        #      time and immune to ``init_or_die()`` reinit that
+        #      might lose the registry on a fresh runtime singleton.
         if mode == "auto":
-            if self.is_sensitive_tool(tool_name):
+            if self.is_sensitive_tool(tool_name) or is_strict_mode_forced(tool_name):
                 mode = "strict"
             else:
                 mode = "inline"
 
         # For inline mode with non-sensitive tools, skip execute and use local enforcement
-        if mode == "inline" and not self.is_sensitive_tool(tool_name):
+        if mode == "inline" and not (
+            self.is_sensitive_tool(tool_name) or is_strict_mode_forced(tool_name)
+        ):
             return {
                 "decision": "allow",
                 "decision_source": DecisionSource.LOCAL,

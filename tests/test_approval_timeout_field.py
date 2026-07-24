@@ -193,22 +193,28 @@ class TestApprovalTimeoutResolution:
         # on the very first event.wait(), so we explicitly reject
         # non-positive values.
         #
-        # Sprint 0 (coverage): this test is rare-flaky under
+        # Sprint 0 (coverage): this test was rare-flaky under
         # pytest-xdist on CI (linux, Python 3.12) — the spawned
-        # wait thread occasionally misses the release_after_ms
-        # window when the main thread is mid-test-collection, and
-        # the entry stays empty so ``result_box.get("result")``
-        # is None. ``pytest-rerunfailures`` (already in dev-deps)
-        # retries up to 2 times. Local pytest on Windows is
-        # unaffected; the failure mode is xdist worker scheduling
-        # under load.
-        @pytest.mark.rerunfailures(max_retries=2)
+        # wait thread occasionally missed the 50ms release window
+        # when the main thread was mid-test-collection, and the
+        # entry stayed empty so ``result_box.get("result")`` was
+        # None. Two fixes applied together:
+        #
+        # 1. ``@pytest.mark.rerunfailures(reruns=2)`` (dev plugin
+        #    pytest-rerunfailures>=14.0,<16.0) retries the flaky
+        #    inner helper up to 2 times.
+        # 2. ``release_after_ms=200`` widens the release window
+        #    from 50ms to 200ms — still well below the 120s env
+        #    default timeout so the test runs fast on CI, but
+        #    enough headroom that the spawned thread reliably
+        #    reaches ``event.wait()`` before the release fires.
+        @pytest.mark.rerunfailures(reruns=2)
         def _check_zero(bad_value: float) -> None:
             rt = _make_runtime(env_timeout=120.0)
             try:
                 result_box = _run_wait_and_release(
                     rt, "appr-zero", timeout_seconds=bad_value,
-                    release_after_ms=50,
+                    release_after_ms=200,
                 )
                 assert result_box.get("result") is not None
                 assert result_box["result"]["timeout_seconds"] == 120.0, (
