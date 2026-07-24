@@ -247,8 +247,26 @@ def _signed_request_body(payload: dict[str, Any]) -> bytes:
     ``backend/src/auth/hmac.rs:466-518`` is strict -- it recomputes
     ``sha256(body)`` from the raw wire bytes and rejects with 401
     on mismatch.
+
+    2026-07-24 (Decimal serialization): the gate's typed-impact
+    extractor (``money_outflow(units="major")``) hands the SDK
+    a ``Decimal`` value (precision-preserving for money). When
+    the user's body returns a Decimal from a tool call, the
+    subsequent ``track_tool`` event carries that Decimal on the
+    wire payload. ``json.dumps`` raises ``TypeError`` on Decimal
+    (no JSON encoder by default), which silently drops the event
+    — the operator sees no ``refund_customer`` cost_events on
+    the dashboard, even though the body ran. ``default=str``
+    converts Decimal to its string representation
+    (``"50.99"`` → ``"50.99"``), which is the lossless form for
+    the audit log: the backend stores the string and the
+    pricing math runs on the same string. Other non-JSON-native
+    types (bytes, datetime, UUID) get the same ``str()`` fallback
+    so a single encoder pass handles them all. The wire shape is
+    stable: pre-fix events that serialised cleanly still
+    serialise to the same bytes.
     """
-    return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    return json.dumps(payload, separators=(",", ":"), default=str).encode("utf-8")
 
 
 # =============================================================================
@@ -708,7 +726,13 @@ class Transport:
         try:
             with open(tmp_path, "a") as f:
                 for event in self._buffer:
-                    f.write(json.dumps(event) + "\n")
+                    # 2026-07-24 (Decimal serialization): same default=str as
+                    # ``_signed_request_body`` so the on-disk fallback log
+                    # accepts Decimal / bytes / datetime values without
+                    # raising. The fallback log is read by ops only when the
+                    # backend is unreachable, so the wire-format guarantee
+                    # does not apply here.
+                    f.write(json.dumps(event, default=str) + "\n")
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp_path, wal_path)
