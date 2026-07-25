@@ -7,6 +7,32 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [0.14.2] - 2026-07-24
+
+Three hotfixes that fell out of the 0.14.1 demo run. Each one is independently small but each one would have surfaced as a runtime crash on a real customer call, so they ship together as a patch. No on-wire breaking change. No SDK_MIN_VERSION bump. Backends on `1.0.0` keep working unchanged.
+
+### Fixed
+
+- **`@protect` decorator now emits a `tools/track_tool` event** — `decorators.py:470` and `decorators.py:521` (sync + async wrappers) now call `runtime.track_tool(fn.__name__, metadata={"arguments": _safe_kwargs(kwargs)})` after the wrapped body returns. Pre-0.14.2 the `protected` decorator only fired the gate check and skipped the bookkeeping emit, so the dashboard never saw a `protect` execution even though the body ran. The new emit goes through the same sink as `llm_call` events, so it picks up the dedup LRU at `runtime.track()` for free.
+- **`track_tool` event carries `tokens: 0` and a fresh `uuidv7` `execution_id`** — `runtime.py:3077` now stamps both fields onto every `tool_call` event. The backend's `SdkTrackRequest` requires `tokens: u64` (non-Optional) and a threadable `execution_id`; pre-0.14.2 the event dict only carried `type` / `tool_name` / `is_retry` and the deserializer rejected it. Span lifecycle events (`span_start` / `span_end`) get the same `tokens: 0` default via `runtime.py:2161`.
+- **Approval-resolved WS callback is now a plain sync function** — `transport.py:1757` `wrapped_approval_resolved` was previously declared `async def` to be awaitable, but the WebSocket dispatch path invokes it as a plain function (the dispatch signature is `dict[str, Any] -> None`, not awaitable). The async-decorated coroutine was silently dropped, so the sync `threading.Event` inside `runtime._wait_for_approval_resolution` never got set on the first approval round-trip — the demo's first approval hung forever. Caught 2026-07-24 with the demo's first approval resolution.
+- **WebSocket cancellation is treated as a clean shutdown** — `runtime.py:1160` now catches `asyncio.CancelledError` before the generic `except Exception` block. `WebSocketConnection.close()` cancels the receive task to unblock this waiter during normal shutdown; on Python 3.11+ `CancelledError` derives from `BaseException` (not `Exception`), so the old code re-raised it and produced a noisy `WS receive loop ended: <never logged>` debug line on every clean shutdown. The new branch is silent and the path stays contained.
+
+### Tests
+
+- `tests/test_approval_ws_sync_callback.py` — 103 lines of new coverage for the WS approval-resolved dispatch path: the callback is invoked as a sync function, the `threading.Event` is set, the wait returns within the timeout, and the previous async-decorated shape is asserted-not-present.
+- `tests/test_runtime_branches.py` — 36 lines of new coverage for the `await conn._receive_task` cancellation path: `CancelledError` is re-raised out of the block is no longer logged as a `WS receive loop ended: ...` debug line, and the `finally` cleanup still runs.
+- The existing `tests/test_sensitive_extractor.py` (5/5) and `tests/test_approval_money_flow.py` (18/18) pass unchanged — the new fields are additive on top of the 0.14.1 wire shape.
+
+### Compatibility
+
+- **Backward-compatible bug fix.** No SDK_MIN_VERSION bump. No public API change.
+- The new `tokens: 0` / `execution_id` fields on `track_tool` events are forwarded exactly as minted; the backend's `SdkTrackRequest` already accepts them (the 0.14.0 envelope contract).
+- The approval-resolved callback is the same public contract (`def on_approval_resolved(payload: dict) -> None`); only the in-transport wrapper changed from `async def` to `def`.
+- The WS cancellation handler is silent in the same way the previous `except Exception` was silent; the only user-visible delta is a removed debug log line on clean shutdown.
+
+---
+
 ## [0.14.1] - 2026-07-24
 
 Decimal JSON serialization patch. `track_tool` event payloads that contain a `Decimal` value (e.g. `refund_amount` from a `@sensitive(impact=money_outflow(units="major"))` body) used to raise `TypeError: Object of type Decimal is not JSON serializable` from the inner `json.dumps` call. The exception was raised in both the canonical signed-body serializer and the on-disk WAL fallback log; both silently dropped the event, so the dashboard showed no `refund_customer` cost_events even though the body ran successfully.

@@ -75,6 +75,13 @@ class _RecordingRuntime:
     def track_event(self, event_type: str, **kwargs) -> None:
         self.events.append({"type": event_type, **kwargs})
 
+    def track_tool(self, tool_name: str, **kwargs) -> None:
+        # Commit 33d2b5f wires ``@protect`` to emit a tools/track_tool event
+        # after the wrapped body returns. The stub captures that emit the
+        # same way it captures the other track paths so the gate-order
+        # assertions keep working unchanged.
+        self.events.append({"type": "tool_call", "tool_name": tool_name, **kwargs})
+
     # The two gates we want to track, in order. The decorator
     # calls them — we record the call sequence.
 
