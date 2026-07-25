@@ -130,7 +130,17 @@ name = "nullrun"
 # cleanly still serialise to the same bytes because
 # ``default=`` is only consulted when the default encoder
 # fails. No SDK_MIN_VERSION bump. No public API change.
-version = "0.14.1"
+#
+# 0.14.2 (2026-07-24): Three runtime / transport hotfixes
+# living on the archive/cleanup-attempted-1c1e326 branch.
+# Approval-resolved WS callback was an async-decorated coroutine
+# the dispatcher silently dropped (sync threading.Event never
+# got set); asyncio.CancelledError escaping the WS await caused
+# noisy debug logs on normal shutdown; track_tool events emitted
+# by ``@protect`` were missing ``tokens``/``execution_id`` so
+# the backend's SdkTrackRequest rejected them. See CHANGELOG.md
+# for the full per-commit description.
+version = "0.14.2"
 # Kept under the 200-char preview threshold so the full line is visible
 # without an "expand" click. Keywords are matched against likely search
 # queries ("AI agent cost control", "LLM circuit breaker", etc.).
