@@ -1200,7 +1200,7 @@ class Transport:
         # * 5xx → raise_for_status raises HTTPStatusError → retry helper backs off
         # and re-attempts. 429 is included in this category (the helper honors
         # Retry-After when present).
-        # * 4xx (other than 429) → return as-is, the outer raise_for_status 
+        # * 4xx (other than 429) → return as-is, the outer raise_for_status
         # surfaces it. These are real client bugs (auth, payload) and must
         # NOT be retried — retrying a 401 just wastes the user's budget.
         def _post_batch() -> httpx.Response:
@@ -1298,9 +1298,7 @@ class Transport:
                     if action_type:
                         handle_action(action_type, workflow_id, reason)
                 except Exception as item_err:
-                    logger.warning(
-                        "Skipping malformed action %r: %s", action, item_err
-                    )
+                    logger.warning("Skipping malformed action %r: %s", action, item_err)
             # Display-only backend messages (renamed from `actions_taken: Vec<String>`).
             for msg in data.get("messages", []) or []:
                 logger.info("Backend message: %s", msg)
@@ -1592,15 +1590,11 @@ class Transport:
             # `set_call_context(tools=[...])` had no effect on /gate.
             # When unset (None) we omit the key entirely — the backend
             # distinguishes "no tools sent" from "explicit []".
-            **(
-                {"tools": check_request["tools"]}
-                if "tools" in check_request
-                else {}
-            ),
+            **({"tools": check_request["tools"]} if "tools" in check_request else {}),
         }
 
         # 2026-07-02 (v0.11.0): wire-protocol v3 fields (
-        #). Forwarded only when present so legacy /gate callers
+        # ). Forwarded only when present so legacy /gate callers
         # (which never set chain_id) keep their previous payload
         # shape. The backend treats missing as "single-shot Hard".
         if check_request.get("chain_id") is not None:
@@ -1746,7 +1740,7 @@ class Transport:
             if on_policy_invalidated:
                 on_policy_invalidated(ws_id, policy_id, new_version)
 
-# Wrap the key rotated callback to re-fetch credentials
+        # Wrap the key rotated callback to re-fetch credentials
         async def wrapped_key_rotated(ws_id: str, key_id: str, new_version: int) -> None:
             logger.info(f"Key {key_id} rotated (v{new_version}), re-fetching credentials")
             await self._refetch_credentials()
@@ -1908,62 +1902,62 @@ class Transport:
     ) -> dict[str, Any]:
         """POST /api/v1/track — wire-protocol v3 single-event consume.
 
-. The single-event path is the v3
-        replacement for the legacy `/api/v1/track/batch` POST body.
-        It runs the CONSUME_SCRIPT invariant
-        ``actual_cost <= reserved_cents + epsilon_cents`` (§25
-        ADR-005) and rejects with 422 CONSUME_OVERBUDGET on
-        violation. The reserved binding is the one created by the
-        matching ``/check`` call (same ``reservation_id``).
+        . The single-event path is the v3
+                replacement for the legacy `/api/v1/track/batch` POST body.
+                It runs the CONSUME_SCRIPT invariant
+                ``actual_cost <= reserved_cents + epsilon_cents`` (§25
+                ADR-005) and rejects with 422 CONSUME_OVERBUDGET on
+                violation. The reserved binding is the one created by the
+                matching ``/check`` call (same ``reservation_id``).
 
-        The wire shape is built by ``runtime._build_v3_track_payload``
-        (see ``runtime.py:2679-2776``); this method just forwards
-        whatever dict the caller hands it. The post-fix schema is:
+                The wire shape is built by ``runtime._build_v3_track_payload``
+                (see ``runtime.py:2679-2776``); this method just forwards
+                whatever dict the caller hands it. The post-fix schema is:
 
-        Args:
-            request: Consume request body. Must include:
+                Args:
+                    request: Consume request body. Must include:
 
-                * ``reservation_id`` (str, server-minted uuidv7 from
-                  the matching /check response — wired via
-                  ``_capture_server_minted_execution_id``)
-                * ``workflow_id`` (str, the workflow the call belongs to)
-                * ``tokens`` (int, sum of input + output tokens)
-                * ``cost_cents`` (int, ``0`` — backend computes the
-                  authoritative cost from tokens + the org's
-                  pricing policy; sending a wrong number risks
-                  double-billing, see _WIRE_STRIP_FIELDS in runtime.py)
-                * ``cost_source`` (str, ``"provisional"`` /
-                  ``"authoritative"`` per — SDK always emits
-                  ``"provisional"``)
+                        * ``reservation_id`` (str, server-minted uuidv7 from
+                          the matching /check response — wired via
+                          ``_capture_server_minted_execution_id``)
+                        * ``workflow_id`` (str, the workflow the call belongs to)
+                        * ``tokens`` (int, sum of input + output tokens)
+                        * ``cost_cents`` (int, ``0`` — backend computes the
+                          authoritative cost from tokens + the org's
+                          pricing policy; sending a wrong number risks
+                          double-billing, see _WIRE_STRIP_FIELDS in runtime.py)
+                        * ``cost_source`` (str, ``"provisional"`` /
+                          ``"authoritative"`` per — SDK always emits
+                          ``"provisional"``)
 
-                Optional fields: ``input_tokens``, ``output_tokens``
-                ``model``, ``latency_ms``, ``metadata``, ``trace_id``
-                ``span_id``, ``agent_id``, ``environment``
-                ``agent_type``, ``attempt_index``, ``is_retry``
-                ``idempotency_key``.
+                        Optional fields: ``input_tokens``, ``output_tokens``
+                        ``model``, ``latency_ms``, ``metadata``, ``trace_id``
+                        ``span_id``, ``agent_id``, ``environment``
+                        ``agent_type``, ``attempt_index``, ``is_retry``
+                        ``idempotency_key``.
 
-        Returns:
-            Parsed JSON dict with at least
-            ``{"status": "ok"|"idempotent_replay",...}``.
+                Returns:
+                    Parsed JSON dict with at least
+                    ``{"status": "ok"|"idempotent_replay",...}``.
 
-        Raises:
-            NullRunConsumeOverbudgetError: 422 CONSUME_OVERBUDGET —
-                ``actual_cost > reserved + epsilon_cents``. The
-                reservation is NOT silently re-reserved.
-            NullRunBackendError: 503 RESERVATION_NOT_FOUND /
-                EXECUTION_NOT_BOUND.
-            NullRunAuthenticationError: 401/403.
+                Raises:
+                    NullRunConsumeOverbudgetError: 422 CONSUME_OVERBUDGET —
+                        ``actual_cost > reserved + epsilon_cents``. The
+                        reservation is NOT silently re-reserved.
+                    NullRunBackendError: 503 RESERVATION_NOT_FOUND /
+                        EXECUTION_NOT_BOUND.
+                    NullRunAuthenticationError: 401/403.
 
-         2026-07-04 (B2): pre-fix this docstring (and the
-        surrounding module comment) described a fictitious wire
-        shape ``{execution_id, actual_cost_cents, api_key_id
-        cost_source}``. The backend's actual ``TrackRequestRaw`` is
-        ``{workflow_id, tokens, cost_cents,...}``; ``execution_id``
-        is replaced by ``reservation_id``, ``actual_cost_cents`` is
-        replaced by ``cost_cents`` (the SDK always sends 0 — see
-        ``_WIRE_STRIP_FIELDS``), and ``api_key_id`` is derived
-        server-side from the request auth, not supplied by the SDK.
-        The docstring now matches the real wire contract.
+                 2026-07-04 (B2): pre-fix this docstring (and the
+                surrounding module comment) described a fictitious wire
+                shape ``{execution_id, actual_cost_cents, api_key_id
+                cost_source}``. The backend's actual ``TrackRequestRaw`` is
+                ``{workflow_id, tokens, cost_cents,...}``; ``execution_id``
+                is replaced by ``reservation_id``, ``actual_cost_cents`` is
+                replaced by ``cost_cents`` (the SDK always sends 0 — see
+                ``_WIRE_STRIP_FIELDS``), and ``api_key_id`` is derived
+                server-side from the request auth, not supplied by the SDK.
+                The docstring now matches the real wire contract.
         """
         # 2026-07-06 (bug-fix): the previous shape called
         # `_build_signed_headers()` *before* `_signed_request_body()`.
@@ -2010,23 +2004,23 @@ class Transport:
     ) -> dict[str, Any]:
         """POST /api/v1/cancel — cancel an in-flight execution.
 
-. The server uses
-        ``cancel:{execution_id}`` SETNX to deduplicate repeated
-        cancellations: a 200 OK response is idempotent. A
-        non-existent ``execution_id`` returns 404 — we surface it
-        as ``NullRunBackendError`` because retrying with the same
-        id is not a valid recovery path (the execution already
-        terminated).
+        . The server uses
+                ``cancel:{execution_id}`` SETNX to deduplicate repeated
+                cancellations: a 200 OK response is idempotent. A
+                non-existent ``execution_id`` returns 404 — we surface it
+                as ``NullRunBackendError`` because retrying with the same
+                id is not a valid recovery path (the execution already
+                terminated).
 
-        Args:
-            execution_id: Server-minted id from the matching /check
-                response.
-            reason: Optional human-readable reason for the
-                cancellation (audit trail).
+                Args:
+                    execution_id: Server-minted id from the matching /check
+                        response.
+                    reason: Optional human-readable reason for the
+                        cancellation (audit trail).
 
-        Returns:
-            Parsed JSON dict (typically ``{"status": "ok"
-            "execution_id":..., "cancelled_at": ts}``).
+                Returns:
+                    Parsed JSON dict (typically ``{"status": "ok"
+                    "execution_id":..., "cancelled_at": ts}``).
         """
         request: dict[str, Any] = {"execution_id": execution_id}
         if reason:
@@ -2065,23 +2059,23 @@ class Transport:
     ) -> dict[str, Any]:
         """POST /api/v1/heartbeat — extend a chain's idle TTL.
 
-. The server runs
-        ``EXPIRE chain:{org}:{chain_id} 300`` atomically and
-        deduplicates repeated heartbeats via
-        ``heartbeat:{chain_id}:{ts_floor_30s}`` SETNX
-        (TTL = 35s — the 5s tail absorbs ±5s skew per).
+        . The server runs
+                ``EXPIRE chain:{org}:{chain_id} 300`` atomically and
+                deduplicates repeated heartbeats via
+                ``heartbeat:{chain_id}:{ts_floor_30s}`` SETNX
+                (TTL = 35s — the 5s tail absorbs ±5s skew per).
 
-        Recommended cadence: every 30s of wall-clock time (the
-        SDK's ``ping_chain`` helper wraps this method with the
-        time-based scheduler). Bursting heartbeats more often than
-        once per 30s is wasted bandwidth — the SETNX dedups them.
+                Recommended cadence: every 30s of wall-clock time (the
+                SDK's ``ping_chain`` helper wraps this method with the
+                time-based scheduler). Bursting heartbeats more often than
+                once per 30s is wasted bandwidth — the SETNX dedups them.
 
-        Args:
-            chain_id: Active chain_id.
+                Args:
+                    chain_id: Active chain_id.
 
-        Returns:
-            Parsed JSON dict (typically ``{"status": "ok"
-            "chain_id":..., "last_active": ts}``).
+                Returns:
+                    Parsed JSON dict (typically ``{"status": "ok"
+                    "chain_id":..., "last_active": ts}``).
         """
         request = {"chain_id": chain_id}
         # 2026-07-06 (bug-fix): same body-before-headers reorder as
@@ -2113,25 +2107,25 @@ class Transport:
         chain_id: str,
     ) -> dict[str, Any]:
         """Close a chain explicitly via /api/v1/gate with chain_op=end
-.
+        .
 
-        Pre-fix this method POSTed to ``/api/v1/chain/end``. That
-        endpoint was never registered on the backend
-        (``backend/src/proxy/http/routes.rs`` has zero matches for
-        ``chain/end`` or ``chain_end_handler``) — the only documented
-        way to close a chain is to POST /api/v1/gate with
-        ``{"chain_id": "...", "chain_op": "end"}``. The handler is
-        already idempotent — a no-op 200 OK for an unknown chain_id
-        is the documented success path. The SDK still raises through
-        the envelope parser on a true non-2xx so unexpected backend
-        regressions surface.
+                Pre-fix this method POSTed to ``/api/v1/chain/end``. That
+                endpoint was never registered on the backend
+                (``backend/src/proxy/http/routes.rs`` has zero matches for
+                ``chain/end`` or ``chain_end_handler``) — the only documented
+                way to close a chain is to POST /api/v1/gate with
+                ``{"chain_id": "...", "chain_op": "end"}``. The handler is
+                already idempotent — a no-op 200 OK for an unknown chain_id
+                is the documented success path. The SDK still raises through
+                the envelope parser on a true non-2xx so unexpected backend
+                regressions surface.
 
-        Args:
-            chain_id: Chain to close.
+                Args:
+                    chain_id: Chain to close.
 
-        Returns:
-            Parsed JSON dict (typically ``{"decision": "allow"
-            "chain_id":...}``).
+                Returns:
+                    Parsed JSON dict (typically ``{"decision": "allow"
+                    "chain_id":...}``).
         """
         # 2026-07-04 (B3): POST /api/v1/gate with
         # ``chain_op: "end"``. The backend's gate handler
@@ -2182,31 +2176,31 @@ class Transport:
     ) -> dict[str, Any]:
         """GET /api/v1/budget/approximate — UI-only budget estimation.
 
-. NEVER for enforcement — the backend stamps
-        ``is_approximate: true`` on every response. The endpoint
-        returns 503 ``BUDGET_DATA_UNAVAILABLE`` if all three sources
-        (Redis period counter → Postgres cost_events → last-known
-        cache) fail — NEVER returns 0, because a UI that displays
-        "≈ $0 spent" when no data is available misleads the user.
+        . NEVER for enforcement — the backend stamps
+                ``is_approximate: true`` on every response. The endpoint
+                returns 503 ``BUDGET_DATA_UNAVAILABLE`` if all three sources
+                (Redis period counter → Postgres cost_events → last-known
+                cache) fail — NEVER returns 0, because a UI that displays
+                "≈ $0 spent" when no data is available misleads the user.
 
-        Used by ``nullrun.cost_dashboard `` / ``examples/cost_dashboard.py``
-        and the dashboard rollup panel.
+                Used by ``nullrun.cost_dashboard `` / ``examples/cost_dashboard.py``
+                and the dashboard rollup panel.
 
-        Args:
-            organization_id: Optional org override; defaults to the
-                transport's bound org via the auth/verify result.
+                Args:
+                    organization_id: Optional org override; defaults to the
+                        transport's bound org via the auth/verify result.
 
-        Returns:
-            Parsed JSON dict with ``current_spend_cents_estimate``
-            ``is_approximate: True``, ``source`` (BudgetSource enum
-            string), ``confidence`` (High/Medium/Low), and
-            ``last_updated_at``.
+                Returns:
+                    Parsed JSON dict with ``current_spend_cents_estimate``
+                    ``is_approximate: True``, ``source`` (BudgetSource enum
+                    string), ``confidence`` (High/Medium/Low), and
+                    ``last_updated_at``.
 
-        Raises:
-            NullRunBackendError: 503 BUDGET_DATA_UNAVAILABLE (all
-                sources failed) — caller should display "Data
-                unavailable" + retry button, NOT "$0 spent".
-            NullRunAuthenticationError: 401/403.
+                Raises:
+                    NullRunBackendError: 503 BUDGET_DATA_UNAVAILABLE (all
+                        sources failed) — caller should display "Data
+                        unavailable" + retry button, NOT "$0 spent".
+                    NullRunAuthenticationError: 401/403.
         """
         # ApproximateBudget uses GET (not POST) per the wire contract
         # no signed body, so we use _auth_headers directly instead
@@ -2336,9 +2330,7 @@ def _extract_error_envelope(
         code = str(body.get("error_code", "") or "")
         # The 503 budget path uses "message" instead of
         # "error_message". Accept both.
-        message = str(
-            body.get("error_message") or body.get("message") or raw_text or ""
-        )
+        message = str(body.get("error_message") or body.get("message") or raw_text or "")
         details_raw = body.get("details") or {}
         if not isinstance(details_raw, dict):
             details_raw = {}
@@ -2369,9 +2361,7 @@ def _extract_error_envelope(
         # Everything except ``error`` and ``message`` goes into
         # details for diagnostic context.
         details = {
-            k: v
-            for k, v in body.items()
-            if k not in ("error", "message") and not k.startswith("_")
+            k: v for k, v in body.items() if k not in ("error", "message") and not k.startswith("_")
         }
         return (code, message, details)
 
@@ -2419,7 +2409,7 @@ def _parse_v3_error_envelope(
     if not isinstance(body, dict):
         body = {}
 
-# Drift §3 (2026-07-06): the wire envelope is NOT one shape.
+    # Drift §3 (2026-07-06): the wire envelope is NOT one shape.
     # The backend has three distinct error emission paths today:
     #
     # 1. v3 envelope (gate/internal.rs, handlers.rs::track_handler):
@@ -2443,9 +2433,7 @@ def _parse_v3_error_envelope(
     # _extract_error_envelope() handles all four shapes; this block
     # just consumes the normalised tuple.
     backend_code, message, details = _extract_error_envelope(body, response.text)
-    retry_after_ms: float | None = (
-        body.get("retry_after_ms") if isinstance(body, dict) else None
-    )
+    retry_after_ms: float | None = body.get("retry_after_ms") if isinstance(body, dict) else None
     # Retry-After header takes precedence over the JSON field when
     # both are present (server-side convention — header is canonical
     # per RFC 7231, JSON is a NullRun-specific fallback).
@@ -2465,11 +2453,11 @@ def _parse_v3_error_envelope(
     full_message = f"{endpoint}: {message}"
 
     if backend_code == "PROTOCOL_TOO_OLD" or backend_code == "PROTOCOL_TOO_NEW":
-            # NullRunProtocolError → NullRunInfrastructureError →
-            # NullRunError base. Base constructor does NOT accept
-            # a generic ``details=`` kwarg. Pass message only — the
-            # catalog value already encodes error_code + retryable.
-            return NullRunProtocolError(full_message)
+        # NullRunProtocolError → NullRunInfrastructureError →
+        # NullRunError base. Base constructor does NOT accept
+        # a generic ``details=`` kwarg. Pass message only — the
+        # catalog value already encodes error_code + retryable.
+        return NullRunProtocolError(full_message)
 
     if backend_code == "CONSUME_OVERBUDGET":
         return NullRunConsumeOverbudgetError(
@@ -2482,7 +2470,11 @@ def _parse_v3_error_envelope(
             status_code=status,  # 422 per backend mapping
         )
 
-    if backend_code == "CHAIN_MAX_DURATION_EXCEEDED" or backend_code == "CHAIN_CROSS_ORG" or backend_code == "CHAIN_ORG_MISMATCH":
+    if (
+        backend_code == "CHAIN_MAX_DURATION_EXCEEDED"
+        or backend_code == "CHAIN_CROSS_ORG"
+        or backend_code == "CHAIN_ORG_MISMATCH"
+    ):
         return NullRunChainError(
             full_message,
             chain_id=details.get("chain_id"),
@@ -2499,13 +2491,13 @@ def _parse_v3_error_envelope(
         )
 
     if backend_code == "RATE_LIMIT_REDIS_UNAVAILABLE":
-            # NullRunRateLimitRedisError → NullRunInfrastructureError
-            # → NullRunError base. Base constructor accepts only
-            # message + (error_code, user_action, retryable, docs_url
-            # cause) — NOT a generic ``details=``. The catalog value
-            # already encodes error_code + retryable, so we just pass
-            # the message.
-            return NullRunRateLimitRedisError(full_message)
+        # NullRunRateLimitRedisError → NullRunInfrastructureError
+        # → NullRunError base. Base constructor accepts only
+        # message + (error_code, user_action, retryable, docs_url
+        # cause) — NOT a generic ``details=``. The catalog value
+        # already encodes error_code + retryable, so we just pass
+        # the message.
+        return NullRunRateLimitRedisError(full_message)
 
     if backend_code == "RATE_LIMIT_EXCEEDED":
         retry_after = retry_after_ms / 1000.0 if retry_after_ms else None
@@ -2580,14 +2572,12 @@ def _parse_v3_error_envelope(
     # that exposes status_code + error_code for the caller.
     if status in (401, 403):
         return NullRunAuthenticationError(
-            f"Auth failed on {endpoint} (status {status}, error_code="
-            f"{backend_code!r}): {message}"
+            f"Auth failed on {endpoint} (status {status}, error_code={backend_code!r}): {message}"
         )
     if status == 429:
         retry_after = retry_after_ms / 1000.0 if retry_after_ms else None
         return RateLimitError(
-            f"Rate limited on {endpoint} (status 429, error_code="
-            f"{backend_code!r}): {message}",
+            f"Rate limited on {endpoint} (status 429, error_code={backend_code!r}): {message}",
             source=TransportErrorSource.GATEWAY_ERROR,
             endpoint=endpoint,
             retry_after=retry_after,
@@ -2595,14 +2585,12 @@ def _parse_v3_error_envelope(
         )
     if 500 <= status < 600:
         return NullRunBackendError(
-            f"{endpoint}: {message} (status {status}, error_code="
-            f"{backend_code!r})",
+            f"{endpoint}: {message} (status {status}, error_code={backend_code!r})",
             endpoint=endpoint,
             status_code=status,
         )
     return NullRunBackendError(
-        f"{endpoint}: {message} (status {status}, error_code="
-        f"{backend_code!r})",
+        f"{endpoint}: {message} (status {status}, error_code={backend_code!r})",
         endpoint=endpoint,
         status_code=status,
     )

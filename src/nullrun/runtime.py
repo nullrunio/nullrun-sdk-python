@@ -167,6 +167,7 @@ def is_strict_mode_forced(tool_name: str) -> bool:
     """
     return tool_name in _STRICT_MODE_FORCED
 
+
 # 2026-07-04 (v0.12.0 wiring fix — ):
 # the maximum age (seconds) for a captured ``reservation_id``
 # to be eligible for forwarding onto a /track payload. Past
@@ -241,6 +242,7 @@ def _validate_approval_timeout(value: object, log_prefix: str) -> float | None:
         return None
     return candidate
 
+
 # Phase 4.1: privacy boundary. Fields that MUST NOT leave the SDK on
 # the wire. The transport layer (POST /api/v1/track/batch) reads
 # whatever is in the event dict, so anything not allowlisted ends up
@@ -266,9 +268,7 @@ def _validate_approval_timeout(value: object, log_prefix: str) -> float | None:
 # Anything new added here MUST also be added to the in-process
 # callers that consume these fields (the dedup LRU at
 # ``_seen_track_fingerprints``, any local loggers).
-_WIRE_STRIP_FIELDS: frozenset[str] = frozenset(
-    {"cost_cents", "_fingerprint", "raw_usage"}
-)
+_WIRE_STRIP_FIELDS: frozenset[str] = frozenset({"cost_cents", "_fingerprint", "raw_usage"})
 
 
 # Phase 3 (2026-07-05): metaclass is what routes the legacy
@@ -296,10 +296,10 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
     Usage:
         # Automatic (via protect )
         import nullrun
-        nullrun.protect 
+        nullrun.protect
 
         # Manual
-        rt = NullRunRuntime.get_instance 
+        rt = NullRunRuntime.get_instance
         # Note: `cost_cents` is NOT a valid event key — the SDK strips
         # it before sending (see ``track_event`` / wire payload below).
         # The backend computes cost from tokens + the org's pricing
@@ -609,9 +609,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # hot path is a single frozenset membership check (no set
         # comprehension per call). Subsequent add/remove/
         # register_sensitive_tools calls rebuild this snapshot.
-        self._sensitive_tools_lower = frozenset(
-            t.lower() for t in self._sensitive_tools
-        )
+        self._sensitive_tools_lower = frozenset(t.lower() for t in self._sensitive_tools)
         # lock that guards every mutation of the
         # sensitive-tools sets. The pre-fix code did
         # ``self._strict_mode_tools.add(tool_name)`` from
@@ -1140,6 +1138,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 logger.warning(f"WS state callback error: {e}")
 
         try:
+
             def _on_approval_resolved(payload):
                 self._handle_approval_resolved(payload)
 
@@ -1403,8 +1402,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 )
                 candidate = None
             if candidate is not None and (
-                candidate < MIN_APPROVAL_TIMEOUT_SECONDS
-                or candidate > MAX_APPROVAL_TIMEOUT_SECONDS
+                candidate < MIN_APPROVAL_TIMEOUT_SECONDS or candidate > MAX_APPROVAL_TIMEOUT_SECONDS
             ):
                 logger.warning(
                     "approval %s: server timeout=%.1fs out of range [%.1f, %.1f]; falling back to env default",
@@ -1431,8 +1429,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             # diagnosing "why did this approval time out
             # earlier than I configured" tickets.
             logger.debug(
-                "approval %s: using server timeout=%.1fs "
-                "(env default would have been %.1fs)",
+                "approval %s: using server timeout=%.1fs (env default would have been %.1fs)",
                 approval_id,
                 effective_timeout,
                 self._approval_timeout_seconds,
@@ -1453,8 +1450,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             signaled = event.wait(timeout=effective_timeout)
             if not signaled:
                 logger.warning(
-                    "approval %s: WS push silent for %.1fs -- "
-                    "falling back to /status poll",
+                    "approval %s: WS push silent for %.1fs -- falling back to /status poll",
                     approval_id,
                     effective_timeout,
                 )
@@ -1692,18 +1688,14 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                     # transport + classified SDK errors. Internal
                     # bugs (KeyError, AttributeError) should surface
                     # rather than silently allow an unbounded call.
-                    logger.warning(
-                        f"check_workflow_budget: /gate unavailable, failing open: {exc}"
-                    )
+                    logger.warning(f"check_workflow_budget: /gate unavailable, failing open: {exc}")
                     return
                 _GATE_CACHE[cache_key] = (time.monotonic(), response)
         else:
             try:
                 response = self._transport.check(check_req)
             except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    f"check_workflow_budget: /gate unavailable, failing open: {exc}"
-                )
+                logger.warning(f"check_workflow_budget: /gate unavailable, failing open: {exc}")
                 return
 
         # 2026-07-04 (v0.12.0 wiring fix — ):
@@ -1762,9 +1754,8 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             # why it blocked ("Budget exhausted: need 2 cents, 0 available").
             # Fall back to `explanation` (singular String) when the list is
             # empty so the real reason surfaces in the kill/pause reason.
-            reasons = (
-                response.get("explanations")
-                or ([response["explanation"]] if response.get("explanation") else ["block"])
+            reasons = response.get("explanations") or (
+                [response["explanation"]] if response.get("explanation") else ["block"]
             )
             # Sprint 3 follow-up (B23): bump ``cost_limit_exceeded``
             # when the pre-flight blocks the workflow. The counter
@@ -1777,18 +1768,16 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 reason="; ".join(reasons),
             )
         if decision == "throttle":
-            reasons = (
-                response.get("explanations")
-                or ([response["explanation"]] if response.get("explanation") else ["throttle"])
+            reasons = response.get("explanations") or (
+                [response["explanation"]] if response.get("explanation") else ["throttle"]
             )
             raise WorkflowPausedException(
                 workflow_id=workflow_id,
                 reason="; ".join(reasons),
             )
         if decision == "throttle":
-            reasons = (
-                response.get("explanations")
-                or ([response["explanation"]] if response.get("explanation") else ["throttle"])
+            reasons = response.get("explanations") or (
+                [response["explanation"]] if response.get("explanation") else ["throttle"]
             )
             raise WorkflowPausedException(
                 workflow_id=workflow_id,
@@ -1855,9 +1844,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 # @protect call, so we just return success here.
                 # The caller proceeds with the original
                 # function body.
-                logger.info(
-                    f"check_workflow_budget: approval {approval_id} approved -- resuming"
-                )
+                logger.info(f"check_workflow_budget: approval {approval_id} approved -- resuming")
                 return
             if outcome == "denied":
                 raise WorkflowKilledInterrupt(
@@ -1872,6 +1859,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                     f"{self._approval_timeout_seconds:.0f}s"
                 ),
             )
+
     # =============================================================================
     # v3 wire-protocol helpers
     # =============================================================================
@@ -1882,39 +1870,39 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         interval: float = 30.0,
     ) -> Callable[[], None]:
         """Schedule time-based heartbeats for an active chain
-.
+        .
 
-        Returns a ``stop `` callable that cancels the scheduler
-        thread. The heartbeat runs on a dedicated daemon thread so
-        the agent loop stays unblocked.
+                Returns a ``stop `` callable that cancels the scheduler
+                thread. The heartbeat runs on a dedicated daemon thread so
+                the agent loop stays unblocked.
 
-        Replaces the previous chunk-based heuristic (every N chunks)
-        with a wall-clock scheduler. Chunks do not correlate with
-        time — one chunk per minute still leaves the chain idle for
-        long stretches between heartbeat emissions, while bursty
-        1000-chunk-per-second traffic wastes heartbeat budget on an
-        already-fresh chain. ``time.monotonic `` ties the cadence
-        to wall-clock time as recommended.
+                Replaces the previous chunk-based heuristic (every N chunks)
+                with a wall-clock scheduler. Chunks do not correlate with
+                time — one chunk per minute still leaves the chain idle for
+                long stretches between heartbeat emissions, while bursty
+                1000-chunk-per-second traffic wastes heartbeat budget on an
+                already-fresh chain. ``time.monotonic `` ties the cadence
+                to wall-clock time as recommended.
 
-        Args:
-            chain_id: Active chain_id (UUID v4). Must match a chain
-                registered via ``with chain(chain_id, op="start")``.
-            interval: Seconds between heartbeats. Default 30s
-                the spec (configurable per policy in the
-                10-120s range). ±5s skew is tolerated server-side.
+                Args:
+                    chain_id: Active chain_id (UUID v4). Must match a chain
+                        registered via ``with chain(chain_id, op="start")``.
+                    interval: Seconds between heartbeats. Default 30s
+                        the spec (configurable per policy in the
+                        10-120s range). ±5s skew is tolerated server-side.
 
-        Returns:
-            ``stop `` — call to cancel the scheduler. Idempotent.
+                Returns:
+                    ``stop `` — call to cancel the scheduler. Idempotent.
 
-        Notes:
-            - The heartbeat POST is non-blocking and best-effort.
-              A failed heartbeat is logged at DEBUG and the chain
-              will simply expire via the server-side idle TTL.
-            - The thread is a daemon so an interpreter shutdown
-              without explicit ``stop `` does not hang.
-            - Cadence is wall-clock (``time.monotonic``), not
-              chunk-count. Bursting the agent loop 100x/sec does
-              not change the heartbeat rate.
+                Notes:
+                    - The heartbeat POST is non-blocking and best-effort.
+                      A failed heartbeat is logged at DEBUG and the chain
+                      will simply expire via the server-side idle TTL.
+                    - The thread is a daemon so an interpreter shutdown
+                      without explicit ``stop `` does not hang.
+                    - Cadence is wall-clock (``time.monotonic``), not
+                      chunk-count. Bursting the agent loop 100x/sec does
+                      not change the heartbeat rate.
         """
         import threading as _threading
 
@@ -1970,62 +1958,62 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
 
     def cancel_execution(self, execution_id: str, reason: str | None = None) -> dict[str, Any]:
         """Cancel an in-flight execution via /api/v1/cancel
-.
+        .
 
-        Idempotent: repeated calls with the same ``execution_id``
-        return 200 OK without side effects. A non-existent id
-        surfaces as ``NullRunBackendError`` — the user should not
-        retry in that case (the execution already terminated).
+                Idempotent: repeated calls with the same ``execution_id``
+                return 200 OK without side effects. A non-existent id
+                surfaces as ``NullRunBackendError`` — the user should not
+                retry in that case (the execution already terminated).
 
-        Args:
-            execution_id: Server-minted id from the matching /check
-                response. Client-supplied execution_ids from pre-v3
-                SDKs are NOT accepted.
-            reason: Optional audit-trail reason.
+                Args:
+                    execution_id: Server-minted id from the matching /check
+                        response. Client-supplied execution_ids from pre-v3
+                        SDKs are NOT accepted.
+                    reason: Optional audit-trail reason.
 
-        Returns:
-            Parsed JSON dict.
+                Returns:
+                    Parsed JSON dict.
         """
         return self._transport.cancel(execution_id, reason=reason)
 
     def chain_end(self, chain_id: str) -> dict[str, Any]:
         """Close a chain explicitly via /api/v1/chain/end
-.
+        .
 
-        Idempotent on the server — a no-op 200 for unknown
-        chain_ids is the documented success path. Prefer using the
-        ``with chain(...)`` contextmanager for normal flows; this
-        helper is for the case where the chain was opened in a
-        prior request and you need to close it from a different
-        one.
+                Idempotent on the server — a no-op 200 for unknown
+                chain_ids is the documented success path. Prefer using the
+                ``with chain(...)`` contextmanager for normal flows; this
+                helper is for the case where the chain was opened in a
+                prior request and you need to close it from a different
+                one.
 
-        Args:
-            chain_id: Chain to close.
+                Args:
+                    chain_id: Chain to close.
 
-        Returns:
-            Parsed JSON dict.
+                Returns:
+                    Parsed JSON dict.
         """
         return self._transport.chain_end(chain_id)
 
     def approximate_budget(self) -> dict[str, Any]:
         """UI-only budget estimate via GET /api/v1/budget/approximate
-.
+        .
 
-        NEVER use this value for enforcement — the response carries
-        ``is_approximate: True`` and the estimate lags the
-        authoritative budget counter by the outbox flush interval.
-        Dashboards should display "Data unavailable" + retry button
-        on the 503 path, NEVER "≈ $0 spent".
+                NEVER use this value for enforcement — the response carries
+                ``is_approximate: True`` and the estimate lags the
+                authoritative budget counter by the outbox flush interval.
+                Dashboards should display "Data unavailable" + retry button
+                on the 503 path, NEVER "≈ $0 spent".
 
-        Returns:
-            Parsed JSON dict with ``current_spend_cents_estimate``
-            ``is_approximate: True``, ``source``, ``confidence``
-            ``last_updated_at``.
+                Returns:
+                    Parsed JSON dict with ``current_spend_cents_estimate``
+                    ``is_approximate: True``, ``source``, ``confidence``
+                    ``last_updated_at``.
 
-        Raises:
-            NullRunBackendError: 503 BUDGET_DATA_UNAVAILABLE when
-                all three sources (Redis period counter → Postgres
-                cost_events → last-known cache) failed.
+                Raises:
+                    NullRunBackendError: 503 BUDGET_DATA_UNAVAILABLE when
+                        all three sources (Redis period counter → Postgres
+                        cost_events → last-known cache) failed.
         """
         return self._transport.approximate_budget(
             organization_id=self.organization_id,
@@ -2217,9 +2205,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # to see in operator logs) instead of silent (the JSON null
         # case).
         wire_event = {
-            k: v
-            for k, v in enriched.items()
-            if k not in _WIRE_STRIP_FIELDS and v is not None
+            k: v for k, v in enriched.items() if k not in _WIRE_STRIP_FIELDS and v is not None
         }
 
         # Audit 2026-06-29 (SDK↔backend wire: silent zero-billing):
@@ -2290,30 +2276,30 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
 
     def is_sensitive_tool(self, tool_name: str) -> bool:
         """
-        Check if a tool is sensitive (requires strict mode).
+               Check if a tool is sensitive (requires strict mode).
 
-        Sensitive tools MUST go through /execute endpoint for pre-execution
-        enforcement. They cannot be executed directly.
+               Sensitive tools MUST go through /execute endpoint for pre-execution
+               enforcement. They cannot be executed directly.
 
-        Args:
-            tool_name: Name of the tool
+               Args:
+                   tool_name: Name of the tool
 
-        Returns:
-            True if tool requires strict mode
+               Returns:
+                   True if tool requires strict mode
 
-        P2-3: match is case-insensitive. The pre-fix code did an exact
-        ``tool_name in self._sensitive_tools`` check, so a tool
-        registered as ``"stripe.charge"`` would silently fail to
-        match a caller passing ``"Stripe.Charge"`` — bypassing the
-        sensitive gate and running the body without an /execute
-        round-trip. The fix normalises both sides to lowercase
-        before the membership test, matching the case-insensitive
-        style of ``_safe_kwargs``.
+               P2-3: match is case-insensitive. The pre-fix code did an exact
+               ``tool_name in self._sensitive_tools`` check, so a tool
+               registered as ``"stripe.charge"`` would silently fail to
+               match a caller passing ``"Stripe.Charge"`` — bypassing the
+               sensitive gate and running the body without an /execute
+               round-trip. The fix normalises both sides to lowercase
+               before the membership test, matching the case-insensitive
+               style of ``_safe_kwargs``.
 
- #39: the read path takes ``_tools_lock`` so it sees a
-        consistent snapshot alongside any concurrent
-        ``add_sensitive_tool``. The lock is uncontended under
-        CPython's GIL, so the cost is negligible.
+        #39: the read path takes ``_tools_lock`` so it sees a
+               consistent snapshot alongside any concurrent
+               ``add_sensitive_tool``. The lock is uncontended under
+               CPython's GIL, so the cost is negligible.
         """
         # Phase 4 (2026-07-05): O(1) lookup against the
         # pre-lowercased frozenset snapshot. The lock is still
@@ -2323,10 +2309,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # read itself is a single frozenset membership check.
         needle = tool_name.lower()
         with self._tools_lock:
-            return (
-                needle in self._sensitive_tools_lower
-                or needle in self._strict_mode_tools_lower
-            )
+            return needle in self._sensitive_tools_lower or needle in self._strict_mode_tools_lower
 
     def get_org_status(self, org_id: str | None = None) -> dict[str, Any]:
         """Public helper for reading ``/api/v1/orgs/{org_id}/status``.
@@ -2370,50 +2353,46 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
 
     def add_sensitive_tool(self, tool_name: str) -> None:
         """
-        Add a tool to the sensitive tools list.
+               Add a tool to the sensitive tools list.
 
-        Sensitive tools require strict mode enforcement and must go through
-        the /execute endpoint for pre-execution policy evaluation.
+               Sensitive tools require strict mode enforcement and must go through
+               the /execute endpoint for pre-execution policy evaluation.
 
-        Args:
-            tool_name: Name of the tool to mark as sensitive
+               Args:
+                   tool_name: Name of the tool to mark as sensitive
 
-        Example:
-            runtime = NullRunRuntime.get_instance 
-            runtime.add_sensitive_tool("my.custom_tool")
+               Example:
+                   runtime = NullRunRuntime.get_instance
+                   runtime.add_sensitive_tool("my.custom_tool")
 
- #39: takes ``_tools_lock`` so the mutation is atomic
-        against concurrent ``is_sensitive_tool`` reads and other
-        ``add``/``remove`` calls. Without the lock a free-threaded
-        build could observe a torn set state during the mutation.
+        #39: takes ``_tools_lock`` so the mutation is atomic
+               against concurrent ``is_sensitive_tool`` reads and other
+               ``add``/``remove`` calls. Without the lock a free-threaded
+               build could observe a torn set state during the mutation.
         """
         with self._tools_lock:
             self._strict_mode_tools.add(tool_name)
             # Phase 4: rebuild the lowercase snapshot so the
             # hot-path is_sensitive_tool sees the new entry.
-            self._strict_mode_tools_lower = frozenset(
-                t.lower() for t in self._strict_mode_tools
-            )
+            self._strict_mode_tools_lower = frozenset(t.lower() for t in self._strict_mode_tools)
 
     def remove_sensitive_tool(self, tool_name: str) -> None:
         """
-        Remove a tool from the sensitive tools list.
+               Remove a tool from the sensitive tools list.
 
-        Args:
-            tool_name: Name of the tool to remove from sensitive list
+               Args:
+                   tool_name: Name of the tool to remove from sensitive list
 
-        Example:
-            runtime = NullRunRuntime.get_instance 
-            runtime.remove_sensitive_tool("my.custom_tool")
+               Example:
+                   runtime = NullRunRuntime.get_instance
+                   runtime.remove_sensitive_tool("my.custom_tool")
 
- #39: takes ``_tools_lock`` to mirror ``add_sensitive_tool``.
+        #39: takes ``_tools_lock`` to mirror ``add_sensitive_tool``.
         """
         with self._tools_lock:
             self._strict_mode_tools.discard(tool_name)
             # Phase 4: rebuild the lowercase snapshot.
-            self._strict_mode_tools_lower = frozenset(
-                t.lower() for t in self._strict_mode_tools
-            )
+            self._strict_mode_tools_lower = frozenset(t.lower() for t in self._strict_mode_tools)
 
     def register_sensitive_tools(self, tool_names: list[str]) -> None:
         """
@@ -2423,7 +2402,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             tool_names: List of tool names to mark as sensitive
 
         Example:
-            runtime = NullRunRuntime.get_instance 
+            runtime = NullRunRuntime.get_instance
             runtime.register_sensitive_tools([
                 "stripe.charge"
                 "payment.process"
@@ -2436,9 +2415,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             # Phase 4: rebuild the lowercase snapshot once
             # after the batch insert (a single set comprehension
             # beats N rebuilds in the loop).
-            self._strict_mode_tools_lower = frozenset(
-                t.lower() for t in self._strict_mode_tools
-            )
+            self._strict_mode_tools_lower = frozenset(t.lower() for t in self._strict_mode_tools)
 
     def get_sensitive_tools(self) -> set[str]:
         """
@@ -2687,21 +2664,21 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
 
     def start_recording(self, workflow_id: str, metadata: dict[str, Any] = None) -> str:
         """
-        Start recording events for local decision history.
+                Start recording events for local decision history.
 
-.. deprecated:: 0.8.0
-            Decision history moved to the backend dashboard. This method
-            is a no-op stub and will be removed in 0.9.0. Use
-            ``nullrun.status `` for a per-runtime snapshot or visit
-            https:/docs.nullrun.io/concepts/decision-history for the
-            dashboard workflow.
+        .. deprecated:: 0.8.0
+                    Decision history moved to the backend dashboard. This method
+                    is a no-op stub and will be removed in 0.9.0. Use
+                    ``nullrun.status `` for a per-runtime snapshot or visit
+                    https:/docs.nullrun.io/concepts/decision-history for the
+                    dashboard workflow.
 
-        Args:
-            workflow_id: ID of the workflow to record
-            metadata: Optional metadata about the session
+                Args:
+                    workflow_id: ID of the workflow to record
+                    metadata: Optional metadata about the session
 
-        Returns:
-            session_id for this recording (always ``""`` since 0.4.0)
+                Returns:
+                    session_id for this recording (always ``""`` since 0.4.0)
         """
         # FIX 2026-06-28: was a silent no-op with logger.debug. Now emits
         # DeprecationWarning so customer code that still imports this
@@ -2717,18 +2694,17 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
 
     def stop_recording(self):
         """
-        Stop recording and return the session.
+                Stop recording and return the session.
 
-.. deprecated:: 0.8.0
-            See:meth:`start_recording`. Will be removed in 0.9.0.
+        .. deprecated:: 0.8.0
+                    See:meth:`start_recording`. Will be removed in 0.9.0.
 
-        Returns:
-            The recorded session, or None if not recording
+                Returns:
+                    The recorded session, or None if not recording
         """
         # FIX 2026-06-28: paired deprecation warning for start_recording.
         warnings.warn(
-            "NullRunRuntime.stop_recording() is deprecated and will be "
-            "removed in nullrun 0.9.0.",
+            "NullRunRuntime.stop_recording() is deprecated and will be removed in nullrun 0.9.0.",
             DeprecationWarning,
             stacklevel=2,
         )
@@ -2807,6 +2783,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                     from nullrun.context import (
                         clear_server_minted_execution_id,
                     )
+
                     clear_server_minted_execution_id()
                     logger.debug(
                         "_enrich_event: dropping stale server-minted "
@@ -2895,48 +2872,46 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
 
     def _route_track(self, wire_event: dict[str, Any]) -> None:
         """Route a tracked event to v3 single-event /track or
-        legacy batch /track/batch.
+               legacy batch /track/batch.
 
-        Why this exists
-        ---------------
-        Pre-0.12.0 wiring the SDK always called
-        ``self._transport.track(wire_event)`` which posts to the
-        legacy ``/api/v1/track/batch`` (the ``process_span_event``
-        pipeline). That pipeline reads the org's lifetime
-        ``monthly_cost`` counter — drift with the dashboard's
-        period-bound ``bp:{ts}:cost_cents`` per G1
-        and never exercises v3 ``consume_budget_v3`` so the
-        consume ≤ reserve + ε invariant is never validated.
+               Why this exists
+               ---------------
+               Pre-0.12.0 wiring the SDK always called
+               ``self._transport.track(wire_event)`` which posts to the
+               legacy ``/api/v1/track/batch`` (the ``process_span_event``
+               pipeline). That pipeline reads the org's lifetime
+               ``monthly_cost`` counter — drift with the dashboard's
+               period-bound ``bp:{ts}:cost_cents`` per G1
+               and never exercises v3 ``consume_budget_v3`` so the
+               consume ≤ reserve + ε invariant is never validated.
 
-        The fix: route events that have a paired ``/check``
-        reservation (currently: ``llm_call``) to
-        ``track_single`` which posts to ``/api/v1/track``. The
-        backend's consume takes the server-minted execution_id
-        from the request, looks up
-        ``reservation:{execution_id}`` and runs the invariant.
-        Span events still ride /track/batch — they have no
-        reservation to release.
+               The fix: route events that have a paired ``/check``
+               reservation (currently: ``llm_call``) to
+               ``track_single`` which posts to ``/api/v1/track``. The
+               backend's consume takes the server-minted execution_id
+               from the request, looks up
+               ``reservation:{execution_id}`` and runs the invariant.
+               Span events still ride /track/batch — they have no
+               reservation to release.
 
-        Opt-out
-        -------
-        ``NULLRUN_V3_TRACK_DISABLE=1`` forces every event
-        through the legacy batch path. Use it on backends that
-        haven't flipped ``NULLRUN_CONSUME_V3_ENABLED=1`` yet.
+               Opt-out
+               -------
+               ``NULLRUN_V3_TRACK_DISABLE=1`` forces every event
+               through the legacy batch path. Use it on backends that
+               haven't flipped ``NULLRUN_CONSUME_V3_ENABLED=1`` yet.
 
-        Failure mode
-        ------------
-        ``track_single`` raises on 422 / 503 / 5xx (see
-        ``nullrun.breaker.exceptions``). We catch and log at
-        WARNING level; the event is dropped (NOT retried via
-        the batch path — that would risk double-billing
- idempotency contract).
+               Failure mode
+               ------------
+               ``track_single`` raises on 422 / 503 / 5xx (see
+               ``nullrun.breaker.exceptions``). We catch and log at
+               WARNING level; the event is dropped (NOT retried via
+               the batch path — that would risk double-billing
+        idempotency contract).
         """
         from nullrun.context import get_server_minted_execution_id
 
         event_type = wire_event.get("type")
-        v3_disabled = (
-            os.environ.get("NULLRUN_V3_TRACK_DISABLE", "").strip() == "1"
-        )
+        v3_disabled = os.environ.get("NULLRUN_V3_TRACK_DISABLE", "").strip() == "1"
 
         if event_type != "llm_call" or v3_disabled:
             # Span / heartbeat / tool events have no reservation
@@ -2975,8 +2950,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 status_code=getattr(exc, "status_code", None),
             )
             logger.warning(
-                "_route_track: track_single failed for "
-                "execution_id=%s (%s) — event dropped",
+                "_route_track: track_single failed for execution_id=%s (%s) — event dropped",
                 smid,
                 exc,
             )
@@ -3163,7 +3137,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             except httpx.RequestError as e:
                 last_exc = e
                 if attempt < max_attempts - 1:
-                    backoff_s = min(0.5 * (2 ** attempt), 5.0)
+                    backoff_s = min(0.5 * (2**attempt), 5.0)
                     logger.debug(
                         f"/auth/verify network error "
                         f"(attempt {attempt + 1}/{max_attempts}): "
@@ -3182,9 +3156,9 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                         backoff_s = float(retry_after_header)
                     except ValueError:
                         # HTTP-date or unparseable — fall back to exp backoff
-                        backoff_s = min(0.5 * (2 ** attempt), 5.0)
+                        backoff_s = min(0.5 * (2**attempt), 5.0)
                 else:
-                    backoff_s = min(0.5 * (2 ** attempt), 5.0)
+                    backoff_s = min(0.5 * (2**attempt), 5.0)
                 logger.debug(
                     f"/auth/verify returned {response.status_code} "
                     f"(attempt {attempt + 1}/{max_attempts}); "
@@ -3213,6 +3187,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
 def __getattr__(name):
     if name == "_runtime":
         from nullrun._registry import get_active_runtime
+
         return get_active_runtime()
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
@@ -3223,7 +3198,6 @@ def __getattr__(name):
 # . See the long-form comment in
 # nullrun._singleton for why a plain  does not work
 # on module instances.
-
 
 
 # 2026-07-04 (v0.12.0 wiring fix — ):
@@ -3368,8 +3342,7 @@ def _build_v3_track_payload(
         # SDK never bound the API key to a workflow (legacy
         # legacy-no-binding). Fall back.
         logger.debug(
-            "_build_v3_track_payload: missing workflow_id — "
-            "cannot shape v3 /track payload"
+            "_build_v3_track_payload: missing workflow_id — cannot shape v3 /track payload"
         )
         return None
 
@@ -3377,10 +3350,7 @@ def _build_v3_track_payload(
     if tokens is None:
         # Same as llm_call missing required fields — the backend
         # would 422 anyway. Fall back to batch.
-        logger.debug(
-            "_build_v3_track_payload: missing tokens — cannot "
-            "shape v3 /track payload"
-        )
+        logger.debug("_build_v3_track_payload: missing tokens — cannot shape v3 /track payload")
         return None
 
     payload: dict[str, Any] = {
@@ -3388,7 +3358,7 @@ def _build_v3_track_payload(
         "workflow_id": wf_id,
         "tokens": int(tokens),
         "cost_cents": 0,
-        "cost_source": "provisional",  # 
+        "cost_source": "provisional",  #
     }
     if "input_tokens" in wire_event and wire_event["input_tokens"] is not None:
         payload["input_tokens"] = int(wire_event["input_tokens"])

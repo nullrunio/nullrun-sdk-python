@@ -392,44 +392,44 @@ def _emit_span_end(
 
 def protect(fn: F | None = None) -> F | Callable[[F], F]:
     """
-    Decorator that wraps a function in a NullRun span.
+        Decorator that wraps a function in a NullRun span.
 
-    Usage:
-        @nullrun.protect
-        def my_agent(query: str) -> str:
-...
+        Usage:
+            @nullrun.protect
+            def my_agent(query: str) -> str:
+    ...
 
-        @nullrun.protect
-        async def my_async_agent(query: str) -> str:
-...
+            @nullrun.protect
+            async def my_async_agent(query: str) -> str:
+    ...
 
-    The span hierarchy is built automatically from the calling context
-    (via `nullrun.tracing.SpanContext` contextvars) — nested `@protect`
-    calls become child spans of the outer one. No parameters are needed:
-    the workflow is derived from the API key on the backend.
+        The span hierarchy is built automatically from the calling context
+        (via `nullrun.tracing.SpanContext` contextvars) — nested `@protect`
+        calls become child spans of the outer one. No parameters are needed:
+        the workflow is derived from the API key on the backend.
 
-    ## Pre-execution gate order (ADR-008 Rule 4)
+        ## Pre-execution gate order (ADR-008 Rule 4)
 
-    The wrapper runs three gates in this order. KILL short-circuits:
+        The wrapper runs three gates in this order. KILL short-circuits:
 
-        1. `check_control_plane` — KILL/PAUSE is terminal.
-        2. `check_workflow_budget` — "any budget left?" via /gate.
-        3. `_enforce_sensitive_tool` — per-tool policy (no-op if not
-                                      marked sensitive).
+            1. `check_control_plane` — KILL/PAUSE is terminal.
+            2. `check_workflow_budget` — "any budget left?" via /gate.
+            3. `_enforce_sensitive_tool` — per-tool policy (no-op if not
+                                          marked sensitive).
 
-    Each gate has its own fail-OPEN/CLOSED policy declared in
-    `runtime.py`; see ADR-008 Rule 5 for the full table. `span_end`
-    is emitted on every path (including KILL/PAUSE) so the dashboard
-    can render the kill with span context.
+        Each gate has its own fail-OPEN/CLOSED policy declared in
+        `runtime.py`; see ADR-008 Rule 5 for the full table. `span_end`
+        is emitted on every path (including KILL/PAUSE) so the dashboard
+        can render the kill with span context.
 
-    `fn` may be omitted to return the decorator itself (the standard
-    `@decorator` vs `@decorator ` shape), so this works for both:
+        `fn` may be omitted to return the decorator itself (the standard
+        `@decorator` vs `@decorator ` shape), so this works for both:
 
-        @nullrun.protect
-        def f:...
+            @nullrun.protect
+            def f:...
 
-        @nullrun.protect 
-        def g:...
+            @nullrun.protect
+            def g:...
     """
     if fn is None:
         # `@nullrun.protect ` with empty parens — return the decorator
@@ -691,8 +691,7 @@ def _enforce_sensitive_tool(
             err = NullRunBlockedException(
                 workflow_id=workflow_id,
                 reason=(
-                    f"failed to extract business_impact for sensitive "
-                    f"tool {fn.__name__!r}: {exc}"
+                    f"failed to extract business_impact for sensitive tool {fn.__name__!r}: {exc}"
                 ),
                 tool_name=fn.__name__,
                 error_code="NR-B003",
@@ -976,10 +975,12 @@ def sensitive(
     # gate can find the extractor via a single ``getattr`` on
     # the bare function — no chain walk needed at gate time.
     if fn is None:
+
         def _attach_decorator(_fn: F) -> F:
             if impact is not None:
                 _stamp_extractor_on_innermost(_fn, impact)
             return _do_sensitive_register(_fn)
+
         return _attach_decorator  # type: ignore[return-value]
 
     # Bare form: @sensitive.
@@ -1074,6 +1075,7 @@ def reset() -> None:
     # reads through the registry, so the next `@protect` call
     # sees no active runtime and falls back to get_instance().
     from nullrun._registry import get_registry
+
     get_registry().clear()
     logger.info("NullRun runtime reset")
 

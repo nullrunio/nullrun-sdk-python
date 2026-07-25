@@ -50,6 +50,13 @@ class _RecordingRuntime:
     def track_event(self, event_type: str, **kwargs) -> None:
         self.events.append({"type": event_type, **kwargs})
 
+    def track_tool(self, tool_name: str, **kwargs) -> None:
+        # Commit 33d2b5f wires ``@protect`` to emit a tools/track_tool event
+        # after the wrapped body returns. The stub captures that emit the
+        # same way it captures span_start/span_end so the dashboard-level
+        # assertions keep working unchanged.
+        self.events.append({"type": "tool_call", "tool_name": tool_name, **kwargs})
+
     def check_control_plane(self, workflow_id) -> None:  # noqa: ARG002
         return None
 
