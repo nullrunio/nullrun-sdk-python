@@ -95,21 +95,12 @@ class MoneyImpact:
         backend's `MoneyImpact::validate()` mirrors these checks.
         """
         if self.direction not in (OUTFLOW, INFLOW):
-            raise ValueError(
-                f"direction must be {OUTFLOW!r} or {INFLOW!r}, "
-                f"got {self.direction!r}"
-            )
-        if not isinstance(self.amount_minor, int) or isinstance(
-            self.amount_minor, bool
-        ):
+            raise ValueError(f"direction must be {OUTFLOW!r} or {INFLOW!r}, got {self.direction!r}")
+        if not isinstance(self.amount_minor, int) or isinstance(self.amount_minor, bool):
             # bool is a subclass of int in Python — explicit exclude.
-            raise ValueError(
-                f"amount_minor must be int, got {type(self.amount_minor).__name__}"
-            )
+            raise ValueError(f"amount_minor must be int, got {type(self.amount_minor).__name__}")
         if self.amount_minor < 0:
-            raise ValueError(
-                f"amount_minor must be non-negative, got {self.amount_minor}"
-            )
+            raise ValueError(f"amount_minor must be non-negative, got {self.amount_minor}")
         if (
             not isinstance(self.currency, str)
             or len(self.currency) != 3
@@ -117,8 +108,7 @@ class MoneyImpact:
             or not self.currency.isupper()
         ):
             raise ValueError(
-                f"currency must be a 3-letter uppercase ISO-4217 code, "
-                f"got {self.currency!r}"
+                f"currency must be a 3-letter uppercase ISO-4217 code, got {self.currency!r}"
             )
 
     def to_wire_dict(self) -> dict[str, Any]:
@@ -187,16 +177,12 @@ class ToolCallParams:
         if not isinstance(self.tool_name, str) or not self.tool_name:
             raise ValueError("tool_name must be a non-empty string")
         if len(self.tool_name) > 128:
-            raise ValueError(
-                f"tool_name length {len(self.tool_name)} exceeds max 128"
-            )
+            raise ValueError(f"tool_name length {len(self.tool_name)} exceeds max 128")
         if not self.tool_name.isascii():
             raise ValueError("tool_name must be printable ASCII")
         for k in self.params:
             if not isinstance(k, str):
-                raise ValueError(
-                    f"params key {k!r} must be a string"
-                )
+                raise ValueError(f"params key {k!r} must be a string")
             if len(k) > TOOL_PARAMETERS_MAX_PARAM_NAME:
                 raise ValueError(
                     f"params['{k}'] key length {len(k)} exceeds "

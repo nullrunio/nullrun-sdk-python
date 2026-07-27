@@ -38,8 +38,8 @@ import pytest
 from nullrun._registry import get_registry
 from nullrun.business_impact import (
     KIND_TOOL_CALL,
-    BusinessImpact,
     TOOL_PARAMETERS_MAX_PARAM_NAME,
+    BusinessImpact,
     ToolCallParams,
     compute_action_digest,
 )
@@ -56,7 +56,6 @@ from nullrun.extractor import (
     tool_params,
 )
 from nullrun.runtime import NullRunRuntime
-
 
 # ---------------------------------------------------------------------------
 # Wire payload capture (same pattern as test_sensitive_extractor.py)
@@ -166,6 +165,7 @@ class TestToolParamsExtraction:
         wire under its own name, regardless of how many args the
         function has or what their types are.
         """
+
         def delete_user(user_id: int, force: bool = False) -> None:
             pass
 
@@ -174,9 +174,7 @@ class TestToolParamsExtraction:
         fn._nullrun_extractor = ext
         _register_tool(captured_runtime, fn)
 
-        _enforce_sensitive_tool(
-            captured_runtime, fn, (), {"user_id": 42, "force": True}
-        )
+        _enforce_sensitive_tool(captured_runtime, fn, (), {"user_id": 42, "force": True})
 
         kwargs = captured_payload.last_kwargs
         assert kwargs is not None
@@ -197,6 +195,7 @@ class TestToolParamsExtraction:
         captured; everything else is dropped. The rule param name
         (key) and the function arg name (value) may differ.
         """
+
         def delete_user(uid: int, force: bool = False) -> None:
             pass
 
@@ -225,6 +224,7 @@ class TestToolParamsExtraction:
         no args is still eligible for ToolCall-kind Approval
         Rules.
         """
+
         def list_accounts() -> None:
             pass
 
@@ -254,6 +254,7 @@ class TestToolParamsExtraction:
         ``"***"`` via ``_safe_kwargs`` BEFORE the extractor sees
         them; this test simulates that pre-masked state.
         """
+
         def charge_card(pan: str, amount: int) -> None:
             pass
 
@@ -264,9 +265,7 @@ class TestToolParamsExtraction:
 
         # pan was masked by the decorator's _safe_kwargs layer
         # before reaching the extractor.
-        _enforce_sensitive_tool(
-            captured_runtime, fn, (), {"pan": "***", "amount": 5000}
-        )
+        _enforce_sensitive_tool(captured_runtime, fn, (), {"pan": "***", "amount": 5000})
 
         impact = captured_payload.last_kwargs["business_impact"]
         assert "pan" not in impact["params"], (
@@ -295,6 +294,7 @@ class TestToolParamsExtraction:
         listing only the JSON-safe keys) is documented but
         opt-in: bare ``@sensitive`` drops ``float`` silently.
         """
+
         def set_rate(rate: float, count: int) -> None:
             pass
 
@@ -304,9 +304,7 @@ class TestToolParamsExtraction:
         _register_tool(captured_runtime, fn)
 
         # Must NOT raise: float is filtered, int is captured.
-        _enforce_sensitive_tool(
-            captured_runtime, fn, (), {"rate": 1.5, "count": 7}
-        )
+        _enforce_sensitive_tool(captured_runtime, fn, (), {"rate": 1.5, "count": 7})
 
         impact = captured_payload.last_kwargs["business_impact"]
         assert "rate" not in impact["params"], (
@@ -332,6 +330,7 @@ class TestToolParamsExtraction:
         before calling the tool. Failing the whole call would
         punish the JSON-safe args.
         """
+
         def set_rate(rate: float, count: int) -> None:
             pass
 
@@ -340,9 +339,7 @@ class TestToolParamsExtraction:
         fn._nullrun_extractor = ext
         _register_tool(captured_runtime, fn)
 
-        _enforce_sensitive_tool(
-            captured_runtime, fn, (), {"rate": 1.5, "count": 7}
-        )
+        _enforce_sensitive_tool(captured_runtime, fn, (), {"rate": 1.5, "count": 7})
 
         impact = captured_payload.last_kwargs["business_impact"]
         # rate was filtered; count survived.
@@ -357,6 +354,7 @@ class TestToolParamsExtraction:
         digest-bound approval row rejects every legitimate
         post-approval re-check.
         """
+
         def delete_user(user_id: int, force: bool = False) -> None:
             pass
 
@@ -365,9 +363,7 @@ class TestToolParamsExtraction:
         fn._nullrun_extractor = ext
         _register_tool(captured_runtime, fn)
 
-        _enforce_sensitive_tool(
-            captured_runtime, fn, (), {"user_id": 42, "force": True}
-        )
+        _enforce_sensitive_tool(captured_runtime, fn, (), {"user_id": 42, "force": True})
 
         kwargs = captured_payload.last_kwargs
         impact = BusinessImpact.tool_call(
@@ -402,6 +398,7 @@ class TestAutoAttachOnBareSensitive:
         and the wire payload carries ``kind: tool_call`` with
         all kwargs as ``params``.
         """
+
         def delete_user(user_id: int, force: bool = False) -> None:
             pass
 
@@ -414,16 +411,13 @@ class TestAutoAttachOnBareSensitive:
 
         ext = getattr(delete_user, "_nullrun_extractor")
         assert isinstance(ext, ToolParamsExtractor), (
-            f"bare @sensitive should auto-attach ToolParamsExtractor, "
-            f"got {type(ext).__name__}"
+            f"bare @sensitive should auto-attach ToolParamsExtractor, got {type(ext).__name__}"
         )
         assert ext.include_all is True
         assert ext.param_extractors is None
 
         # Verify the wire payload uses the auto-attached extractor.
-        _enforce_sensitive_tool(
-            captured_runtime, delete_user, (), {"user_id": 42, "force": True}
-        )
+        _enforce_sensitive_tool(captured_runtime, delete_user, (), {"user_id": 42, "force": True})
         impact = captured_payload.last_kwargs["business_impact"]
         assert impact["kind"] == KIND_TOOL_CALL
         assert impact["params"] == {"user_id": 42, "force": True}
@@ -436,6 +430,7 @@ class TestAutoAttachOnBareSensitive:
         MUST NOT overwrite the explicit extractor with the
         default ``ToolParamsExtractor``. Money semantics win.
         """
+
         def refund_customer(amount_cents: int, customer_id: str = "c-1") -> None:
             pass
 
@@ -458,9 +453,7 @@ class TestAutoAttachOnBareSensitive:
         assert isinstance(ext, MoneyImpactExtractor)
 
         # Verify the wire payload still uses money semantics.
-        _enforce_sensitive_tool(
-            captured_runtime, refund_customer, (5000,), {"customer_id": "c-1"}
-        )
+        _enforce_sensitive_tool(captured_runtime, refund_customer, (5000,), {"customer_id": "c-1"})
         impact = captured_payload.last_kwargs["business_impact"]
         assert impact["kind"] == "money"
         assert impact["amount_minor"] == 5000
@@ -509,9 +502,7 @@ class TestToolCallParamsShape:
 
     def test_validate_rejects_overlong_param_name(self) -> None:
         long_key = "x" * (TOOL_PARAMETERS_MAX_PARAM_NAME + 1)
-        p = ToolCallParams(
-            tool_name="x", params={long_key: 1}
-        )
+        p = ToolCallParams(tool_name="x", params={long_key: 1})
         with pytest.raises(ValueError) as exc_info:
             p.validate()
         assert "key length" in str(exc_info.value)
@@ -550,9 +541,7 @@ class TestToolCallParamsShape:
         assert m.kind == "money"
         assert m.to_wire_dict()["kind"] == "money"
 
-        t = BusinessImpact.tool_call(
-            tool_name="x", params={"y": 1}
-        )
+        t = BusinessImpact.tool_call(tool_name="x", params={"y": 1})
         assert t.kind == KIND_TOOL_CALL
         assert t.to_wire_dict()["kind"] == KIND_TOOL_CALL
 
@@ -590,6 +579,7 @@ class TestAutoAttachChainWalk:
         """Bare ``@sensitive`` (no impact=...) walks the chain
         and finds NO extractor, so auto-attach stamps the default.
         """
+
         def tool_fn(user_id: int) -> None:
             pass
 
@@ -616,6 +606,7 @@ class TestAutoAttachChainWalk:
         "_nullrun_extractor", None)`` returned None even though
         the bare function carried the attribute.
         """
+
         def tool_fn(force: bool) -> None:
             pass
 
@@ -646,6 +637,7 @@ class TestAutoAttachChainWalk:
         money variant must NOT be overwritten by the Tier 2
         auto-attach).
         """
+
         def tool_fn(amount_cents: int) -> None:
             pass
 
@@ -668,6 +660,7 @@ class TestAutoAttachChainWalk:
         3-call cycle and verify the walk returns None within
         the bounded hop count.
         """
+
         # Build a self-referential __wrapped__ cycle.
         class Cycle:
             def __init__(self) -> None:

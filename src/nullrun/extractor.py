@@ -440,9 +440,7 @@ def business_cap_minor(currency: str) -> int:
     return _BUSINESS_CAP_MINOR[normalize_currency(currency)]
 
 
-def _decimal_has_more_fractional_digits(
-    value: Decimal, allowed: int
-) -> bool:
+def _decimal_has_more_fractional_digits(value: Decimal, allowed: int) -> bool:
     """Return True iff ``value`` has more fractional digits than
     ``allowed``.
 
@@ -493,9 +491,7 @@ def _check_overflow(amount_minor: int, currency: str) -> None:
         )
 
 
-def _check_business_cap(
-    amount_minor: int, currency: str, enforce: bool
-) -> None:
+def _check_business_cap(amount_minor: int, currency: str, enforce: bool) -> None:
     """Raise ``InvalidMoneyAmountError`` if ``amount_minor``
     exceeds the per-currency business cap.
 
@@ -522,7 +518,9 @@ def _check_business_cap(
 
 
 def _to_minor_units(
-    value: int | Decimal, units: str, currency: str,
+    value: int | Decimal,
+    units: str,
+    currency: str,
     enforce_business_cap: bool = True,
 ) -> int:
     """Convert a Decimal-or-int value to integer minor units.
@@ -601,9 +599,7 @@ def _to_minor_units(
         _check_business_cap(converted, currency, enforce_business_cap)
         return converted
 
-    raise ValueError(
-        f"unknown units={units!r}; expected one of: {UNITS}"
-    )
+    raise ValueError(f"unknown units={units!r}; expected one of: {UNITS}")
 
 
 class MoneyImpactExtractor:
@@ -645,14 +641,9 @@ class MoneyImpactExtractor:
         enforce_business_cap: bool = True,
     ) -> None:
         if direction not in (OUTFLOW, INFLOW):
-            raise ValueError(
-                f"direction must be {OUTFLOW!r} or {INFLOW!r}, "
-                f"got {direction!r}"
-            )
+            raise ValueError(f"direction must be {OUTFLOW!r} or {INFLOW!r}, got {direction!r}")
         if units not in UNITS:
-            raise ValueError(
-                f"units must be one of {UNITS}, got {units!r}"
-            )
+            raise ValueError(f"units must be one of {UNITS}, got {units!r}")
         # ``normalize_currency`` raises ``InvalidCurrencyError``
         # if the input is not a 3-letter uppercase ISO-4217
         # code in the whitelist. The constructor fails-CLOSED:
@@ -868,8 +859,7 @@ class ToolParamsExtractor:
             # almost certainly a typo -- fail-CLOSED at decorator-
             # application time rather than silently dropping rules.
             raise ValueError(
-                "ToolParamsExtractor: param_extractors and "
-                "include_all=False are mutually exclusive"
+                "ToolParamsExtractor: param_extractors and include_all=False are mutually exclusive"
             )
         self.param_extractors = param_extractors
         self.include_all = include_all
@@ -1045,4 +1035,5 @@ def compute_impact_digest(impact: BusinessImpact) -> str:
 
 def gc_get_objects() -> list[Any]:
     import gc
+
     return gc.get_objects()

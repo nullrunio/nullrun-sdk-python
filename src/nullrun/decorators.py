@@ -704,32 +704,32 @@ def _enforce_sensitive_tool(
             # (or the include_all flag if no map was supplied).
             if isinstance(extractor, MoneyImpactExtractor):
                 hint = (
-                    f"could not extract a MoneyImpact from the live "
-                    f"arguments. Check that the function declares the "
-                    f"argument named in `impact=money_outflow(...)`."
+                    "could not extract a MoneyImpact from the live "
+                    "arguments. Check that the function declares the "
+                    "argument named in `impact=money_outflow(...)`."
                 )
             elif isinstance(extractor, ToolParamsExtractor):
                 if extractor.param_extractors is not None:
                     hint = (
-                        f"could not extract a ToolCall impact from the "
-                        f"live arguments. Check that the function "
-                        f"declares every arg named in "
-                        f"`impact=tool_params(...)`."
+                        "could not extract a ToolCall impact from the "
+                        "live arguments. Check that the function "
+                        "declares every arg named in "
+                        "`impact=tool_params(...)`."
                     )
                 else:
                     hint = (
-                        f"could not extract a ToolCall impact from the "
-                        f"live arguments. The @sensitive tool's kwargs "
-                        f"could not be validated for wire emission "
-                        f"(unsupported types or invalid param keys)."
+                        "could not extract a ToolCall impact from the "
+                        "live arguments. The @sensitive tool's kwargs "
+                        "could not be validated for wire emission "
+                        "(unsupported types or invalid param keys)."
                     )
             else:
                 # Defensive fallback for a future extractor type
                 # that doesn't update this hint.
                 hint = (
-                    f"could not extract business_impact from the live "
-                    f"arguments. Check the @sensitive decorator's "
-                    f"`impact=...` argument."
+                    "could not extract business_impact from the live "
+                    "arguments. Check the @sensitive decorator's "
+                    "`impact=...` argument."
                 )
             err = NullRunBlockedException(
                 workflow_id=workflow_id,
@@ -738,10 +738,7 @@ def _enforce_sensitive_tool(
                 ),
                 tool_name=fn.__name__,
                 error_code="NR-B003",
-                user_action=(
-                    f"The @sensitive decorator on {fn.__name__!r} "
-                    f"{hint}"
-                ),
+                user_action=(f"The @sensitive decorator on {fn.__name__!r} {hint}"),
             )
             runtime._emit_sdk_error(
                 err,

@@ -180,9 +180,7 @@ class TestBusinessImpactWireDict:
 # ---------------------------------------------------------------------------
 
 
-def _refund_customer_func(
-    amount_cents: int, customer_id: str = "c-1"
-) -> dict:
+def _refund_customer_func(amount_cents: int, customer_id: str = "c-1") -> dict:
     """Stand-in for a user-decorated tool. Mirrors the shape of
     ``refund_customer(amount_cents=..., customer_id=...)`` that
     ``test_approval_money_flow.py::TestExtractor`` exercises."""
@@ -311,10 +309,7 @@ class TestToolCallActionDigestPins:
             "stripe.charge",
             {"region": "EU", "amount": 500},
         )
-        assert (
-            compute_action_digest(impact)
-            == GOLDEN_HEX_TOOL_CALL_STRIPE_CHARGE_500
-        ), (
+        assert compute_action_digest(impact) == GOLDEN_HEX_TOOL_CALL_STRIPE_CHARGE_500, (
             "ToolCall digest drifted from the Rust golden pin; SDK "
             "and backend disagree on the same payload. See "
             "docs/runbooks/action-digest-contract.md BEFORE bumping "
