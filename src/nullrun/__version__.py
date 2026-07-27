@@ -1,6 +1,7 @@
 """NullRun Platform SDK.
 
-v3.29 / 0.14.1 (2026-07-24) — Decimal JSON serialization patch.
+v3.30 / 0.14.4 (2026-07-27) — ToolParameters Approval Rules
+wire contract (Tier 2 / Разрыв 2 follow-up).
 
 Pre-fix 0.14.0, a ``track_tool`` event payload containing a
 ``Decimal`` (e.g. ``refund_amount`` from a
@@ -1017,5 +1018,5 @@ Recommended upgrade path: 0.13.4 -> 0.13.5.
 
 """
 
-__version__ = "0.13.11"
+__version__ = "0.14.4"
 __platform_version__ = "1.0.0"

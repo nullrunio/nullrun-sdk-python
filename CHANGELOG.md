@@ -7,6 +7,43 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [0.14.4] - 2026-07-27
+
+ToolParameters Approval Rules wire contract (Tier 2 / Разрыв 2 follow-up). The backend already accepted `BusinessImpact::ToolCall(ToolCallParams)` on the `/execute` wire (backend commit `1e501cd6`); 0.14.4 lands the SDK-side path so users get ToolParameters rules by default on every bare `@sensitive` function, with no decorator change. Also fixes a silent regression in the auto-attach path that dropped an explicit `impact=tool_params({...})` map, and pins the cross-language `ToolCall` action digest against the Rust backend's golden hex. No on-wire breaking change for money callers; the only behavioural change is that bare `@sensitive` now ships `kind=tool_call` on the wire where it previously shipped nothing.
+
+### Added
+
+- **`BusinessImpact.tool_call(tool_name, params)`** factory — `business_impact.py:323` new factory builds a `BusinessImpact(kind='tool_call', tool_name=..., params=...)` envelope by analogy with the legacy `BusinessImpact` money constructor. Mirrors the backend `BusinessImpact::ToolCall(ToolCallParams)` variant (`backend/src/proxy/gate/business_impact.rs:62-307`). Used internally by `ToolParamsExtractor`; exposed publicly so users can hand-build impacts without importing the dataclass.
+- **`ToolCallParams` dataclass** — `business_impact.py:143` mirrors the backend struct (`tool_name` ≤ 128 bytes, `param_name` ≤ 64, JSON-roundtrippable values only). `BusinessImpact.kind` now discriminates `Money` | `ToolCall`; existing money callers continue to discriminate on the same field via the `extractor_*` metadata.
+- **`ToolParamsExtractor` + `tool_params(...)` factory** — `extractor.py:815` (class) and the matching factory. Three modes: explicit `{rule_param: arg_name}` map, `include_all=True` (default — every kwarg captured), or `include_all=False` with no map (empty). PII-masked sentinels (`"***"`) and JSON-unsafe values (`float`, custom objects) are filtered before the wire. The factory is the analogue of `MoneyImpactExtractor + money_outflow(...)`.
+- **Bare `@sensitive` now ships ToolParameters on the wire** — `decorators.py:1096` (`_do_sensitive_register`) auto-attaches a default `ToolParamsExtractor(include_all=True)` on a bare `@sensitive` decorator. The stamp goes through `_stamp_extractor_on_innermost` so the bare function (the one `@protect` captures as `fn`) carries the attribute, not just the `@protect` wrapper. An explicit `@sensitive(impact=money_outflow(...))` or `@sensitive(impact=tool_params({...}))` wins — the auto-attach only fires when no extractor is present.
+- **`@sensitive(impact=tool_params({...}))` decorator form** — `decorators.py:1065` new docstring + `decorators.py:711` dispatch branch. Operators writing ToolParameters Approval Rules on the backend can now declare the per-rule param map directly at the decorator site instead of relying on the auto-attach default.
+
+### Fixed
+
+- **Auto-attach chain walk preserves an explicit `impact=tool_params({...})` map** — `decorators.py:43` new helper `_find_extractor_in_chain` walks `__wrapped__` (bounded at 32 hops) so the auto-attach check sees the explicit extractor stamped on the bare function instead of falling through to the default. **Before this fix**, `@sensitive(impact=tool_params({"delete_force": "force"})) @protect def delete_user(force, user_id): ...` silently shipped `{force: <bool>, user_id: <int>}` (the auto-attach default) instead of the explicit `{delete_force: <bool>}` map. **After this fix**, the renamed key reaches the wire. Regression tests in `TestAutoAttachChainWalk` (4 cases): bare auto-attach, explicit tool_params map preserved, explicit money_outflow preserved, circular-`__wrapped__` defensive bounded walk.
+- **`_enforce_sensitive_tool` dispatch handles both extractor types** — `decorators.py:677` (success path) and `decorators.py:711` (error path) now branch by extractor type. NR-B003 error hint text branches too — operators writing ToolParameters rules see "did you mean `impact=tool_params(...)`?" while money operators see the money remediation advice.
+- **Bare `@sensitive` regression in the existing `tests/test_sensitive_extractor.py`** — the 5 existing tests still pass because they register the tool manually via `rt.add_sensitive_tool(name)`, which bypasses the decorator auto-attach path. Documented as a deliberate carve-out: only `@sensitive` (the decorator form) auto-attaches.
+
+### Tests
+
+- `tests/test_tool_params_extractor.py` — **23 new tests** across 5 classes (`TestToolParamsFactory`, `TestToolParamsExtraction`, `TestAutoAttachOnBareSensitive`, `TestToolCallParamsShape`, `TestAutoAttachChainWalk`). Covers factory shape (3), three extraction modes (4), PII sentinel + float filtering (3), action digest byte-identity with the backend's canonical JSON (1), the auto-attach wiring (2), dataclass validator (7), kind dispatch (1), and the chain-walk regression (4). Verified: 23/23 pass.
+- `tests/test_business_impact.py::TestToolCallActionDigestPins` — **5 new tests** cross-language parity for the `ToolCall` impact, pinned to the same hex literal the Rust backend pins in `backend/src/proxy/gate/business_impact.rs::tests::tool_call_digest_golden_value_stripe_charge_500`. A drift on either side trips the test on the other side next time the suite runs. Fixture payload: `tool_call("stripe.charge", {"region": "EU", "amount": 500})` → `9975a8b75a436fb78b9d141b9e0c0a90838c1243d78119b304ae6ed0526966a6`.
+- `tests/test_sensitive_extractor.py` — 5/5 pass (regression check, the auto-attach wiring is additive on top of 0.14.1).
+- `tests/test_business_impact.py` — full class passes (28/28 including the 5 new parity pins).
+- `tests/test_extractors.py` — 35/35 pass.
+- `tests/test_protect.py + test_protect_branches.py + test_execute_approval_flow.py + test_approval_money_flow.py + test_gate_real_path.py + test_handle.py` — 99/99 pass.
+- `tests/test_runtime.py + test_runtime_branches.py + test_init_contract.py` — 70/70 pass (1 skipped, pre-existing).
+
+### Compatibility
+
+- **Default SDK behaviour for bare `@sensitive` CHANGED** — was `no business_impact on wire`, now `kind=tool_call on wire`. Operators who relied on the Phase 0 path (approval_id-only grant consume) must either pass `@sensitive(impact=tool_params(include_all=False))` explicitly, or accept the new ToolParameters wire shape. The change is additive on the SDK side; legacy backends ignore `kind=tool_call` and fall through to a no-op.
+- **Existing `@sensitive(impact=money_outflow(...))` callers are unaffected** — the explicit extractor wins over the auto-attach (verified by `test_explicit_money_outflow_chain_walk_preserved`).
+- **Legacy "no impact extractor" call sites (registered via `rt.add_sensitive_tool(name)` directly) are unaffected** — the auto-attach is only wired through `_do_sensitive_register`, which only the `@sensitive` decorator calls.
+- **No SDK_MIN_VERSION bump.** ToolParameters is an opt-in backend feature; SDK 0.14.4 talking to a backend that has the `BusinessImpact::ToolCall` variant (commit `1e501cd6` and later) is the supported path. SDK 0.14.4 talking to an older backend works but the `kind=tool_call` envelope is ignored — same effective behaviour as 0.14.3 minus the wire bytes.
+
+---
+
 ## [0.14.2] - 2026-07-24
 
 Three hotfixes that fell out of the 0.14.1 demo run. Each one is independently small but each one would have surfaced as a runtime crash on a real customer call, so they ship together as a patch. No on-wire breaking change. No SDK_MIN_VERSION bump. Backends on `1.0.0` keep working unchanged.

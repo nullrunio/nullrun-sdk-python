@@ -674,9 +674,19 @@ def _enforce_sensitive_tool(
     if extractor is not None:
         try:
             from nullrun.business_impact import compute_action_digest
-            from nullrun.extractor import MoneyImpactExtractor
+            from nullrun.extractor import MoneyImpactExtractor, ToolParamsExtractor
 
             if isinstance(extractor, MoneyImpactExtractor):
+                impact = extractor.impact_for(fn, args, kwargs)
+                business_impact_dict = impact.to_wire_dict()
+                action_digest_hex = compute_action_digest(impact)
+            elif isinstance(extractor, ToolParamsExtractor):
+                # Phase 1 / MVP 1.1 (Tier 2): free-form tool-call
+                # argument bag, matched against ToolParameters
+                # Approval Rules on the backend. Same wire envelope
+                # (BusinessImpact) and same digest contract as the
+                # Money variant -- only the discriminator and the
+                # ``params`` field differ.
                 impact = extractor.impact_for(fn, args, kwargs)
                 business_impact_dict = impact.to_wire_dict()
                 action_digest_hex = compute_action_digest(impact)
@@ -688,6 +698,39 @@ def _enforce_sensitive_tool(
             )
 
             workflow_id = get_workflow_id() or UNKNOWN_WORKFLOW_ID
+            # The user-facing hint depends on which extractor fired.
+            # Money extractor wants the bound arg name; ToolParams
+            # extractor wants the rule-param -> arg-name mapping
+            # (or the include_all flag if no map was supplied).
+            if isinstance(extractor, MoneyImpactExtractor):
+                hint = (
+                    "could not extract a MoneyImpact from the live "
+                    "arguments. Check that the function declares the "
+                    "argument named in `impact=money_outflow(...)`."
+                )
+            elif isinstance(extractor, ToolParamsExtractor):
+                if extractor.param_extractors is not None:
+                    hint = (
+                        "could not extract a ToolCall impact from the "
+                        "live arguments. Check that the function "
+                        "declares every arg named in "
+                        "`impact=tool_params(...)`."
+                    )
+                else:
+                    hint = (
+                        "could not extract a ToolCall impact from the "
+                        "live arguments. The @sensitive tool's kwargs "
+                        "could not be validated for wire emission "
+                        "(unsupported types or invalid param keys)."
+                    )
+            else:
+                # Defensive fallback for a future extractor type
+                # that doesn't update this hint.
+                hint = (
+                    "could not extract business_impact from the live "
+                    "arguments. Check the @sensitive decorator's "
+                    "`impact=...` argument."
+                )
             err = NullRunBlockedException(
                 workflow_id=workflow_id,
                 reason=(
@@ -695,12 +738,7 @@ def _enforce_sensitive_tool(
                 ),
                 tool_name=fn.__name__,
                 error_code="NR-B003",
-                user_action=(
-                    f"The @sensitive decorator on {fn.__name__!r} "
-                    f"could not extract a MoneyImpact from the live "
-                    f"arguments. Check that the function declares the "
-                    f"argument named in `impact=money_outflow(...)`."
-                ),
+                user_action=(f"The @sensitive decorator on {fn.__name__!r} {hint}"),
             )
             runtime._emit_sdk_error(
                 err,
@@ -1017,7 +1055,84 @@ def _stamp_extractor_on_innermost(fn: F, impact: Any) -> None:
     setattr(fn, "_nullrun_extractor", impact)  # noqa: B010
 
 
+def _find_extractor_in_chain(fn: Any) -> Any:
+    """Walk ``fn.__wrapped__`` looking for a stamped extractor.
+
+    Used by ``_do_sensitive_register`` to detect an explicit
+    ``impact=tool_params({...})`` (or ``impact=money_outflow(...)``)
+    that was already stamped on the bare function by the
+    ``@sensitive`` factory form. Without the chain walk the
+    auto-attach path would see ``None`` on the @protect wrapper
+    and silently stamp its default ToolParamsExtractor on top,
+    breaking the user's explicit map.
+
+    Returns the extractor object (the actual ``_nullrun_extractor``
+    value) or ``None`` if no extractor is found on the chain.
+    The chain walk is bounded to ``len(repr(callable))`` hops to
+    defend against pathological ``__wrapped__`` cycles; in practice
+    the chain is at most 3 deep (@sensitive factory + @protect +
+    functools.wraps chain from @protect).
+    """
+    seen: set[int] = set()
+    current: Any = fn
+    # Bound the walk: a decorator chain longer than this is almost
+    # certainly a cycle. The cap is generous (the real chain is
+    # typically 2-3 deep).
+    for _ in range(32):
+        if current is None or id(current) in seen:
+            return None
+        seen.add(id(current))
+        ext = getattr(current, "_nullrun_extractor", None)
+        if ext is not None:
+            return ext
+        current = getattr(current, "__wrapped__", None)
+    return None
+
+
 def _do_sensitive_register(fn: F) -> F:
+    # Phase 1 / MVP 1.1 (Tier 2 -- ToolParameters): if @sensitive
+    # was applied bare (no impact=...), auto-attach a default
+    # ``ToolParamsExtractor(include_all=True)`` so the tool is
+    # immediately eligible for ToolParameters Approval Rules
+    # without requiring every user to write
+    # ``@sensitive(impact=tool_params())`` explicitly.
+    #
+    # The existing money extractor (set via
+    # ``@sensitive(impact=money_outflow(...))``) wins because the
+    # ``@sensitive`` decorator stamps the explicit extractor
+    # BEFORE calling this function; we only auto-attach when no
+    # extractor is present. See ``sensitive()`` factory form
+    # (lines ~979) where ``_attach_decorator`` runs first and may
+    # have already set ``_nullrun_extractor``.
+    #
+    # The auto-attach uses ``_stamp_extractor_on_innermost`` so the
+    # attribute lands on the bare user function -- the @protect
+    # wrapper captures the bare function as ``fn`` and the
+    # ``_enforce_sensitive_tool`` guard finds the extractor via a
+    # single ``getattr`` lookup. See the 2026-07-24 root-cause
+    # fix (line 1024 onward) for the rationale.
+    try:
+        from nullrun.extractor import ToolParamsExtractor, tool_params
+
+        # Walk the __wrapped__ chain in case the explicit extractor
+        # was stamped on the bare function (by
+        # ``_stamp_extractor_on_innermost``) and we received the
+        # @protect-wrapped outer function as ``fn``. Without the
+        # chain walk, the auto-attach would silently overwrite
+        # the explicit extractor and break the user's
+        # ``impact=tool_params({...})`` map.
+        if _find_extractor_in_chain(fn) is None:
+            _stamp_extractor_on_innermost(fn, tool_params(include_all=True))
+    except ImportError:
+        # The extractor module is loaded above us on every path
+        # we care about; this ImportError guard is defensive in
+        # case the SDK is shrunk (e.g. for a hypothetical
+        # tool-only build). Falling back to legacy Phase 0 path
+        # is the safe default -- the wire payload drops the
+        # business_impact field and the backend uses approval_id-
+        # only grant consume.
+        pass
+
     try:
         # Use the same slot the @protect wrapper uses so the
         # registration lands on the same runtime instance the

@@ -49,10 +49,20 @@ GTE = "gte"
 EQ = "eq"
 
 
-# MVP: only `money` kind is supported; the discriminated union is
-# shaped forward-compat for record_count / resource_quantity etc.
-# when they land in MVPs 1.1+.
+# MVP 1.0: `money` kind for per-call flat amounts.
+# MVP 1.1 (ToolParameters / Phase 1 / Tier 2): `tool_call` kind
+# for free-form tool-call argument bags matched against
+# ToolParameters Approval Rules on the backend.
 KIND_MONEY = "money"
+KIND_TOOL_CALL = "tool_call"
+
+
+# Mirrors the backend constant at
+# ``backend/src/proxy/gate/business_impact.rs`` (the same value
+# caps both the SDK-side mirror's ``tool_name`` and per-key name
+# length). Kept in sync manually; a backend-side bump is a one-line
+# edit here.
+TOOL_PARAMETERS_MAX_PARAM_NAME = 64
 
 
 @dataclass
@@ -85,21 +95,12 @@ class MoneyImpact:
         backend's `MoneyImpact::validate()` mirrors these checks.
         """
         if self.direction not in (OUTFLOW, INFLOW):
-            raise ValueError(
-                f"direction must be {OUTFLOW!r} or {INFLOW!r}, "
-                f"got {self.direction!r}"
-            )
-        if not isinstance(self.amount_minor, int) or isinstance(
-            self.amount_minor, bool
-        ):
+            raise ValueError(f"direction must be {OUTFLOW!r} or {INFLOW!r}, got {self.direction!r}")
+        if not isinstance(self.amount_minor, int) or isinstance(self.amount_minor, bool):
             # bool is a subclass of int in Python — explicit exclude.
-            raise ValueError(
-                f"amount_minor must be int, got {type(self.amount_minor).__name__}"
-            )
+            raise ValueError(f"amount_minor must be int, got {type(self.amount_minor).__name__}")
         if self.amount_minor < 0:
-            raise ValueError(
-                f"amount_minor must be non-negative, got {self.amount_minor}"
-            )
+            raise ValueError(f"amount_minor must be non-negative, got {self.amount_minor}")
         if (
             not isinstance(self.currency, str)
             or len(self.currency) != 3
@@ -107,8 +108,7 @@ class MoneyImpact:
             or not self.currency.isupper()
         ):
             raise ValueError(
-                f"currency must be a 3-letter uppercase ISO-4217 code, "
-                f"got {self.currency!r}"
+                f"currency must be a 3-letter uppercase ISO-4217 code, got {self.currency!r}"
             )
 
     def to_wire_dict(self) -> dict[str, Any]:
@@ -129,6 +129,125 @@ class MoneyImpact:
         }
 
 
+@dataclass
+class ToolCallParams:
+    """Free-form tool-call argument bag (Phase 1 / Tier 2 wire shape).
+
+    Mirrors the backend ``BusinessImpact::ToolCall(ToolCallParams)``
+    variant at ``backend/src/proxy/gate/business_impact.rs:62-307``.
+    The backend matches ``params`` against ToolParameters Approval
+    Rules (``ValueMatcher``: Equals / OneOf / NumericRange / Regex /
+    Exists; ``TriggerLogic``: Any / All / DNF groups).
+
+    Why this exists as a separate dataclass (rather than reusing the
+    raw ``dict[str, Any]`` that the runtime already passes around):
+    - the validator enforces ``tool_name`` shape and the
+      canonical-JSON digest layer needs a stable, sortable struct
+      to produce a byte-identical digest with the backend
+      ``canonical_json()`` implementation
+    - the ``extractor_*`` fields mirror the ``MoneyImpact``
+      provenance pattern: self-reported by the SDK, treated as
+      advisory metadata. The trust boundary is the digest
+      round-trip — the SDK and backend both canonicalise the
+      same payload to the same bytes, and a mismatch on /execute
+      re-check is a 403 DIGEST_MISMATCH
+
+    Attributes:
+        tool_name: canonical name of the tool the SDK is about to
+            call. Must be non-empty and <= 128 bytes.
+        params: free-form argument bag the operator wrote the rule
+            against. Keyed by the rule's ``param_name`` field.
+        extractor_id: self-reported SDK extractor id (e.g.
+            "nullrun.tool_call.path").
+        extractor_version: self-reported version.
+    """
+
+    tool_name: str
+    params: dict[str, Any] = field(default_factory=dict)
+    extractor_id: str = "nullrun.tool_call.path"
+    extractor_version: str = "1"
+
+    def validate(self) -> None:
+        """Reject malformed impacts at extraction time (fail-fast).
+
+        Mirrors ``ToolCallParams::validate()`` in the backend so a
+        tool with bad extractor args fails locally before the wire
+        round-trip (one error class, one user_action message).
+        """
+        if not isinstance(self.tool_name, str) or not self.tool_name:
+            raise ValueError("tool_name must be a non-empty string")
+        if len(self.tool_name) > 128:
+            raise ValueError(f"tool_name length {len(self.tool_name)} exceeds max 128")
+        if not self.tool_name.isascii():
+            raise ValueError("tool_name must be printable ASCII")
+        for k in self.params:
+            if not isinstance(k, str):
+                raise ValueError(f"params key {k!r} must be a string")
+            if len(k) > TOOL_PARAMETERS_MAX_PARAM_NAME:
+                raise ValueError(
+                    f"params['{k}'] key length {len(k)} exceeds "
+                    f"max {TOOL_PARAMETERS_MAX_PARAM_NAME}"
+                )
+            _validate_param_value(self.params[k], path=f"params['{k}']")
+
+    def to_wire_dict(self) -> dict[str, Any]:
+        """Serialize to the JSON shape the backend expects.
+
+        Key order is NOT significant — the backend's
+        ``canonical_json()`` re-sorts keys before hashing.
+        """
+        return {
+            "kind": KIND_TOOL_CALL,
+            "tool_name": self.tool_name,
+            "params": dict(self.params),
+            "extractor_id": self.extractor_id,
+            "extractor_version": self.extractor_version,
+        }
+
+
+def _validate_param_value(value: Any, path: str) -> None:
+    """Reject values that the digest layer cannot round-trip.
+
+    Backend mirror at ``business_impact.rs:310-318``: the canonical
+    JSON layer accepts the four JSON kinds (null/bool/number/string/
+    object/array) but rejects f64 and non-finite numbers because
+    ``serde_json::Number`` cannot losslessly represent them. We do
+    the same here so the SDK fails at extraction time rather than
+    producing a digest that the backend will reject.
+    """
+    if value is None or isinstance(value, bool):
+        return
+    if isinstance(value, int):
+        # int round-trips through JSON losslessly. NOTE: bool is a
+        # subclass of int in Python; we explicitly handle it above.
+        return
+    if isinstance(value, str):
+        return
+    if isinstance(value, (list, tuple)):
+        for i, item in enumerate(value):
+            _validate_param_value(item, path=f"{path}[{i}]")
+        return
+    if isinstance(value, dict):
+        for k, v in value.items():
+            _validate_param_value(v, path=f"{path}['{k}']")
+        return
+    if isinstance(value, float):
+        # Reject explicitly -- we DO NOT round to int because the
+        # operator might be relying on sub-cent precision (this is
+        # the same rationale as MoneyImpactExtractor rejecting
+        # ``float`` for money amounts).
+        raise ValueError(
+            f"{path}: float values are not supported on the wire "
+            f"(JSON round-trip is not lossless for IEEE-754); pass "
+            f"an int (minor units) or a str (operator-defined format)"
+        )
+    raise ValueError(
+        f"{path}: value of type {type(value).__name__!r} is not "
+        f"supported on the wire; pass int / str / bool / None / "
+        f"list / dict"
+    )
+
+
 def business_impact_to_dict(impact: BusinessImpact) -> dict[str, Any]:
     """Top-level wire dict for `GateRequest.business_impact`.
 
@@ -146,18 +265,23 @@ def business_impact_to_dict(impact: BusinessImpact) -> dict[str, Any]:
 class BusinessImpact:
     """Top-level BusinessImpact union.
 
-    For MVP 1.0 the only supported variant is `Money`. Future
-    kinds land by adding new subclasses and a `kind` value.
+    MVP 1.0: `Money` only.
+    MVP 1.1 (Phase 1 / Tier 2): adds `ToolCall` for free-form
+    tool-call argument bags matched against ToolParameters
+    Approval Rules on the backend.
+
     The SDK validates the variant at construction time so the
     backend never sees malformed output.
     """
 
-    impact: Any  # MoneyImpact in MVP.
+    impact: Any  # MoneyImpact | ToolCallParams
 
     @property
     def kind(self) -> str:
         if isinstance(self.impact, MoneyImpact):
             return KIND_MONEY
+        if isinstance(self.impact, ToolCallParams):
+            return KIND_TOOL_CALL
         raise TypeError(f"unknown impact type: {type(self.impact)}")
 
     def validate(self) -> None:
@@ -180,6 +304,31 @@ class BusinessImpact:
         )
         m.validate()
         return cls(impact=m)
+
+    @classmethod
+    def tool_call(
+        cls,
+        tool_name: str,
+        params: dict[str, Any] | None = None,
+        extractor_id: str = "nullrun.tool_call.path",
+        extractor_version: str = "1",
+    ) -> BusinessImpact:
+        """Construct a ``kind="tool_call"`` BusinessImpact.
+
+        Used by the ToolParamsExtractor; callers building impacts
+        by hand should use this factory rather than constructing
+        ``ToolCallParams`` and wrapping themselves -- the factory
+        validates before returning so a misuse fails locally
+        instead of after a wire round-trip.
+        """
+        p = ToolCallParams(
+            tool_name=tool_name,
+            params=params or {},
+            extractor_id=extractor_id,
+            extractor_version=extractor_version,
+        )
+        p.validate()
+        return cls(impact=p)
 
 
 def _canonicalize_json(value: Any) -> Any:
