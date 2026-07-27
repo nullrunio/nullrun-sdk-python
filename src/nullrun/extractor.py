@@ -167,6 +167,7 @@ from nullrun.business_impact import (
     OUTFLOW,
     BusinessImpact,
     MoneyImpact,
+    ToolCallParams,
     compute_action_digest,
 )
 
@@ -439,9 +440,7 @@ def business_cap_minor(currency: str) -> int:
     return _BUSINESS_CAP_MINOR[normalize_currency(currency)]
 
 
-def _decimal_has_more_fractional_digits(
-    value: Decimal, allowed: int
-) -> bool:
+def _decimal_has_more_fractional_digits(value: Decimal, allowed: int) -> bool:
     """Return True iff ``value`` has more fractional digits than
     ``allowed``.
 
@@ -492,9 +491,7 @@ def _check_overflow(amount_minor: int, currency: str) -> None:
         )
 
 
-def _check_business_cap(
-    amount_minor: int, currency: str, enforce: bool
-) -> None:
+def _check_business_cap(amount_minor: int, currency: str, enforce: bool) -> None:
     """Raise ``InvalidMoneyAmountError`` if ``amount_minor``
     exceeds the per-currency business cap.
 
@@ -521,7 +518,9 @@ def _check_business_cap(
 
 
 def _to_minor_units(
-    value: int | Decimal, units: str, currency: str,
+    value: int | Decimal,
+    units: str,
+    currency: str,
     enforce_business_cap: bool = True,
 ) -> int:
     """Convert a Decimal-or-int value to integer minor units.
@@ -600,9 +599,7 @@ def _to_minor_units(
         _check_business_cap(converted, currency, enforce_business_cap)
         return converted
 
-    raise ValueError(
-        f"unknown units={units!r}; expected one of: {UNITS}"
-    )
+    raise ValueError(f"unknown units={units!r}; expected one of: {UNITS}")
 
 
 class MoneyImpactExtractor:
@@ -644,14 +641,9 @@ class MoneyImpactExtractor:
         enforce_business_cap: bool = True,
     ) -> None:
         if direction not in (OUTFLOW, INFLOW):
-            raise ValueError(
-                f"direction must be {OUTFLOW!r} or {INFLOW!r}, "
-                f"got {direction!r}"
-            )
+            raise ValueError(f"direction must be {OUTFLOW!r} or {INFLOW!r}, got {direction!r}")
         if units not in UNITS:
-            raise ValueError(
-                f"units must be one of {UNITS}, got {units!r}"
-            )
+            raise ValueError(f"units must be one of {UNITS}, got {units!r}")
         # ``normalize_currency`` raises ``InvalidCurrencyError``
         # if the input is not a 3-letter uppercase ISO-4217
         # code in the whitelist. The constructor fails-CLOSED:
@@ -768,6 +760,274 @@ def money_outflow(
     )
 
 
+# ============================================================================
+# Phase 1 / MVP 1.1 -- ToolParameters (Разрыв 2 / Tier 2)
+# ============================================================================
+#
+# The ToolParamsExtractor is the SDK-side mirror of the backend's
+# ``BusinessImpact::ToolCall(ToolCallParams)`` variant. It captures a
+# free-form argument bag from the live call and ships it as
+# ``kind: "tool_call"`` on the /execute wire so the backend can match
+# the params against ToolParameters Approval Rules (ValueMatcher:
+# Equals / OneOf / NumericRange / Regex / Exists; TriggerLogic: Any /
+# All / DNF groups).
+#
+# Why this exists alongside MoneyImpactExtractor:
+# - The Money variant answers one question ("how much money?") and
+#   is matched against MoneyAmount predicates.
+# - The ToolCall variant answers a different question ("which args?")
+#   and is matched against ToolParameters predicates.
+# - Same wire envelope (``BusinessImpact``), same digest contract, same
+#   fail-CLOSED semantics at extraction time -- only the
+#   ``impact_for(...)`` body differs.
+#
+# Why ``include_all=True`` is the default (and not opt-in):
+# - Operators adopting ToolParameters Approval Rules need their
+#   tools to ship args without rewriting every decorator site.
+# - Bare ``@sensitive`` (no impact=...) auto-attaches this extractor
+#   in ``_do_sensitive_register`` (see decorators.py) so the
+#   behavior is "every @sensitive tool ships its args by default".
+# - Users with sensitive args (e.g. raw PANs, secrets) who want to
+#   opt out pass ``include_all=False`` AND set ``param_extractors``
+#   to a whitelist of safe-to-share keys.
+#
+# Why ``param_extractors`` is an explicit map (not a glob):
+# - The operator-facing rule references param names
+#   ("user_id == 42") not arg names ("uid", "userId" -- which the
+#   SDK may rename mid-refactor). An explicit map decouples the
+#   rule name from the function signature.
+# - Without it, a Python refactor of ``uid`` -> ``user_id`` would
+#   silently break every ToolParameters rule without warning.
+
+_TOOL_CALL_EXTRACTOR_ID = "nullrun.tool_call.path"
+_TOOL_CALL_EXTRACTOR_VERSION = "1"
+
+
+class ToolParamsExtractor:
+    """Phase 1 / MVP 1.1 tool-params impact extractor.
+
+    Captures the live call's kwargs into a free-form JSON object
+    that the backend matches against ToolParameters Approval
+    Rules. The wire shape mirrors ``ToolCallParams`` in
+    ``nullrun.business_impact`` and the backend
+    ``BusinessImpact::ToolCall`` variant in
+    ``backend/src/proxy/gate/business_impact.rs:62-307``.
+
+    Three extraction modes (mutually exclusive in priority order):
+
+    1. ``param_extractors`` set: explicit {rule_param: arg_name}
+       map. Only the listed args are extracted; everything else
+       is dropped. Use this when the rule name diverges from the
+       function arg name (``{"user_id": "uid"}``).
+    2. ``include_all=True`` (default): capture every kwarg as-is.
+       Use this when rule names match arg names.
+    3. ``include_all=False`` and no map: empty ``params``. Rare;
+       for tools that take no args but should still be eligible
+       for ToolCall-kind Approval Rules.
+
+    Args dropped from ``params``:
+    - positional args (only kwargs survive; positional binding
+      would require the operator to know Python's arg-order
+      semantics, which is fragile across refactors)
+    - values that fail ``_validate_param_value`` (e.g. ``float``
+      which can't round-trip through JSON losslessly)
+    - values that survived ``_safe_kwargs`` masking (i.e.
+      ``***`` sentinels for PAN, password, etc.). Sending a
+      masked sentinel to the operator would never match a
+      real rule -- the rule predicate sees ``"***"`` and never
+      the real value. So masking happens BEFORE this extractor
+      runs and the masked value is filtered out here.
+    """
+
+    __slots__ = (
+        "param_extractors",
+        "include_all",
+        "extractor_id",
+        "extractor_version",
+    )
+
+    def __init__(
+        self,
+        param_extractors: dict[str, str] | None = None,
+        *,
+        include_all: bool = True,
+        extractor_id: str = _TOOL_CALL_EXTRACTOR_ID,
+        extractor_version: str = _TOOL_CALL_EXTRACTOR_VERSION,
+    ) -> None:
+        if param_extractors is not None and include_all is False:
+            # The two modes are mutually exclusive. Setting both is
+            # almost certainly a typo -- fail-CLOSED at decorator-
+            # application time rather than silently dropping rules.
+            raise ValueError(
+                "ToolParamsExtractor: param_extractors and include_all=False are mutually exclusive"
+            )
+        self.param_extractors = param_extractors
+        self.include_all = include_all
+        self.extractor_id = extractor_id
+        self.extractor_version = extractor_version
+
+    def impact_for(
+        self,
+        fn: Callable[..., Any],
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> BusinessImpact:
+        """Extract a ToolCall BusinessImpact from the live call.
+
+        Args:
+            fn: the decorated function (used only for ``fn.__name__``
+                on the wire; positional arg shape is not consulted).
+            args: positional args (dropped; only kwargs are extracted).
+            kwargs: keyword args from the live call. May have been
+                PII-masked by ``_safe_kwargs`` before reaching here;
+                masked values (any ``str`` that equals the
+                ``MASK_SENTINEL`` value used by the masking layer)
+                are filtered out before the wire.
+
+        Returns:
+            ``BusinessImpact(impact=ToolCallParams(...))`` ready to
+            serialise to wire via ``to_wire_dict()``.
+
+        Raises:
+            ValueError: if the resulting ``ToolCallParams`` fails
+                validation (bad ``tool_name``, ``params`` key too
+                long, f64 value, unsupported type).
+        """
+        # Filter masked values BEFORE building ToolCallParams. The
+        # masking layer uses a fixed sentinel string (e.g. "***");
+        # sending that to the backend would never match a real
+        # rule, so we silently drop it. This matches the
+        # pre-existing rationale that masked audit-log entries
+        # exist for compliance, not for runtime matching.
+        # Note: the decorator wrapper above us already masked the
+        # positional args (via ``_safe_args``) and the kwargs (via
+        # ``_safe_kwargs``); we just filter kwargs against the
+        # same sentinel value.
+        params = self._extract_params(kwargs)
+
+        params_obj = ToolCallParams(
+            tool_name=fn.__name__,
+            params=params,
+            extractor_id=self.extractor_id,
+            extractor_version=self.extractor_version,
+        )
+        params_obj.validate()
+        return BusinessImpact(impact=params_obj)
+
+    def _extract_params(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Pull the right kwargs into the wire-shape ``params`` dict.
+
+        Three branches, in priority order:
+        1. ``param_extractors`` set: explicit {rule_param: arg_name}
+        2. ``include_all=True``: every kwarg
+        3. neither: empty dict
+
+        Each value is filtered through ``_safe_for_wire``: only
+        JSON-roundtrippable types survive, and PII-masked
+        sentinels are dropped.
+        """
+        result: dict[str, Any] = {}
+        if self.param_extractors is not None:
+            for rule_param, arg_name in self.param_extractors.items():
+                if arg_name not in kwargs:
+                    continue
+                value = kwargs[arg_name]
+                if not _safe_for_wire(value):
+                    continue
+                result[rule_param] = value
+        elif self.include_all:
+            for k, v in kwargs.items():
+                if not _safe_for_wire(v):
+                    continue
+                result[k] = v
+        return result
+
+
+def _safe_for_wire(value: Any) -> bool:
+    """Return True if ``value`` can land on the wire unmodified.
+
+    Two reasons to drop a value:
+    1. It's a PII-masked sentinel (``"***"`` or similar) -- the
+       operator would see a placeholder, never the real value,
+       so the rule predicate can't match.
+    2. It's an unsupported type that the canonical-JSON layer
+       can't round-trip (``float``, ``set``, custom objects).
+       The extractor validates each surviving value through
+       ``_validate_param_value`` which catches f64 explicitly.
+
+    This is the wire-safety mirror of the backend's
+    ``ToolCallParams::validate()`` and ``_check_value_kind``.
+    Doing the check here keeps the SDK's "what to ship" logic
+    in one place (this module), so the wire shape is
+    documented and testable without crossing the network.
+    """
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return True
+    if isinstance(value, int):
+        return True
+    if isinstance(value, str):
+        # Drop PII-masked sentinels. The masking layer uses the
+        # literal "***" string; a rule that matches "***" would
+        # be a confused rule. Real values that happen to equal
+        # "***" are vanishingly rare; if the operator runs into
+        # it, they can rename the value.
+        if value == "***":
+            return False
+        return True
+    if isinstance(value, (list, tuple)):
+        return True
+    if isinstance(value, dict):
+        return True
+    # float, set, custom objects -- rejected at this layer so we
+    # never build a ToolCallParams that the backend would reject.
+    return False
+
+
+def tool_params(
+    param_extractors: dict[str, str] | None = None,
+    *,
+    include_all: bool = True,
+) -> ToolParamsExtractor:
+    """Shorthand constructor used by ``@sensitive(impact=tool_params(...))``.
+
+    Phase 1 / MVP 1.1 (Tier 2): every bare ``@sensitive`` tool
+    auto-attaches a ``ToolParamsExtractor(include_all=True)``
+    (see ``_do_sensitive_register`` in decorators.py), so most
+    users never need to call this function explicitly. The
+    factory below is for two opt-in cases:
+
+    1. Explicit ``{rule_param: arg_name}`` mapping when the
+       rule name diverges from the function arg name::
+
+           @sensitive(impact=tool_params({"user_id": "uid"}))
+           def delete_user(uid: int): ...
+
+    2. Strict opt-out from auto-capture (rare; for tools whose
+       every kwarg is a secret the operator must never see)::
+
+           @sensitive(impact=tool_params(include_all=False))
+           def handle_secret(token: str): ...
+
+    Args:
+        param_extractors: explicit ``{rule_param: arg_name}`` map.
+            When set, only those args are captured under
+            ``rule_param`` keys. ``include_all`` is ignored.
+        include_all: when True (default), capture every kwarg.
+            Ignored when ``param_extractors`` is set.
+
+    Returns:
+        ``ToolParamsExtractor`` ready to be passed to
+        ``@sensitive(impact=...)`` or stamped on a function by the
+        auto-attach path.
+    """
+    return ToolParamsExtractor(
+        param_extractors=param_extractors,
+        include_all=include_all,
+    )
+
+
 def compute_impact_digest(impact: BusinessImpact) -> str:
     """Thin alias re-exported for call-site readability."""
     return compute_action_digest(impact)
@@ -775,4 +1035,5 @@ def compute_impact_digest(impact: BusinessImpact) -> str:
 
 def gc_get_objects() -> list[Any]:
     import gc
+
     return gc.get_objects()
