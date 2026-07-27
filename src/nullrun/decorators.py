@@ -1058,6 +1058,40 @@ def _stamp_extractor_on_innermost(fn: F, impact: Any) -> None:
     setattr(fn, "_nullrun_extractor", impact)  # noqa: B010
 
 
+def _find_extractor_in_chain(fn: Any) -> Any:
+    """Walk ``fn.__wrapped__`` looking for a stamped extractor.
+
+    Used by ``_do_sensitive_register`` to detect an explicit
+    ``impact=tool_params({...})`` (or ``impact=money_outflow(...)``)
+    that was already stamped on the bare function by the
+    ``@sensitive`` factory form. Without the chain walk the
+    auto-attach path would see ``None`` on the @protect wrapper
+    and silently stamp its default ToolParamsExtractor on top,
+    breaking the user's explicit map.
+
+    Returns the extractor object (the actual ``_nullrun_extractor``
+    value) or ``None`` if no extractor is found on the chain.
+    The chain walk is bounded to ``len(repr(callable))`` hops to
+    defend against pathological ``__wrapped__`` cycles; in practice
+    the chain is at most 3 deep (@sensitive factory + @protect +
+    functools.wraps chain from @protect).
+    """
+    seen: set[int] = set()
+    current: Any = fn
+    # Bound the walk: a decorator chain longer than this is almost
+    # certainly a cycle. The cap is generous (the real chain is
+    # typically 2-3 deep).
+    for _ in range(32):
+        if current is None or id(current) in seen:
+            return None
+        seen.add(id(current))
+        ext = getattr(current, "_nullrun_extractor", None)
+        if ext is not None:
+            return ext
+        current = getattr(current, "__wrapped__", None)
+    return None
+
+
 def _do_sensitive_register(fn: F) -> F:
     # Phase 1 / MVP 1.1 (Tier 2 -- ToolParameters): if @sensitive
     # was applied bare (no impact=...), auto-attach a default
@@ -1083,7 +1117,14 @@ def _do_sensitive_register(fn: F) -> F:
     try:
         from nullrun.extractor import ToolParamsExtractor, tool_params
 
-        if getattr(fn, "_nullrun_extractor", None) is None:
+        # Walk the __wrapped__ chain in case the explicit extractor
+        # was stamped on the bare function (by
+        # ``_stamp_extractor_on_innermost``) and we received the
+        # @protect-wrapped outer function as ``fn``. Without the
+        # chain walk, the auto-attach would silently overwrite
+        # the explicit extractor and break the user's
+        # ``impact=tool_params({...})`` map.
+        if _find_extractor_in_chain(fn) is None:
             _stamp_extractor_on_innermost(fn, tool_params(include_all=True))
     except ImportError:
         # The extractor module is loaded above us on every path

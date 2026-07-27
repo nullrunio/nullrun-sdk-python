@@ -46,6 +46,7 @@ from nullrun.business_impact import (
 from nullrun.decorators import (
     _do_sensitive_register,
     _enforce_sensitive_tool,
+    _find_extractor_in_chain,
     _stamp_extractor_on_innermost,
 )
 from nullrun.extractor import (
@@ -554,3 +555,130 @@ class TestToolCallParamsShape:
         )
         assert t.kind == KIND_TOOL_CALL
         assert t.to_wire_dict()["kind"] == KIND_TOOL_CALL
+
+
+# ---------------------------------------------------------------------------
+# 5. Regression: explicit-extractor-vs-auto-attach priority (Phase 1 / MVP 1.1)
+# ---------------------------------------------------------------------------
+#
+# Bug found via ad-hoc verification after the initial auto-attach
+# commit (40d391a): the auto-attach path called
+# ``getattr(fn, "_nullrun_extractor", None)`` on the @protect
+# wrapper. The explicit extractor (set by ``@sensitive(impact=...)``
+# factory form) lives on the BARE function -- the wrapper does NOT
+# carry the attribute -- so the check returned None and the
+# auto-attach path silently overwrote the user's explicit map with
+# ``ToolParamsExtractor(include_all=True)``. Result: ``impact=
+# tool_params({"delete_force": "force"})`` looked like it took
+# effect at decoration time but the wire payload used the default
+# ``{delete_force: <anything>}`` mapping -- silent param-drop.
+#
+# The fix walks the ``__wrapped__`` chain in
+# ``_do_sensitive_register``. The regression tests below pin both
+# the bare case and the explicit-map case.
+
+
+class TestAutoAttachChainWalk:
+    """Pin the ``_do_sensitive_register`` chain walk so future
+    decorator reordering does not silently regress the
+    explicit-extractor priority.
+    """
+
+    def test_bare_sensitive_chain_walk_attaches_default(
+        self, captured_runtime: NullRunRuntime
+    ) -> None:
+        """Bare ``@sensitive`` (no impact=...) walks the chain
+        and finds NO extractor, so auto-attach stamps the default.
+        """
+        def tool_fn(user_id: int) -> None:
+            pass
+
+        assert _find_extractor_in_chain(tool_fn) is None, (
+            "sanity: bare function should not have an extractor"
+        )
+
+        _do_sensitive_register(tool_fn)
+
+        ext = _find_extractor_in_chain(tool_fn)
+        assert ext is not None
+        assert isinstance(ext, ToolParamsExtractor)
+        assert ext.include_all is True
+
+    def test_explicit_tool_params_chain_walk_preserves_map(
+        self, captured_runtime: NullRunRuntime
+    ) -> None:
+        """``@sensitive(impact=tool_params({...}))`` stamped on the
+        bare function MUST survive ``_do_sensitive_register``.
+
+        Pre-fix this silently overwrote the explicit extractor
+        with the auto-attach default ``ToolParamsExtractor(
+        include_all=True)`` because ``getattr(wrapper,
+        "_nullrun_extractor", None)`` returned None even though
+        the bare function carried the attribute.
+        """
+        def tool_fn(force: bool) -> None:
+            pass
+
+        # Simulate the @sensitive(impact=tool_params({...}))
+        # factory form stamping the explicit extractor on the
+        # bare function via ``_stamp_extractor_on_innermost``.
+        explicit = tool_params({"delete_force": "force"})
+        _stamp_extractor_on_innermost(tool_fn, explicit)
+
+        # Now run the registration path -- the auto-attach MUST
+        # see the explicit extractor and skip the default.
+        _do_sensitive_register(tool_fn)
+
+        ext = _find_extractor_in_chain(tool_fn)
+        assert ext is explicit, (
+            "explicit tool_params map was overwritten by "
+            "auto-attach default -- this is the regression fixed "
+            "in the chain-walk patch"
+        )
+        assert ext.param_extractors == {"delete_force": "force"}
+        assert ext.include_all is True
+
+    def test_explicit_money_outflow_chain_walk_preserved(
+        self, captured_runtime: NullRunRuntime
+    ) -> None:
+        """``@sensitive(impact=money_outflow(...))`` also survives
+        the auto-attach path (the original Phase 1 / MVP 1.0
+        money variant must NOT be overwritten by the Tier 2
+        auto-attach).
+        """
+        def tool_fn(amount_cents: int) -> None:
+            pass
+
+        explicit = money_outflow(argument="amount_cents")
+        _stamp_extractor_on_innermost(tool_fn, explicit)
+
+        _do_sensitive_register(tool_fn)
+
+        ext = _find_extractor_in_chain(tool_fn)
+        assert isinstance(ext, MoneyImpactExtractor), (
+            f"explicit MoneyImpactExtractor was overwritten by "
+            f"auto-attach default; got {type(ext).__name__}"
+        )
+
+    def test_chain_walk_does_not_loop_on_circular_wraps(
+        self, captured_runtime: NullRunRuntime
+    ) -> None:
+        """Defensive: a pathological ``__wrapped__`` cycle must
+        not hang ``_find_extractor_in_chain``. We construct a
+        3-call cycle and verify the walk returns None within
+        the bounded hop count.
+        """
+        # Build a self-referential __wrapped__ cycle.
+        class Cycle:
+            def __init__(self) -> None:
+                self._attr = "marker"
+
+        a = Cycle()
+        a.__wrapped__ = a  # direct self-cycle
+        # The walk must return None and not hang.
+        assert _find_extractor_in_chain(a) is None
+        # And a longer cycle: a -> b -> a -> b ...
+        b = Cycle()
+        a.__wrapped__ = b
+        b.__wrapped__ = a
+        assert _find_extractor_in_chain(a) is None
