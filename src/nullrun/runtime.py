@@ -1567,6 +1567,8 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         metrics.inc_runtime("check_calls")
 
         from nullrun.context import (
+            get_call_mcp_annotations,
+            get_call_mcp_class,
             get_call_model,
             get_call_tools,
             get_chain_id,
@@ -1634,6 +1636,23 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # tell you what tools will be called" (None).
         if call_tools:
             check_req["tools"] = list(call_tools)
+
+        # Разрыв 3 / 2026-07-28: forward cached MCP tool class +
+        # annotations when the SDK recognises an MCP server. Both
+        # fields are optional — `None` means "I don't know", and the
+        # gate treats absent values as unknown rather than false.
+        # The honest-SDK trust boundary (CLAUDE.md §22): a
+        # malicious SDK could lie about annotations to bypass the
+        # destructive block. We accept that trade-off (matches the
+        # existing model-string trust model) — server-side discovery
+        # for verification is in the v3.31 Phase C scope and
+        # requires HTTP-transport MCP servers only.
+        mcp_class = get_call_mcp_class()
+        if mcp_class is not None:
+            check_req["tool_class"] = mcp_class
+        mcp_annotations = get_call_mcp_annotations()
+        if mcp_annotations is not None:
+            check_req["mcp_annotations"] = mcp_annotations
 
         # Chain context — only included when the user has set it.
         # None vs missing chain_id is significant on the backend:

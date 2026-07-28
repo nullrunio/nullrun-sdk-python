@@ -41,6 +41,21 @@ _attempt_index_var: ContextVar[int] = ContextVar("attempt_index", default=0)
 # on /track only — see gate/internal.rs T3).
 _call_model_var: ContextVar[str | None] = ContextVar("call_model", default=None)
 _call_tools_var: ContextVar[tuple[str, ...]] = ContextVar("call_tools", default=())
+# Разрыв 3 / 2026-07-28: per-call MCP tool class + annotations.
+# Set via the new ``set_mcp_tool_context`` helper when the SDK
+# recognises an MCP server. The gate honors `tool_class` over
+# its own `classify_tool(tool_name)` parse, and uses
+# `mcp_annotations` to evaluate `mcp_destructive_policy` /
+# `mcp_readonly_policy`. ``None`` means "I don't know" — the
+# gate treats absent values as unknown (NOT as false), so a
+# server that forgets to set annotations cannot accidentally get
+# a read-only bypass.
+_call_mcp_class_var: ContextVar[str | None] = ContextVar(
+    "call_mcp_class", default=None
+)
+_call_mcp_annotations_var: ContextVar[dict | None] = ContextVar(
+    "call_mcp_annotations", default=None
+)
 
 # 2026-07-02 (v0.11.0): chain_id contextvar for soft-mode gate
 #.
@@ -143,6 +158,29 @@ def get_call_tools() -> tuple[str, ...]:
     configured ``blocked_tools`` aggregate.
     """
     return _call_tools_var.get()
+
+
+def get_call_mcp_class() -> str | None:
+    """Canonical tool class for the next ``/check`` call.
+
+    One of ``"builtin" | "mcp" | "custom" | "invalid"``. Set via
+    ``set_mcp_tool_context`` when the SDK recognises an MCP server
+    (curl `tools/list` once per cache window, then forward on every
+    ``/check``). ``None`` means "I don't know — derive from the
+    raw ``tool`` string on the server".
+    """
+    return _call_mcp_class_var.get()
+
+
+def get_call_mcp_annotations() -> dict | None:
+    """Per-tool MCP annotations for the next ``/check`` call.
+
+    Mirrors the MCP spec's ``tools/list`` ``annotations`` object —
+    keys ``read_only``, ``destructive``, ``open_world``, each
+    optional ``bool`` or ``None``. ``None`` means "I have no
+    opinion" — the gate treats the value as unknown.
+    """
+    return _call_mcp_annotations_var.get()
 
 
 # ---------------------------------------------------------------------------
@@ -420,6 +458,33 @@ def set_call_context(
         _call_model_var.set(model)
     if tools is not None:
         _call_tools_var.set(tuple(tools))
+
+
+def set_mcp_tool_context(
+    tool_class: str | None = None,
+    annotations: dict | None = None,
+) -> None:
+    """Разрыв 3 / 2026-07-28: forward the cached MCP tool class +
+    annotations to the next ``/check`` call.
+
+    Use after fetching ``tools/list`` from an MCP server — the SDK
+    caches the response and on each subsequent ``/check`` should
+    call this with the matching class and annotations for the
+    tool being invoked.
+
+    Args:
+        tool_class: One of ``"builtin" | "mcp" | "custom" | "invalid"``.
+            When ``None`` the SDK stays quiet and the backend falls
+            back to ``classify_tool(raw_tool_name)``.
+        annotations: Per-tool MCP annotations dict (keys
+            ``read_only``, ``destructive``, ``open_world`` —
+            each ``bool | None``). When ``None`` the SDK has no
+            opinion and the gate treats the value as unknown.
+    """
+    if tool_class is not None:
+        _call_mcp_class_var.set(tool_class)
+    if annotations is not None:
+        _call_mcp_annotations_var.set(annotations)
 
 
 def generate_trace_id() -> str:
