@@ -340,10 +340,13 @@ def test_call_tool_does_not_emit_empty_annotations_dict():
     distinguishes ``unknown`` from ``absent``."""
 
     class _NoAnnClient(_MockMcpClient):
-        def list_tools(self) -> list[_Tool]:
-            return [_Tool(name="bare_tool", annotations=None)]
+        def __init__(self) -> None:
+            super().__init__([_Tool(name="bare_tool", annotations=None)])
 
-    adapter = MCPAdapter(server_name="bare", mcp_client=_NoAnnClient([]))
+        def list_tools(self) -> list[_Tool]:
+            return list(self._tools.values())
+
+    adapter = MCPAdapter(server_name="bare", mcp_client=_NoAnnClient())
     adapter.call_tool("bare_tool")
     ann = get_call_mcp_annotations()
     assert ann is not None  # explicit None dict, not absent
@@ -362,19 +365,24 @@ def test_call_tool_unknown_annotations_helper_is_explicit_none():
         annotations: dict[str, Any]
 
     class _DictAnnClient(_MockMcpClient):
-        def list_tools(self) -> list[Any]:
-            return [
-                _DictAnnTool(
-                    name="d",
-                    annotations={
-                        "readOnlyHint": False,
-                        "destructiveHint": True,
-                        "openWorldHint": True,
-                    },
-                )
-            ]
+        def __init__(self) -> None:
+            super().__init__(
+                [
+                    _DictAnnTool(
+                        name="d",
+                        annotations={
+                            "readOnlyHint": False,
+                            "destructiveHint": True,
+                            "openWorldHint": True,
+                        },
+                    ),
+                ]
+            )
 
-    adapter = MCPAdapter(server_name="dict", mcp_client=_DictAnnClient([]))
+        def list_tools(self) -> list[Any]:
+            return list(self._tools.values())
+
+    adapter = MCPAdapter(server_name="dict", mcp_client=_DictAnnClient())
     adapter.call_tool("d")
     ann = get_call_mcp_annotations()
     assert ann["read_only"] is False
@@ -432,16 +440,19 @@ def test_call_tool_refreshes_cache_when_inventory_changes():
     assert client.list_calls == 1
 
     # Replace the upstream inventory with a new toolset.
-    client.snapshot = [
-        _Tool(
-            name="replacement_tool",
-            annotations=_Ann(
-                readOnlyHint=False,
-                destructiveHint=True,
-                openWorldHint=False,
-            ),
-        )
-    ]
+    # Both ``snapshot`` (what list_tools returns) AND ``_tools``
+    # (the underlying call_tool mock) need to stay in sync —
+    # the mock's call_tool validates against ``_tools``.
+    new_tool = _Tool(
+        name="replacement_tool",
+        annotations=_Ann(
+            readOnlyHint=False,
+            destructiveHint=True,
+            openWorldHint=False,
+        ),
+    )
+    client.snapshot = [new_tool]
+    client._tools = {new_tool.name: new_tool}
     # Reset the cache to force a refresh — simulates elapsed
     # TTL without waiting on wallclock. The adapter exposes
     # no public ``invalidate`` method (we'd rather keep the

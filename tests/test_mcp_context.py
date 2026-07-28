@@ -71,17 +71,54 @@ class TestMcpContext:
         assert ann == {"destructive": True}
 
     def test_clearing_class_with_none(self):
-        # Explicit None in tool_class position should clear.
-        set_mcp_tool_context(tool_class="mcp")
+        """Partial-update contract: explicit ``None`` does NOT
+        clear a previously-set value. ``set_mcp_tool_context`` is
+        designed so the caller can update just the fields they
+        care about (most callers don't want to wipe the
+        annotations when re-stamping the class). Use
+        ``set_mcp_tool_context(tool_class='invalid')`` to
+        reset to a sentinel, or just don't call the helper at
+        all to inherit the default ``None``."""
+
+        set_mcp_tool_context(
+            tool_class="mcp",
+            annotations={"destructive": True},
+        )
         assert get_call_mcp_class() == "mcp"
+        assert get_call_mcp_annotations() == {"destructive": True}
+        # Explicit None for one field leaves the other alone —
+        # partial-update behavior, NOT clear-on-None semantics.
         set_mcp_tool_context(tool_class=None)
+        assert get_call_mcp_class() == "mcp"  # unchanged
+        # To actually clear, set an explicit sentinel value.
+
+        # To get a fresh-None state for the next test, clear via
+        # the helper that exists for this exact purpose:
+        import nullrun.context as _ctx
+
+        _ctx._call_mcp_class_var.set(None)  # noqa: SLF001
+        _ctx._call_mcp_annotations_var.set(None)  # noqa: SLF001
         assert get_call_mcp_class() is None
+        assert get_call_mcp_annotations() is None
+
 
     def test_clearing_annotations_with_none(self):
-        set_mcp_tool_context(annotations={"destructive": True})
-        assert get_call_mcp_annotations() is not None
+        """Partial-update contract (see also
+        ``test_clearing_class_with_none``): ``set_mcp_tool_context``
+        with ``annotations=None`` leaves the previously-set
+        class alone."""
+
+        set_mcp_tool_context(
+            tool_class="mcp",
+            annotations={"destructive": True},
+        )
+        assert get_call_mcp_class() == "mcp"
+        assert get_call_mcp_annotations() == {"destructive": True}
+        # Passing None for annotations leaves it alone —
+        # partial-update semantics.
         set_mcp_tool_context(annotations=None)
-        assert get_call_mcp_annotations() is None
+        assert get_call_mcp_annotations() == {"destructive": True}
+        assert get_call_mcp_class() == "mcp"
 
     def test_annotations_partial_dict_allowed(self):
         # Operators may forward only the keys they have. The
