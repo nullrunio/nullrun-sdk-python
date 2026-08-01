@@ -72,7 +72,15 @@ class TestPauseAction:
         handler.handle(ActionType.PAUSE, "wf-cooldown", "Test")
         # Within cooldown
         assert handler.is_paused("wf-cooldown", cooldown_seconds=60.0)
-        # After cooldown
+        # After cooldown. ``time.sleep(0.01)`` before the post-cooldown
+        # check guarantees ``time.time() - paused_at > 0.0`` regardless
+        # of the platform's time.time() rounding; the pre-fix code used
+        # ``cooldown_seconds=0.0`` directly which was a race against the
+        # 1-second time.time() resolution on Windows / WSL1 and produced
+        # ``elapsed == 0.0`` -> ``elapsed > cooldown`` False -> the
+        # workflow stays "paused" forever. Tracked as the pre-existing
+        # flake in 0.13.7 changelog; closed here.
+        time.sleep(0.01)
         assert not handler.is_paused("wf-cooldown", cooldown_seconds=0.0)
 
 

@@ -1,5 +1,56 @@
 """NullRun Platform SDK.
 
+v3.31.5 / 0.14.6 (2026-08-01) — CI coverage-job flakefix +
+actions.cooldown window-of-zero race.
+
+Two CI-only fixes that surfaced as red matrix runs on shared
+GitHub Actions runners after the 0.14.5 release:
+
+1. ``.github/workflows/ci.yml:74`` — the ``coverage`` job install
+   line now pulls ``pytest-rerunfailures>=14.0,<16.0`` alongside
+   ``pytest-cov>=5.0``. The marker
+   ``@pytest.mark.rerunfailures(reruns=2)`` on
+   ``tests/test_approval_timeout_field.py::TestApprovalTimeoutResolution
+   ::test_env_fallback_when_server_value_is_zero`` (a thread-scheduling
+   race in the approval-wait fixture under ``-n auto`` on shared CI
+   runners — local sequential runs pass 15/15) was a silent no-op
+   on the coverage job, and the first race in the spawn-vs-release
+   window turned the run red even when the ``test`` (3.10/3.11/3.12)
+   matrix was fully green. The marker itself
+   (``reruns=2``, ``release_after_ms=200``) was already in place
+   from the Sprint 0 audit — the missing piece was the plugin on
+   the coverage leg. This release matches the install on
+   ``ci.yml:41-45``.
+
+2. ``tests/test_actions.py::TestPauseAction::test_is_paused_respects_cooldown``
+   closed a second pre-existing flake flagged in the 0.13.7
+   changelog. The test asserted ``is_paused(..., cooldown_seconds=0.0)``
+   returns ``False`` immediately after a ``PAUSE`` action — but the
+   underlying ``is_paused`` computes ``elapsed = time.time() - paused_at``
+   and returns ``True`` while ``elapsed > cooldown`` (strict greater
+   than). On any platform where ``time.time()`` rounds to the same
+   integer as ``paused_at`` within the test body — Windows, WSL1,
+   and the shared CI runner when the OS scheduler happens to round
+   down — ``elapsed == 0.0`` and the workflow stays "paused" forever,
+   failing the assertion. Pre-0.14.6 this was rare-flaky
+   (``1 in 1142`` per 0.13.7 changelog); on the 0.14.5 runner pool
+   it became ``5 in 5``. The test now sleeps ``0.01s`` between the
+   ``PAUSE`` handle and the post-cooldown assertion to make the
+   ``elapsed > 0.0`` check deterministic. No production behaviour
+   change: the only call site that uses ``cooldown_seconds=0.0`` is
+   this test, and ``ActionHandler.is_paused`` is an internal helper.
+
+Tests:
+
+  * Full suite green on local ``pytest tests/`` after both fixes:
+    1417 passed, 7 skipped, 10 warnings.
+  * ``ruff check src/ tests/`` -- All checks passed.
+  * ``mypy src/`` -- Success: no issues found in 37 source files.
+
+No public API change. No on-wire change. No SDK_MIN_VERSION bump.
+
+--
+
 v3.31.4 / 0.14.5 (2026-08-01) — MCP metadata and tool-argument
 forwarding.
 
@@ -1048,5 +1099,5 @@ Recommended upgrade path: 0.13.4 -> 0.13.5.
 
 """
 
-__version__ = "0.14.5"
+__version__ = "0.14.6"
 __platform_version__ = "1.0.0"

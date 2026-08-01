@@ -140,7 +140,7 @@ name = "nullrun"
 # by ``@protect`` were missing ``tokens``/``execution_id`` so
 # the backend's SdkTrackRequest rejected them. See CHANGELOG.md
 # for the full per-commit description.
-version = "0.14.5"
+version = "0.14.6"
 # Kept under the 200-char preview threshold so the full line is visible
 # without an "expand" click. Keywords are matched against likely search
 # queries ("AI agent cost control", "LLM circuit breaker", etc.).
