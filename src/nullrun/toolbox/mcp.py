@@ -55,8 +55,9 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable
+from typing import Any
 
 from nullrun.context import (
     get_call_mcp_annotations,

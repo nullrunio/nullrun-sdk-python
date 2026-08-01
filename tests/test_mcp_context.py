@@ -15,6 +15,7 @@ honest-SDK trust boundary (McpAnnotations forwarded verbatim from
 
 import pytest
 
+import nullrun.context as _ctx
 from nullrun.context import (
     get_call_mcp_annotations,
     get_call_mcp_class,
@@ -22,9 +23,24 @@ from nullrun.context import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_mcp_context():
+    """Reset the module-level ContextVars around every test.
+
+    MCP adapter tests run earlier in the full suite and intentionally
+    leave their last call metadata in the current context. Reset the
+    variables directly because ``set_mcp_tool_context(None, None)``
+    has partial-update semantics and therefore does not clear them.
+    """
+    _ctx._call_mcp_class_var.set(None)
+    _ctx._call_mcp_annotations_var.set(None)
+    yield
+    _ctx._call_mcp_class_var.set(None)
+    _ctx._call_mcp_annotations_var.set(None)
+
+
 class TestMcpContext:
     def test_class_defaults_to_none(self):
-        # Fresh context — no setters called yet.
         assert get_call_mcp_class() is None
         assert get_call_mcp_annotations() is None
 
@@ -100,7 +116,6 @@ class TestMcpContext:
         _ctx._call_mcp_annotations_var.set(None)  # noqa: SLF001
         assert get_call_mcp_class() is None
         assert get_call_mcp_annotations() is None
-
 
     def test_clearing_annotations_with_none(self):
         """Partial-update contract (see also

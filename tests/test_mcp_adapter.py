@@ -22,7 +22,6 @@ from nullrun.context import (
 )
 from nullrun.toolbox.mcp import DEFAULT_CACHE_SECONDS, MCPAdapter
 
-
 # -----------------------------------------------------------------------
 # Test fixtures / mocks
 # -----------------------------------------------------------------------
