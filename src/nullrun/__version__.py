@@ -1,5 +1,35 @@
 """NullRun Platform SDK.
 
+v3.31.4 / 0.14.5 (2026-08-01) — MCP metadata and tool-argument
+forwarding.
+
+This release completes the SDK-side path for MCP-aware gate
+policies and schema-drift fingerprints:
+
+  * ``set_mcp_tool_context`` stores the canonical tool class and
+    MCP ``tools/list`` annotations in per-call context variables.
+    ``NullRunRuntime.check_workflow_budget`` forwards populated
+    values as optional ``tool_class`` and ``mcp_annotations``
+    fields on ``/check``.
+  * ``MCPAdapter`` wraps a connected synchronous MCP client,
+    caches ``tools/list`` metadata for 300 seconds, normalises
+    ``readOnlyHint`` / ``destructiveHint`` / ``openWorldHint``,
+    stamps the context before each call, and delegates the call
+    without changing the client's result or exception surface.
+  * ``Transport.execute`` accepts optional ``tool_arguments``;
+    ``Transport.check`` forwards the same field from its request
+    mapping. The backend can use this JSON argument bag to compute
+    and record a stable tool-schema fingerprint.
+
+All new wire fields are optional and omitted when unavailable, so
+existing callers and older SDK integrations preserve their prior
+request shape. MCP annotations remain an honest-client signal;
+the SDK does not independently verify a server's declarations.
+The adapter does not implement MCP transports or JSON-RPC and does
+not auto-collect arguments for arbitrary callers.
+
+---
+
 v3.30 / 0.14.4 (2026-07-27) — ToolParameters Approval Rules
 wire contract (Tier 2 / Разрыв 2 follow-up).
 
@@ -1018,5 +1048,5 @@ Recommended upgrade path: 0.13.4 -> 0.13.5.
 
 """
 
-__version__ = "0.14.4"
+__version__ = "0.14.5"
 __platform_version__ = "1.0.0"

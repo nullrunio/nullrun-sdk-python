@@ -1345,6 +1345,15 @@ class Transport:
         # policy violation happened).
         business_impact: dict[str, Any] | None = None,
         action_digest: str | None = None,
+        # Разрыв 4 (T5.6, 2026-07-31): tool-call
+        # argument bag forwarded on /execute so the
+        # gate can compute a schema fingerprint and
+        # write it to mcp_tool_signatures. Optional
+        # — legacy SDKs (≤ 0.14.4) do not pass this;
+        # the gate's T5.6 fallback chain reads
+        # `tool_params` (Разрыв 2) when this is
+        # absent.
+        tool_arguments: dict[str, Any] | None = None,
         on_transport_error: Callable[[Exception], dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """
@@ -1416,6 +1425,14 @@ class Transport:
             gate_request["business_impact"] = business_impact
         if action_digest is not None:
             gate_request["action_digest"] = action_digest
+        # Разрыв 4 (T5.6, 2026-07-31): same forwarding
+        # on the /execute path. The tool_arguments
+        # field is the same wire-shape as on /check.
+        # Re-using the call site identity so the
+        # field name is the canonical one across all
+        # gate endpoints.
+        if tool_arguments is not None:
+            gate_request["tool_arguments"] = tool_arguments
 
         # 2026-07-02 (v0.11.0 refactor): route through the canonical
         # signed-headers helper — produces Content-Type + X-API-Key +
@@ -1605,6 +1622,20 @@ class Transport:
             gate_request["idempotency_key"] = check_request["idempotency_key"]
         if "stream" in check_request:
             gate_request["stream"] = bool(check_request["stream"])
+        # Разрыв 4 (T5.6, 2026-07-31): forward the
+        # `tool_arguments` bag alongside `tool` so the
+        # gate can hash it via `signature::compute_schema_hash`
+        # and write the fingerprint into
+        # `mcp_tool_signatures` (T5.6). Pre-T5.6 SDKs
+        # never set this; the backend's gate falls
+        # back to `tool_params` (Разрыв 2) when the
+        # field is missing, so legacy callers do not
+        # regress. The shape is `Optional[dict[str,
+        # Any]]` — the backend canonicalises the JSON
+        # before hashing, so field ordering inside
+        # the dict does not affect the fingerprint.
+        if "tool_arguments" in check_request and check_request["tool_arguments"] is not None:
+            gate_request["tool_arguments"] = check_request["tool_arguments"]
 
         # 2026-07-02 (v0.11.0 refactor): route through the canonical
         # signed-headers helper — produces Content-Type + X-API-Key +
