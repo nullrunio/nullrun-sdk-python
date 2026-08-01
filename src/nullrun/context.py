@@ -53,7 +53,7 @@ _call_tools_var: ContextVar[tuple[str, ...]] = ContextVar("call_tools", default=
 _call_mcp_class_var: ContextVar[str | None] = ContextVar(
     "call_mcp_class", default=None
 )
-_call_mcp_annotations_var: ContextVar[dict | None] = ContextVar(
+_call_mcp_annotations_var: ContextVar[dict[str, bool | None] | None] = ContextVar(
     "call_mcp_annotations", default=None
 )
 
@@ -172,7 +172,7 @@ def get_call_mcp_class() -> str | None:
     return _call_mcp_class_var.get()
 
 
-def get_call_mcp_annotations() -> dict | None:
+def get_call_mcp_annotations() -> dict[str, bool | None] | None:
     """Per-tool MCP annotations for the next ``/check`` call.
 
     Mirrors the MCP spec's ``tools/list`` ``annotations`` object —
@@ -462,7 +462,7 @@ def set_call_context(
 
 def set_mcp_tool_context(
     tool_class: str | None = None,
-    annotations: dict | None = None,
+    annotations: dict[str, bool | None] | None = None,
 ) -> None:
     """Разрыв 3 / 2026-07-28: forward the cached MCP tool class +
     annotations to the next ``/check`` call.
