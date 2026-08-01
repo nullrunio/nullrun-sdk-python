@@ -7,6 +7,34 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [0.14.5] - 2026-08-01
+
+MCP-aware gate metadata and tool-argument forwarding. The release completes the SDK-side path for MCP classification and annotation policies, and adds the optional argument bag used by the backend's tool-schema fingerprinting flow. All new wire fields are optional and omitted when unavailable.
+
+### Added
+
+- **Per-call MCP context** — `set_mcp_tool_context(...)`, `get_call_mcp_class()`, and `get_call_mcp_annotations()` store and expose the canonical tool class plus normalised MCP annotations. `NullRunRuntime.check_workflow_budget()` forwards populated values as `tool_class` and `mcp_annotations` on `/check`.
+- **`MCPAdapter`** — `nullrun.toolbox.mcp.MCPAdapter` wraps an already-connected synchronous MCP client. It lazily caches `tools/list` for 300 seconds, accepts object- or dict-shaped annotation metadata, maps `readOnlyHint` / `destructiveHint` / `openWorldHint` to the gate's `read_only` / `destructive` / `open_world` shape, marks unadvertised tools as `invalid`, and preserves the wrapped client's return and exception behavior.
+- **`tool_arguments` on `/execute` and `/gate`** — `Transport.execute(...)` accepts an optional argument mapping, while `Transport.check(...)` forwards the same field from `check_request`. The backend can canonicalise this JSON bag into a stable tool-schema fingerprint.
+
+### Fixed
+
+- **MCP context tests no longer leak module-level `ContextVar` state** — the release includes isolation fixes for the class and annotation tests that were flaky only during the full suite.
+
+### Tests
+
+- `tests/test_mcp_context.py` pins context defaults, partial updates, supported tool-class values, and `/check` forwarding.
+- `tests/test_mcp_adapter.py` covers cache behavior, dict- and attribute-shaped MCP metadata, unknown tools, repeated calls, custom discovery, and exception pass-through.
+- `tests/test_transport.py::TestToolArgumentsForwarding` covers exact forwarding and omission of `None` on both gate endpoints.
+
+### Compatibility
+
+- **Backward-compatible additive wire change.** Existing callers do not need to pass any new fields; absent MCP metadata and `tool_arguments=None` are omitted.
+- MCP annotations are an honest-client signal. The SDK does not independently verify an MCP server's declarations.
+- `MCPAdapter` does not implement MCP transports, JSON-RPC framing, or asynchronous client adaptation; callers provide a connected synchronous client or a compatible discovery callable.
+
+---
+
 ## [0.14.4] - 2026-07-27
 
 ToolParameters Approval Rules wire contract (Tier 2 / Разрыв 2 follow-up). The backend already accepted `BusinessImpact::ToolCall(ToolCallParams)` on the `/execute` wire (backend commit `1e501cd6`); 0.14.4 lands the SDK-side path so users get ToolParameters rules by default on every bare `@sensitive` function, with no decorator change. Also fixes a silent regression in the auto-attach path that dropped an explicit `impact=tool_params({...})` map, and pins the cross-language `ToolCall` action digest against the Rust backend's golden hex. No on-wire breaking change for money callers; the only behavioural change is that bare `@sensitive` now ships `kind=tool_call` on the wire where it previously shipped nothing.

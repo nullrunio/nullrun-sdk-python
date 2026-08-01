@@ -816,3 +816,126 @@ class TestRefetchCredentialsUsesSharedClient:
             f"{[m for m in new_modules if 'request' in m.lower()]}). "
             "B20 regression: the refetch path must use ``self._client``."
         )
+
+
+class TestToolArgumentsForwarding:
+    """Разрыв 4 / T5.6 (2026-07-31) wire-shape pins for
+    the `tool_arguments` field on the /execute and /check
+    endpoints. The backend (T5.6) reads `tool_arguments`
+    from the request, computes a schema fingerprint, and
+    UPSERTs into `mcp_tool_signatures` on every
+    authenticated MCP /check.
+
+    Pre-T5.6 SDKs (≤ 0.14.4) never set this field; the
+    backend falls back to the Разрыв 2 `tool_params`
+    field. The wire change is additive-only.
+    """
+
+    @respx.mock
+    def test_execute_forwards_tool_arguments_to_wire(self, transport):
+        """`tool_arguments` is included on the wire when
+        the caller passes a non-None value."""
+        captured: dict = {}
+
+        def capture(request: httpx.Request) -> httpx.Response:
+            import json
+            captured.update(json.loads(request.content))
+            return httpx.Response(
+                200,
+                json={
+                    "decision": "allow",
+                    "policy_id": "policy-123",
+                    "policy_version": 5,
+                    "explanation": "allowed",
+                },
+            )
+
+        respx.post("https://api.test.nullrun.io/api/v1/execute").mock(
+            side_effect=capture
+        )
+        result = transport.execute(
+            organization_id="ws-123",
+            execution_id="exec-456",
+            trace_id="trace-789",
+            tool="mcp://github/create_issue",
+            input_data={},
+            tool_arguments={"repo": "acme/api", "title": "fix"},
+        )
+        assert result["decision"] == "allow"
+        # Wire contract: the JSON body must contain
+        # `tool_arguments` with the exact payload the
+        # caller passed. Field name, not nested under
+        # `input` or `details`.
+        assert "tool_arguments" in captured
+        assert captured["tool_arguments"] == {
+            "repo": "acme/api",
+            "title": "fix",
+        }
+
+    @respx.mock
+    def test_execute_omits_tool_arguments_when_none(self, transport):
+        """Default `tool_arguments=None` MUST NOT appear
+        on the wire. Legacy SDKs (≤ 0.14.4) round-trip
+        cleanly because the field is absent.
+        """
+        captured: dict = {}
+
+        def capture(request: httpx.Request) -> httpx.Response:
+            import json
+            captured.update(json.loads(request.content))
+            return httpx.Response(
+                200,
+                json={"decision": "allow", "policy_id": "p", "policy_version": 1},
+            )
+
+        respx.post("https://api.test.nullrun.io/api/v1/execute").mock(
+            side_effect=capture
+        )
+        transport.execute(
+            organization_id="ws-123",
+            execution_id="exec-456",
+            trace_id="trace-789",
+            tool="mcp://github/create_issue",
+            input_data={},
+        )
+        # `tool_arguments` MUST be absent when caller
+        # didn't pass it. The wire change is additive-
+        # only; pre-T5.6 SDKs never wrote the key.
+        assert "tool_arguments" not in captured
+
+    @respx.mock
+    def test_check_forwards_tool_arguments_via_check_request(self, transport):
+        """The /check (gate) path forwards
+        `tool_arguments` from `check_request` dict.
+        Mirrors the contract on /execute; same field
+        name, same shape."""
+        captured: dict = {}
+
+        def capture(request: httpx.Request) -> httpx.Response:
+            import json
+            captured.update(json.loads(request.content))
+            return httpx.Response(
+                200,
+                json={
+                    "decision": "allow",
+                    "policy_id": "policy-123",
+                    "policy_version": 5,
+                    "explanation": "allowed",
+                },
+            )
+
+        respx.post("https://api.test.nullrun.io/api/v1/gate").mock(
+            side_effect=capture
+        )
+        result = transport.check(
+            check_request={
+                "organization_id": "ws-123",
+                "execution_id": "exec-456",
+                "tool": "mcp://github/create_issue",
+                "tool_arguments": {"repo": "acme/api"},
+            }
+        )
+        assert result["decision"] == "allow"
+        # Wire contract: tool_arguments round-trips
+        # verbatim from check_request → wire JSON.
+        assert captured.get("tool_arguments") == {"repo": "acme/api"}
