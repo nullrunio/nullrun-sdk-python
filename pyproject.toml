@@ -140,7 +140,19 @@ name = "nullrun"
 # by ``@protect`` were missing ``tokens``/``execution_id`` so
 # the backend's SdkTrackRequest rejected them. See CHANGELOG.md
 # for the full per-commit description.
-version = "0.14.6"
+# 0.14.7 (2026-08-04): init contract hardening — strip leading
+# and trailing whitespace from ``api_key`` (and the env fallback
+# ``NULLRUN_API_KEY``) BEFORE the truthiness check in
+# ``nullrun.init()`` and ``NullRunRuntime.__init__``. Pre-fix,
+# whitespace-only strings (``"   "``, ``"\t"``, ``"\n"``) were
+# truthy in Python and silently slipped past the empty-key
+# guard; they were stored on the runtime and reached the gateway
+# as a malformed ``Authorization: Bearer   *** header, surfacing
+# as a backend 401 only on the first /gate call rather than at
+# startup. The strip normalises the value before storage so the
+# HMAC signing path and the Authorization header see the same
+# canonical form on both sides of the wire.
+version = "0.14.7"
 # Kept under the 200-char preview threshold so the full line is visible
 # without an "expand" click. Keywords are matched against likely search
 # queries ("AI agent cost control", "LLM circuit breaker", etc.).

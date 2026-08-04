@@ -7,6 +7,31 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [0.14.7] - 2026-08-04
+
+Init contract hardening — strip leading and trailing whitespace from `api_key` (and the `NULLRUN_API_KEY` env fallback) BEFORE the truthiness check in `nullrun.init()` and `NullRunRuntime.__init__`. Pre-fix, whitespace-only strings (`"   "`, `"\t"`, `"\n"`) are TRUTHY in Python and silently slipped past the empty-key guard; they were stored on the runtime and reached the gateway as a malformed `Authorization: Bearer   ***` header, surfacing as a backend 401 only on the first `/gate` call rather than at startup.
+
+### Fixed
+
+- **`nullrun.init()` now strips whitespace before the truthiness check** — `src/nullrun/__init__.py:249` resolves `raw_key = api_key if api_key is not None else os.getenv("NULLRUN_API_KEY")`, then `resolved_key = raw_key.strip() if isinstance(raw_key, str) else None`, before the empty-key guard. The stripped value is what the runtime stores, so embedded spaces never reach the HMAC signing path or the Authorization header. `NullRunAuthenticationError` is raised synchronously (no runtime constructed) for `api_key=None`, `api_key=""`, `api_key="   "`, `api_key="\t"`, `api_key="\n"`, `NULLRUN_API_KEY=""`, and `NULLRUN_API_KEY="   "`. Error message updated to call out the whitespace-rejection contract.
+- **`NullRunRuntime.__init__` mirrors the strip-then-check** — `src/nullrun/runtime.py:370` applies the same contract so direct construction (used by tests and advanced callers) cannot bypass the check.
+
+### Tests
+
+- `tests/test_init_contract.py::TestInitRejectsWhitespaceApiKey` — 7 new tests covering the 7 reject cases, plus a strip-keep case (a value with surrounding whitespace but real content preserves the canonical form) and a constructor mirror (`NullRunRuntime(api_key=" ")` raises the same error as `init(api_key=" ")`).
+- All 39 pre-existing init + runtime tests still pass — the strip is a strict superset of the empty check (`"".strip() == ""` raises; `"x".strip() == "x"` is unchanged).
+
+### Compatibility
+
+- **Backward-compatible bug fix.** The strip is a strict superset of the empty check: pre-fix callers that passed valid keys continue to work unchanged (`"nr_live_xxx"` strips to itself), and callers that pasted whitespace-only keys now get an immediate `NullRunAuthenticationError` at startup instead of a delayed backend 401 on the first `/gate` call.
+- No on-wire change. No SDK_MIN_VERSION bump. No public API change.
+
+### Refs
+
+- FINAL-REPORT-20260803-1 P2-6.
+
+---
+
 ## [0.14.5] - 2026-08-01
 
 MCP-aware gate metadata and tool-argument forwarding. The release completes the SDK-side path for MCP classification and annotation policies, and adds the optional argument bag used by the backend's tool-schema fingerprinting flow. All new wire fields are optional and omitted when unavailable.

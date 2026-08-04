@@ -246,7 +246,15 @@ def init(
     # safety hole — production callers were unaware their policies were
     # not being enforced. We raise instead so the misconfiguration is
     # caught at startup rather than producing silent allow-all decisions.
-    resolved_key = api_key or os.getenv("NULLRUN_API_KEY")
+    # Strip whitespace from either the kwarg or the env before the truthiness
+    # check. Python `or` alone accepts " " / "\t" / "\n" as truthy, which
+    # would let a whitespace-only api_key pass init() and reach the gateway
+    # as a malformed `Authorization: Bearer ` header. The strip preserves
+    # embedded legitimate characters (e.g. "  nr_live_xxx  " is normalised
+    # to the canonical form so HMAC signing sees the same value on both
+    # sides of the wire).
+    raw_key = api_key if api_key is not None else os.getenv("NULLRUN_API_KEY")
+    resolved_key = raw_key.strip() if isinstance(raw_key, str) else None
     if not resolved_key:
         # Layer 1: raise the legacy type (``NullRunAuthenticationError``)
         # so user code with ``except NullRunAuthenticationError:`` still
@@ -260,6 +268,8 @@ def init(
         err = NullRunAuthenticationError(
             "nullrun.init() requires an api_key. Pass api_key='nr_live_...' "
             "explicitly or set the NULLRUN_API_KEY environment variable. "
+            "Whitespace-only values are rejected — strip surrounding spaces "
+            "before passing or exporting the key. "
             "(Silent no-op fallback was removed in 0.3.0 — see CHANGELOG.)",
             error_code="NR-C001",
             user_action=(
