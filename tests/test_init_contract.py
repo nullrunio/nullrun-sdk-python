@@ -371,3 +371,63 @@ class TestShutdownFlushKwarg:
             f"shutdown(flush=False) should leave the buffer alone; "
             f"expected 1 event, got {len(rt._transport._buffer)}."
         )
+
+
+class TestInitRejectsWhitespaceApiKey:
+    """Pins the 0.14.7 strip-then-check contract.
+
+    The pre-0.14.7 code used Python's plain ``or`` truthiness, which
+    accepts any non-empty string — including " " / "\\t" / "\\n". A
+    whitespace-only key would pass ``init()`` and reach the gateway
+    as a malformed ``Authorization: Bearer   `` header, surfacing as
+    a backend 401 only on the first /gate call. The 0.14.7 fix
+    strips leading/trailing whitespace before the truthiness check
+    and rejects whitespace-only keys at startup.
+    """
+
+    @pytest.mark.parametrize(
+        "whitespace_value",
+        ["   ", "\t", "\n", " \t\n "],
+    )
+    def test_init_raises_on_whitespace_only_kwarg(
+        self, monkeypatch, mock_api, whitespace_value
+    ):
+        """``init(api_key=whitespace)`` raises — the kwarg is
+        the only source (env unset), so stripping yields an empty
+        string and the truthiness check fails."""
+        monkeypatch.delenv("NULLRUN_API_KEY", raising=False)
+        with pytest.raises(NullRunAuthenticationError, match="api_key"):
+            nullrun.init(api_key=whitespace_value)
+
+    def test_init_raises_on_whitespace_only_env(self, monkeypatch, mock_api):
+        """``init()`` (no kwargs) with NULLRUN_API_KEY="   " raises
+        because the strip-on-env path also rejects whitespace-only."""
+        monkeypatch.delenv("NULLRUN_API_KEY", raising=False)
+        monkeypatch.setenv("NULLRUN_API_KEY", "   ")
+        with pytest.raises(NullRunAuthenticationError, match="api_key"):
+            nullrun.init()
+
+    def test_init_strips_surrounding_whitespace(self, monkeypatch, mock_api):
+        """A valid key wrapped in whitespace is accepted and the
+        stripped value is what the runtime stores. This is the
+        silent-behaviour-change case: pre-0.14.7 the embedded
+        spaces would survive onto the HMAC signing path and the
+        Authorization header; the fix normalises at startup so
+        the canonical form reaches every downstream caller."""
+        monkeypatch.delenv("NULLRUN_API_KEY", raising=False)
+        monkeypatch.setenv("NULLRUN_API_URL", "https://api.test.nullrun.io")
+        rt = nullrun.init(api_key="  test-key-12345678  ")
+        try:
+            assert rt.api_key == "test-key-12345678", (
+                f"expected stripped key, got {rt.api_key!r}"
+            )
+        finally:
+            rt.shutdown()
+
+    def test_runtime_init_raises_on_whitespace_only(self, monkeypatch, mock_api):
+        """The lower-level NullRunRuntime(...) constructor mirrors
+        init() — the same fix is applied at runtime.py:370 so direct
+        construction cannot bypass the check."""
+        monkeypatch.delenv("NULLRUN_API_KEY", raising=False)
+        with pytest.raises(NullRunAuthenticationError, match="api_key"):
+            NullRunRuntime(api_key="   ")

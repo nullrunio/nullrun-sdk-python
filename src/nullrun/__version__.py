@@ -1,5 +1,66 @@
 """NullRun Platform SDK.
 
+v3.31.6 / 0.14.7 (2026-08-04) — init contract hardening: strip
+whitespace from ``api_key`` before the truthiness check.
+
+Pre-fix 0.14.6, ``nullrun.init()`` resolved ``api_key or
+os.getenv("NULLRUN_API_KEY")`` and raised
+``NullRunAuthenticationError`` only when the resulting value was
+falsy (i.e. ``None`` or ``""``). Whitespace-only strings
+(``"   "``, ``"\t"``, ``"\n"``) are TRUTHY in Python, so they
+slipped past the empty-key guard and reached the gateway as a
+malformed ``Authorization: Bearer   *** header. The
+misconfiguration surfaced only on the first ``/gate`` call as a
+backend 401 (and a noisy ``runtime.shutdown()`` if the user
+already stopped debugging), not at startup — so a stray
+leading newline copy-pasted from an env-management UI would
+silently break every subsequent /gate roundtrip.
+
+Fix:
+
+  * ``src/nullrun/__init__.py:249`` — ``init()`` now resolves
+    ``raw_key = api_key if api_key is not None else
+    os.getenv("NULLRUN_API_KEY")``, then ``resolved_key =
+    raw_key.strip() if isinstance(raw_key, str) else None``,
+    before the truthiness check. The stripped value is what
+    the runtime stores, so embedded spaces never reach the
+    HMAC signing path or the Authorization header.
+  * ``src/nullrun/runtime.py:370`` — the same strip-then-check
+    is mirrored on the lower-level ``NullRunRuntime.__init__``
+    so direct construction (used by tests and advanced
+    callers) cannot bypass the contract.
+  * The legacy ``NullRunAuthenticationError`` is raised
+    synchronously (no runtime constructed) for ``api_key=None``,
+    ``api_key=""``, ``api_key="   "``, ``api_key="\t"``,
+    ``api_key="\n"``, ``NULLRUN_API_KEY=""``, and
+    ``NULLRUN_API_KEY="   "``. The error message is updated
+    to call out the whitespace-rejection contract ("strip
+    surrounding spaces before passing or exporting the key").
+
+Tests:
+
+  * ``tests/test_init_contract.py::TestInitRejectsWhitespaceApiKey``
+    — 7 new tests: parametrised 4 whitespace inputs (literal
+    space, tab, newline, mixed-whitespace), env-only whitespace,
+    strip-keep (a value with surrounding whitespace but real
+    content preserves the canonical form), and constructor
+    mirror (``NullRunRuntime(api_key=" ")`` raises the same
+    error as ``init(api_key=" ")``). Pinned to the 7 reject
+    cases enumerated above; the strip-keep test pins that the
+    stripped value reaches ``self.api_key`` exactly.
+  * All 39 pre-existing init + runtime tests still pass —
+    the strip is a strict superset of the empty check
+    (``"".strip() == ""`` raises; ``"x".strip() == "x"`` is
+    unchanged).
+
+Wire format: unchanged. Backends on 1.0.0 keep working
+unchanged. Pinning unchanged. No SDK_MIN_VERSION bump. No
+public API change.
+
+Refs: FINAL-REPORT-20260803-1 P2-6.
+
+---
+
 v3.31.5 / 0.14.6 (2026-08-01) — CI coverage-job flakefix +
 actions.cooldown window-of-zero race.
 
@@ -1099,5 +1160,5 @@ Recommended upgrade path: 0.13.4 -> 0.13.5.
 
 """
 
-__version__ = "0.14.6"
+__version__ = "0.14.7"
 __platform_version__ = "1.0.0"
