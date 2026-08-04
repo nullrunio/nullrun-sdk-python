@@ -367,7 +367,13 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 direct fallback for tests and advanced callers that
                 build the runtime by hand.
         """
-        self.api_key = api_key or os.getenv("NULLRUN_API_KEY")
+        # Mirror the strip-then-check from nullrun.init() so direct
+        # construction (used by tests and advanced callers) has the same
+        # contract: whitespace-only keys are rejected, and any leading
+        # / trailing whitespace is stripped before the value is stored on
+        # the runtime and reaches the HMAC signing path.
+        raw_key = api_key if api_key is not None else os.getenv("NULLRUN_API_KEY")
+        self.api_key = raw_key.strip() if isinstance(raw_key, str) else None
         self.secret_key = secret_key or os.getenv("NULLRUN_SECRET_KEY")
         self.api_url = api_url or os.getenv("NULLRUN_API_URL", "https://api.nullrun.io")
 
