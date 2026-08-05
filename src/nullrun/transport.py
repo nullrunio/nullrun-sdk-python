@@ -2643,6 +2643,7 @@ def _build_v3_error_code_map() -> dict[str, type[BaseException]]:
     from nullrun.breaker.exceptions import (
         NullRunAuthError,
         NullRunBackendError,
+        NullRunBlockedException,
         NullRunBudgetError,
         NullRunChainError,
         NullRunConsumeOverbudgetError,
@@ -2677,6 +2678,22 @@ def _build_v3_error_code_map() -> dict[str, type[BaseException]]:
         # 503 — backend availability
         "RATE_LIMIT_REDIS_UNAVAILABLE": NullRunRateLimitRedisError,
         "BUDGET_DATA_UNAVAILABLE": NullRunBackendError,
+        # 402 — approval-create failure family (DEF-ARFLOW-TOOLNAME-01,
+        # E2E 2026-08-05). Backend's
+        # ``classify_approval_create_error`` exposes these as
+        # ``details.error_code`` on the gate response so operators
+        # can tell a Postgres outage (retry-friendly) from a data
+        # integrity bug (rebuild-and-retry) from a config bug
+        # (operator fix). All map to ``NullRunBlockedException``
+        # because they are hard-rejects — the body did NOT run,
+        # the approval row could NOT be created, and the
+        # fail-CLOSED posture (CLAUDE.md §5 / §8) is preserved.
+        "APPROVAL_DB_UNAVAILABLE": NullRunBlockedException,
+        "APPROVAL_PERSISTENCE_FAILED": NullRunBlockedException,
+        "APPROVAL_VALIDATION_FAILED": NullRunBlockedException,
+        "APPROVAL_CONFLICT": NullRunBlockedException,
+        "APPROVAL_NOT_FOUND": NullRunBlockedException,
+        "APPROVAL_CREATE_FAILED": NullRunBlockedException,
     }
 
 

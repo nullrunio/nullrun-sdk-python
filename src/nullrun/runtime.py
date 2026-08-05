@@ -2627,32 +2627,56 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # Check if execution is allowed
         if result.get("decision") == "block":
             metrics.inc_runtime("execute_blocked")
-            # Layer 1: best-effort error_code mapping from the
-            # backend's ``explanation`` string. The backend does not
-            # yet stamp a structured block_reason on /execute
-            # responses (planned for the next round), so we match on
-            # keywords in the free-text explanation. Anything we
-            # cannot classify falls back to ``NR-X001`` (generic
-            # block). The mapping is intentionally conservative —
-            # false positives give the user the wrong code, false
-            # negatives just fall back to the generic code.
+            # Layer 1: best-effort error_code mapping.
+            #
+            # The backend stamps a structured ``details.error_code`` on
+            # every block response (Разрыв 1c follow-up, E2E 2026-08-05:
+            # classify_approval_create_error in
+            # backend/src/proxy/http/gate/internal.rs exposes
+            # APPROVAL_DB_UNAVAILABLE / APPROVAL_PERSISTENCE_FAILED /
+            # APPROVAL_VALIDATION_FAILED / APPROVAL_CONFLICT /
+            # APPROVAL_NOT_FOUND / APPROVAL_CREATE_FAILED, alongside
+            # the existing BUDGET_* / RATE_LIMIT_* family). When the
+            # backend provides one, we use it verbatim — no string
+            # parsing, no false positives. Falls back to the legacy
+            # keyword-on-explanation mapping for older backends that
+            # pre-date the structured code (the keyword path stays for
+            # back-compat — a 0.14.x SDK against a pre-Razryv-1c backend
+            # still classifies budget/loop/rate/tool blocks correctly).
             explanation = result.get("explanation", "policy violation")
-            explanation_lower = explanation.lower()
-            if "budget" in explanation_lower or "exhausted" in explanation_lower:
-                block_code, block_action = "NR-B004", "block"
-                block_cls = "NullRunBudgetError"
-            elif "loop" in explanation_lower or "repetition" in explanation_lower:
-                block_code, block_action = "NR-L001", "block"
+            wire_details = result.get("details") or {}
+            if not isinstance(wire_details, dict):
+                wire_details = {}
+            wire_error_code = wire_details.get("error_code")
+            if wire_error_code and isinstance(wire_error_code, str):
+                # Backend-supplied structured code wins. The
+                # catalogue exception class is mapped via
+                # ``_V3_ERROR_CODE_MAP`` on the transport path; on
+                # this /execute path we only have the SCREAMING_SNAKE
+                # backend code, so we surface it as-is in the
+                # ``error_code`` slot and let the caller branch on
+                # the catalog subclass if it has imported one. The
+                # block_code -> SDK exception-class mapping is done
+                # via the catalogue in nullrun.breaker.exceptions.
+                block_code, block_action = wire_error_code, "block"
                 block_cls = "NullRunBlockedException"
-            elif "rate" in explanation_lower or "too many" in explanation_lower:
-                block_code, block_action = "NR-R001", "block"
-                block_cls = "NullRunBlockedException"
-            elif "tool" in explanation_lower and "block" in explanation_lower:
-                block_code, block_action = "NR-T001", "block"
-                block_cls = "NullRunToolBlockedError"
             else:
-                block_code, block_action = "NR-X001", "block"
-                block_cls = "NullRunBlockedException"
+                explanation_lower = explanation.lower()
+                if "budget" in explanation_lower or "exhausted" in explanation_lower:
+                    block_code, block_action = "NR-B004", "block"
+                    block_cls = "NullRunBudgetError"
+                elif "loop" in explanation_lower or "repetition" in explanation_lower:
+                    block_code, block_action = "NR-L001", "block"
+                    block_cls = "NullRunBlockedException"
+                elif "rate" in explanation_lower or "too many" in explanation_lower:
+                    block_code, block_action = "NR-R001", "block"
+                    block_cls = "NullRunBlockedException"
+                elif "tool" in explanation_lower and "block" in explanation_lower:
+                    block_code, block_action = "NR-T001", "block"
+                    block_cls = "NullRunToolBlockedError"
+                else:
+                    block_code, block_action = "NR-X001", "block"
+                    block_cls = "NullRunBlockedException"
             # Note: we still raise the base ``NullRunBlockedException``
             # for non-budget/tool cases to keep the construction
             # shape simple — the catalogue code is what the user
@@ -2662,13 +2686,22 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             # subclass per branch above; keeping one raise here is
             # easier to reason about and matches the way the rest of
             # the codebase handles backend blocks.
+            #
+            # ``details`` carries the wire ``details`` payload so the
+            # caller can introspect ``exc.details["error_code"]`` and
+            # ``exc.details["decision_source"]`` for diagnostic
+            # routing. ``mapped_class`` is preserved as a backwards-
+            # compat shim for callers that branched on the keyword
+            # path; new code should branch on ``exc.error_code``.
+            merged_details = dict(wire_details)
+            merged_details["mapped_class"] = block_cls
             err = NullRunBlockedException(
                 workflow_id=workflow_id or UNKNOWN_WORKFLOW_ID,
                 reason=explanation,
                 action=block_action,
                 tool_name=tool_name,
                 error_code=block_code,
-                details={"mapped_class": block_cls},
+                details=merged_details,
             )
             # Layer 2: fire the on_error hook. The hook sees the
             # same exception the caller will catch plus the
