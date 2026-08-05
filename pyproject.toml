@@ -154,9 +154,13 @@ name = "nullrun"
 # canonical form on both sides of the wire.
 version = "0.14.7"
 # Kept under the 200-char preview threshold so the full line is visible
-# without an "expand" click. Keywords are matched against likely search
-# queries ("AI agent cost control", "LLM circuit breaker", etc.).
-description = "NullRun Python SDK — enforcement gateway for AI agents. Circuit-breaker, policy enforcement and observability for OpenAI, Anthropic, LangGraph, LlamaIndex, CrewAI, AutoGen."
+# without an "expand" click. The headline is the canonical §1 statement
+# from positioning.md — "runtime decision layer for tool-using AI agents"
+# (not "enforcement gateway", which undersells Phase 1 typed action
+# predicates and Разрыв 3 MCP-aware enforcement). Vendor list kept for
+# searchability; "BusinessImpact" + "MCP-aware" surface the two newest
+# differentiators. Keywords below match the likely search queries.
+description = "NullRun Python SDK — runtime decision layer for tool-using AI agents. Phase 1 BusinessImpact predicates, MCP-aware gate, circuit-breaker for OpenAI, Anthropic, LangGraph, LlamaIndex, CrewAI, AutoGen."
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
