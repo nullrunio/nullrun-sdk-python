@@ -30,11 +30,19 @@
 
 # nullrun
 
-**Enforcement gateway for AI agents.**
+**Runtime decision layer for tool-using AI agents.**
 
-Stop runaway agents before they burn the budget. NullRun sits between your
-code and your LLM calls, tracking cost and tool usage so a single agent can't
-take down your account.
+Before your agent executes a supported tool or model call, the SDK sends a
+structured request to NullRun. NullRun evaluates the applicable policy and
+runtime state and returns `allow`, `block`, or `require_approval` — a decision
+the SDK must enforce.
+
+Phase 1 / MVP 1.0 adds typed action predicates: an operator can write
+`IF money outflow in USD exceeds $50` and the system refuses to honor an
+approval that the SDK then executes with a different amount — bound via a
+SHA-256 `action_digest` over the typed `BusinessImpact` payload. Разрыв 3 /
+v3.31 adds MCP-aware gate enforcement so per-org MCP servers can be governed
+before they become action sources.
 
 > ⚠️ **Status: alpha.** The public API may shift between minor versions.
 > Pin your dependency and read the [CHANGELOG](./CHANGELOG.md) on every
