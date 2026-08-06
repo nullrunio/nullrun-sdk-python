@@ -397,17 +397,25 @@ class NullRunProtocolError(NullRunInfrastructureError):
 class NullRunChainError(NullRunDecision):
     """Chain-related failure.
 
-    Covers four backend codes: ``CHAIN_MAX_DURATION_EXCEEDED`` (402)
-    ``CHAIN_CROSS_ORG`` (403), ``CHAIN_ORG_MISMATCH`` (403), and
-    ``CHAIN_NOT_FOUND`` / ``CHAIN_EXPIRED`` (404). Splitting the
-    chain codes into their own class (rather than reusing
+    Covers backend codes: ``CHAIN_MAX_DURATION_EXCEEDED`` (402),
+    ``CHAIN_CROSS_ORG`` (403), ``CHAIN_ORG_MISMATCH`` (403),
+    ``CHAIN_NOT_FOUND`` / ``CHAIN_EXPIRED`` (404), and the
+    Execution Graph v0 (2026-08-06) trio:
+    ``PARENT_EXECUTION_NOT_FOUND`` / ``PARENT_EXECUTION_ORG_MISMATCH``
+    / ``PARENT_EXECUTION_KEY_MISMATCH`` (all 403). Splitting the
+    chain-and-lineage codes into their own class (rather than reusing
     NullRunBlockedException) gives cookbook code a clean way to
     distinguish "you forgot to start a chain" from "your tool is
-    blocked" without string-matching the message.
+    blocked" from "your sub-agent references an execution you do not
+    own" without string-matching the message.
 
     Attributes:
         chain_id: Chain that triggered the error (may be None on a
             cross-org collision).
+        parent_execution_id: Execution Graph v0 (2026-08-06) — the
+            parent execution_id from the rejected sub-agent call.
+            Distinct from chain_id (lifecycle of one SDK run) — the
+            Execution Graph tracks spawn topology across runs.
     """
 
     error_code = "NR-CH001"
@@ -424,12 +432,19 @@ class NullRunChainError(NullRunDecision):
         message: str,
         *,
         chain_id: str | None = None,
+        parent_execution_id: str | None = None,
         backend_code: str | None = None,
         details: dict[str, Any] | None = None,
         status_code: int | None = None,
         **kwargs: Any,
     ) -> None:
         self.chain_id = chain_id
+        # Execution Graph v0 (2026-08-06): when the backend rejects
+        # a sub-agent call with PARENT_EXECUTION_*, the offending
+        # parent_execution_id is preserved on the exception so
+        # cookbook code can log / surface it without re-parsing the
+        # message string. ``None`` for non-lineage chain errors.
+        self.parent_execution_id = parent_execution_id
         self.backend_code = backend_code or self.error_code
         self.details = details or {}
         # 2026-07-04: preserve the wire HTTP
