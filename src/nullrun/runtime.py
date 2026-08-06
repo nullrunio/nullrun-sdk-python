@@ -2851,7 +2851,46 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
 
             idem_key = get_server_minted_idempotency_key()
             if idem_key:
-                enriched["idempotency_key"] = idem_key
+                # 2026-08-06 (DEF-SDKWRAP-CHAIN-SOFT-EXECUTION-ID-REUSE-01,
+                # Session 6 TC-SDKWRAP-05/07/16): the captured /check
+                # operation_id is reused across every llm_call event
+                # within the same chain-context cache window
+                # (``_GATE_CACHE_TTL_SECONDS=5s``). The backend's v3
+                # /track idempotency layer
+                # (``backend/src/proxy/handlers.rs::finalize_track_idempotency``)
+                # hashes the request body against the stored body for
+                # the same key — every event after the FIRST one in
+                # the cache window shares the same idempotency_key but
+                # has a DIFFERENT body (tokens, model, latency, etc.)
+                # → 409 ``IDEMPOTENCY_KEY_MISMATCH`` and the event is
+                # silently dropped. Per CLAUDE.md §22 (Trust model):
+                # "losing actual token counts means downstream billing
+                # sees tokens=0 instead of the real cost" — billing-
+                # integrity regression.
+                #
+                # Fix: derive a per-event idempotency_key by combining
+                # the captured /check operation_id (so retries of the
+                # same event still hit the same server-side cache slot
+                # and the backend returns 200 + ``idempotent_replay:
+                # true``) with a per-event discriminator (span_id is
+                # minted once per @protect invocation, see
+                # ``decorators.py::_next_span`` — unique per event,
+                # stable across retries of the same event). Format:
+                # ``<op_id>:<span_short>`` where ``span_short`` is the
+                # first 16 hex chars of span_id — collision-free for
+                # distinct span_ids (122 bits of entropy in the source
+                # UUID v4) and short enough to keep the key under 80
+                # chars for backend storage. The discriminator only
+                # applies when a captured /check key is in scope —
+                # caller-supplied keys (above) and legacy batch-path
+                # keys (no /check involved) are unaffected.
+                span_id = enriched.get("span_id")
+                if span_id and ":" not in idem_key:
+                    enriched["idempotency_key"] = (
+                        f"{idem_key}:{str(span_id)[:16]}"
+                    )
+                else:
+                    enriched["idempotency_key"] = idem_key
 
         # 2026-07-12 (multi-agent span attachment — SDK counterpart at
         # nullrun-sdk-python release/0.13.5 commit efff530):
