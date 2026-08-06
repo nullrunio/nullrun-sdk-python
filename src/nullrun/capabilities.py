@@ -40,7 +40,7 @@ operator sees the mismatch BEFORE the first /check fails with 503.
 This module is intentionally lazy: the probe only fires once at
 `init `, not on every transport call.
 
-## Drift history
+## Capability history
 
 * 2026-07-06 — fixed P0 (audit §1 capabilities):
   - probe URL was ``/health`` (legacy v1/v2); backend exposes the
@@ -87,7 +87,7 @@ CAPABILITIES_PATH = "/health"
 
 @dataclass(frozen=True)
 class RateLimitFailScope:
-    """Per CLAUDE.md §9 — fail-OPEN/CLOSED matrix for rate limiting.
+    """Fail-OPEN/CLOSED matrix for rate limiting.
 
     ``aggregate`` controls the per-org aggregate bucket; ``per_key``
     controls the per-API-key bucket. Each is either ``"open"`` (fail-OPEN:

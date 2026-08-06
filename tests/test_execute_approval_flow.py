@@ -1,4 +1,4 @@
-"""Phase 0 regression tests for human approval on the live /execute path."""
+"""Regression tests for human approval on the live /execute path."""
 
 from __future__ import annotations
 

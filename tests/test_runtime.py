@@ -90,7 +90,7 @@ class TestNullRunRuntimeTrack:
         rt.track({"event_type": "test"})
 
     def test_wire_payload_strips_sensitive_fields(self, make_runtime):
-        """Phase 4.1 privacy boundary: ``raw_usage``, ``_fingerprint``
+        """Privacy boundary: ``raw_usage``, ``_fingerprint``
         and ``cost_cents`` MUST NOT appear in the dict that lands on
         the transport buffer (i.e. what /api/v1/track/batch would
         serialise). Normalised fields pass through unchanged.
@@ -241,7 +241,7 @@ class TestNullRunRuntimeExecute:
 
     @pytest.mark.skip(
         reason=(
-            "Round 3 (Phase 0.4.0): runtime.execute now requires "
+            "runtime.execute now requires "
             'on_transport_error="raise" to surface classified errors '
             "(preserves legacy fail-OPEN behaviour by default so "
             "check_workflow_budget can treat network errors as transient). "

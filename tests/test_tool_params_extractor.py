@@ -1,7 +1,7 @@
-"""Phase 1 / MVP 1.1 -- SDK e2e for the ToolParameters path.
+"""Typed impact + digest-bound approval -- SDK e2e for the ToolParameters path.
 
 These tests pin the wire shape produced by ``@sensitive`` when
-paired with ``ToolParamsExtractor`` (the Tier 2 / Razryv 2
+paired with ``ToolParamsExtractor`` (the tool-parameters
 follow-up to ``MoneyImpactExtractor``). Mirrors the structure of
 ``test_sensitive_extractor.py`` so a reader who knows one file
 knows the other.
@@ -279,7 +279,7 @@ class TestToolParamsExtraction:
     def test_float_arg_is_silently_dropped(
         self, captured_payload: _PayloadCapture, captured_runtime: NullRunRuntime
     ) -> None:
-        """Phase 1 filter-not-block: a kwarg whose type is not
+        """Typed-impact filter-not-block: a kwarg whose type is not
         JSON-roundtrippable (``float``) is silently dropped from
         the wire payload rather than failing the pre-check.
 
@@ -547,7 +547,7 @@ class TestToolCallParamsShape:
 
 
 # ---------------------------------------------------------------------------
-# 5. Regression: explicit-extractor-vs-auto-attach priority (Phase 1 / MVP 1.1)
+# 5. Regression: explicit-extractor-vs-auto-attach priority (typed impact + tool-params)
 # ---------------------------------------------------------------------------
 #
 # Bug found via ad-hoc verification after the initial auto-attach
@@ -633,9 +633,8 @@ class TestAutoAttachChainWalk:
         self, captured_runtime: NullRunRuntime
     ) -> None:
         """``@sensitive(impact=money_outflow(...))`` also survives
-        the auto-attach path (the original Phase 1 / MVP 1.0
-        money variant must NOT be overwritten by the Tier 2
-        auto-attach).
+        the auto-attach path (the original money variant must NOT be
+        overwritten by the tool-parameters auto-attach).
         """
 
         def tool_fn(amount_cents: int) -> None:

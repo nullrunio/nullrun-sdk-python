@@ -1,4 +1,4 @@
-"""BusinessImpact extraction for @sensitive tools (Phase 1 / MVP 1.0).
+"""BusinessImpact extraction for @sensitive tools.
 
 This module is the SDK-side counterpart of the backend's
 ``BusinessImpact`` discriminated union. It exposes a single
@@ -41,7 +41,7 @@ semantics of a function argument should not flip silently when
 the function signature is refactored. Concretely:
 
     @nullrun.sensitive(impact=nullrun.money_outflow(argument="amount"))
-    def refund(amount: int) -> ...   # Phase 0 path: 50 = 50 cents
+    def refund(amount: int) -> ...   # 50 = 50 cents (minor units)
     def refund(amount: Decimal) -> ... # 50 = $50.00 (5000 cents)
 
 If ``units`` were implicit-from-type, renaming ``amount``'s
@@ -175,7 +175,7 @@ from nullrun.business_impact import (
 #
 # ``minor`` = the value is already in minor units (cents, pence,
 # satoshi-style). The SDK stores the value verbatim on the wire.
-# This is the Phase 0 / pre-Decimal path: a function declared
+# This is the pre-Decimal path: a function declared
 # ``def refund(amount_cents: int)`` already works in minor units
 # so the operator just has to add the decorator and the wire
 # shape does not change.
@@ -605,7 +605,7 @@ def _to_minor_units(
 class MoneyImpactExtractor:
     """Declarative money-impact extractor.
 
-    ``units`` discriminator semantics (Phase 1.1 / UX follow-up):
+    ``units`` discriminator semantics:
 
     - ``units="minor"`` (default): the bound argument is
       already in minor units. ``int`` is the canonical type;
@@ -740,9 +740,8 @@ def money_outflow(
     ``InvalidCurrencyError`` at decorator-application time.
 
     ``units`` defaults to ``"minor"`` for backward compatibility
-    with the Phase 0 / pre-Decimal path. New code that
-    passes Decimal amounts in major units should pass
-    ``units="major"`` explicitly.
+    with the pre-Decimal path. New code that passes Decimal
+    amounts in major units should pass ``units="major"`` explicitly.
 
     ``enforce_business_cap`` defaults to ``True`` so any debit
     above the per-currency cap goes through the explicit
@@ -761,7 +760,7 @@ def money_outflow(
 
 
 # ============================================================================
-# Phase 1 / MVP 1.1 -- ToolParameters (Разрыв 2 / Tier 2)
+# ToolParameters extractor
 # ============================================================================
 #
 # The ToolParamsExtractor is the SDK-side mirror of the backend's
@@ -804,7 +803,7 @@ _TOOL_CALL_EXTRACTOR_VERSION = "1"
 
 
 class ToolParamsExtractor:
-    """Phase 1 / MVP 1.1 tool-params impact extractor.
+    """ToolParameters impact extractor.
 
     Captures the live call's kwargs into a free-form JSON object
     that the backend matches against ToolParameters Approval
@@ -992,11 +991,11 @@ def tool_params(
 ) -> ToolParamsExtractor:
     """Shorthand constructor used by ``@sensitive(impact=tool_params(...))``.
 
-    Phase 1 / MVP 1.1 (Tier 2): every bare ``@sensitive`` tool
-    auto-attaches a ``ToolParamsExtractor(include_all=True)``
-    (see ``_do_sensitive_register`` in decorators.py), so most
-    users never need to call this function explicitly. The
-    factory below is for two opt-in cases:
+    Every bare ``@sensitive`` tool auto-attaches a
+    ``ToolParamsExtractor(include_all=True)`` (see
+    ``_do_sensitive_register`` in decorators.py), so most users
+    never need to call this function explicitly. The factory
+    below is for two opt-in cases:
 
     1. Explicit ``{rule_param: arg_name}`` mapping when the
        rule name diverges from the function arg name::

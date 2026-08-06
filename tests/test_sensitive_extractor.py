@@ -1,4 +1,4 @@
-"""Phase 1 / MVP 1.0 -- SDK e2e for the @sensitive(impact=...) path.
+"""Typed impact + digest-bound approval -- SDK e2e for the @sensitive(impact=...) path.
 
 These tests pin the wire shape produced by the auto-wire path:
 when a sensitive tool decorated with ``@sensitive(impact=...)``
@@ -99,7 +99,7 @@ def captured_payload(captured_runtime) -> _PayloadCapture:
 
 
 # ---------------------------------------------------------------------------
-# Phase 1 typed tools: built manually instead of via the @sensitive
+# Typed-impact tools: built manually instead of via the @sensitive
 # decorator. The decorator wiring is exercised by
 # ``test_decorator_factory_form_attaches_extractor`` below.
 # ---------------------------------------------------------------------------
@@ -110,7 +110,7 @@ def _refund_customer_impl(amount_cents: int, customer_id: str = "c-1") -> dict[s
 
 
 def _register_refund_tool(rt: NullRunRuntime) -> Any:
-    """Bind ``_refund_customer_impl`` with the Phase 1 extractor
+    """Bind ``_refund_customer_impl`` with the typed-impact extractor
     and register it as a sensitive tool. Mirrors what
     ``@sensitive(impact=money_outflow(argument="amount_cents"))``
     would do at decorator-application time, but without paying
@@ -124,8 +124,8 @@ def _register_refund_tool(rt: NullRunRuntime) -> Any:
 
 
 def _register_legacy_tool(rt: NullRunRuntime) -> Any:
-    """Bind a sensitive tool WITHOUT a Phase 1 extractor (legacy
-    Phase 0 path). The wrapper must NOT attach business_impact
+    """Bind a sensitive tool WITHOUT a typed-impact extractor (legacy
+    approval_id-only path). The wrapper must NOT attach business_impact
     or action_digest to the wire.
     """
     def search_docs(query: str) -> list[str]:
@@ -141,7 +141,7 @@ def _register_legacy_tool(rt: NullRunRuntime) -> Any:
 
 
 class TestSensitiveExtractorWirePayload:
-    """Pin the wire shape produced by the Phase 1 auto-wire path.
+    """Pin the wire shape produced by the typed-impact auto-wire path.
 
     These tests replace the SDK's transport with a recorder and
     invoke ``_enforce_sensitive_tool`` directly. The capture
@@ -163,14 +163,14 @@ class TestSensitiveExtractorWirePayload:
         assert captured_payload.last_kwargs is not None
         kwargs = captured_payload.last_kwargs
 
-        # Both Phase 1 fields must be present because the function
+        # Both typed-impact fields must be present because the function
         # has the extractor attribute set.
         assert "business_impact" in kwargs, (
-            f"Phase 1 contract broken: business_impact missing from "
+            f"Typed-impact contract broken: business_impact missing from "
             f"wire kwargs: {sorted(kwargs.keys())}"
         )
         assert "action_digest" in kwargs, (
-            f"Phase 1 contract broken: action_digest missing from "
+            f"Typed-impact contract broken: action_digest missing from "
             f"wire kwargs: {sorted(kwargs.keys())}"
         )
 
@@ -189,7 +189,7 @@ class TestSensitiveExtractorWirePayload:
     def test_legacy_sensitive_tool_sends_no_business_impact(
         self, captured_payload: _PayloadCapture, captured_runtime: NullRunRuntime
     ) -> None:
-        """Phase 0 path: tool is sensitive but has no impact
+        """Legacy path: tool is sensitive but has no impact
         extractor. The SDK MUST NOT attach business_impact or
         action_digest to the wire -- the backend falls back to
         approval_id-only grant consume.
@@ -206,7 +206,7 @@ class TestSensitiveExtractorWirePayload:
     def test_extractor_rejects_unknown_argument_at_call_time(
         self, captured_runtime: NullRunRuntime
     ) -> None:
-        """Phase 1 fail-CLOSED: if the extractor raises (e.g.
+        """Typed-impact fail-CLOSED: if the extractor raises (e.g.
         argument name mismatch), the pre-check MUST fail. The
         body NEVER runs.
         """
@@ -229,7 +229,7 @@ class TestSensitiveExtractorWirePayload:
     def test_extractor_rejects_negative_amount(
         self, captured_runtime: NullRunRuntime
     ) -> None:
-        """Phase 1 fail-CLOSED: a negative amount must NOT pass
+        """Typed-impact fail-CLOSED: a negative amount must NOT pass
         the pre-check. Without this, a hostile SDK caller could
         subtract their way past the rule threshold by passing a
         negative number.
@@ -241,7 +241,7 @@ class TestSensitiveExtractorWirePayload:
         with pytest.raises(NullRunBlockedException) as exc_info:
             _enforce_sensitive_tool(captured_runtime, fn, (-1,), {"customer_id": "c-1"})
         assert exc_info.value.error_code == "NR-B003"
-        # Phase 1.1 hardening: the negative-amount guard now
+        # Decimal support hardening: the negative-amount guard now
         # lives in ``_to_minor_units`` (not in
         # ``MoneyImpact.validate``), so the reason text
         # matches the new "rejected negative" message. The

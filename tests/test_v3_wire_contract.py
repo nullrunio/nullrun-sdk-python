@@ -643,7 +643,7 @@ class TestPingChainScheduler:
         # real 10s interval — turns a 10s test into a sub-second one
         # without changing the production scheduler code.
         #
-        # Sprint 0 (coverage): this test depends on the real
+        # (coverage): this test depends on the real
         # wall clock to accumulate scheduler iterations within the
         # 500ms ``time.sleep`` window. ``@pytest.mark.slow_sleep``
         # on the enclosing class opts out of the conftest autouse

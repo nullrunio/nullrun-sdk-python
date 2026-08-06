@@ -1,4 +1,4 @@
-"""Phase 1.1 UX follow-up: explicit units discriminator + Decimal support.
+"""Decimal support follow-up: explicit units discriminator + Decimal support.
 
 These tests pin the behavior the previous review explicitly
 called out: the unit semantics (major / minor) must be
@@ -86,7 +86,7 @@ class TestMajorUnitsDecimalConversion:
         assert impact.impact.amount_minor == 5_000
 
     def test_decimal_50_005_rejected_for_usd(self) -> None:
-        # Phase 1.1 production-grade contract: precision must be
+        # Production-grade contract: precision must be
         # supplied correctly by the caller. ``Decimal("50.005")``
         # is a sub-cent precision that USD does not support, so
         # the SDK raises ``ValueError`` rather than silently
@@ -321,7 +321,7 @@ class TestGoldenHexSurvivesNewPath:
         )
         impact = ext.impact_for(_refund_cents, (5_000,), {})
         # The canonical wire form is identical to the legacy
-        # Phase 0 path. The golden hex is the SAME on the
+        # pre-Decimal path. The golden hex is the SAME on the
         # backend side (see ``business_impact.rs::tests::
         # action_digest_golden_usd_outflow_5000_cents``).
         from nullrun.business_impact import compute_action_digest
@@ -481,7 +481,7 @@ class TestToMinorUnitsHelper:
 class TestDirectionIsUnaffected:
     """``units`` does not interact with ``direction`` (outflow /
     inflow). The default direction is OUTFLOW, matching the
-    Phase 0 / pre-Decimal path."""
+    pre-Decimal path."""
 
     def test_major_units_default_direction_is_outflow(self) -> None:
         ext = money_outflow(

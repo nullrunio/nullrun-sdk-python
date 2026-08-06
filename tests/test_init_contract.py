@@ -84,10 +84,9 @@ class TestInitWritesAllSingletonSlots:
     """
 
     def test_init_writes_all_three_singleton_slots(self, monkeypatch, mock_api):
-        # Phase 3 (2026-07-05): the three slots
-        # (`runtime._runtime`, `NullRunRuntime._instance`,
+        # The three slots (`runtime._runtime`, `NullRunRuntime._instance`,
         # `decorators._runtime`) all route through the
-        # RuntimeRegistry. We assert the registry pointer directly
+        # RuntimeRegistry (as of 2026-07-05). We assert the registry pointer directly
         # and also confirm the legacy read paths see the same
         # instance (backwards compat).
         from nullrun._registry import get_active_runtime
@@ -114,7 +113,7 @@ class TestInitWritesAllSingletonSlots:
         slots — that directly tests the locking primitive without
         the noise of background WS threads.
 
-        Phase 3 (2026-07-05): the worker writes through the
+        As of 2026-07-05, the worker writes through the
         RuntimeRegistry (the canonical store). The
         NullRunRuntime._instance descriptor routes to the
         registry, and the module-level `_runtime` proxies re-resolve

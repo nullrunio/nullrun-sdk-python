@@ -1,4 +1,4 @@
-"""Tests for the Phase 3 RuntimeRegistry.
+"""Tests for the RuntimeRegistry.
 
 Covers the single-source-of-truth contract:
 
@@ -39,9 +39,8 @@ def test_registry_set_returns_previous_instance():
 
     The contract lets `init()` shut down the old runtime before
     installing a new one without holding the lock across the
-    swap. (Phase 3 commit message: this avoids the deadlock
-    pattern where a stale instance keeps the lock during its
-    own shutdown.)
+    swap. This avoids the deadlock pattern where a stale
+    instance keeps the lock during its own shutdown.
     """
     from nullrun._registry import RuntimeRegistry
 
@@ -58,7 +57,7 @@ def test_registry_set_returns_previous_instance():
 def test_registry_clear_does_not_shutdown():
     """clear() drops the pointer without calling any teardown.
 
-    Phase 3 rationale: the registry never owns the lifetime
+    The registry never owns the lifetime
     of the runtime it stores. Callers that want a real
     shutdown call `runtime.shutdown()` (which itself calls
     `registry.clear()` on success). Conflating the two would
@@ -139,7 +138,7 @@ def test_metaclass_descriptor_routes_through_registry():
     registry, so the class attribute is always the same object
     the registry holds.
 
-    The Phase 3 metaclass proxy is the only path that touches
+    The metaclass proxy is the only path that touches
     the singleton; legacy code that imports
     `NullRunRuntime._instance` keeps working without
     importing the registry directly.
@@ -201,7 +200,7 @@ def test_legacy_globals_set_on_runtime_module_does_not_shadow():
     """Backwards-compat: a test fixture that does
     `runtime._runtime = None` (the historical reset idiom) goes
     through the proxy and clears the registry, NOT a regular
-    attribute. This is the regression we fixed in Phase 3.
+    attribute. This is the regression the proxy fixed.
     """
     import nullrun.runtime as rt_mod
     from nullrun._registry import get_registry

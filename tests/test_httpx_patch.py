@@ -17,7 +17,7 @@ Covers:
   header — otherwise the downstream openai/anthropic client tries to
   decompress an already-decompressed body and raises `zlib.error: Error
   -3 while decompressing data: incorrect header check`. Regression
-  test for the bug that broke Phase 3 of `policy_e2e_demo.py`.
+  test for the bug that broke the policy demo's end-to-end gzip path.
 """
 
 from __future__ import annotations

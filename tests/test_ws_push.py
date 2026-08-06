@@ -1,5 +1,5 @@
 """
-Tests for the SDK WebSocket push path (Phase B of the hardening plan).
+Tests for the SDK WebSocket push path.
 
 The push contract: when the server pushes a `state_change` message with
 `state: "Killed"`, the runtime's `on_state_change` callback writes the
@@ -458,7 +458,7 @@ def test_dispatch_state_drops_older_versions_after_seen_higher():
 
 
 # ---------------------------------------------------------------------------
-# 5. Sprint 1.5 (B13): HMAC verify failure on signed messages
+# 5. B13: HMAC verify failure on signed messages
 # ---------------------------------------------------------------------------
 # Pre-fix: a signed WS message with a bad signature was logged at
 # WARNING and dropped silently. For a safety-layer product, a

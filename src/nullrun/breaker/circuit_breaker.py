@@ -199,9 +199,8 @@ class CircuitBreaker:
         """Record state transition metrics."""
         if new_state == CBState.OPEN:
             metrics.inc_transport("circuit_open_count")
-            # Sprint 3 follow-up (B24): also bump the
-            # ``circuit_breaker_opens`` global counter on
-            # ``TransportMetrics`` (was 0-call). This is the
+            # Also bump the global ``circuit_breaker_opens`` counter
+            # on ``TransportMetrics`` (was 0-call). This is the
             # cross-CB-instance counter — the operator alerts
             # on its rate, not on the per-CB ``circuit_open_count``.
             metrics.inc_transport("circuit_breaker_opens")
@@ -227,11 +226,11 @@ class CircuitBreaker:
 
     @property
     def state(self) -> CBState:
-        # Phase 0.3.1: hold the lock for the whole transition so
-        # concurrent threads do not race into HALF_OPEN. The
-        # previous version only held the lock for the dict read
-        # which let two workers independently decide they should
-        # both probe in HALF_OPEN at the same wall-clock moment.
+        # Hold the lock for the whole transition so concurrent
+        # threads do not race into HALF_OPEN. The previous
+        # version only held the lock for the dict read which
+        # let two workers independently decide they should both
+        # probe in HALF_OPEN at the same wall-clock moment.
         # The fix also publishes HALF_OPEN to Redis (was defined
         # but never called) so other workers see the state via
         # ``_check_global_state`` instead of falling back to
@@ -301,8 +300,8 @@ class CircuitBreaker:
         if self._state == CBState.OPEN and self._opened_at is not None:
             time_in_open = time.monotonic() - self._opened_at
             if time_in_open >= self._recovery_timeout:
-                # Phase 8: cap at 5s (was 30s). 5s is plenty to
-                # spread reconnects across workers.
+                # Cap at 5s. 5s is plenty to spread reconnects
+                # across workers.
                 jitter = random.uniform(0, 5.0)
                 time.sleep(jitter)
 

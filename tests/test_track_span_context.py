@@ -1,7 +1,7 @@
 """
 Tests for span-context attachment in track_llm / track_tool.
 
-Phase 2 Commit 5: track_llm and track_tool must auto-include
+track_llm and track_tool must auto-include
 `trace_id` / `span_id` (and `parent_span_id` / `depth`) from the
 active SpanContext set by `@protect` or a manual `set_span`. This
 lets the backend render LLM/tool calls under the right node of the

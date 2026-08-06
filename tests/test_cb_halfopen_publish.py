@@ -69,7 +69,7 @@ class TestPublishHalfOpen:
 
 
 # ===========================================================================
-# Sprint 2.5 (B3): HALF_OPEN call-allocation under concurrent load
+# HALF_OPEN call-allocation under concurrent load (B3)
 # ===========================================================================
 # Pins the invariant: when the breaker is HALF_OPEN, at most
 # ``half_open_max_calls`` concurrent calls are allowed to probe

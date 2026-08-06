@@ -1,10 +1,9 @@
 """
-Regression tests for Phase 8 release polish.
+Regression tests for release polish.
 
-Phase 8:
-- #8.1: get_org_status public method on NullRunRuntime.
-- #8.4: NULLRUN_BATCH_SIZE / NULLRUN_FLUSH_INTERVAL_MS env vars.
-- #8.6: RecordingSession does not persist _fingerprint.
+- get_org_status public method on NullRunRuntime.
+- NULLRUN_BATCH_SIZE / NULLRUN_FLUSH_INTERVAL_MS env vars.
+- RecordingSession does not persist _fingerprint.
 - Circuit-breaker sleep capped at 5s.
 """
 
@@ -13,7 +12,7 @@ from __future__ import annotations
 import pytest
 
 # ===========================================================================
-# 8.1: get_org_status
+# get_org_status
 # ===========================================================================
 
 
@@ -81,7 +80,7 @@ def test_get_org_status_calls_endpoint(monkeypatch):
 
 
 # ===========================================================================
-# 8.4: env vars
+# env vars
 # ===========================================================================
 
 
@@ -115,9 +114,9 @@ def test_batch_size_env_invalid_ignored(monkeypatch):
 
 
 # ===========================================================================
-# 8.6: _fingerprint not persisted
+# _fingerprint not persisted
 # ===========================================================================
-# Sprint 2.1: the local decision-history recorder was deleted (the
+# The local decision-history recorder was deleted (the
 # feature moved to the backend dashboard; the SDK does not store
 # request/response payloads). The ``start_recording`` / ``stop_recording``
 # methods on ``NullRunRuntime`` are kept as no-op stubs for one minor
@@ -129,7 +128,7 @@ def test_batch_size_env_invalid_ignored(monkeypatch):
 def test_start_stop_recording_are_noop_stubs():
     """``start_recording`` returns "" and ``stop_recording`` returns None.
 
-    Pre-Sprint-2.1 these returned a ``RecordingSession`` /
+    Before this change these returned a ``RecordingSession`` /
     ``session_id`` and persisted events to disk. The recorder
     itself was deleted, so the methods are now no-op stubs. This
     test pins the new contract.

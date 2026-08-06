@@ -1,6 +1,6 @@
 # Backwards-compat proxy descriptor for ``NullRunRuntime._instance``.
 
-# Phase 3 (2026-07-05) refactored the singleton slot into the
+# The singleton slot was refactored into the
 # ``nullrun._registry.RuntimeRegistry`` so there is exactly one
 # source of truth. External code (test fixtures, third-party
 # extensions, dashboard scripts) still introspects
@@ -71,9 +71,9 @@ def install_module_proxy(module, attribute_name: str = "_runtime") -> None:
     Backwards-compat for code that imports
     nullrun.runtime._runtime or
     nullrun.decorators._runtime directly — historically these
-    were plain module attributes holding the active runtime. After
-    Phase 3 the registry is the source of truth, so the module
-    attribute is now a property-style proxy.
+    were plain module attributes holding the active runtime. The
+    registry is the source of truth now, so the module attribute
+    is a property-style proxy.
 
     Args:
         module: The module object to patch.

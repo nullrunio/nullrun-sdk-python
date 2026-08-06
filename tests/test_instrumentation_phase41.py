@@ -1,4 +1,4 @@
-"""Coverage padding for Phase 4.1 instrumentation additions.
+"""Coverage padding for instrumentation additions (finish_reason normaliser, cache/reasoning/tool-name extraction).
 
 The PR adds a finish_reason normaliser + cache / reasoning / tool-name
 extraction in two places:
@@ -7,7 +7,7 @@ extraction in two places:
   new branches in ``_openai_extractor`` / ``_anthropic_extractor`` /
   etc.
 * ``nullrun.instrumentation.langgraph._safe_get_gen_message``
-  ``_get_finish_reason``, and the Phase 4.1 second-tier fields of
+  ``_get_finish_reason``, and the second-tier fields of
   ``extract_usage_from_response``.
 
 The functions are pure (or near-pure) — feed them a representative
@@ -94,9 +94,9 @@ class TestNormalizeFinishReason:
 
 
 # ---------------------------------------------------------------------------
-# _openai_extractor — Phase 4.1 second-tier fields
+# _openai_extractor — second-tier fields
 # ---------------------------------------------------------------------------
-class TestOpenAIPhase41Fields:
+class TestOpenAISecondTierFields:
     def test_cache_read_and_reasoning_tokens_extracted(self) -> None:
         # OpenAI's o-series responses nest cache + reasoning under
         # prompt_tokens_details / completion_tokens_details.
@@ -123,7 +123,7 @@ class TestOpenAIPhase41Fields:
         assert out["cache_write_tokens"] == 0
 
     def test_finish_reason_normalised(self) -> None:
-        # The Phase 4.1 extractor pulls ``finish_reason`` off the
+        # The extractor pulls ``finish_reason`` off the
         # first choice and routes it through the normaliser.
         body = json.dumps(
             {
@@ -170,9 +170,9 @@ class TestOpenAIPhase41Fields:
 
 
 # ---------------------------------------------------------------------------
-# _anthropic_extractor — Phase 4.1 cache_read + cache_write
+# _anthropic_extractor — cache_read + cache_write
 # ---------------------------------------------------------------------------
-class TestAnthropicPhase41Fields:
+class TestAnthropicSecondTierFields:
     def test_cache_read_and_write_tokens(self) -> None:
         # Anthropic exposes BOTH cache_read_input_tokens and
         # cache_creation_input_tokens — the SDK surfaces both.
@@ -273,9 +273,9 @@ class TestGetFinishReason:
 
 
 # ---------------------------------------------------------------------------
-# extract_usage_from_response — Phase 4.1 second-tier fields
+# extract_usage_from_response — second-tier fields
 # ---------------------------------------------------------------------------
-class TestExtractUsagePhase41:
+class TestExtractUsageSecondTier:
     def test_cache_read_tokens_from_anthropic(self) -> None:
         # Anthropic exposes cache_read_input_tokens directly on the
         # usage block; the SDK mirrors it as cache_read_tokens.

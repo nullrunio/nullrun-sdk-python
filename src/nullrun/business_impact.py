@@ -1,13 +1,12 @@
 """BusinessImpact + action_digest (SDK mirror of backend).
 
-Phase 1 / MVP 1.0 (Разрыв 1c follow-up). The Python SDK
-must produce the *exact* same SHA-256 hex digest the Rust
+The SDK must produce the *exact* same SHA-256 hex digest the Rust
 backend computes, so the digest re-check on /execute re-check
 matches byte-for-byte. Drift between SDK and backend would be
 caught at the first mismatch attack on a real customer.
 
 Wire format mirrors `backend::proxy::gate::business_impact`:
-- discriminated union with a single MVP variant `kind="money"`
+- discriminated union with a single variant `kind="money"`
 - `MoneyImpact(direction, amount_minor, currency, ...)`
 - `Condition(MoneyAmount(direction, operator, threshold_minor,
   currency))` lives on the **rule side** in the backend; the
@@ -49,10 +48,9 @@ GTE = "gte"
 EQ = "eq"
 
 
-# MVP 1.0: `money` kind for per-call flat amounts.
-# MVP 1.1 (ToolParameters / Phase 1 / Tier 2): `tool_call` kind
-# for free-form tool-call argument bags matched against
-# ToolParameters Approval Rules on the backend.
+# `money` kind for per-call flat amounts.
+# `tool_call` kind for free-form tool-call argument bags matched
+# against ToolParameters Approval Rules on the backend.
 KIND_MONEY = "money"
 KIND_TOOL_CALL = "tool_call"
 
@@ -67,15 +65,15 @@ TOOL_PARAMETERS_MAX_PARAM_NAME = 64
 
 @dataclass
 class MoneyImpact:
-    """Flat per-call money amount, USD-centric in MVP 1.0.
+    """Flat per-call money amount.
 
     Attributes:
         direction: "outflow" (refund/payout) or "inflow" (charge/invoice).
-            MVP approval rules only fire on outflow.
+            Approval rules only fire on outflow.
         amount_minor: integer cents for USD, MUST be non-negative.
             Negatives are rejected at validate() time. Sign convention
             is `direction`, not `+/- amount` — do not switch.
-        currency: ISO-4217 (3 uppercase letters). MVP is "USD". The
+        currency: ISO-4217 (3 uppercase letters). Default is "USD". The
             backend treats any other currency as a no-match against a
             USD-only rule (separate per-currency rule needed by author).
         extractor_id: self-reported SDK extractor id (e.g. "nullrun.money.path").
@@ -131,7 +129,7 @@ class MoneyImpact:
 
 @dataclass
 class ToolCallParams:
-    """Free-form tool-call argument bag (Phase 1 / Tier 2 wire shape).
+    """Free-form tool-call argument bag.
 
     Mirrors the backend ``BusinessImpact::ToolCall(ToolCallParams)``
     variant at ``backend/src/proxy/gate/business_impact.rs:62-307``.
@@ -260,15 +258,16 @@ def business_impact_to_dict(impact: BusinessImpact) -> dict[str, Any]:
 # Dataclasses that mirror the Rust backend's discriminated union via
 # `kind` discriminator. In Python we represent the union as a
 # tagged dict at the wire layer and a small class hierarchy at the
-# in-process layer. MVP 1.0 only materializes MoneyImpact.
+# in-process layer. The SDK validates the variant at construction
+# time so the backend never sees malformed output.
 @dataclass
 class BusinessImpact:
     """Top-level BusinessImpact union.
 
-    MVP 1.0: `Money` only.
-    MVP 1.1 (Phase 1 / Tier 2): adds `ToolCall` for free-form
-    tool-call argument bags matched against ToolParameters
-    Approval Rules on the backend.
+    Variants:
+        `Money`: flat per-call money amount (cents, USD-centric).
+        `ToolCall`: free-form tool-call argument bag matched
+            against ToolParameters Approval Rules on the backend.
 
     The SDK validates the variant at construction time so the
     backend never sees malformed output.
