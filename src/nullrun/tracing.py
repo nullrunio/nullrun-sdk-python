@@ -1,19 +1,16 @@
 """
 Trace/span context management via Python contextvars.
 
-This module is the core of the new trace/span system (Phase 2 of
-the SDK cleanup plan). The previous `nullrun.context` module
-exposed loose `_trace_id` and `_span_id` contextvars — fine for
-attaching IDs to events, but it didn't model the parent/child
-hierarchy that a trace timeline needs.
+The previous `nullrun.context` module exposed loose `_trace_id` and
+`_span_id` contextvars — fine for attaching IDs to events, but it
+didn't model the parent/child hierarchy that a trace timeline needs.
 
 `SpanContext` is a structured value: a single contextvar holds
 the *current* span, and child spans are derived from it via
 `create_child_span(parent)`. This is the same pattern OpenTelemetry
 uses for its Python SDK (`opentelemetry.context.get_current`) and
-gives `@protect` (Commit 4) and `track_*` (Commit 5) a uniform
-way to attach `trace_id` / `span_id` / `parent_span_id` / `depth`
-to every emitted event.
+gives `@protect` and `track_*` a uniform way to attach `trace_id` /
+`span_id` / `parent_span_id` / `depth` to every emitted event.
 
 Thread/async safety: `ContextVar` is thread-local by default but
 PEP 567 guarantees the right value is restored across `await`
@@ -97,11 +94,11 @@ def create_child_span(parent: SpanContext) -> SpanContext:
         ValueError: if `parent` is ``None``. The function does NOT
             silently degrade to creating a root span — that would
             hide bugs in the caller where a parent was expected.
-            Sprint 2.6 (B5): pre-fix this raised
-            ``TypeError: unsupported operand for None + 1`` on
-            ``parent.depth + 1`` which crashed the entire
-            ``@protect`` / track_* pipeline. Raise a clear
-            ``ValueError`` instead so the caller can fix the bug.
+            Pre-fix this raised ``TypeError: unsupported operand
+            for None + 1`` on ``parent.depth + 1`` (B5) which
+            crashed the entire ``@protect`` / track_* pipeline.
+            Raise a clear ``ValueError`` instead so the caller
+            can fix the bug.
     """
     if parent is None:
         raise ValueError(

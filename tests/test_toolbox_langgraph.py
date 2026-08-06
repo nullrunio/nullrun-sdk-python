@@ -105,6 +105,6 @@ def test_old_instrument_path_is_removed():
     import nullrun.instrumentation.langgraph as mod
 
     assert not hasattr(mod, "instrument"), (
-        "Phase 1 Commit 6: `instrument` should be removed; "
+        "`instrument` should be removed; "
         "use `nullrun.toolbox.langgraph.wrapper` instead."
     )

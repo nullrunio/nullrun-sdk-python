@@ -1,9 +1,9 @@
 """
 Vendor-independent auto-instrumentation for NullRun SDK.
 
-Phase D of the hardening plan: a single `nullrun.init(api_key=...)` call should
-track every LLM call regardless of vendor. The user does not need to remember
-to call `patch_openai ` or wire callbacks.
+A single `nullrun.init(api_key=...)` call should track every LLM call
+regardless of vendor. The user does not need to remember to call
+`patch_openai` or wire callbacks.
 
 Three observation paths feed a single sink (`runtime.track`):
 
@@ -181,7 +181,7 @@ def _openai_extractor(body: bytes, status: int) -> ExtractedUsage | None:
         # body bytes) never collides with the callback's scheme and
         # the dedup LRU cannot collapse duplicates.
         "id": payload.get("id"),
-        # Phase 4.1: explicit cache / reasoning / finish / tool fields.
+        # Explicit cache / reasoning / finish / tool fields.
         # Previously these were reachable only via raw_usage (now
         # stripped at the wire boundary). Backend gate/budget/loop
         # detection now sees them as first-class columns.
@@ -402,7 +402,7 @@ def _cohere_extractor(body: bytes, status: int) -> ExtractedUsage | None:
     Note: Cohere streaming has no usage in stream — only non-streaming
     responses carry it. Documented in the plan.
 
-    2026-07-13 (drift fix #N): v2 has THREE schema changes the SDK
+    2026-07-13: v2 has THREE schema changes the SDK
     silently missed:
 
       1. ``tool_calls`` live under ``message.tool_calls`` (not at
@@ -734,7 +734,7 @@ def _check_kill_before_send(runtime: Any, request: httpx.Request) -> None:
       - no workflow can be resolved (no active context, no API key binding)
       - the cached state is anything other than Killed / Paused
 
-    Note: prior to T3-S2 (0.3.0) this also short-circuited in
+    Note: prior to 0.3.0 this also short-circuited in
     `local_mode` (no api_key). The local_mode branch is gone because
     api_key is now required at runtime construction — every runtime
     has a remote control plane to consult.
@@ -750,11 +750,11 @@ def _check_kill_before_send(runtime: Any, request: httpx.Request) -> None:
     # rather than crashing the user's transport hook.
     if not hasattr(runtime, "_resolve_workflow_id"):
         return
-    # Phase 5 #5.8: the kill check is independent of which LLM host
-    # the user is talking to. Previously the check was gated on the
-    # extractor table, so a custom LLM endpoint silently bypassed the
-    # dashboard KILL switch. The kill state lives in `_remote_states`
-    # which is keyed by workflow, not by host.
+    # The kill check is independent of which LLM host the user is
+    # talking to. Previously the check was gated on the extractor
+    # table, so a custom LLM endpoint silently bypassed the dashboard
+    # KILL switch. The kill state lives in `_remote_states` which is
+    # keyed by workflow, not by host.
     workflow_id = runtime._resolve_workflow_id(None)
     if not workflow_id:
         return
@@ -784,14 +784,14 @@ def _check_kill_before_send(runtime: Any, request: httpx.Request) -> None:
 # once, the extractor runs, and a fresh Response is returned with the same
 # body bytes — callers see no behavioural change.
 
-# NOTE (Sprint 2.3): the ``_STREAMING_CONTENT_TYPES`` constant was
-# defined here but only consumed in ``auto_requests.py`` (same
-# constant is re-defined there). The streaming branch in the
-# httpx transport wrapper does not actually consult this table
-# it just reads the body and lets the extractors return ``None``
-# for non-usage bodies. The constant is deleted to avoid the
-# false impression that this module has streaming-specific
-# behaviour. See auto.py module docstring §"Streaming".
+# NOTE: the ``_STREAMING_CONTENT_TYPES`` constant was defined here
+# but only consumed in ``auto_requests.py`` (same constant is
+# re-defined there). The streaming branch in the httpx transport
+# wrapper does not actually consult this table — it just reads the
+# body and lets the extractors return ``None`` for non-usage bodies.
+# The constant is deleted to avoid the false impression that this
+# module has streaming-specific behaviour. See auto.py module
+# docstring §"Streaming".
 
 class NullRunSyncTransport(httpx.BaseTransport):
     """Synchronous httpx transport that emits a `llm_call` event for known
@@ -866,9 +866,9 @@ class NullRunSyncTransport(httpx.BaseTransport):
         # against the post-decompression byte count.
         req = getattr(response, "_request", None) or request
         headers = response.headers.copy()
-        # Phase 6 #6.2: also strip Transfer-Encoding so downstream
-        # HTTP clients (and httpx itself) don't try to chunk-decode
-        # an already-buffered body.
+        # Also strip Transfer-Encoding so downstream HTTP clients
+        # (and httpx itself) don't try to chunk-decode an
+        # already-buffered body.
         for enc in (
             "content-encoding", "Content-Encoding",
             "transfer-encoding", "Transfer-Encoding",
@@ -929,8 +929,8 @@ class NullRunSyncTransport(httpx.BaseTransport):
         # a known provider. See plan at
         # `~/.claude/plans/async-swinging-hanrahan.md`.
         try:
-            # Phase 4.1: lift cache / reasoning / finish / tool names
-            # out of raw_usage onto the event itself. The backend's
+            # Lift cache / reasoning / finish / tool names out of
+            # raw_usage onto the event itself. The backend's
             # gate/budget/loop detection needs them as first-class
             # columns; raw_usage is no longer on the wire (stripped
             # at the track boundary — see _WIRE_STRIP_FIELDS in
@@ -1050,9 +1050,9 @@ class NullRunAsyncTransport(httpx.AsyncBaseTransport):
         # zlib.error.
         req = getattr(response, "_request", None) or request
         headers = response.headers.copy()
-        # Phase 6 #6.2: also strip Transfer-Encoding so downstream
-        # HTTP clients (and httpx itself) don't try to chunk-decode
-        # an already-buffered body.
+        # Also strip Transfer-Encoding so downstream HTTP clients
+        # (and httpx itself) don't try to chunk-decode an
+        # already-buffered body.
         for enc in (
             "content-encoding", "Content-Encoding",
             "transfer-encoding", "Transfer-Encoding",
@@ -1091,9 +1091,9 @@ class NullRunAsyncTransport(httpx.AsyncBaseTransport):
         # `_extract_model_from_request_body` is sync-only); leave
         # model as the response-body value or None.
         try:
-            # Phase 4.1: see sync _emit for rationale. Async path
-            # uses identical event shape so the dedup key space
-            # stays unified across sync + async transports.
+            # See sync _emit for rationale. Async path uses
+            # identical event shape so the dedup key space stays
+            # unified across sync + async transports.
             #
             # Audit 2026-06-29 (unified fingerprint): see sync
             # _emit for the rationale — async transport must use the
@@ -1170,12 +1170,11 @@ def _fingerprint_for(host: str, body: bytes, status: int) -> str:
 def _fingerprint_for_event_dict(event: dict[str, Any]) -> str:
     """Stable fingerprint for a generic event dict.
 
-    Phase 3 of the production-readiness plan: ``runtime.track_event``
-    was the only emit path that did NOT set ``_fingerprint``, so two
-    observers firing for the same LLM call (the user's manual
-    ``track_event`` plus the httpx transport hook) produced two
-    ``/track`` POSTs. This helper gives the dedup LRU a stable key
-    derived from the event's content.
+    ``runtime.track_event`` was the only emit path that did NOT set
+    ``_fingerprint``, so two observers firing for the same LLM call
+    (the user's manual ``track_event`` plus the httpx transport hook)
+    produced two ``/track`` POSTs. This helper gives the dedup LRU a
+    stable key derived from the event's content.
     """
     try:
         payload = json.dumps(event, sort_keys=True, default=str).encode("utf-8")
@@ -1652,8 +1651,8 @@ def _emit_from_agents_result(runtime: Any, result: Any) -> None:
         if prompt == 0 and completion == 0 and total == 0:
             continue
         try:
-            # Phase 4.1: lift cache / reasoning / finish / tool fields
-            # from raw_usage onto the event itself, mirroring the
+            # Lift cache / reasoning / finish / tool fields from
+            # raw_usage onto the event itself, mirroring the
             # sync/async httpx transport shape. The Agents SDK emits
             # the OpenAI usage shape so the field names line up.
             prompt_details = usage.get("prompt_tokens_details") or {}
@@ -1847,13 +1846,13 @@ def auto_instrument(runtime: Any) -> bool:
     at least one path was installed (so the caller can log a useful
     'instrumented N paths' message).
 
-    Sprint 2.9 (B47): every patch call is wrapped in ``safe_patch``
-    which logs at WARNING if the patch raised a non-ImportError
-    exception. Pre-fix the 25+ scattered ``try/except Exception:
-    pass # pragma: no cover`` blocks meant a vendor SDK breaking
-    change (e.g. a renamed method) would silently disable cost
-    tracking with no log line. The operator would only find out
-    when the bill arrived.
+    Every patch call is wrapped in ``safe_patch`` (B47) which logs
+    at WARNING if the patch raised a non-ImportError exception. The
+    pre-fix ``try/except Exception: pass # pragma: no cover`` blocks
+    meant a vendor SDK breaking change (e.g. a renamed method)
+    would silently disable cost tracking with no log line. The
+    operator would only find out when the bill arrived.
+
     """
     global _auto_installed
     with _auto_lock:
@@ -2015,7 +2014,7 @@ def reset_for_tests() -> None:
 # events. This is exposed here so tests can introspect / clear the LRU
 # without poking into the runtime module.
 
-DEDUP_LRU_MAX = 4096  # Phase 6 #6.7: 4096 entries give a 410ms dedup window at 10K events/sec
+DEDUP_LRU_MAX = 4096  # 4096 entries give a 410ms dedup window at 10K events/sec
 
 # P0-3: streaming-OOM cap. Pre-fix, the sync transport
 # called ``response.read `` and the async transport called

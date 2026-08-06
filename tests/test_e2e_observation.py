@@ -1,5 +1,5 @@
 """
-Phase 2: real e2e observation test.
+Real e2e observation test.
 
 The previous suite used respx to mock the NULLRUN backend. That's
 fine for unit coverage, but it doesn't prove the SDK actually

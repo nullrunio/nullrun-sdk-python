@@ -57,8 +57,8 @@ GOLDEN_HEX_USD_50_DOLLARS_OUTFLOW = (
     "dfc96387ca539b7130caebe705e042f2e34e52ab44352ae5e527bcef64f0df27"
 )
 
-# Cross-language parity pin for the Tier 2 / Разрыв 2
-# ``ToolCall`` impact (Разрыв 2 / 2026-07-27). The Rust backend
+# Cross-language parity pin for the
+# ``ToolCall`` impact (2026-07-27). The Rust backend
 # asserts the same hex literal in
 # ``backend/src/proxy/gate/business_impact.rs::tests::
 # tool_call_digest_golden_value_stripe_charge_500``. Any drift
@@ -262,7 +262,7 @@ class TestExtractorFailureModes:
 
     def test_negative_amount_raises_value_error(self) -> None:
         ext = money_outflow(argument="amount_cents")
-        # Phase 1.1: hardening pass added ``InvalidMoneyAmountError``
+        # Decimal support hardening pass added ``InvalidMoneyAmountError``
         # which subclasses ``ValueError``; the legacy matcher
         # still works for ``except ValueError`` callers.
         with pytest.raises(ValueError, match="rejected negative"):
@@ -285,7 +285,7 @@ class TestExtractorFailureModes:
 
 
 # ---------------------------------------------------------------------------
-# 1b. Tier 2 / Разрыв 2 — ToolCall impact cross-language parity
+# 1b. ToolCall impact cross-language parity
 # ---------------------------------------------------------------------------
 #
 # Pins the SDK digest to the SAME hex literal the Rust backend

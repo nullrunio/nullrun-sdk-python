@@ -1,4 +1,4 @@
-"""Tests for the v3.31 (Разрыв 3) MCP tool-context helpers.
+"""Tests for the v3.31 MCP tool-context helpers.
 
 Pure contextvar plumbing — no network involved. These tests are
 the SDK-side contract pin for the wire fields the backend expects:
@@ -138,7 +138,7 @@ class TestMcpContext:
     def test_annotations_partial_dict_allowed(self):
         # Operators may forward only the keys they have. The
         # backend treats absent keys as "unknown" rather than
-        # false (per Разрыв 3 / wire contract). The SDK does
+        # false (per wire contract). The SDK does
         # the same — partial dicts are accepted verbatim.
         set_mcp_tool_context(annotations={"destructive": True})
         ann = get_call_mcp_annotations()

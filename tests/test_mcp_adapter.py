@@ -261,7 +261,7 @@ def test_call_tool_unknown_tool_stamps_class_invalid():
 
     assert get_call_mcp_class() == "invalid"
     ann = get_call_mcp_annotations()
-    # Per Разрыв 3 / wire contract, all three hints are
+    # Per wire contract, all three hints are
     # explicitly ``None`` (= unknown) rather than ``False``
     # so the gate cannot accidentally bypass a destructive
     # block because the adapter lied.

@@ -24,7 +24,7 @@ the authoritative table; deviations require an ADR amendment (Rule 5).
 | `_emit_span_start` / `_emit_span_end` | n/a -- never blocks | n/a | n/a |
 | `/track` batch path (legacy) | OPEN-on-network-error (event dropped, no retry) | n/a -- circuit breaker backoff applies | none |
 
-**Drift fix 2026-07-04:** the SDK_README.md claim
+**Readme correction (2026-07-04):** the SDK_README.md claim
 "Fail-OPEN на инфраструктурных сбоях. Если backend недоступен, бюджет
 не блокирует агента" is **partially wrong** — it conflates SDK-side
 transport failure with backend-side budget-enforcement failure. The
@@ -103,11 +103,11 @@ from nullrun.uuid7 import uuid7_str  # 2026-07-04 BUG #4
 
 logger = logging.getLogger(__name__)
 
-# Phase 0.3.1: sentinel used when a gate fires outside a
-# ``with workflow(...)`` context. The double-underscore prefix
-# namespacing avoids collision with a user workflow that happens
-# to be named ``<unknown>`` (the previous literal was a
-# collision hazard). Wire compat: still a string.
+# Sentinel used when a gate fires outside a ``with workflow(...)``
+# context. The double-underscore prefix namespacing avoids
+# collision with a user workflow that happens to be named
+# ``<unknown>`` (the previous literal was a collision hazard).
+# Wire compat: still a string.
 UNKNOWN_WORKFLOW_ID: str = "__nullrun_unknown__"
 
 # 2026-07-04 (BUG #5): in-process gate cache for chain-mode
@@ -180,13 +180,13 @@ def is_strict_mode_forced(tool_name: str) -> bool:
 # worth the simplicity of a hard-coded threshold).
 SERVER_MINTED_RESERVATION_MAX_AGE_SECONDS: float = 295.0
 
-# Phase 0 review (2026-07-23): hard cap on server-supplied
-# approval_timeout_seconds. The backend is authoritative for the
-# approval window, but a misconfigured backend (or a malicious
-# proxy in front of one) could advertise an absurdly long
-# timeout (e.g. 1e9 seconds) and lock the calling thread
-# indefinitely. We clamp the server value to this ceiling as
-# the maximum time we'll ever wait for an operator click.
+# Hard cap on server-supplied approval_timeout_seconds. The
+# backend is authoritative for the approval window, but a
+# misconfigured backend (or a malicious proxy in front of one)
+# could advertise an absurdly long timeout (e.g. 1e9 seconds) and
+# lock the calling thread indefinitely. We clamp the server
+# value to this ceiling as the maximum time we'll ever wait for
+# an operator click.
 # The env default `NULLRUN_APPROVAL_TIMEOUT_SECONDS` is also
 # clamped — see check_workflow_budget / runtime.execute for the
 # exact clamp call.
@@ -202,10 +202,10 @@ MIN_APPROVAL_TIMEOUT_SECONDS: float = 1.0
 def _validate_approval_timeout(value: object, log_prefix: str) -> float | None:
     """Validate and clamp a server-supplied approval_timeout_seconds.
 
-    Phase 0 review (2026-07-23): the server is authoritative for the
-    approval window, but it could advertise 0 (deadlock), 1e9 (lock the
-    thread for years), a non-numeric string, or `None`. We refuse to
-    forward anything outside `[MIN_APPROVAL_TIMEOUT_SECONDS,
+    The server is authoritative for the approval window, but it
+    could advertise 0 (deadlock), 1e9 (lock the thread for
+    years), a non-numeric string, or `None`. We refuse to forward
+    anything outside `[MIN_APPROVAL_TIMEOUT_SECONDS,
     MAX_APPROVAL_TIMEOUT_SECONDS]` and return `None` so the caller
     falls back to `_approval_timeout_seconds` (the env default).
 
@@ -243,10 +243,10 @@ def _validate_approval_timeout(value: object, log_prefix: str) -> float | None:
     return candidate
 
 
-# Phase 4.1: privacy boundary. Fields that MUST NOT leave the SDK on
-# the wire. The transport layer (POST /api/v1/track/batch) reads
-# whatever is in the event dict, so anything not allowlisted ends up
-# in the user's audit log on the backend side. We strip:
+# Privacy boundary: fields that MUST NOT leave the SDK on the
+# wire. The transport layer (POST /api/v1/track/batch) reads
+# whatever is in the event dict, so anything not allowlisted ends
+# up in the user's audit log on the backend side. We strip:
 #
 # * ``cost_cents`` -- the SDK does not estimate cost; the backend
 # recomputes it from tokens + the org's pricing policy. Sending
@@ -258,7 +258,7 @@ def _validate_approval_timeout(value: object, log_prefix: str) -> float | None:
 # which prompts went through dedup, defeating the purpose.
 # * ``raw_usage`` -- the vendor's full usage dict (OpenAI
 # ``prompt_tokens_details``, Anthropic ``cache_*_input_tokens``
-# etc.) — Phase 4.1 moved every field we care about out of
+# etc.) -- every field we care about has been lifted out of
 # raw_usage onto the event itself, so the original dict is now
 # just an opaque blob of provider-specific data. Carrying it on
 # the wire is a privacy regression: provider response payloads
@@ -271,15 +271,15 @@ def _validate_approval_timeout(value: object, log_prefix: str) -> float | None:
 _WIRE_STRIP_FIELDS: frozenset[str] = frozenset({"cost_cents", "_fingerprint", "raw_usage"})
 
 
-# Phase 3 (2026-07-05): metaclass is what routes the legacy
-# NullRunRuntime._instance class-attribute access through the
-# registry (see :class:`nullrun._singleton._NullRunRuntimeMeta`).
-# The descriptor protocol only fires on class-level access if the
-# descriptor lives on the metaclass — defining _instance on
-# the class body would route reads through type.__getattribute__
-# and never call our __get__. Keeping the metaclass minimal
-# (it only owns _instance) means every other attribute behaves
-# exactly as before.
+# The metaclass routes the legacy NullRunRuntime._instance
+# class-attribute access through the registry (see
+# :class:`nullrun._singleton._NullRunRuntimeMeta`). The descriptor
+# protocol only fires on class-level access if the descriptor
+# lives on the metaclass -- defining _instance on the class body
+# would route reads through type.__getattribute__ and never call
+# our __get__. Keeping the metaclass minimal (it only owns
+# _instance) means every other attribute behaves exactly as
+# before.
 from nullrun._singleton import _NullRunRuntimeMeta
 
 
@@ -392,11 +392,12 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             )
         # organization_id is set by _authenticate; stays None until then.
         self.organization_id: str | None = None
-        # Phase 139+: workflow_id is set by _authenticate from the API
-        # key's binding (organization_api_keys.workflow_id). Used as a
-        # fallback for /check, /status, and span events when the user
-        # hasn't entered a `with workflow(...)` context. None on legacy
-        # keys (pre-139 or never used) -- call sites must NOT invent one.
+        # workflow_id is set by _authenticate from the API key's
+        # binding (organization_api_keys.workflow_id). Used as a
+        # fallback for /check, /status, and span events when the
+        # user hasn't entered a `with workflow(...)` context. None
+        # on legacy keys (pre-139 or never used) -- call sites
+        # must NOT invent one.
         self.workflow_id: str | None = None
 
         self._test_mode = _test_mode
@@ -417,12 +418,11 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         self._transport: Transport | None = None
 
         # Local enforcement state
-        # Phase 0.3.1: the BoundedDict-based per-workflow cost /
-        # loop / retry counters have been removed alongside
-        # ``_check_local_limits``. As of 0.7.0 ALL local
-        # enforcement (LoopTracker / RateTracker / _local_check /
-        # hardcoded thresholds) has been removed -- the SDK is a
-        # thin client, the backend is authoritative.
+        # The BoundedDict-based per-workflow cost / loop / retry
+        # counters have been removed alongside ``_check_local_limits``.
+        # As of 0.7.0 ALL local enforcement (LoopTracker / RateTracker
+        # / _local_check / hardcoded thresholds) has been removed --
+        # the SDK is a thin client, the backend is authoritative.
         self._workflow_start_time: float = time.time()
 
         # Layer 3: ring buffer for the ``nullrun.status `` recent
@@ -440,11 +440,11 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         self._last_backend_attempt_at: float | None = None
         self._last_backend_attempt_ok: bool | None = None
 
-        # Phase D: dedup LRU. Multiple observation paths (httpx transport
-        # LangChain callback, OpenAI Agents tracer) can fire for the same
-        # LLM call. We collapse them to a single track per fingerprint.
-        # The fingerprint is computed at the observation point and passed
-        # via the `_fingerprint` event field.
+        # Dedup LRU. Multiple observation paths (httpx transport,
+        # LangChain callback, OpenAI Agents tracer) can fire for
+        # the same LLM call. We collapse them to a single track per
+        # fingerprint. The fingerprint is computed at the observation
+        # point and passed via the `_fingerprint` event field.
         from nullrun.instrumentation.auto import make_dedup_state
 
         self._seen_track_fingerprints = make_dedup_state()
@@ -465,15 +465,15 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # Remote control plane state (per-workflow, pushed from server via WS).
         # Unified model: effective_state = max(local_state, remote_state).
         # All writes and reads go through the `_remote_state_for` /
-        # `_set_remote_state` helpers (Phase 5 #5.1) so the WS callback
-        # the HTTP poll, and the gate check can run concurrently
-        # without a TOCTOU race. RLock because the same thread can
-        # re-enter via the gate's get-then-set sequence.
+        # `_set_remote_state` helpers so the WS callback, the HTTP
+        # poll, and the gate check can run concurrently without a
+        # TOCTOU race. RLock because the same thread can re-enter
+        # via the gate's get-then-set sequence.
         self._remote_states: dict[str, dict[str, Any]] = {}
         self._states_lock = threading.RLock()
 
-        # Drift section 7 (2026-07-06): human-approval pending registry.
-        # When a /gate response carries decision="require_approval",
+        # Human-approval pending registry. When a /gate response
+        # carries decision="require_approval",
         # the SDK stores the (approval_id, workflow_id, execution_id)
         # tuple here and blocks until either:
         #   - the WS push arrives with outcome="approved" (release
@@ -501,11 +501,12 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             _t = 300.0
         self._approval_timeout_seconds: float = _t
 
-        # Phase B: control plane transport. The SDK connects to the server's
-        # WS endpoint and receives state push events (killed/paused) within
-        # ~100ms of the operator action -- vs the previous 1s HTTP poll.
-        # The HTTP poll path is preserved as a fallback when
-        # `NULLRUN_TRANSPORT=http` is set (env var defaults to `ws`).
+        # Control plane transport. The SDK connects to the server's
+        # WS endpoint and receives state push events (killed/paused)
+        # within ~100ms of the operator action -- vs the previous 1s
+        # HTTP poll. The HTTP poll path is preserved as a fallback
+        # when `NULLRUN_TRANSPORT=http` is set (env var defaults to
+        # `ws`).
         self._transport_mode: str = os.getenv("NULLRUN_TRANSPORT", "ws").lower()
         self._ws_thread: threading.Thread | None = None
         self._ws_stop_event = threading.Event()
@@ -570,12 +571,12 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # Initialize action handler
         self._action_handler = ActionHandler()
 
-        # Phase 1.4: Sensitive tools that require strict mode (pre-execution enforcement)
-        # These tools MUST go through /execute endpoint, NOT direct execution
-        # Phase 4 (2026-07-05): is_sensitive_tool is the hot
-        # path on every @protect call against a sensitive tool.
-        # We keep a pre-lowercased mirror so the read does not
-        # have to build a set comprehension on every call. The
+        # Sensitive tools that require strict mode (pre-execution
+        # enforcement). These tools MUST go through /execute
+        # endpoint, NOT direct execution. ``is_sensitive_tool`` is
+        # the hot path on every @protect call against a sensitive
+        # tool. We keep a pre-lowercased mirror so the read does
+        # not have to build a set comprehension on every call. The
         # cache is mutated alongside _sensitive_tools under
         # _tools_lock (see add/remove_sensitive_tool below) and
         # every value is lowercased at insertion time.
@@ -616,12 +617,11 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # comprehension per call). Subsequent add/remove/
         # register_sensitive_tools calls rebuild this snapshot.
         self._sensitive_tools_lower = frozenset(t.lower() for t in self._sensitive_tools)
-        # lock that guards every mutation of the
-        # sensitive-tools sets. The pre-fix code did
-        # ``self._strict_mode_tools.add(tool_name)`` from
-        # ``add_sensitive_tool`` without holding any lock; the
-        # reader in ``is_sensitive_tool`` (line 1270-ish) did
-        # ``tool_name in self._strict_mode_tools`` without a lock.
+        # Lock that guards every mutation of the sensitive-tools
+        # sets. Reads and writes to these sets are guarded so a
+        # concurrent reader cannot observe a mid-mutation snapshot
+        # on a free-threaded build. The lock is uncontended on the
+        # read path so the cost is one acquire per call.
         # Under CPython's GIL the set mutation is atomic at the
         # bytecode level, but the snapshot you read can still be
         # stale mid-mutation (a single-threaded read can see the
@@ -637,11 +637,10 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
     def get_instance(cls) -> "NullRunRuntime":
         """Get the singleton runtime instance.
 
-        Thread-safe: the singleton lock is held for the full read-compare-
-        rebuild sequence (Phase 5 #5.3). The previous version dropped the
-        lock between shutdown and the recursive get_instance, creating a
-        window where a concurrent caller could observe a half-shutdown
-        runtime.
+        Thread-safe: the singleton lock is held for the full
+        read-compare-rebuild sequence. The lock prevents a
+        concurrent caller from observing a half-shutdown runtime
+        between an inner shutdown and the recursive rebuild.
         """
         with cls._lock:
             # Re-read env vars at every call site so credential rotation
@@ -949,20 +948,21 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                     raise err
                 self.organization_id = org_id
 
-                # Phase 139+: pick up the workflow this key is bound to.
-                # `None` on legacy keys (pre-139 or never-used) -- call
-                # sites that NEED a workflow (check_workflow_budget
-                # check_control_plane, span events) will fall through to
-                # the contextvar when self.workflow_id is None, exactly
-                # like before. New keys always have this set.
+                # Pick up the workflow this key is bound to.
+                # `None` on legacy keys (pre-139 or never-used) --
+                # call sites that NEED a workflow
+                # (check_workflow_budget, check_control_plane, span
+                # events) will fall through to the contextvar when
+                # self.workflow_id is None, exactly like before.
+                # New keys always have this set.
                 self.workflow_id = data.get("workflow_id")
 
-                # Phase 0.3.1: pre-Phase-139 API keys do not return
-                # workflow_id, so the SDK cannot honour the
-                # dashboard's KILL/PAUSE for that workflow. Emit a
-                # one-time WARNING so the operator knows to rotate
-                # the key. Without this, the kill switch silently
-                # no-ops (a real safety hole for legacy users).
+                # Legacy API keys do not return workflow_id, so the
+                # SDK cannot honour the dashboard's KILL/PAUSE for
+                # that workflow. Emit a one-time WARNING so the
+                # operator knows to rotate the key. Without this,
+                # the kill switch silently no-ops (a real safety
+                # hole for legacy users).
                 if self.workflow_id is None:
                     masked_key = (
                         (self.api_key[:8] + "***")
@@ -972,7 +972,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                     logger.warning(
                         f"API key {masked_key!s} is a legacy key with no "
                         f"workflow binding; remote kill/pause will not be "
-                        f"honoured. Rotate to a Phase 139+ key in the "
+                        f"honoured. Rotate to a workflow-bound key in the "
                         f"dashboard to enable control plane enforcement."
                     )
 
@@ -1037,10 +1037,11 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
     def _start_remote_polling(self) -> None:
         """Start the control-plane background listener.
 
-        Phase B: defaults to WebSocket push for sub-second kill/pause
-        propagation. Set `NULLRUN_TRANSPORT=http` to fall back to the
-        legacy 1-second HTTP poll (kept for environments where the WS
-        endpoint is blocked or for parity with old SDK behavior).
+        Defaults to WebSocket push for sub-second kill/pause
+        propagation. Set `NULLRUN_TRANSPORT=http` to fall back to
+        the legacy 1-second HTTP poll (kept for environments where
+        the WS endpoint is blocked or for parity with old SDK
+        behavior).
         """
         if self._transport_mode == "http":
             self._start_http_poller()
@@ -1057,12 +1058,13 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         logger.info("Started remote state poller (HTTP)")
 
     def _start_ws_listener(self) -> None:
-        """Phase B: connect the WebSocket push channel in a background thread.
+        """Connect the WebSocket push channel in a background thread.
 
-        The thread runs its own asyncio loop so the WS receive task can
-        drive `_remote_states` from server pushes without contending with
-        the user's main loop. Reconnects with exponential backoff on
-        disconnect (handled inside `WebSocketConnection`).
+        The thread runs its own asyncio loop so the WS receive task
+        can drive `_remote_states` from server pushes without
+        contending with the user's main loop. Reconnects with
+        exponential backoff on disconnect (handled inside
+        `WebSocketConnection`).
         """
         if not self.organization_id:
             logger.warning(
@@ -1207,24 +1209,23 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
 
           1. `explicit` -- passed by the call site (e.g. contextvar in
              track_event or the user-supplied arg in check_control_plane)
-          2. `self.workflow_id` -- bound to the API key by the server
-             (Phase 139+). Set during _authenticate. None on legacy
-             keys.
+          2. `self.workflow_id` -- bound to the API key by the server.
+             Set during _authenticate. None on legacy keys.
           3. None -- caller is in cloud mode but has no workflow scope.
              /check falls through to org-level policy; /status is
              skipped; span events are emitted without workflow_id
              (orphan, as before).
 
-        The SDK does NOT auto-generate a workflow_id. The Phase 139
-        invariant -- workflow is derived server-side from the key, never
-        invented by the SDK -- is preserved.
+        The SDK does NOT auto-generate a workflow_id. The
+        invariant -- workflow is derived server-side from the key,
+        never invented by the SDK -- is preserved.
         """
         if explicit:
             return explicit
         return self.workflow_id
 
     def _remote_state_for(self, workflow_id: str) -> dict[str, Any]:
-        """Return the cached remote state for `workflow_id` (Phase 5 #5.1).
+        """Return the cached remote state for `workflow_id`.
 
         Thread-safe via `_states_lock`. If no state has been pushed
         yet, returns an empty dict (so callers can do
@@ -1253,9 +1254,9 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         backend/src/proxy/handlers.rs:9758, accepts X-API-Key OR
         Authorization: Bearer). Pre-swap the HTTP-poll path silently
         401'd on every poll, so the legacy HTTP-poll fallback never
-        observed a remote kill/pause. WS push (the default mode since
-        Phase 5) does NOT go through this code path, so the WS control
-        plane is unaffected.
+        observed a remote kill/pause. WS push (the default mode)
+        does NOT go through this code path, so the WS control plane
+        is unaffected.
 
         Backend ``StatusResponse`` (handlers.rs:9747-9756) returns
         ``workflow_id, state, version, reason?, updated_at
@@ -1292,11 +1293,10 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             logger.debug(f"Failed to fetch remote state for {workflow_id}: {e}")
 
     def _handle_approval_resolved(self, payload: dict[str, Any]) -> None:
-        """Drift section 7 (2026-07-06): WS push handler for an
-        approval resolution. Releases the matching gate
-        reservation (approved) or raises WorkflowKilledInterrupt
-        (denied) so the agent can resume from the same
-        execution_id.
+        """WS push handler for an approval resolution. Releases
+        the matching gate reservation (approved) or raises
+        WorkflowKilledInterrupt (denied) so the agent can resume
+        from the same execution_id.
 
         Args:
             payload: The WsMessage::ApprovalResolved dict from the
@@ -1340,8 +1340,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         execution_id: str,
         timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
-        """Drift section 7 (2026-07-06) + Разрыв 1c (2026-07-21):
-        block the calling thread until the WS approval push
+        """Block the calling thread until the WS approval push
         arrives (or the per-approval timeout elapses). The WS
         handler (``_handle_approval_resolved`` above) sets the
         threading Event when the push lands; this method waits
@@ -1353,16 +1352,14 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             execution_id: Execution the approval gates.
             timeout_seconds: Server-authoritative wait duration
                 from the /gate response field
-                ``approval_timeout_seconds`` (added in Разрыв 1c,
-                2026-07-21). When set, this overrides
-                ``self._approval_timeout_seconds`` (the
+                ``approval_timeout_seconds``. When set, this
+                overrides ``self._approval_timeout_seconds`` (the
                 ``NULLRUN_APPROVAL_TIMEOUT_SECONDS`` env
                 default) so the SDK can never silently desync
                 from the backend row's actual expiry. When
-                ``None`` (legacy backend without Разрыв 1c
-                field, or malformed response), falls back to the
-                env-derived default — same behavior as pre-Разрыв
-                1c SDKs.
+                ``None`` (legacy backend without that field, or
+                malformed response), falls back to the
+                env-derived default.
 
         Returns:
             The entry dict, with ``outcome`` populated (either
@@ -1370,13 +1367,10 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             a sentinel ``{"outcome": "timeout", "timed_out": True}``.
 
             **The caller is expected to fail-CLOSED on timeout** —
-            raise ``WorkflowKilledInterrupt``. The Разрыв 1c
-            contract deliberately rejected a `/status` poll
-            fallback here (per `references/razriv1c-approval-flow.md`,
-            Phase 4 H4): a silent timeout must not silently
-            approve a privileged action. The legacy docstring
-            "fall back to legacy /status poll path" was incorrect
-            and is removed as part of the 2026-07-23 review.
+            raise ``WorkflowKilledInterrupt``. The contract
+            deliberately rejects a `/status` poll fallback here:
+            a silent timeout must not silently approve a
+            privileged action.
 
         Raises:
             Nothing. Approval timeouts are returned, not raised,
@@ -1384,19 +1378,19 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             (raise WorkflowKilledInterrupt on denied OR on
             timeout, resume on approved).
         """
-        # Per-approval timeout resolution (Разрыв 1c, 2026-07-21):
-        # prefer the server-authoritative value from the /gate
-        # response so the SDK never times out before the
-        # backend's expiry sweeper (Разрыв 3 class of bug).
-        # Fall back to the env default only on missing or
-        # out-of-range value — both signal "backend didn't send a
-        # sane value" and we preserve the pre-Разрыв 1c behaviour.
+        # Per-approval timeout resolution: prefer the
+        # server-authoritative value from the /gate response so
+        # the SDK never times out before the backend's expiry
+        # sweeper. Fall back to the env default only on missing
+        # or out-of-range value -- both signal "backend didn't
+        # send a sane value" and we preserve the legacy
+        # behaviour.
         #
-        # Phase 0 review (2026-07-23): we clamp the server value
-        # to `[MIN, MAX]`. A misconfigured backend advertising
-        # 0 (deadlock), 1e9 (lock the thread for years), or any
-        # other garbage value will not stall the agent loop —
-        # we fall back to the env default instead.
+        # Clamp the server value to `[MIN, MAX]`. A
+        # misconfigured backend advertising 0 (deadlock), 1e9
+        # (lock the thread for years), or any other garbage
+        # value will not stall the agent loop -- we fall back
+        # to the env default instead.
         if timeout_seconds is not None:
             try:
                 candidate = float(timeout_seconds)
@@ -1487,20 +1481,19 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             WorkflowPausedException: If workflow is paused on server
             WorkflowKilledInterrupt: If workflow is killed on server
         """
-        # Phase 139+: prefer the explicit arg (contextvar-supplied), fall
-        # back to the API key's bound workflow. None on legacy keys --
+        # Prefer the explicit arg (contextvar-supplied), fall back
+        # to the API key's bound workflow. None on legacy keys --
         # in that case there's no workflow to check, so we no-op
-        # (preserves pre-139 behavior for keys that have never been
-        # workflow-bound).
+        # (preserves the legacy behavior for keys that have never
+        # been workflow-bound).
         resolved = self._resolve_workflow_id(workflow_id or None)
         if not resolved:
             return
         workflow_id = resolved
 
-        # Ensure we have the latest remote state
-        # Phase 5 #5.1: use the lock-protected getter so a concurrent
-        # WS push can't drop the state between the membership check
-        # and the read.
+        # Ensure we have the latest remote state. Use the
+        # lock-protected getter so a concurrent WS push can't drop
+        # the state between the membership check and the read.
         remote_state = self._remote_state_for(workflow_id)
         if not remote_state:
             # Fetch synchronously if not in cache yet
@@ -1536,9 +1529,6 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         before the wrapped function runs, so a workflow with no remaining
         budget never gets to spend tokens.
 
-        Sprint 3.1: bumps the ``check_calls`` metric so the dashboard
-        can show the rate of pre-flight budget checks.
-
         Decision → exception mapping:
             "block" → WorkflowKilledInterrupt (hard policy / reservation error)
             "throttle"→ WorkflowPausedException (insufficient budget, can resume)
@@ -1566,10 +1556,10 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             logger.debug("check_workflow_budget: skipped via NULLRUN_SKIP_BUDGET_CHECK=1")
             return
 
-        # Sprint 3.1 (B23): bump the ``check_calls`` counter so the
-        # dashboard can show the rate of pre-flight budget checks
-        # and the operator can verify the pre-flight is actually
-        # running (not silently always-skipped).
+        # Bump the ``check_calls`` counter so the dashboard can show
+        # the rate of pre-flight budget checks and the operator can
+        # verify the pre-flight is actually running (not silently
+        # always-skipped).
         metrics.inc_runtime("check_calls")
 
         from nullrun.context import (
@@ -1582,28 +1572,27 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             get_workflow_id,
         )
 
-        # Phase 139+: prefer the user-set contextvar (explicit `with
-        # workflow(...)` block), fall back to the API key's bound
-        # workflow. Returns None only on legacy keys that have never
-        # been workflow-bound -- in that case the check is silently
-        # skipped, exactly as before this change.
+        # Prefer the user-set contextvar (explicit `with workflow(...)`
+        # block), fall back to the API key's bound workflow. Returns
+        # None only on legacy keys that have never been
+        # workflow-bound -- in that case the check is silently
+        # skipped.
         workflow_id = self._resolve_workflow_id(get_workflow_id())
         if not workflow_id:
             return
 
-        # T4 (2026-06-27): use the real model name from the call
-        # context if the user set it via `set_call_context(model=...)`
-        # (or via a future `with workflow(..., model=...)` block).
-        # Pre-T4 this always sent the literal string "budget-precheck"
-        # — a fake sentinel that:
-        # 1. forced backend pricing lookup to fall through to the
-        # default 3.0 rate, so projected_cost was always computed
-        # against the wrong per-model rate
-        # 2. blocked any future per-model budget tier (model-specific
-        # caps) from being enforced correctly.
-        # Sending `None` is fine — backend `calculate_projected_cost`
-        # defaults to claude-sonnet-4 when model is unset, and tool_block
-        # enforcement on /gate is best-effort when no tools are sent.
+        # Use the real model name from the call context if the user
+        # set it via `set_call_context(model=...)` (or via a future
+        # `with workflow(..., model=...)` block). Earlier SDK
+        # versions always sent the literal string "budget-precheck"
+        # -- a fake sentinel that forced backend pricing lookup to
+        # fall through to the default rate, so projected_cost was
+        # always computed against the wrong per-model rate and
+        # blocked any future per-model budget tier (model-specific
+        # caps) from being enforced correctly. Sending `None` is
+        # fine -- backend `calculate_projected_cost` defaults when
+        # model is unset, and tool_block enforcement on /gate is
+        # best-effort when no tools are sent.
         call_model = get_call_model()
         call_tools = get_call_tools()
 
@@ -1643,16 +1632,15 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         if call_tools:
             check_req["tools"] = list(call_tools)
 
-        # Разрыв 3 / 2026-07-28: forward cached MCP tool class +
-        # annotations when the SDK recognises an MCP server. Both
-        # fields are optional — `None` means "I don't know", and the
-        # gate treats absent values as unknown rather than false.
-        # The honest-SDK trust boundary (CLAUDE.md §22): a
-        # malicious SDK could lie about annotations to bypass the
-        # destructive block. We accept that trade-off (matches the
-        # existing model-string trust model) — server-side discovery
-        # for verification is in the v3.31 Phase C scope and
-        # requires HTTP-transport MCP servers only.
+        # Forward cached MCP tool class + annotations when the SDK
+        # recognises an MCP server. Both fields are optional --
+        # `None` means "I don't know", and the gate treats absent
+        # values as unknown rather than false. The trust boundary
+        # is honest: a malicious SDK could lie about annotations to
+        # bypass the destructive block. We accept that trade-off
+        # (matches the existing model-string trust model) --
+        # server-side discovery for verification requires
+        # HTTP-transport MCP servers only.
         mcp_class = get_call_mcp_class()
         if mcp_class is not None:
             check_req["tool_class"] = mcp_class
@@ -1676,8 +1664,8 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # an idempotency_key without an extra round-trip.
         check_req["idempotency_key"] = check_req["operation_id"]
 
-        # 2026-07-04 (BUG #5): in-process gate cache for chain-mode.
-        # See module-top comment on _GATE_CACHE for full rationale.
+        # In-process gate cache for chain-mode invocations. See
+        # module-top comment on _GATE_CACHE for full rationale.
         response: dict[str, Any]
         cache_key: tuple[str, str | None, str | None] | None = None
         cache_enabled = (
@@ -1709,9 +1697,9 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 try:
                     response = self._transport.check(check_req)
                 except (httpx.HTTPError, NullRunError) as exc:
-                    # Narrow catch (Phase 6 H5): fail-OPEN only on
-                    # transport + classified SDK errors. Internal
-                    # bugs (KeyError, AttributeError) should surface
+                    # Narrow catch: fail-OPEN only on transport +
+                    # classified SDK errors. Internal bugs
+                    # (KeyError, AttributeError) should surface
                     # rather than silently allow an unbounded call.
                     logger.warning(f"check_workflow_budget: /gate unavailable, failing open: {exc}")
                     return
@@ -1752,11 +1740,11 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
 
         decision = response.get("decision", "allow")
         decision_source = response.get("decision_source", DecisionSource.GATEWAY)
-        # Round 3 (Phase 0.4.0): only fail-OPEN on EXPLICIT synthetic
-        # responses (decision_source starts with "fallback" or is one
-        # of the classified TransportErrorSource values). Real
-        # backend decisions (decision_source="gateway", or missing
-        # for backward compat) are honoured.
+        # Only fail-OPEN on EXPLICIT synthetic responses
+        # (decision_source starts with "fallback" or is one of the
+        # classified TransportErrorSource values). Real backend
+        # decisions (decision_source="gateway", or missing for
+        # backward compat) are honoured.
         if decision_source.startswith("fallback") or decision_source in {
             TransportErrorSource.NETWORK_ERROR,
             TransportErrorSource.GATEWAY_ERROR,
@@ -1782,11 +1770,11 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             reasons = response.get("explanations") or (
                 [response["explanation"]] if response.get("explanation") else ["block"]
             )
-            # Sprint 3 follow-up (B23): bump ``cost_limit_exceeded``
-            # when the pre-flight blocks the workflow. The counter
-            # is the operator's primary signal for "the budget
-            # cap is biting" — distinct from loop / retry / rate
-            # which have their own counters.
+            # Bump ``cost_limit_exceeded`` when the pre-flight
+            # blocks the workflow. The counter is the operator's
+            # primary signal for "the budget cap is biting" --
+            # distinct from loop / retry / rate which have their
+            # own counters.
             metrics.inc_runtime("cost_limit_exceeded")
             raise WorkflowKilledInterrupt(
                 workflow_id=workflow_id,
@@ -1810,26 +1798,24 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             )
 
         if decision == "require_approval":
-            # Drift section 7 (2026-07-06) + Разрыв 1c (2026-07-21):
-            # the gate requires a human-approval before the call
+            # The gate requires a human-approval before the call
             # may proceed. Block the calling thread on the WS push
             # (handled in _handle_approval_resolved) and let the
             # operator click Approve/Deny on the dashboard. On
             # timeout (WS push silent for the configured duration)
             # we fall through and the caller is expected to treat
-            # the call as blocked — the same fail-CLOSED semantics
+            # the call as blocked -- the same fail-CLOSED semantics
             # as a regular block.
             #
-            # Разрыв 1c: prefer the server-authoritative
+            # Prefer the server-authoritative
             # `approval_timeout_seconds` value from the response
-            # (added in commit 0ad03b9) over the env default
+            # over the env default
             # `NULLRUN_APPROVAL_TIMEOUT_SECONDS`. This prevents the
-            # SDK/backend desync that the Разрыв 3 sweeper was
-            # written to fix on the backend side. We fall back to
-            # the env default only when the field is missing or
-            # non-positive — both signal "backend without Разрыв 1c
-            # field" and we preserve the pre-Разрыв 1c behaviour
-            # for those callers.
+            # SDK/backend desync that the backend expiry sweeper
+            # was written to fix. We fall back to the env default
+            # only when the field is missing or non-positive --
+            # both signal "backend without that field" and we
+            # preserve the legacy behaviour for those callers.
             approval_id = response.get("approval_id", "") or ""
             if not approval_id:
                 logger.warning(
@@ -1844,10 +1830,10 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             # `approval_expires_at` (ISO8601 string) are exposed;
             # we prefer the integer field because it's directly
             # usable in `event.wait(timeout=...)`. If the backend
-            # only sent the ISO8601 string (e.g. older Разрыв 1c
-            # draft or proxy rewriting the field), fall through to
-            # the env default rather than try to parse it inline —
-            # the field is documented as informational for UI/logs
+            # only sent the ISO8601 string (e.g. an older proxy
+            # rewriting the field), fall through to the env
+            # default rather than try to parse it inline -- the
+            # field is documented as informational for UI/logs
             # and isn't required for the SDK's wait math.
             server_timeout = _validate_approval_timeout(
                 response.get("approval_timeout_seconds"),
@@ -1934,7 +1920,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         if interval < 10.0 or interval > 120.0:
             raise ValueError(
                 f"ping_chain interval must be in [10, 120] seconds per "
-                f"CLAUDE.md §26, got {interval}"
+                f"the chain heartbeat spec, got {interval}"
             )
 
         stop_event = _threading.Event()
@@ -2077,14 +2063,14 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # Stop the HTTP poller (legacy path) if it was started.
         self._poll_running = False
         if self._poll_thread and self._poll_thread.is_alive():
-            # Phase 6 #6.3: cap to 0.5s (was 2.0s) so a SIGTERM
-            # handler returns quickly. The HTTP-poll is best-effort
-            # and the WS push channel is the authoritative source.
+            # Cap to 0.5s so a SIGTERM handler returns quickly.
+            # The HTTP-poll is best-effort and the WS push channel
+            # is the authoritative source.
             self._poll_thread.join(timeout=0.5)
 
-        # Stop the WS control plane listener (Phase B). Closing the
-        # connection causes the receive task to unblock, the loop to
-        # exit, and the thread to terminate.
+        # Stop the WS control plane listener. Closing the
+        # connection causes the receive task to unblock, the loop
+        # to exit, and the thread to terminate.
         self._ws_stop_event.set()
         conn = self._ws_connection
         if conn is not None and self._ws_loop is not None:
@@ -2147,10 +2133,11 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         """
         logger.debug(f"Tracking event: {event.get('event_type', 'unknown')}")
 
-        # Phase D: dedup gate. The httpx transport, LangChain callback, and
-        # OpenAI Agents tracer can all fire for the same LLM call. We drop
-        # repeats keyed by `_fingerprint` (set by the observation path) so
-        # each unique call produces exactly one /api/v1/track POST.
+        # Dedup gate. The httpx transport, LangChain callback, and
+        # OpenAI Agents tracer can all fire for the same LLM call.
+        # We drop repeats keyed by `_fingerprint` (set by the
+        # observation path) so each unique call produces exactly
+        # one /api/v1/track POST.
         fp = event.get("_fingerprint")
         if fp:
             from nullrun.instrumentation.auto import _fingerprint_is_seen
@@ -2200,7 +2187,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         if workflow_id:
             self._remote_state_for(workflow_id)
 
-        # Phase 0.3.1: the local cost / loop / retry-storm check
+        # The local cost / loop / retry-storm check
         # (``_check_local_limits``) has been removed. It read
         # ``event.get("cost_cents", 0)`` and accumulated into a
         # per-workflow counter, but ``track_llm`` /
@@ -2296,7 +2283,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 # Let the exception propagate
 
     # =============================================================================
-    # Phase 1.4: Pre-Execution Enforcement (SDK Boundary Fix)
+    # Pre-Execution Enforcement (SDK Boundary)
     # =============================================================================
 
     def is_sensitive_tool(self, tool_name: str) -> bool:
@@ -2326,12 +2313,12 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                ``add_sensitive_tool``. The lock is uncontended under
                CPython's GIL, so the cost is negligible.
         """
-        # Phase 4 (2026-07-05): O(1) lookup against the
-        # pre-lowercased frozenset snapshot. The lock is still
-        # taken to keep the snapshot coherent with the live
-        # set during concurrent add/remove_sensitive_tool calls
-        # (the snapshot is rebuilt under the lock), but the
-        # read itself is a single frozenset membership check.
+        # O(1) lookup against the pre-lowercased frozenset
+        # snapshot. The lock is still taken to keep the snapshot
+        # coherent with the live set during concurrent
+        # add/remove_sensitive_tool calls (the snapshot is rebuilt
+        # under the lock), but the read itself is a single
+        # frozenset membership check.
         needle = tool_name.lower()
         with self._tools_lock:
             return needle in self._sensitive_tools_lower or needle in self._strict_mode_tools_lower
@@ -2339,9 +2326,8 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
     def get_org_status(self, org_id: str | None = None) -> dict[str, Any]:
         """Public helper for reading ``/api/v1/orgs/{org_id}/status``.
 
-        Phase 8 #8.1: routes through ``self._transport._client`` so
-        the shared connection pool, retry policy, and circuit breaker
-        apply. Used by ``examples/cost_dashboard.py``.
+        Routes through ``self._transport._client`` so the shared
+        connection pool, retry policy, and circuit breaker apply.
 
         Args:
             org_id: Optional organisation ID. Defaults to the runtime's
@@ -2397,8 +2383,8 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         """
         with self._tools_lock:
             self._strict_mode_tools.add(tool_name)
-            # Phase 4: rebuild the lowercase snapshot so the
-            # hot-path is_sensitive_tool sees the new entry.
+            # Rebuild the lowercase snapshot so the hot-path
+            # is_sensitive_tool sees the new entry.
             self._strict_mode_tools_lower = frozenset(t.lower() for t in self._strict_mode_tools)
 
     def remove_sensitive_tool(self, tool_name: str) -> None:
@@ -2416,7 +2402,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         """
         with self._tools_lock:
             self._strict_mode_tools.discard(tool_name)
-            # Phase 4: rebuild the lowercase snapshot.
+            # Rebuild the lowercase snapshot.
             self._strict_mode_tools_lower = frozenset(t.lower() for t in self._strict_mode_tools)
 
     def register_sensitive_tools(self, tool_names: list[str]) -> None:
@@ -2437,9 +2423,9 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         with self._tools_lock:
             for tool_name in tool_names:
                 self._strict_mode_tools.add(tool_name)
-            # Phase 4: rebuild the lowercase snapshot once
-            # after the batch insert (a single set comprehension
-            # beats N rebuilds in the loop).
+            # Rebuild the lowercase snapshot once after the batch
+            # insert (a single set comprehension beats N rebuilds
+            # in the loop).
             self._strict_mode_tools_lower = frozenset(t.lower() for t in self._strict_mode_tools)
 
     def get_sensitive_tools(self) -> set[str]:
@@ -2473,11 +2459,11 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 - "auto": auto-select based on tool risk
             on_transport_error: Optional callback for transport-error
                 handling (legacy); prefer the typed exception path.
-            business_impact: Phase 1 / MVP 1.0 typed action payload
-                (Money impact for now). When supplied, the backend
-                uses it to evaluate rule predicates AND stamps the
-                approval row's `action_digest` so the post-approval
-                /execute re-check can refuse tampered payloads.
+            business_impact: Typed action payload (Money impact for
+                now). When supplied, the backend uses it to evaluate
+                rule predicates AND stamps the approval row's
+                `action_digest` so the post-approval /execute re-check
+                can refuse tampered payloads.
             action_digest: SHA-256 hex of the canonicalised impact
                 JSON. Computed client-side (Python helper in
                 ``nullrun.business_impact.compute_action_digest``)
@@ -2556,13 +2542,13 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             "operation_id": operation_id,
             "on_transport_error": on_transport_error,
         }
-        # Phase 1 / MVP 1.0: digest-bound approval. Forward the
-        # typed impact + digest to the wire when supplied. The
-        # backend stamps the approval row with the digest and
-        # verifies it on the post-approval re-check. When the
-        # caller did NOT supply them (legacy Phase 0 path), the
-        # fields are absent from the wire; the backend falls
-        # back to approval_id-only grant consume.
+        # Digest-bound approval: forward the typed impact + digest
+        # to the wire when supplied. The backend stamps the approval
+        # row with the digest and verifies it on the post-approval
+        # re-check. When the caller did NOT supply them (the
+        # legacy approval_id-only path), the fields are absent from
+        # the wire; the backend falls back to approval_id-only
+        # grant consume.
         if business_impact is not None:
             execute_kwargs["business_impact"] = business_impact
         if action_digest is not None:
@@ -2629,20 +2615,16 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             metrics.inc_runtime("execute_blocked")
             # Layer 1: best-effort error_code mapping.
             #
-            # The backend stamps a structured ``details.error_code`` on
-            # every block response (Разрыв 1c follow-up, E2E 2026-08-05:
-            # classify_approval_create_error in
-            # backend/src/proxy/http/gate/internal.rs exposes
-            # APPROVAL_DB_UNAVAILABLE / APPROVAL_PERSISTENCE_FAILED /
-            # APPROVAL_VALIDATION_FAILED / APPROVAL_CONFLICT /
-            # APPROVAL_NOT_FOUND / APPROVAL_CREATE_FAILED, alongside
-            # the existing BUDGET_* / RATE_LIMIT_* family). When the
-            # backend provides one, we use it verbatim — no string
-            # parsing, no false positives. Falls back to the legacy
-            # keyword-on-explanation mapping for older backends that
-            # pre-date the structured code (the keyword path stays for
-            # back-compat — a 0.14.x SDK against a pre-Razryv-1c backend
-            # still classifies budget/loop/rate/tool blocks correctly).
+            # The backend stamps a structured ``details.error_code``
+            # on every block response, alongside the existing
+            # BUDGET_* / RATE_LIMIT_* family. When the backend
+            # provides one, we use it verbatim -- no string
+            # parsing, no false positives. Falls back to the
+            # legacy keyword-on-explanation mapping for older
+            # backends that pre-date the structured code (the
+            # keyword path stays for back-compat -- an older
+            # SDK still classifies budget/loop/rate/tool blocks
+            # correctly).
             explanation = result.get("explanation", "policy violation")
             wire_details = result.get("details") or {}
             if not isinstance(wire_details, dict):
@@ -2772,10 +2754,9 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         """Add context fields to event."""
         enriched = dict(event)  # Don't modify original
 
-        # Phase 139+: workflow_id from context, else from the API
-        # key's binding (set in _authenticate). Stays unset on legacy
-        # keys -- emitted events then carry no workflow_id (orphan, as
-        # before this change).
+        # workflow_id from context, else from the API key's
+        # binding (set in _authenticate). Stays unset on legacy
+        # keys -- emitted events then carry no workflow_id (orphan).
         if "workflow_id" not in enriched:
             wf_id = self._resolve_workflow_id(get_workflow_id())
             if wf_id:
@@ -3144,9 +3125,9 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         """
         event = {"type": event_type, **kwargs}
         event.setdefault("tokens", 0)
-        # Phase 3: emit a stable fingerprint so the dedup LRU at
-        # the track sink can collapse repeat emissions of the
-        # same event (e.g. when the user calls track_event manually
+        # Emit a stable fingerprint so the dedup LRU at the
+        # track sink can collapse repeat emissions of the same
+        # event (e.g. when the user calls track_event manually
         # AND the httpx transport hook fires for the same LLM
         # call). Field is stripped before wire send (see
         # ``_strip_wire_only_fields``).
@@ -3235,10 +3216,10 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
 
 
 # Module-level convenience functions.
-# Phase 3 (2026-07-05): the legacy _runtime module slot is now a
-# proxy over the registry (see __getattr__ below). Reads and
-# writes route through :class:`nullrun._registry.RuntimeRegistry`,
-# which is the single source of truth. External code that imports
+# The legacy _runtime module slot is now a proxy over the
+# registry (see __getattr__ below). Reads and writes route
+# through :class:`nullrun._registry.RuntimeRegistry`, which is
+# the single source of truth. External code that imports
 # nullrun.runtime._runtime keeps working unchanged.
 
 
@@ -3250,12 +3231,11 @@ def __getattr__(name):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-# Phase 3 (2026-07-05): the module-level  slot is a
-# proxy over the registry. The PEP 562  above handles
-# reads; writes go through the proxy class installed by
-# . See the long-form comment in
-# nullrun._singleton for why a plain  does not work
-# on module instances.
+# The module-level slot is a proxy over the registry. The
+# PEP 562 __getattr__ above handles reads; writes go through the
+# proxy class installed by install_runtime_proxy. See the
+# long-form comment in nullrun._singleton for why a plain
+# assignment does not work on module instances.
 
 
 # 2026-07-04 (v0.12.0 wiring fix — ):
@@ -3520,11 +3500,11 @@ def _build_v3_track_payload(
 def get_runtime() -> NullRunRuntime:
     """Get or create the global runtime instance.
 
-    Phase 3 (2026-07-05): prefer the registry. We keep the
-    legacy global _runtime slot as a backwards-compat cache so
-    external code that imports nullrun.runtime._runtime still
-    works, but the canonical source of truth is the registry
-    (see nullrun._registry.RuntimeRegistry).
+    Prefers the registry. The legacy global _runtime slot is
+    kept as a backwards-compat cache so external code that
+    imports nullrun.runtime._runtime still works, but the
+    canonical source of truth is the registry (see
+    nullrun._registry.RuntimeRegistry).
     """
     cached = get_active_runtime()
     if cached is not None:
@@ -3547,9 +3527,10 @@ def track(event: dict[str, Any]) -> dict[str, Any]:
     return get_runtime().track(event)
 
 
-# Phase 3.4: explicit alias for `track ` -- same call signature, friendlier
-# name for users who reach for `track_event` first. Both names share the
-# same callable object, so `nullrun.track is nullrun.track_event` is True.
+# Explicit alias for `track` -- same call signature, friendlier
+# name for users who reach for `track_event` first. Both names
+# share the same callable object, so `nullrun.track is
+# nullrun.track_event` is True.
 track_event = track
 
 
@@ -3594,12 +3575,12 @@ def track_tool(
     return get_runtime().track_tool(tool_name, duration_ms=duration_ms, **kwargs)
 
 
-# Phase 3 (2026-07-05): install the registry-backed proxy on the
-# module class so reads AND writes to ``runtime._runtime`` route
-# through the registry. PEP 562 ``__getattr__`` alone covers the
-# read path; writes need a real data descriptor on the module's
-# metaclass — see ``nullrun._singleton._RuntimeProxyModule`` for
-# the long-form rationale.
+# Install the registry-backed proxy on the module class so
+# reads AND writes to ``runtime._runtime`` route through the
+# registry. PEP 562 ``__getattr__`` alone covers the read
+# path; writes need a real data descriptor on the module's
+# metaclass -- see ``nullrun._singleton._RuntimeProxyModule``
+# for the long-form rationale.
 from nullrun._singleton import install_runtime_proxy
 
 install_runtime_proxy(__name__)

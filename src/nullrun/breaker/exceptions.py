@@ -320,7 +320,7 @@ class RateLimitError(NullRunTransportError):
     """Raised when the gateway returns HTTP 429 with a ``Retry-After``
     header (or JSON body field).
 
-    Phase 4: subclass of ``NullRunTransportError`` so
+    Subclass of ``NullRunTransportError`` so
     ``except NullRunTransportError`` keeps catching it. Surfaces
     ``retry_after`` (seconds) and ``upgrade_url`` so callers can
     schedule a retry or surface a billing upgrade prompt.
@@ -466,7 +466,7 @@ class NullRunConsumeOverbudgetError(NullRunDecision):
     user_action = (
         "The actual cost exceeded the reservation by more than the "
         "epsilon_cents tolerance. The reservation was NOT silently "
-        "re-reserved (CLAUDE.md §25). Either reduce the call's "
+        "re-reserved. Either reduce the call's "
         "expected cost before /check (model downgrade, fewer tokens) "
         "or increase the per-policy ``epsilon_cents`` after manual "
         "review — never bypass the invariant by retrying."
@@ -498,13 +498,12 @@ class NullRunConsumeOverbudgetError(NullRunDecision):
 
 
 class NullRunWorkflowInactiveError(NullRunDecision):
-    """Workflow soft-deleted; gate blocks per-key traffic (
- — Sprint 6 v1 12.2 hot-path wiring).
+    """Workflow soft-deleted; gate blocks per-key traffic.
 
     Raised when the workflow's ``is_active`` flag is false (soft
     delete + ``killed_at`` not null) AND an active API key still
-    tries to drive traffic against it. Per the fail-CLOSED contract
-    in, the SDK must not let the agent body run in
+    tries to drive traffic against it. Per the fail-CLOSED contract,
+    the SDK must not let the agent body run in
     this state — a soft-deleted workflow implies the operator
     intentionally revoked it.
     """
@@ -550,10 +549,10 @@ class NullRunRateLimitRedisError(NullRunInfrastructureError):
     error_code = "NR-R002"
     user_action = (
         "The NullRun backend cannot reach Redis for the aggregate "
-        "rate limit. The request was rejected (fail-CLOSED per "
-        "CLAUDE.md §4) because the rate limit is the authoritative "
-        "gate, not a soft advisory. Retry after the operator "
-        "confirms Redis is healthy — check status.nullrun.io."
+        "rate limit. The request was rejected (fail-CLOSED) because "
+        "the rate limit is the authoritative gate, not a soft "
+        "advisory. Retry after the operator confirms Redis is "
+        "healthy — check status.nullrun.io."
     )
     retryable = True
 
@@ -712,9 +711,7 @@ class NullRunBlockedException(NullRunDecision):
             storm) where there was no wire response. Lets FastAPI /
             Starlette exception handlers map to the correct HTTP
             status without re-deriving it from
-            ``type(exc).__name__``. Drift fix 2026-07-04
-            (P1-1: SDK_README's NR-B004 → 429 claim was
-            wrong; the real wire status is 402).
+            ``type(exc).__name__``.
     """
 
     error_code = "NR-X001"  # generic block; subclasses override
@@ -798,12 +795,12 @@ class NullRunToolBlockedError(NullRunBlockedException):
     retryable = False
 
 
-# NOTE (Sprint 2.2): the following six exception classes were removed
-# in 0.4.0 because they had no callers in the SDK or in any
-# test. They were zombie public surface — defined but never raised.
-# If a real use case emerges in the future, they should be re-added
-# with at least one in-tree caller and a regression test that
-# exercises the raise path:
+# NOTE: the following six exception classes were removed in 0.4.0
+# because they had no callers in the SDK or in any test. They were
+# zombie public surface — defined but never raised. If a real use
+# case emerges in the future, they should be re-added with at least
+# one in-tree caller and a regression test that exercises the raise
+# path:
 # - CostLimitExceeded
 # - ApprovalRequired
 # - BreakerTimeout

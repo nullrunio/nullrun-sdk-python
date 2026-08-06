@@ -1,4 +1,4 @@
-"""Phase 1.1 hardening tests for the money contract.
+"""Decimal support hardening tests for the money contract.
 
 This module is the dedicated hardening suite for the
 ``MoneyImpactExtractor`` hardening pass that closed the

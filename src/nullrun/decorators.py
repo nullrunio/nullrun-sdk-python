@@ -1,11 +1,11 @@
 """
 Decorators for the NullRun SDK.
 
-Public surface (Phase 2 Commit 4): `protect` is the only gate decorator.
-It takes NO parameters — span hierarchy is built automatically from the
-caller's context via contextvars, and the workflow is derived from the
-API key on the backend (the dashboard surfaces the agent's name from
-the key's `name` field).
+Public surface: `protect` is the only gate decorator. It takes NO
+parameters — span hierarchy is built automatically from the caller's
+context via contextvars, and the workflow is derived from the API key
+on the backend (the dashboard surfaces the agent's name from the
+key's `name` field).
 
 Usage:
     # Basic — auto-init from env, auto-build span tree
@@ -68,8 +68,8 @@ logger = logging.getLogger(__name__)
 
 F = TypeVar("F", bound=Callable[..., Any])
 
-# Phase 3: expanded sensitive-arg keys. The original 7-key set
-# missed obvious PII tokens and credential names; ``@sensitive`` and
+# Expanded sensitive-arg keys. The original 7-key set missed
+# obvious PII tokens and credential names; ``@sensitive`` and
 # ``_safe_kwargs`` would have shipped them in the audit log.
 # Matching is case-insensitive (see ``_safe_kwargs`` which calls
 # ``.lower `` on the key).
@@ -135,14 +135,14 @@ def _safe_repr(value: object, max_len: int = 50) -> str:
     convention only. ``_safe_repr`` is now the single source of truth.
     """
     r = repr(value)
-    # Phase 1: redact ``details={...}`` substrings on the FULL repr.
+    # Redact ``details={...}`` substrings on the FULL repr.
     # Cheap (single linear scan over the string), and ensures the
     # ``details=`` substring is replaced before we potentially
     # truncate it away.
     r = _strip_details_balanced(r)
-    # Phase 2: truncate to ``max_len`` so a giant repr doesn't bloat
-    # span events. We append ``...<truncated>`` so consumers can
-    # see the cut happened.
+    # Truncate to ``max_len`` so a giant repr doesn't bloat span
+    # events. We append ``...<truncated>`` so consumers can see the
+    # cut happened.
     if len(r) > max_len:
         return r[:max_len] + "...<truncated>"
     return r
@@ -199,11 +199,10 @@ def _safe_args(fn: Callable[..., Any], args: tuple[Any, ...]) -> list[Any]:
     return masked
 
 
-# SEC-29: strip the `details={...}` payload from an exception's
-# string form before it lands in the span_end audit event.
-# Phase 3 replaced the previous one-level regex with a
-# balanced-brace walker that handles nested dicts and dict values
-# that contain `{` / `}` in their string content.
+# Strip the `details={...}` payload from an exception's string form
+# before it lands in the span_end audit event. The current walker
+# handles nested dicts and dict values that contain `{` / `}` in
+# their string content.
 _DETAILS_REDACTED = "<redacted>"  # the payload only — caller prepends "details="
 
 
@@ -269,17 +268,15 @@ def _strip_details_balanced(text: str) -> str:
 
 
 def _safe_error_str(error: BaseException | None) -> str | None:
-    """Return a log-safe string for ``error`` (SEC-29, Phase 3)."""
+    """Return a log-safe string for ``error``."""
     if error is None:
         return None
     raw = str(error)
     return _strip_details_balanced(raw)
 
 
-# Module-level cache for the runtime instance — the @protect decorator needs
-# The legacy module-level  slot was removed in
-# Phase 3 (2026-07-05). Reads/writes now route through the
-# registry (see nullrun._singleton._RuntimeProxyModule).
+# The legacy module-level slot was removed. Reads/writes now route
+# through the registry (see nullrun._singleton._RuntimeProxyModule).
 
 
 def _get_or_create_runtime() -> NullRunRuntime:
@@ -526,11 +523,10 @@ def protect(fn: F | None = None) -> F | Callable[[F], F]:
             return result
         except BaseException as exc:  # noqa: BLE001
             error = exc
-            # Round 3 (Phase 0.4.0): unify the "blocked" signal at
-            # the @protect boundary so callers can catch a single
-            # NullRunBlockedException for both policy blocks and
-            # sensitive-tool blocks. Direct calls to
-            # check_workflow_budget still raise the original
+            # Unify the "blocked" signal at the @protect boundary so
+            # callers can catch a single NullRunBlockedException for
+            # both policy blocks and sensitive-tool blocks. Direct
+            # calls to check_workflow_budget still raise the original
             # exception type so callers that distinguish hard vs
             # soft blocks keep that signal.
             if isinstance(exc, (WorkflowKilledInterrupt, WorkflowPausedException)):
@@ -651,14 +647,14 @@ def _enforce_sensitive_tool(
     # the /execute payload that lands in the audit log.
     masked_args = _safe_args(fn, args)
 
-    # Phase 1 / MVP 1.0: if the wrapped function carries an
-    # ``_nullrun_extractor`` attribute (set by the @sensitive
-    # decorator's ``impact=money_outflow(...)`` argument), extract
-    # the typed action impact from the live args before sending
-    # /execute. The extractor returns a fully-validated
-    # BusinessImpact; we then compute its action_digest and pass
-    # both onto the wire so the backend can stamp the approval row
-    # AND verify the digest on the post-approval re-check.
+    # If the wrapped function carries an ``_nullrun_extractor``
+    # attribute (set by the @sensitive decorator's
+    # ``impact=money_outflow(...)`` argument), extract the typed
+    # action impact from the live args before sending /execute.
+    # The extractor returns a fully-validated BusinessImpact; we
+    # then compute its action_digest and pass both onto the wire
+    # so the backend can stamp the approval row AND verify the
+    # digest on the post-approval re-check.
     #
     # If the extractor raises (bad arg name, wrong type, negative
     # amount, etc.), we fail-CLOSED per ADR-008: a sensitive tool
@@ -681,12 +677,11 @@ def _enforce_sensitive_tool(
                 business_impact_dict = impact.to_wire_dict()
                 action_digest_hex = compute_action_digest(impact)
             elif isinstance(extractor, ToolParamsExtractor):
-                # Phase 1 / MVP 1.1 (Tier 2): free-form tool-call
-                # argument bag, matched against ToolParameters
-                # Approval Rules on the backend. Same wire envelope
-                # (BusinessImpact) and same digest contract as the
-                # Money variant -- only the discriminator and the
-                # ``params`` field differ.
+                # Free-form tool-call argument bag, matched against
+                # ToolParameters Approval Rules on the backend.
+                # Same wire envelope (BusinessImpact) and same
+                # digest contract as the Money variant -- only the
+                # discriminator and the ``params`` field differ.
                 impact = extractor.impact_for(fn, args, kwargs)
                 business_impact_dict = impact.to_wire_dict()
                 action_digest_hex = compute_action_digest(impact)
@@ -767,18 +762,17 @@ def _enforce_sensitive_tool(
     workflow_id = get_workflow_id() or UNKNOWN_WORKFLOW_ID
 
     try:
-        # Round 3 (Phase 0.4.0): pass on_transport_error="raise" so
-        # the transport raises NullRunTransportError on network / 5xx
-        # failure instead of returning a synthetic dict. The arm
-        # below converts the typed error into NullRunBlockedException
-        # so the caller's `except NullRunBlockedException` catches it
-        # uniformly.
+        # Pass on_transport_error="raise" so the transport raises
+        # NullRunTransportError on network / 5xx failure instead of
+        # returning a synthetic dict. The arm below converts the
+        # typed error into NullRunBlockedException so the caller's
+        # `except NullRunBlockedException` catches it uniformly.
         #
-        # Phase 1 / MVP 1.0: thread the typed impact + digest
-        # through. When the decorator did NOT see an extractor, both
-        # are None and the runtime.execute() drops them from the
-        # payload; the backend then uses the approval_id-only
-        # grant consume (Phase 0 fallback).
+        # Thread the typed impact + digest through. When the
+        # decorator did NOT see an extractor, both are None and the
+        # runtime.execute() drops them from the payload; the
+        # backend then uses the approval_id-only grant consume
+        # (the legacy approval_id-only fallback).
         result = runtime.execute(
             fn.__name__,
             {"args": masked_args, "kwargs": masked},
@@ -957,10 +951,10 @@ def sensitive(
         def charge_card(amount: int) -> str:
             ...
 
-    Phase 1 / MVP 1.0: ``@sensitive(impact=money_outflow(...))``
-    attaches a typed ``MoneyImpactExtractor`` to the function via
-    the ``_nullrun_extractor`` attribute. The wrapper reads it
-    inside ``_enforce_sensitive_tool`` to extract a typed
+    ``@sensitive(impact=money_outflow(...))`` attaches a typed
+    ``MoneyImpactExtractor`` to the function via the
+    ``_nullrun_extractor`` attribute. The wrapper reads it inside
+    ``_enforce_sensitive_tool`` to extract a typed
     ``BusinessImpact`` + ``action_digest`` from the live call
     arguments and forward them to /execute, so the backend can
     stamp the approval row with the digest and refuse tampered
@@ -974,7 +968,7 @@ def sensitive(
     Args:
         fn: the function to decorate. May be None when used with
             keyword arguments (the ``@sensitive(impact=...)`` form).
-        impact: Phase 1 typed action extractor. Currently only
+        impact: typed action extractor. Currently only
             ``MoneyImpactExtractor`` (returned by
             ``money_outflow(argument=...)``) is supported.
 
@@ -1090,10 +1084,9 @@ def _find_extractor_in_chain(fn: Any) -> Any:
 
 
 def _do_sensitive_register(fn: F) -> F:
-    # Phase 1 / MVP 1.1 (Tier 2 -- ToolParameters): if @sensitive
-    # was applied bare (no impact=...), auto-attach a default
-    # ``ToolParamsExtractor(include_all=True)`` so the tool is
-    # immediately eligible for ToolParameters Approval Rules
+    # If @sensitive was applied bare (no impact=...), auto-attach a
+    # default ``ToolParamsExtractor(include_all=True)`` so the tool
+    # is immediately eligible for ToolParameters Approval Rules
     # without requiring every user to write
     # ``@sensitive(impact=tool_params())`` explicitly.
     #
@@ -1127,10 +1120,10 @@ def _do_sensitive_register(fn: F) -> F:
         # The extractor module is loaded above us on every path
         # we care about; this ImportError guard is defensive in
         # case the SDK is shrunk (e.g. for a hypothetical
-        # tool-only build). Falling back to legacy Phase 0 path
-        # is the safe default -- the wire payload drops the
-        # business_impact field and the backend uses approval_id-
-        # only grant consume.
+        # tool-only build). Falling back to the legacy
+        # approval_id-only grant consume is the safe default --
+        # the wire payload drops the business_impact field and the
+        # backend uses approval_id-only grant consume.
         pass
 
     try:
@@ -1207,8 +1200,8 @@ def get_protected_runtime() -> NullRunRuntime | None:
         return None
 
 
-# Phase 3 (2026-07-05): install the registry-backed proxy on the
-# module class (see nullrun._singleton for the rationale).
+# Install the registry-backed proxy on the module class
+# (see nullrun._singleton for the rationale).
 from nullrun._singleton import install_runtime_proxy
 
 install_runtime_proxy(__name__)

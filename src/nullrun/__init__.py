@@ -27,16 +27,16 @@ import threading as _threading
 from nullrun.__version__ import __version__
 
 # Module-level lock that serialises the three singleton-slot writes
-# inside `init `. See plan item B3.
+# inside `init `.
 _init_lock = _threading.Lock()
 
 # ---------------------------------------------------------------------------
-# Curated public surface (Phase 3.4)
+# Curated public surface
 # ---------------------------------------------------------------------------
 # These six names are imported eagerly so they show up in `dir(nullrun)` and
-# in tab-completion — that's the "track AI cost in 5 minutes" surface. All
-# other names (legacy Breaker exports, instrumentation, exceptions, …) live
-# in `_LAZY_EXPORTS` below and are loaded on first access via __getattr__.
+# in tab-completion. All other names (legacy Breaker exports,
+# instrumentation, exceptions, …) live in `_LAZY_EXPORTS` below and are
+# loaded on first access via __getattr__.
 from nullrun.decorators import protect  # the gate decorator
 from nullrun.runtime import track_event, track_llm, track_tool
 
@@ -327,9 +327,9 @@ def init(
             except Exception as e:  # noqa: BLE001 — best-effort
                 logger.warning("previous runtime shutdown raised during init(): %s", e)
 
-        # Phase 3 (2026-07-05): install the runtime in the registry
-        # so every consumer (decorators, @protect, track_*) sees the
-        # same instance regardless of which init path we use.
+        # Install the runtime in the registry so every consumer
+        # (decorators, @protect, track_*) sees the same instance
+        # regardless of which init path we use.
         from nullrun._registry import get_registry
 
         registry = get_registry()
@@ -380,7 +380,7 @@ def init(
     except Exception as e:  # noqa: BLE001 — best-effort probe
         logger.debug("nullrun.init: capability probe raised %s", e)
 
-    # Phase D6: wire auto-instrumentation AFTER the runtime is fully
+    # Wire auto-instrumentation AFTER the runtime is fully
     # constructed. In 0.3.0 api_key is required, so this branch is
     # unconditional — we always have a remote LLM traffic source if
     # auto-instrumentation libraries are installed.
@@ -418,8 +418,8 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "get_trace_id": ("nullrun.context", "get_trace_id"),
     "get_span_id": ("nullrun.context", "get_span_id"),
     "get_agent_id": ("nullrun.context", "get_agent_id"),
-    # T4 (2026-06-27): per-call context for /gate pre-flight. Users
-    # call `set_call_context(model=..., tools=[...])` inside
+    # Per-call context for /gate pre-flight. Users call
+    # `set_call_context(model=..., tools=[...])` inside
     # `with workflow(...)` so the backend's budget + tool_block
     # enforcement sees real values instead of the previous fake
     # `"budget-precheck"` sentinel and empty tool list.
@@ -436,27 +436,26 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "set_chain_op": ("nullrun.context", "set_chain_op"),
     # Instrumentation
     "NullRunCallback": ("nullrun.instrumentation", "NullRunCallback"),
-    # NOTE (Sprint 1.2 / B11-B12): `patch_openai` and `unpatch_openai`
-    # were removed from `_LAZY_EXPORTS` because they pointed at
-    # non-existent attributes on `nullrun.instrumentation` (the actual
-    # function is `patch_openai_agents`, with different semantics —
-    # it patches `agents.Runner`, not the `openai` SDK). The pre-fix
-    # lazy entries caused `AttributeError` on first access, which is
-    # a worse failure mode than a clean `ImportError` from
+    # NOTE: `patch_openai` and `unpatch_openai` were removed from
+    # `_LAZY_EXPORTS` because they pointed at non-existent
+    # attributes on `nullrun.instrumentation` (the actual function
+    # is `patch_openai_agents`, with different semantics — it patches
+    # `agents.Runner`, not the `openai` SDK). The pre-fix lazy
+    # entries caused `AttributeError` on first access, which is a
+    # worse failure mode than a clean `ImportError` from
     # `from nullrun import patch_openai` failing because the symbol
     # is no longer in the lazy table.
-    # Toolbox — framework-specific wrappers (Phase 1 Commit 6).
-    # The previous `instrument ` helper lived at
-    # `nullrun.instrumentation.langgraph.instrument`; it is now
-    # `nullrun.toolbox.langgraph.wrapper`. Reachable as
+    # Toolbox — framework-specific wrappers. The previous `instrument `
+    # helper lived at `nullrun.instrumentation.langgraph.instrument`;
+    # it is now `nullrun.toolbox.langgraph.wrapper`. Reachable as
     # `from nullrun import wrapper` for one-line import.
     "wrapper": ("nullrun.toolbox.langgraph", "wrapper"),
-    # Span / trace context (Phase 2 Commit 3).
-    # `tracing.py` is the structured replacement for the loose `_trace_id`
-    # / `_span_id` contextvars in `nullrun.context`. `SpanContext` is a
-    # single value (parent + children derive from it); `set_span` /
-    # `reset_span` are the token-based API the runtime and `@protect`
-    # use to push/pop the active span.
+    # Span / trace context. `tracing.py` is the structured replacement
+    # for the loose `_trace_id` / `_span_id` contextvars in
+    # `nullrun.context`. `SpanContext` is a single value (parent +
+    # children derive from it); `set_span` / `reset_span` are the
+    # token-based API the runtime and `@protect` use to push/pop the
+    # active span.
     "SpanContext": ("nullrun.tracing", "SpanContext"),
     "get_current_span": ("nullrun.tracing", "get_current_span"),
     "create_root_span": ("nullrun.tracing", "create_root_span"),
@@ -465,7 +464,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "reset_span": ("nullrun.tracing", "reset_span"),
     # Decorators
     "sensitive": ("nullrun.decorators", "sensitive"),
-    # Actions (Phase 3)
+    # Actions
     "ActionHandler": ("nullrun.actions", "ActionHandler"),
     "ActionType": ("nullrun.actions", "ActionType"),
     "ActionEvent": ("nullrun.actions", "ActionEvent"),
@@ -473,7 +472,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "handle_action": ("nullrun.actions", "handle_action"),
     "register_action_handler": ("nullrun.actions", "register_action_handler"),
     "get_action_handler": ("nullrun.actions", "get_action_handler"),
-    # Exceptions (Phase 3 + Layer 1)
+    # Exceptions (Layer 1)
     "NullRunError": ("nullrun.breaker.exceptions", "NullRunError"),
     "NullRunBlockedException": ("nullrun.breaker.exceptions", "NullRunBlockedException"),
     "NullRunAuthenticationError": ("nullrun.breaker.exceptions", "NullRunAuthenticationError"),
@@ -488,8 +487,8 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "NullRunStatus": ("nullrun.observability.status", "NullRunStatus"),
     "RecentError": ("nullrun.observability.status", "RecentError"),
     "WorkflowState": ("nullrun.observability.status", "WorkflowState"),
-    # Sprint 2.2: zombie exception classes removed. See the
-    # NOTE block in breaker/exceptions.py for the list.
+    # Zombie exception classes removed. See the NOTE block in
+    # breaker/exceptions.py for the list.
     "WorkflowPausedException": ("nullrun.breaker.exceptions", "WorkflowPausedException"),
     "WorkflowKilledException": ("nullrun.breaker.exceptions", "WorkflowKilledException"),
     "WorkflowKilledInterrupt": ("nullrun.breaker.exceptions", "WorkflowKilledInterrupt"),
@@ -550,10 +549,10 @@ def __dir__() -> list[str]:
 __all__ = [
     # Version (single value, always public)
     "__version__",
-    # Phase 3.4: the curated public surface — six symbols.
-    # Everything else stays importable as `from nullrun import X` for
-    # backward compatibility, but does NOT appear in `dir(nullrun)`
-    # until the user actually accesses it.
+    # The curated public surface — six symbols. Everything else
+    # stays importable as `from nullrun import X` for backward
+    # compatibility, but does NOT appear in `dir(nullrun)` until the
+    # user actually accesses it.
     "init",
     "protect",  # gate decorator
     "track_llm",
@@ -612,11 +611,11 @@ __all__ = [
     "init_or_die",
 ]
 
-# Sprint 2.1: the SDK-side ``decision_history`` module was deleted.
-# Decision history is a backend + dashboard surface only — the SDK
-# does not (and cannot) replay LLM calls because NULLRUN does not
-# store request/response payloads or hold client LLM keys. The
-# orphan ``start_recording`` / ``stop_recording`` methods on
+# The SDK-side ``decision_history`` module was deleted. Decision
+# history is a backend + dashboard surface only — the SDK does not
+# (and cannot) replay LLM calls because NULLRUN does not store
+# request/response payloads or hold client LLM keys. The orphan
+# ``start_recording`` / ``stop_recording`` methods on
 # ``NullRunRuntime`` are kept as no-op stubs for one minor version
 # for backward compatibility; they will be removed in 0.5.0.
 # Do NOT re-export ReplayManager / ReplaySession / ReplayEvent /

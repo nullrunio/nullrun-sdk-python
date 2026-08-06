@@ -250,7 +250,7 @@ def test_httpx_then_langchain_simulation_dedupes():
 
 
 # ---------------------------------------------------------------------------
-# Phase 3 production-readiness: track_event emits a stable _fingerprint
+# track_event emits a stable _fingerprint
 # ---------------------------------------------------------------------------
 
 

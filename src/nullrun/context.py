@@ -3,9 +3,9 @@ Context management for NullRun SDK.
 
 Provides workflow and trace context for automatic event correlation.
 
-Sprint 2.7 (B27): the previously-defined ``_organization_id_var`` /
-``_api_key_id_var`` contextvars and the ``get_organization_id`` /
-``get_api_key_id`` getters were removed because:
+The previously-defined ``_organization_id_var`` / ``_api_key_id_var``
+contextvars and the ``get_organization_id`` / ``get_api_key_id``
+getters were removed (B27) because:
   1. No code path ever wrote to them — both getters always
      returned ``None``.
   2. ``observability.TenantFilter`` (the only consumer) was
@@ -31,25 +31,24 @@ _span_id_var: ContextVar[str | None] = ContextVar("span_id", default=None)
 _agent_id_var: ContextVar[str | None] = ContextVar("agent_id", default=None)
 _attempt_index_var: ContextVar[int] = ContextVar("attempt_index", default=0)
 
-# T4 (2026-06-27): per-call context that flows into the /gate pre-flight
-# request so the backend can compute projected_cost and tool_block
-# decisions from real data instead of the previous fake "budget-precheck"
+# Per-call context that flows into the /gate pre-flight request so
+# the backend can compute projected_cost and tool_block decisions
+# from real data instead of the previous fake "budget-precheck"
 # sentinel. Both default to None/empty; users opt in by calling
 # ``set_call_context(model=..., tools=[...])`` inside a ``with workflow(...)``
 # block. When unset, the backend falls back to its default pricing and
-# skips tool-block enforcement on /gate (per-key tool_block is enforced
-# on /track only — see gate/internal.rs T3).
+# skips tool-block enforcement on /gate (per-key tool_block is
+# enforced on /track only).
 _call_model_var: ContextVar[str | None] = ContextVar("call_model", default=None)
 _call_tools_var: ContextVar[tuple[str, ...]] = ContextVar("call_tools", default=())
-# Разрыв 3 / 2026-07-28: per-call MCP tool class + annotations.
-# Set via the new ``set_mcp_tool_context`` helper when the SDK
-# recognises an MCP server. The gate honors `tool_class` over
-# its own `classify_tool(tool_name)` parse, and uses
-# `mcp_annotations` to evaluate `mcp_destructive_policy` /
-# `mcp_readonly_policy`. ``None`` means "I don't know" — the
-# gate treats absent values as unknown (NOT as false), so a
-# server that forgets to set annotations cannot accidentally get
-# a read-only bypass.
+# Per-call MCP tool class + annotations. Set via the
+# ``set_mcp_tool_context`` helper when the SDK recognises an MCP
+# server. The gate honors `tool_class` over its own
+# `classify_tool(tool_name)` parse, and uses `mcp_annotations` to
+# evaluate `mcp_destructive_policy` / `mcp_readonly_policy`.
+# ``None`` means "I don't know" — the gate treats absent values
+# as unknown (NOT as false), so a server that forgets to set
+# annotations cannot accidentally get a read-only bypass.
 _call_mcp_class_var: ContextVar[str | None] = ContextVar(
     "call_mcp_class", default=None
 )
@@ -438,8 +437,8 @@ def set_call_context(
     """Set per-call context (model name, tool list) for the next /gate
     pre-flight check.
 
-    T4 (2026-06-27): replaces the previous fake ``model="budget-precheck"``
-    and ``estimated_tokens=1`` always-default / always-empty pre-flight.
+    Replaces the previous fake ``model="budget-precheck"`` and
+    ``estimated_tokens=1`` always-default / always-empty pre-flight.
     Call inside a ``with workflow(...)`` block before ``@protect`` to
     give the backend real data.
 
@@ -450,9 +449,9 @@ def set_call_context(
             /track will compute from real token counts.
         tools: List of tool names the call intends to use. Backend
             matches each against the workflow's effective
-            ``blocked_tools`` aggregate (T3 in backend) and returns
-            block on any match. Pass ``None`` to leave whatever was
-            previously set, ``[]`` to clear.
+            ``blocked_tools`` aggregate and returns block on any
+            match. Pass ``None`` to leave whatever was previously
+            set, ``[]`` to clear.
     """
     if model is not None:
         _call_model_var.set(model)
@@ -464,8 +463,8 @@ def set_mcp_tool_context(
     tool_class: str | None = None,
     annotations: dict[str, bool | None] | None = None,
 ) -> None:
-    """Разрыв 3 / 2026-07-28: forward the cached MCP tool class +
-    annotations to the next ``/check`` call.
+    """Forward the cached MCP tool class + annotations to the next
+    ``/check`` call.
 
     Use after fetching ``tools/list`` from an MCP server — the SDK
     caches the response and on each subsequent ``/check`` should
@@ -526,7 +525,7 @@ def workflow(name: str | None = None) -> Generator[str, None, None]:
     Yields:
         The workflow_id string
     """
-    # Phase 5 #5.6: emit a real UUID4 with dashes (matching
+    # Emit a real UUID4 with dashes (matching
     # ``generate_trace_id``). The previous ``wf-{hex32}`` format
     # was inconsistent with the rest of the SDK's id generation.
     workflow_id = name or str(uuid.uuid4())
@@ -600,7 +599,7 @@ def agent(name: str | None = None) -> Generator[str, None, None]:
     Yields:
         The agent_id string
     """
-    # P2-4 / S-8: emit a real UUID4 with dashes (matching
+    # Emit a real UUID4 with dashes (matching
     # ``generate_trace_id`` / ``generate_span_id``). The previous
     # ``f"agent-{uuid.uuid4.hex}"`` format was 32 hex chars
     # without dashes; backend UUID-typed columns (cost_events.

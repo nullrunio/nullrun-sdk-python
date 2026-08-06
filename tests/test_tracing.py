@@ -139,7 +139,7 @@ def test_span_context_is_immutable():
 
 
 # ===========================================================================
-# Sprint 2.6 (B5): create_child_span must reject None parent clearly
+# B5: create_child_span must reject None parent clearly
 # ===========================================================================
 # Pre-fix: ``create_child_span(None)`` raised
 # ``TypeError: unsupported operand for None + 1`` on the

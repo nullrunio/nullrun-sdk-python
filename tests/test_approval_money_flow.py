@@ -1,15 +1,15 @@
-"""Phase 1 / MVP 1.0 — 5 DoD scenarios for the Money approval flow.
+"""Typed impact + digest-bound approval — 5 DoD scenarios for the Money approval flow.
 
 The exact 5 scenarios Anatolii requested (2026-07-23):
 
   1. Refund $40 -> Allow (no approval needed)
   2. Refund $1200 -> Require Approval -> Approve -> Execute (success)
   3. Refund $1200 -> Approve -> Modify amount to $1300 -> Block on
-     digest mismatch (the headline security invariant of Phase 1)
+     digest mismatch (the headline security invariant of typed impact)
   4. Approve -> Execute -> Second Execute -> Block on replay
-     (Phase 0 grant-consume invariant, still must hold)
+     (grant-consume invariant, still must hold)
   5. Approve -> Wait expiry -> Execute -> Block on expiry
-     (Phase 0 expiry invariant, still must hold)
+     (expiry invariant, still must hold)
 
 These are SDK-level tests, not end-to-end HTTP tests. We:
 
@@ -56,8 +56,8 @@ from nullrun.extractor import (
 # A minimal in-process simulator that mirrors gate_internal's
 # decisions without spinning up the backend. Verified against the
 # backend's grant-consume path in `db.rs::consume_approved`
-# (Phase 0 contract: status, execution_id binding, expiry,
-# consumed_at IS NULL) plus the Phase 1 digest compare. The
+# (grant-consume contract: status, execution_id binding, expiry,
+# consumed_at IS NULL) plus the digest compare. The
 # simulator exposes the failure modes so the tests can pin which
 # one fired — different error codes belong to different DoD
 # scenarios.
@@ -86,7 +86,7 @@ class ApprovalSimulator:
         raises. The tests assert on the return value's prefix to
         map to each of the 5 DoD scenarios.
         """
-        # Phase 0 path: missing-replay / wrong-execution / wrong-status.
+        # legacy path: missing-replay / wrong-execution / wrong-status.
         if self.status != "APPROVED":
             self.last_decision = "block:status-not-approved"
             return self.last_decision
@@ -96,12 +96,12 @@ class ApprovalSimulator:
         if time.monotonic() > self.expires_at:
             self.last_decision = "block:expired"
             return self.last_decision
-        # Phase 1 digest check (live: `gate_internal::digest re-check`).
+        # digest check (live: `gate_internal::digest re-check`).
         if business_impact is not None:
             live_digest = compute_action_digest(business_impact)
             stored = self.stored_digest
             if stored is None:
-                # Legacy Phase 0 row: digest-empty approvals cannot
+                # Legacy digest-empty approvals cannot
                 # be re-checked against an impact. Backend falls back
                 # to approval_id-only grant, simulator mirrors.
                 self.last_decision = "allow"
@@ -109,7 +109,7 @@ class ApprovalSimulator:
             if stored != live_digest:
                 self.last_decision = "block:digest-mismatch"
                 return self.last_decision
-        # Phase 0 consume path: stamp consumed_at (we mark in-memory
+        # grant-consume path: stamp consumed_at (we mark in-memory
         # once per decision, so a second call triggers replay).
         self.consumed = True
         self.last_decision = "allow"
@@ -121,7 +121,7 @@ class ApprovalSimulator:
 
 @pytest.fixture(autouse=True)
 def reset_observability() -> None:
-    """Phase 0 SDK policy: tests must not leak metrics across runs."""
+    """SDK policy: tests must not leak metrics across runs."""
     from nullrun.observability import metrics
 
     metrics.reset()
@@ -163,7 +163,7 @@ def extractor_factory():
 class TestBusinessImpactRoundTrip:
     """1. Test the digest primitive itself before wiring it up.
 
-    Phase 1 / MVP 1.0 security invariant: any drift between
+    Typed impact + digest-bound approval security invariant: any drift between
     SDK-computed and backend-computed digests is a P0 bug. We
     pin the digest by encoding a known fixture and asserting
     the exact 64-char hex.
@@ -274,7 +274,7 @@ class TestExtractor:
             ex.impact_for(_refund_call, (1_000,), {})
 
     def test_extractor_rejects_wrong_type(self, extractor_factory):
-        # Phase 1.1 (Decimal support): a string is not a Decimal
+        # Decimal support: a string is not a Decimal
         # and not an int, so the discriminator rejects it. The
         # exact error message names the unit discriminator so the
         # operator can fix the call site.
@@ -285,7 +285,7 @@ class TestExtractor:
             )
 
     def test_extractor_rejects_bool_amount(self, extractor_factory):
-        # Phase 1.1 (Decimal support): ``bool`` is a subclass
+        # Decimal support: ``bool`` is a subclass
         # of ``int`` in Python; the discriminator explicitly
         # rejects ``bool`` so a hostile caller can't smuggle
         # ``True`` as ``amount=1`` cent. The unit-discriminator
@@ -306,7 +306,7 @@ class TestDoDScenarios:
     ):
         # Scenario 1: Refund $40 -> Allow (no approval needed).
         #
-        # The MVP-1.0 rule fires on `outflow > 50 USD cents = $50`.
+        # The 50 USD cents threshold rule fires on `outflow > 50 USD cents = $50`.
         # Refund $40 is below threshold → no approval → /gate
         # returns 'allow' without invoking the approval cycle.
         ex = extractor_factory("amount_cents")
@@ -314,7 +314,7 @@ class TestDoDScenarios:
         sim = ApprovalSimulator(
             stored_digest=None,  # /gate path: never even reaches grant
         )
-        # /gate path: refund of 4000 cents ($40) is below the MVP
+        # /gate path: refund of 4000 cents ($40) is below the
         # threshold; the simulator's grant-consume path is not
         # invoked. We assert the SDK's decision is "no approval
         # needed" by checking the impact is below the rule
@@ -367,7 +367,7 @@ class TestDoDScenarios:
 
     def test_4_replay_after_approved_execute_blocks(self, extractor_factory):
         # Scenario 4: Approved -> Execute -> Second Execute ->
-        # Block on replay. Phase 0 grant-consume contract.
+        # Block on replay. grant-consume contract.
         ex = extractor_factory("amount_cents")
         impact = ex.impact_for(_refund_call, (50_000,), {})
         sim = ApprovalSimulator(

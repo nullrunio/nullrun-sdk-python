@@ -2,7 +2,7 @@
 Regression tests for the new framework auto-instrumentation patches
 in 0.4.0.
 
-Phase 7 of the production-readiness plan adds three new patches:
+Adds three new patches:
 - llama-index (LLMChatEndEvent + FunctionCallEvent via Dispatcher)
 - crewai (Crew.kickoff + Crew.kickoff_async + post-run usage_metrics)
 - autogen (BaseChatAgent.on_messages + OpenAIChatCompletionClient.create)
@@ -12,7 +12,7 @@ The 6 placeholder tests removed on 2026-06-28 were
 provided no coverage and gave a false sense of green-on-arrival.
 Real coverage for these frameworks lives in the framework-specific
 integration suites (one per repo, gated on the framework being
-installed). See Sprint 2.9 ticket.
+installed).
 """
 
 from __future__ import annotations
@@ -90,7 +90,7 @@ def test_new_framework_modules_importable():
 
 
 # ===========================================================================
-# Sprint 2.9 (B47): safe_patch wrapper for centralised error visibility
+# B47: safe_patch wrapper for centralised error visibility
 # ===========================================================================
 # Pre-fix: the auto-instrumentation modules had 25+ scattered
 # ``try/except Exception: pass # pragma: no cover`` blocks. A

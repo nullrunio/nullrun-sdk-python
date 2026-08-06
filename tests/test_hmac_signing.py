@@ -1,8 +1,7 @@
 """
-tests/test_hmac_signing.py — Phase 1 production-readiness.
+tests/test_hmac_signing.py.
 
-Verifies the HMAC always-on contract from the production-readiness
-plan: every POST that has a body and a ``secret_key`` produces a
+Verifies the HMAC always-on contract: every POST that has a body and a ``secret_key`` produces a
 canonical ``X-Signature`` + ``X-Signature-Timestamp`` pair. Without
 ``secret_key`` no signature headers are emitted (preserves the
 dev/legacy path). Tampered bodies and stale timestamps are rejected
@@ -324,7 +323,7 @@ class TestSignedPostWirePath:
         # (This is a smoke test for the wire format. The actual
         # _send_batch_with_retry_info path is integration-tested
         # in test_transport.py — that file has pre-existing
-        # structural issues unrelated to Phase 1.)
+        # structural issues unrelated to HMAC.)
         assert sig is not None
         assert len(sig) == 64
 

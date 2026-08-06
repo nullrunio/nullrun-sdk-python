@@ -1,16 +1,15 @@
 """
 Regression tests for HIGH-reliability fixes in 0.4.0.
 
-Phase 5 of the production-readiness plan:
-- #5.1: _remote_state_for / _set_remote_state / _states_lock helpers.
-- #5.2: PolicyCache policy_version is its own field, not ttl_seconds.
-- #5.3: get_instance atomic credential rotation.
-- #5.5: _fetch_remote_state uses shared transport client.
-- #5.6: workflow emits UUID4 (was wf-{hex32}).
-- #5.7: @sensitive fails CLOSED on registration error (wraps original
-  # exception as RuntimeError with chained __cause__).
-- #5.8: Custom-host KILL reach.
-- #5.10: Transport.execute on_transport_error callback.
+- _remote_state_for / _set_remote_state / _states_lock helpers.
+- PolicyCache policy_version is its own field, not ttl_seconds.
+- get_instance atomic credential rotation.
+- _fetch_remote_state uses shared transport client.
+- workflow emits UUID4 (was wf-{hex32}).
+- @sensitive fails CLOSED on registration error (wraps original
+  exception as RuntimeError with chained __cause__).
+- Custom-host KILL reach.
+- Transport.execute on_transport_error callback.
 """
 
 from __future__ import annotations
@@ -255,7 +254,7 @@ def test_execute_on_transport_error_callback_receives_breaker_error(monkeypatch)
         received.append(exc)
         return {"decision": "block", "decision_source": "FALLBACK"}
 
-    # Round 3 (Phase 0.4.0): runtime.execute raises NullRunBlockedException
+    # runtime.execute raises NullRunBlockedException
     # when the result has decision="block". The callback was already invoked
     # by Transport.execute before the result propagated up.
     import pytest

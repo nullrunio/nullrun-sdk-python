@@ -1,7 +1,6 @@
 """
 Regression tests for BLOCKER fixes in 0.4.0.
 
-Phase 2 of the production-readiness plan:
 - #1 First-`track ` AttributeError on `_workflow_costs` (removed in 0.3.1).
 - #3 `_safe_bump_coverage` missing — `auto_requests.py` was unimportable.
 - #4 `auto_instrument ` did not call `patch_requests`.

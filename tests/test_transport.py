@@ -283,7 +283,7 @@ class TestTransport:
     @respx.mock
     def test_check_endpoint_returns_block_on_error(self, transport):
         """Check endpoint returns block decision on error."""
-        # Round 3 (Phase 0.4.0): check now uses the unified
+        # Check now uses the unified
         # /api/v1/gate endpoint (was /api/v1/check).
         respx.post("https://api.test.nullrun.io/api/v1/gate").mock(
             return_value=httpx.Response(500, text="Server Error")
@@ -710,7 +710,7 @@ class TestTransportHMAC:
 
 
 # ===========================================================================
-# Sprint 2.4 (B20): _refetch_credentials must use the shared httpx client
+# B20: _refetch_credentials must use the shared httpx client
 # ===========================================================================
 # Pre-fix the implementation did ``import requests; requests.post(...)``
 # inside the function body, which:
@@ -819,7 +819,7 @@ class TestRefetchCredentialsUsesSharedClient:
 
 
 class TestToolArgumentsForwarding:
-    """Разрыв 4 / T5.6 (2026-07-31) wire-shape pins for
+    """T5.6 (2026-07-31) wire-shape pins for
     the `tool_arguments` field on the /execute and /check
     endpoints. The backend (T5.6) reads `tool_arguments`
     from the request, computes a schema fingerprint, and
@@ -827,7 +827,7 @@ class TestToolArgumentsForwarding:
     authenticated MCP /check.
 
     Pre-T5.6 SDKs (≤ 0.14.4) never set this field; the
-    backend falls back to the Разрыв 2 `tool_params`
+    backend falls back to the `tool_params`
     field. The wire change is additive-only.
     """
 
