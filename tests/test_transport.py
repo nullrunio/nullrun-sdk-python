@@ -939,3 +939,117 @@ class TestToolArgumentsForwarding:
         # Wire contract: tool_arguments round-trips
         # verbatim from check_request → wire JSON.
         assert captured.get("tool_arguments") == {"repo": "acme/api"}
+
+    @respx.mock
+    def test_check_forwards_parent_execution_id_when_present(self, transport):
+        """Execution Graph v0 (2026-08-06, backend): additive
+        `parent_execution_id` on /gate. A sub-agent SDK call to a
+        child execution names the parent execution here; the
+        backend validates ownership against the parent's
+        ``execution:{id}`` Redis binding. Forwarded only when the
+        caller passes a non-None string -- legacy / single-shot
+        callers keep the previous payload shape (see
+        ``test_check_omits_parent_execution_id_when_absent``).
+        """
+        captured: dict = {}
+
+        def capture(request: httpx.Request) -> httpx.Response:
+            import json
+            captured.update(json.loads(request.content))
+            return httpx.Response(
+                200,
+                json={
+                    "decision": "allow",
+                    "policy_id": "policy-eg",
+                    "policy_version": 1,
+                    "explanation": "sub-agent call; parent lineage OK",
+                },
+            )
+
+        respx.post("https://api.test.nullrun.io/api/v1/gate").mock(
+            side_effect=capture
+        )
+        parent_id = "00000000-0000-0000-0000-000000000099"
+        child_id = "00000000-0000-0000-0000-0000000000aa"
+        result = transport.check(
+            check_request={
+                "organization_id": "ws-123",
+                "execution_id": child_id,
+                "tool": "mcp://github/create_issue",
+                "parent_execution_id": parent_id,
+            }
+        )
+        assert result["decision"] == "allow"
+        # Wire contract: parent_execution_id round-trips
+        # verbatim from check_request → wire JSON.
+        # Field name matches the backend's wire schema at
+        # ``backend/src/proxy/http/gate/schemas.rs:73``.
+        assert captured.get("parent_execution_id") == parent_id
+
+    @respx.mock
+    def test_check_omits_parent_execution_id_when_absent(self, transport):
+        """Default `parent_execution_id=None` (or absent from
+        ``check_request``) MUST NOT appear on the wire. Legacy /
+        single-shot SDKs round-trip cleanly because the field is
+        absent -- the backend's ``skip_serializing_if = "Option::is_none"``
+        contract is mirrored SDK-side by the conditional forward
+        at ``transport.py:`` (after the ``tool_arguments`` block).
+        The wire change is additive-only; pre-Execution-Graph SDKs
+        never wrote the key.
+        """
+        captured: dict = {}
+
+        def capture(request: httpx.Request) -> httpx.Response:
+            import json
+            captured.update(json.loads(request.content))
+            return httpx.Response(
+                200,
+                json={"decision": "allow", "policy_id": "p", "policy_version": 1},
+            )
+
+        respx.post("https://api.test.nullrun.io/api/v1/gate").mock(
+            side_effect=capture
+        )
+        transport.check(
+            check_request={
+                "organization_id": "ws-123",
+                "execution_id": "exec-456",
+                "tool": "mcp://github/create_issue",
+            }
+        )
+        # `parent_execution_id` MUST be absent when caller
+        # didn't pass it. The wire change is additive-only.
+        assert "parent_execution_id" not in captured
+
+    @respx.mock
+    def test_check_omits_parent_execution_id_when_none_explicit(self, transport):
+        """Explicit ``parent_execution_id=None`` in
+        ``check_request`` (vs. key absent) MUST also be omitted.
+        Guards against SDK callers that build their
+        ``check_request`` programmatically and set the field to
+        ``None`` for clarity.
+        """
+        captured: dict = {}
+
+        def capture(request: httpx.Request) -> httpx.Response:
+            import json
+            captured.update(json.loads(request.content))
+            return httpx.Response(
+                200,
+                json={"decision": "allow", "policy_id": "p", "policy_version": 1},
+            )
+
+        respx.post("https://api.test.nullrun.io/api/v1/gate").mock(
+            side_effect=capture
+        )
+        transport.check(
+            check_request={
+                "organization_id": "ws-123",
+                "execution_id": "exec-456",
+                "tool": "mcp://github/create_issue",
+                "parent_execution_id": None,
+            }
+        )
+        # Explicit None must NOT be forwarded -- the SDK
+        # treats None as "no parent" (single-shot semantics).
+        assert "parent_execution_id" not in captured

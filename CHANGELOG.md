@@ -7,6 +7,37 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [0.14.8] - 2026-08-06
+
+Execution Graph v0 — additive sub-agent lineage. The backend landed `parent_execution_id` as an optional wire field on `/api/v1/gate` (backend commit `87fae759`, not pushed yet) so an SDK spawning a sub-agent can name the parent's `execution_id`. Backend validates ownership against the parent's `execution:{id}` Redis binding (mirrors the `/cancel` ownership check) and rejects cross-org / cross-key / not-found with `403 PARENT_EXECUTION_*`. This release ships the SDK-side forward path, the matching capability flag, and the three-way error-code mapping. Wire change is strictly additive (omitted when `None`); no SDK_MIN_VERSION bump.
+
+### Added
+
+- **`parent_execution_id` on `/check` (gate)** — `Transport.check(check_request=...)` forwards the optional `parent_execution_id` field from `check_request` onto the wire when the caller passes a non-None string. Omitted entirely when absent or explicitly `None`, so legacy / single-shot callers keep the previous payload shape. Mirrors the additive forward pattern used by `chain_id` / `tool_arguments` / `idempotency_key` at `src/nullrun/transport.py:1607-1626`. Sub-agent SDKs stamp the field manually from a caller-supplied UUID; auto-injection from a "current execution_id" contextvar is deferred (v0 is intentionally caller-owned).
+- **`execution_graph` capability flag** — `parse_capabilities` reads the new `execution_graph: bool` from `/api/v1/capabilities` (nested under `capabilities:` with top-level fallback for pre-1.0.0 backends). `ServerCapabilities.execution_graph` exposes the flag so SDKs can probe whether the deployment supports sub-agent lineage before sending the field. Pre-Graph backends silently ignore unknown fields, but the probe lets SDKs surface a clean diagnostic at `init()` rather than a 400 on the first call.
+- **`NullRunChainError.parent_execution_id`** — the chain error class gains an optional `parent_execution_id: str | None = None` constructor kwarg (mirroring the existing `chain_id` kwarg at `breaker/exceptions.py:425`). When the backend rejects a sub-agent call with `PARENT_EXECUTION_*`, the offending parent id is preserved on the exception so cookbook code can log / surface it without re-parsing the message string.
+
+### Changed
+
+- **Three new error codes mapped to `NullRunChainError`** — `PARENT_EXECUTION_NOT_FOUND`, `PARENT_EXECUTION_ORG_MISMATCH`, `PARENT_EXECUTION_KEY_MISMATCH` (all 403) are added to `_V3_ERROR_CODE_MAP` at `src/nullrun/transport.py:2675-2685`. Mapped to `NullRunChainError` (not a new class) because the diagnostic profile is identical to `CHAIN_CROSS_ORG` / `CHAIN_ORG_MISMATCH` — 403-class security errors with `(org_id, api_key_id)` ownership semantics. Diagnostic clarity wins over a new exception class per CLAUDE.md §13 philosophy.
+
+### Tests
+
+- `tests/test_transport.py::TestParentExecutionIdForwarding` — 3 new tests: `test_check_forwards_parent_execution_id_when_present` (round-trips from `check_request` → wire JSON), `test_check_omits_parent_execution_id_when_absent` (legacy / single-shot callers keep the old payload shape), `test_check_omits_parent_execution_id_when_none_explicit` (explicit `None` is treated as "no parent" / single-shot).
+
+### Compatibility
+
+- **Backward-compatible additive wire change.** Pre-Execution-Graph SDKs that never set `parent_execution_id` continue to work unchanged — the field is omitted entirely from the wire.
+- **Backward-compatible capability flag.** Pre-Graph backends return `execution_graph: false` (or omit the field entirely); the SDK treats both as "don't send the parent field". `is_v3_ready()` is unchanged — the flag is informational, not a hard gate.
+- **Backward-compatible exception class.** `NullRunChainError` gains a kwarg with a default; the existing 4-arg call sites (CHAIN_MAX_DURATION_EXCEEDED, CHAIN_CROSS_ORG, CHAIN_ORG_MISMATCH, CHAIN_NOT_FOUND/EXPIRED) continue to work unchanged.
+- No on-wire change for legacy callers. No SDK_MIN_VERSION bump. The `parent_execution_id` field is omitted on the wire whenever the caller does not pass it explicitly.
+
+### Refs
+
+- Backend commit `87fae759` (not pushed; awaiting local review + push authorisation). Additive wire contract at `backend/src/proxy/http/gate/schemas.rs:62-73`; ownership validation at `backend/src/proxy/http/gate/internal.rs` (lifts `parent_execution_id` parsing before the validation block + persistence call site); migration 266 adds `execution_records.parent_execution_id` + partial index for graph queries (Tasks #11-14, not in v0).
+
+---
+
 ## [0.14.7] - 2026-08-04
 
 Init contract hardening — strip leading and trailing whitespace from `api_key` (and the `NULLRUN_API_KEY` env fallback) BEFORE the truthiness check in `nullrun.init()` and `NullRunRuntime.__init__`. Pre-fix, whitespace-only strings (`"   "`, `"\t"`, `"\n"`) are TRUTHY in Python and silently slipped past the empty-key guard; they were stored on the runtime and reached the gateway as a malformed `Authorization: Bearer   ***` header, surfacing as a backend 401 only on the first `/gate` call rather than at startup.

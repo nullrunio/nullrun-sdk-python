@@ -133,6 +133,15 @@ class ServerCapabilities:
     decision_log: bool = False
     outbox_async_drain: bool = False
     idempotency_keys: bool = False
+    # Execution Graph v0 (2026-08-06, backend): additive
+    # `parent_execution_id` wire field on /gate. SDKs probe this
+    # flag before sending the field; pre-Graph backends silently
+    # ignore unknown fields, but the probe lets SDKs surface a
+    # clean diagnostic at `init()` ("sub-agent mode requires
+    # server v0.5+") instead of a 400 on the first call. NOT
+    # included in `is_v3_ready()` -- it's informational, not a
+    # hard gate.
+    execution_graph: bool = False
     rate_limit_fail_scope: RateLimitFailScope = field(
         default_factory=lambda: RateLimitFailScope()
     )
@@ -173,6 +182,7 @@ class ServerCapabilities:
                 "decision_log": self.decision_log,
                 "outbox_async_drain": self.outbox_async_drain,
                 "idempotency_keys": self.idempotency_keys,
+                "execution_graph": self.execution_graph,
                 "rate_limit_fail_scope": {
                     "aggregate": self.rate_limit_fail_scope.aggregate,
                     "per_key": self.rate_limit_fail_scope.per_key,
@@ -252,6 +262,11 @@ def parse_capabilities(payload: dict[str, Any]) -> ServerCapabilities:
         decision_log=_v3_flag("decision_log"),
         outbox_async_drain=_v3_flag("outbox_async_drain"),
         idempotency_keys=_v3_flag("idempotency_keys"),
+        # Execution Graph v0 (2026-08-06, backend): additive flag
+        # -- defaults to False so pre-Graph backends (which omit
+        # the field entirely) yield a fail-closed view where the
+        # SDK does NOT send `parent_execution_id`.
+        execution_graph=_v3_flag("execution_graph"),
         rate_limit_fail_scope=_parse_rate_limit_scope(caps.get("rate_limit_fail_scope")),
     )
 

@@ -1552,6 +1552,7 @@ class Transport:
         self,
         check_request: dict[str, Any],
         on_transport_error: Callable[[Exception], dict[str, Any]] | str | None = None,
+        parent_execution_id: str | None = None,
     ) -> dict[str, Any]:
         """
         Call /api/v1/gate endpoint for pre-execution budget checking.
@@ -1624,6 +1625,27 @@ class Transport:
         # fingerprint.
         if "tool_arguments" in check_request and check_request["tool_arguments"] is not None:
             gate_request["tool_arguments"] = check_request["tool_arguments"]
+        # Execution Graph v0 (2026-08-06, backend): additive
+        # `parent_execution_id` wire field on /gate. A sub-agent SDK
+        # call to a child execution names the parent execution here;
+        # the backend validates ownership against the parent's
+        # `execution:{id}` Redis binding (mirrors the /cancel
+        # ownership check at `backend/src/proxy/http/cancel.rs:258-329`)
+        # and rejects cross-org / cross-key / not-found with 403
+        # PARENT_EXECUTION_*. Forwarded only when the caller passes
+        # a non-None string -- unset (legacy / single-shot) callers
+        # keep the previous payload shape. Resolution order:
+        # 1. `check_request["parent_execution_id"]` (preferred --
+        #    lets the runtime layer stamp it from a captured
+        #    server-minted execution_id via
+        #    `nullrun.capture_current_execution_id()`).
+        # 2. `parent_execution_id` kwarg (caller-supplied; useful
+        #    for fan-out where the parent is not the current
+        #    execution).
+        # 3. None / omitted entirely (legacy / single-shot).
+        _parent_execution_id = check_request.get("parent_execution_id", parent_execution_id)
+        if _parent_execution_id is not None:
+            gate_request["parent_execution_id"] = _parent_execution_id
 
         # 2026-07-02 (v0.11.0 refactor): route through the canonical
         # signed-headers helper — produces Content-Type + X-API-Key +
@@ -2656,6 +2678,18 @@ def _build_v3_error_code_map() -> dict[str, type[BaseException]]:
         # 403 — chain security + workflow state
         "CHAIN_CROSS_ORG": NullRunChainError,
         "CHAIN_ORG_MISMATCH": NullRunChainError,
+        # 403 — Execution Graph v0 (2026-08-06, backend). Sub-agent
+        # ownership validation against the parent's
+        # `execution:{id}` Redis binding (mirrors the /cancel
+        # ownership check). Fail-CLOSED — the sub-agent call does
+        # NOT proceed. Same diagnostic class as CHAIN_CROSS_ORG /
+        # CHAIN_ORG_MISMATCH: 403-class security errors with
+        # `(org_id, api_key_id)` ownership semantics. Diagnostic
+        # clarity wins over a new exception class per CLAUDE.md §13
+        # philosophy.
+        "PARENT_EXECUTION_NOT_FOUND": NullRunChainError,
+        "PARENT_EXECUTION_ORG_MISMATCH": NullRunChainError,
+        "PARENT_EXECUTION_KEY_MISMATCH": NullRunChainError,
         "WORKFLOW_INACTIVE": NullRunWorkflowInactiveError,
         # 401/403 — auth
         "API_KEY_REVOKED": NullRunAuthError,
