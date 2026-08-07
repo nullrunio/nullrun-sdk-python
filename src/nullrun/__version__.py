@@ -1,5 +1,33 @@
 """NullRun Platform SDK.
 
+v3.38 / 0.14.9 (2026-08-07) — wire-drift close: three real
+contract bugs that diverged from backend source code.
+(1) ``nullrun.capabilities.CAPABILITIES_PATH`` was ``/health``
+(legacy liveness endpoint) instead of the canonical
+``/api/v1/capabilities``. Pre-fix every ``init()`` probe
+returned None and ``is_v3_ready()`` was always False, leaving
+the v3 capability flags as runtime no-ops.
+(2) Backend v3.38 split the ``API_KEY_REVOKED`` bucket into
+five distinct wire codes (``API_KEY_EXPIRED`` /
+``API_KEY_DISABLED`` / ``API_KEY_INVALID`` /
+``API_KEY_MISSING`` / ``API_KEY_MALFORMED``) — pre-fix only
+``API_KEY_REVOKED`` was mapped in ``_V3_ERROR_CODE_MAP``, so
+the other five silently fell through to the generic
+HTTP-status fallback and never surfaced as
+``NullRunAuthError``, losing both the exception class and the
+diagnostic ``wire_code``.
+(3) Backend returns ``decision == "soft_pass"`` for soft-mode
+calls that proceed via the chain's overdraft cap (CLAUDE.md
+§5); pre-fix ``check_workflow_budget`` had no branch for
+``soft_pass`` and it fell through the default allow path with
+no log line and no ``soft_overdraft_used`` counter increment
+— silent budget drift. The new soft_pass branch increments
+the counter via ``metrics.inc_runtime("soft_overdraft_used")``
+and logs at WARNING with ``overdraft_used_cents`` so
+operators have visibility into which chains are burning
+overdraft.
+Recommended upgrade path: 0.14.8 -> 0.14.9 (or 0.14.7 -> 0.14.9).
+
 v3.31.6 / 0.14.7 (2026-08-04) — init contract hardening: strip
 whitespace from ``api_key`` before the truthiness check.
 
@@ -1160,5 +1188,5 @@ Recommended upgrade path: 0.13.4 -> 0.13.5.
 
 """
 
-__version__ = "0.14.7"
+__version__ = "0.14.9"
 __platform_version__ = "1.0.0"
