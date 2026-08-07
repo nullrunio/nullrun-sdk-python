@@ -1788,14 +1788,43 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 workflow_id=workflow_id,
                 reason="; ".join(reasons),
             )
-        if decision == "throttle":
-            reasons = response.get("explanations") or (
-                [response["explanation"]] if response.get("explanation") else ["throttle"]
+        if decision == "soft_pass":
+            # Soft-mode call proceeded via the chain's overdraft cap
+            # (CLAUDE.md §5). The body MUST execute — soft_pass is
+            # semantically distinct from `block`; rejecting here
+            # would silently disable the soft-mode escape hatch for
+            # every agent. We log at INFO so the operator sees the
+            # overdraft is biting and track the cents-burned for
+            # telemetry, but we do NOT raise -- execution continues.
+            #
+            # Wire shape (backend::gate::internal.rs
+            # GateResponse::soft_pass):
+            #   {
+            #     decision: "soft_pass",
+            #     decision_source: "gateway",
+            #     explanation: "Budget exhausted, overdraft cap covers request",
+            #     overdraft_used_cents: 50,    # incremented on backend
+            #     max_overdraft_cents: 200,
+            #     remaining_overdraft_cents: 150,
+            #     details: {...}
+            #   }
+            overdraft_used = response.get("overdraft_used_cents")
+            max_overdraft = response.get("max_overdraft_cents")
+            remaining = response.get("remaining_overdraft_cents")
+            explanation = response.get("explanation") or "soft_pass"
+            # Counter name parallels ``cost_limit_exceeded`` for hard
+            # blocks — operators can graph "soft overdraft pressure"
+            # alongside "hard cap hits" via the same dashboard panel.
+            metrics.inc_runtime("soft_overdraft_used")
+            logger.warning(
+                "check_workflow_budget: soft_pass -- %s "
+                "(overdraft_used=%s, max=%s, remaining=%s)",
+                explanation,
+                overdraft_used,
+                max_overdraft,
+                remaining,
             )
-            raise WorkflowPausedException(
-                workflow_id=workflow_id,
-                reason="; ".join(reasons),
-            )
+            return
 
         if decision == "require_approval":
             # The gate requires a human-approval before the call

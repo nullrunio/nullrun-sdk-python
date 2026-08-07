@@ -349,11 +349,11 @@ def init(
         NullRunRuntime._instance = runtime
 
     # v3.12 / 0.12.0 — server-minted execution_id default ON. Probe
-    # the backend's /health endpoint and log any version mismatch
-    # so the operator sees the gap at startup rather than on the
-    # first failed /check. We do NOT fail init — the gate still
-    # rejects with 400 PROTOCOL_TOO_OLD, and the SDK's role is
-    # advisory here.
+    # the backend's /api/v1/capabilities endpoint and log any
+    # version mismatch so the operator sees the gap at startup
+    # rather than on the first failed /check. We do NOT fail init —
+    # the gate still rejects with 400 PROTOCOL_TOO_OLD, and the
+    # SDK's role is advisory here.
     try:
         from nullrun.__version__ import __version__
         from nullrun.capabilities import (
@@ -367,13 +367,13 @@ def init(
             for w in warnings:
                 logger.warning("nullrun.init: %s", w)
         else:
-            # /health unreachable — most likely the operator
-            # hasn't pointed the SDK at the right host. We don't
-            # fail init (the user might intentionally init 
+            # /api/v1/capabilities unreachable — most likely the
+            # operator hasn't pointed the SDK at the right host.
+            # We don't fail init (the user might intentionally init
             # before network is ready) but we log at INFO so the
             # operator sees it.
             logger.info(
-                "nullrun.init: could not probe %s/health — "
+                "nullrun.init: could not probe %s/api/v1/capabilities — "
                 "v3 capability negotiation skipped",
                 runtime.api_url,
             )
