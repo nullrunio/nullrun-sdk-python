@@ -76,10 +76,11 @@ __api_version__ = "1.0"
 #
 # Bumping `NULLRUN_PROTOCOL_VERSION` here must be coordinated with
 # the backend's `proxy::http::gate::protocol` constant and the
-# `/health` endpoint's `current_protocol_version`. /health also
-# publishes `min_protocol_version` (the floor — older SDKs get
-# `PROTOCOL_TOO_OLD`) and `max_protocol_version` (the ceiling —
-# newer SDKs get `PROTOCOL_TOO_NEW`).
+# `/api/v1/capabilities` endpoint's `protocol_version`.
+# `/api/v1/capabilities` also publishes `min_protocol_version`
+# (the floor — older SDKs get `PROTOCOL_TOO_OLD`) and
+# `max_protocol_version` (the ceiling — newer SDKs get
+# `PROTOCOL_TOO_NEW`).
 NULLRUN_PROTOCOL_VERSION: int = 3
 HEADER_PROTOCOL: str = "X-NULLRUN-PROTOCOL"
 
@@ -2432,6 +2433,7 @@ def _parse_v3_error_envelope(
     # would create a cycle. The price is one extra import
     # non-2xx response — irrelevant for the failure path.
     from nullrun.breaker.exceptions import (
+        NullRunAuthError,
         NullRunBackendError,
         NullRunBudgetError,
         NullRunChainError,
@@ -2593,8 +2595,35 @@ def _parse_v3_error_envelope(
             return catalog(full_message)
         if catalog is NullRunProtocolError:
             return catalog(full_message)
+        # NullRunAuthError — surface the wire error_code (one of
+        # v3.38's API_KEY_REVOKED / API_KEY_EXPIRED / API_KEY_DISABLED
+        # / API_KEY_INVALID / API_KEY_MISSING / API_KEY_MALFORMED) on
+        # ``self.wire_code`` so callers can branch on granular
+        # lifecycle state without clobbering the SDK-side
+        # ``error_code`` taxonomy (NR-A003). Mirrors the
+        # ``NullRunChainError.backend_code`` pattern.
+        #
+        # Filter ``details`` to the kwargs the base NullRunError
+        # constructor accepts — the envelope's ``details`` dict can
+        # carry arbitrary keys (``expires_at``, ``ttl_seconds``, ...)
+        # and the base class rejects unknown kwargs with TypeError.
+        # Unknown fields are stored on ``self.details`` for caller
+        # introspection instead.
+        if catalog is NullRunAuthError:
+            allowed = {"error_code", "user_action", "retryable", "docs_url", "cause"}
+            forwarded = {k: v for k, v in details.items() if k in allowed}
+            extra = {k: v for k, v in details.items() if k not in allowed}
+            instance = NullRunAuthError(
+                full_message,
+                wire_code=backend_code,
+                **forwarded,
+            )
+            if extra:
+                instance.details = extra  # type: ignore[attr-defined]
+            return cast(Exception, instance)
         # Final fallback for catalog classes with a generic
-        # (message, **details) signature (NullRunAuthError).
+        # (message, **details) signature (NullRunWorkflowInactiveError
+        # and any future addition).
         # The details payload is forwarded as a positional kwarg
         # via **details (typed as Any to satisfy mypy since
         # type[BaseException] does not expose the kwargs the
@@ -2605,7 +2634,9 @@ def _parse_v3_error_envelope(
         # _V3_ERROR_CODE_MAP is a real Exception subclass. Cast
         # to Exception so mypy stops flagging the return value
         # as BaseException (the helper declares -> Exception).
-        instance = catalog(full_message, **details)  # type: ignore[call-arg]
+        allowed = {"error_code", "user_action", "retryable", "docs_url", "cause"}
+        forwarded = {k: v for k, v in details.items() if k in allowed}
+        instance = catalog(full_message, **forwarded)  # type: ignore[call-arg]
         return cast(Exception, instance)
 
     # Fallback — use HTTP status. The catalog may not yet cover
@@ -2691,8 +2722,20 @@ def _build_v3_error_code_map() -> dict[str, type[BaseException]]:
         "PARENT_EXECUTION_ORG_MISMATCH": NullRunChainError,
         "PARENT_EXECUTION_KEY_MISMATCH": NullRunChainError,
         "WORKFLOW_INACTIVE": NullRunWorkflowInactiveError,
-        # 401/403 — auth
+        # 401/403 — auth (v3.38 distinct lifecycle states).
+        # The backend splits the v3.36 ``API_KEY_REVOKED`` bucket into
+        # five distinct wire codes so SDKs can branch on each state
+        # (e.g. surface "rotate this key" vs "this key was admin-
+        # disabled" vs "no Authorization header was sent"). All map
+        # to NullRunAuthError — diagnostic class is preserved; the
+        # granular codes live in ``details.error_code`` and are
+        # surfaced via NullRunAuthError.code for handler dispatch.
         "API_KEY_REVOKED": NullRunAuthError,
+        "API_KEY_EXPIRED": NullRunAuthError,
+        "API_KEY_DISABLED": NullRunAuthError,
+        "API_KEY_INVALID": NullRunAuthError,
+        "API_KEY_MISSING": NullRunAuthError,
+        "API_KEY_MALFORMED": NullRunAuthError,
         # 422 — consume invariant violation
         "CONSUME_OVERBUDGET": NullRunConsumeOverbudgetError,
         # 429 — rate limit

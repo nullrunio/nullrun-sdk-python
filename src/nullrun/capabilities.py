@@ -74,15 +74,15 @@ logger = logging.getLogger("nullrun.capabilities")
 SDK_MIN_VERSION_FOR_V3 = "0.12.0"
 
 
-# Wire path for the canonical capabilities endpoint. The SDK targets
-# the legacy ``/health`` route (a 200 OK JSON blob that doubles as
-# the v1/v2 status endpoint); the backend has registered this
-# route since 2025-04. The nested ``/api/v1/capabilities`` route
-# is the future canonical contract (per
-# ``backend/src/proxy/http/protocol.rs:189``) but is opt-in for
-# backends < 1.0.0 — we probe the older URL so the SDK works
-# against any 1.0.0-rc.0+ backend without coordination.
-CAPABILITIES_PATH = "/health"
+# Wire path for the canonical capabilities endpoint. The backend
+# exposes this at ``/api/v1/capabilities`` (per
+# ``backend/src/proxy/http/protocol.rs:189``) since 2025-04. The
+# legacy ``/health`` route returns a generic liveness payload —
+# it does NOT carry the v3-gating fields, so probing there always
+# returned None and ``is_v3_ready()`` was always False, leaving
+# every capability flag a no-op at runtime. See capability
+# history note in module docstring (2026-07-06 fix).
+CAPABILITIES_PATH = "/api/v1/capabilities"
 
 
 @dataclass(frozen=True)

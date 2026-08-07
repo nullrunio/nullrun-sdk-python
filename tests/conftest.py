@@ -134,8 +134,26 @@ def mock_api():
         )
         # 0.7.0: SDK no longer fetches /policies on init (backend
         # owns all policy state; SDK is a thin client).
-        # Health endpoint
-        respx.get(f"{BASE_URL}/health").mock(return_value=Response(200, json={"status": "ok"}))
+        # Capabilities endpoint (canonical /api/v1/capabilities,
+        # mirrors backend/src/proxy/http/protocol.rs:189).
+        # Empty capabilities object — SDK treats this as a non-v3
+        # backend and continues in compatibility mode.
+        respx.get(f"{BASE_URL}/api/v1/capabilities").mock(
+            return_value=Response(
+                200,
+                json={
+                    "min_protocol_version": 1,
+                    "max_protocol_version": 1,
+                    "protocol_version": 1,
+                    "capabilities": {
+                        "server_minted_execution_id": False,
+                        "per_execution_reservations": False,
+                        "enforcement_modes_soft": False,
+                        "heartbeat_time_based": False,
+                    },
+                },
+            )
+        )
         yield
 
 

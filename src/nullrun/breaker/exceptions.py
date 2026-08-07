@@ -670,6 +670,14 @@ class NullRunAuthError(NullRunAuthenticationError):
 
     Subclass of:class:`NullRunAuthenticationError` so existing
     ``except NullRunAuthenticationError`` clauses keep matching.
+
+    The wire error code (one of ``API_KEY_REVOKED`` /
+    ``API_KEY_EXPIRED`` / ``API_KEY_DISABLED`` / ``API_KEY_INVALID``
+    / ``API_KEY_MISSING`` / ``API_KEY_MALFORMED`` per v3.38) is
+    stored on ``self.wire_code`` so callers can branch on the
+    granular lifecycle state without clobbering the SDK-side
+    ``error_code`` taxonomy (``NR-A003``). Pattern mirrors
+    :class:`NullRunChainError.backend_code`.
     """
 
     error_code = "NR-A003"
@@ -679,6 +687,19 @@ class NullRunAuthError(NullRunAuthenticationError):
         "and rotate it if it has been revoked."
     )
     retryable = False
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        wire_code: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        self.wire_code = wire_code or "API_KEY_REVOKED"
+        # Preserve the historical ``self.message`` attribute — some
+        # user code reads ``exc.message`` instead of ``str(exc)``.
+        self.message = message
+        super().__init__(message, **kwargs)
 
 
 # ---------------------------------------------------------------------------

@@ -4,7 +4,7 @@ These tests cover:
 - parse_capabilities: tolerant parsing with default-false fallbacks
 - validate_sdk_version: returns warnings for version mismatch
 - is_v3_ready: True only when ALL three v3 capabilities are set
-- probe_capabilities: /health fetch with respx (network failure paths)
+- probe_capabilities: /api/v1/capabilities fetch with respx (network failure paths)
 """
 
 from __future__ import annotations
@@ -160,7 +160,7 @@ def test_sdk_min_version_constant():
 
 
 # ---------------------------------------------------------------------------
-# probe_capabilities — /health fetch (network failure paths)
+# probe_capabilities — /api/v1/capabilities fetch (network failure paths)
 # ---------------------------------------------------------------------------
 # These cover the ``logger.debug`` branches in probe_capabilities that the
 # pure-data tests above cannot reach: non-2xx responses and transport
@@ -169,17 +169,19 @@ def test_sdk_min_version_constant():
 
 
 def test_probe_capabilities_returns_caps_on_2xx():
-    """A successful /health response parses into a ServerCapabilities."""
+    """A successful /api/v1/capabilities response parses into a ServerCapabilities."""
     payload = {
         "min_protocol_version": 3,
         "max_protocol_version": 3,
-        "server_minted_execution_id": True,
-        "per_execution_reservations": True,
-        "enforcement_modes_soft": False,
-        "heartbeat_time_based": True,
+        "capabilities": {
+            "server_minted_execution_id": True,
+            "per_execution_reservations": True,
+            "enforcement_modes_soft": False,
+            "heartbeat_time_based": True,
+        },
     }
     with respx.mock:
-        respx.get(f"{BASE_URL}/health").mock(
+        respx.get(f"{BASE_URL}/api/v1/capabilities").mock(
             return_value=httpx.Response(200, json=payload)
         )
         caps = probe_capabilities(BASE_URL)
@@ -189,14 +191,14 @@ def test_probe_capabilities_returns_caps_on_2xx():
 
 
 def test_probe_capabilities_returns_none_on_non_2xx():
-    """A non-2xx /health response returns None (advisory, not fatal).
+    """A non-2xx /api/v1/capabilities response returns None (advisory, not fatal).
 
     Pins the ``logger.debug("... returned %d",...)` branch in
     probe_capabilities so a future refactor can't silently swallow
     the response code without a test catching it.
     """
     with respx.mock:
-        respx.get(f"{BASE_URL}/health").mock(
+        respx.get(f"{BASE_URL}/api/v1/capabilities").mock(
             return_value=httpx.Response(503, text="service unavailable")
         )
         caps = probe_capabilities(BASE_URL)
@@ -211,7 +213,7 @@ def test_probe_capabilities_returns_none_on_network_error():
     branch (transport-level exception path).
     """
     with respx.mock:
-        respx.get(f"{BASE_URL}/health").mock(
+        respx.get(f"{BASE_URL}/api/v1/capabilities").mock(
             side_effect=httpx.ConnectError("connection refused")
         )
         caps = probe_capabilities(BASE_URL)
@@ -223,7 +225,7 @@ def test_probe_capabilities_returns_none_on_malformed_json():
     contract as a transport error: best-effort, not fatal.
     """
     with respx.mock:
-        respx.get(f"{BASE_URL}/health").mock(
+        respx.get(f"{BASE_URL}/api/v1/capabilities").mock(
             return_value=httpx.Response(200, text="not-json{")
         )
         caps = probe_capabilities(BASE_URL)
