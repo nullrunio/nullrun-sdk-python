@@ -261,7 +261,7 @@ class TestSnapshotAndBlock:
 
 
 # ===========================================================================
-# Sprint 1.5 (B14): unknown action type must NOT silently BLOCK
+# B14: unknown action type must NOT silently BLOCK
 # ===========================================================================
 # Pre-fix: an unknown action type (e.g. server schema regression
 # version mismatch, or attacker-controlled input) silently degraded

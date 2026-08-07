@@ -90,7 +90,7 @@ class TestNullRunRuntimeTrack:
         rt.track({"event_type": "test"})
 
     def test_wire_payload_strips_sensitive_fields(self, make_runtime):
-        """Phase 4.1 privacy boundary: ``raw_usage``, ``_fingerprint``
+        """Privacy boundary: ``raw_usage``, ``_fingerprint``
         and ``cost_cents`` MUST NOT appear in the dict that lands on
         the transport buffer (i.e. what /api/v1/track/batch would
         serialise). Normalised fields pass through unchanged.
@@ -195,9 +195,53 @@ class TestNullRunRuntimeExecute:
         with pytest.raises(NullRunBlockedException):
             rt.execute(tool_name="gpt-4", input_data={}, mode="strict")
 
+    def test_execute_blocked_surfaces_wire_error_code(self, make_runtime, mock_api):
+        # DEF-ARFLOW-TOOLNAME-01 (E2E 2026-08-05): the backend now stamps
+        # ``details.error_code`` on block responses via
+        # ``classify_approval_create_error``. The SDK must surface the
+        # structured code verbatim instead of falling back to the
+        # keyword-on-explanation path (which would have classified
+        # "Approval infrastructure unavailable: validation error during
+        # approval row creation" as the generic NR-X001 — the very
+        # bug the journal test surfaced).
+        respx.post(f"{BASE_URL}/api/v1/execute").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "decision": "block",
+                    "explanation": (
+                        "Approval infrastructure unavailable: validation "
+                        "error during approval row creation — failing closed "
+                        "per Hard-always policy"
+                    ),
+                    "decision_source": "gateway",
+                    "policy_version": 1,
+                    "details": {
+                        "error_code": "APPROVAL_VALIDATION_FAILED",
+                        "decision_source": "approval_create_failed",
+                    },
+                },
+            )
+        )
+        rt = make_runtime()
+        with pytest.raises(NullRunBlockedException) as exc_info:
+            rt.execute(tool_name="refund_customer", input_data={}, mode="strict")
+        # The wire code wins — no keyword guessing.
+        assert exc_info.value.error_code == "APPROVAL_VALIDATION_FAILED"
+        # The structured payload is preserved on details so a caller
+        # can introspect ``decision_source`` for routing/alerting.
+        # ``NullRunBlockedException.__init__`` wraps ``**details`` so
+        # the dict lands under the "details" key on self.details.
+        wire_details = exc_info.value.details.get("details") or {}
+        assert wire_details.get("error_code") == "APPROVAL_VALIDATION_FAILED"
+        assert wire_details.get("decision_source") == "approval_create_failed"
+        # Back-compat shim: the legacy ``mapped_class`` field is still
+        # populated so any caller that branched on it pre-fix keeps working.
+        assert wire_details.get("mapped_class") == "NullRunBlockedException"
+
     @pytest.mark.skip(
         reason=(
-            "Round 3 (Phase 0.4.0): runtime.execute now requires "
+            "runtime.execute now requires "
             'on_transport_error="raise" to surface classified errors '
             "(preserves legacy fail-OPEN behaviour by default so "
             "check_workflow_budget can treat network errors as transient). "

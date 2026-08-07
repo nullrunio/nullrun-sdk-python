@@ -84,10 +84,9 @@ class TestInitWritesAllSingletonSlots:
     """
 
     def test_init_writes_all_three_singleton_slots(self, monkeypatch, mock_api):
-        # Phase 3 (2026-07-05): the three slots
-        # (`runtime._runtime`, `NullRunRuntime._instance`,
+        # The three slots (`runtime._runtime`, `NullRunRuntime._instance`,
         # `decorators._runtime`) all route through the
-        # RuntimeRegistry. We assert the registry pointer directly
+        # RuntimeRegistry (as of 2026-07-05). We assert the registry pointer directly
         # and also confirm the legacy read paths see the same
         # instance (backwards compat).
         from nullrun._registry import get_active_runtime
@@ -114,7 +113,7 @@ class TestInitWritesAllSingletonSlots:
         slots — that directly tests the locking primitive without
         the noise of background WS threads.
 
-        Phase 3 (2026-07-05): the worker writes through the
+        As of 2026-07-05, the worker writes through the
         RuntimeRegistry (the canonical store). The
         NullRunRuntime._instance descriptor routes to the
         registry, and the module-level `_runtime` proxies re-resolve
@@ -165,10 +164,11 @@ class TestInitWritesAllSingletonSlots:
 
 class TestInitCapabilityProbeLogging:
     """Pins the ``logger.warning/info/debug`` branches added in 0.12.0
-    when ``init `` runs the /health capability probe. These tests
-    exist to keep the new logging paths covered so a refactor that
-    accidentally drops one (e.g. replacing ``logger.info`` with
-    ``print``) gets caught in CI rather than at first production init.
+    when ``init `` runs the /api/v1/capabilities capability probe.
+    These tests exist to keep the new logging paths covered so a
+    refactor that accidentally drops one (e.g. replacing
+    ``logger.info`` with ``print``) gets caught in CI rather than
+    at first production init.
     """
 
     def test_init_with_debug_true_sets_log_level(
@@ -238,11 +238,11 @@ class TestInitCapabilityProbeLogging:
     def test_init_logs_info_when_probe_unreachable(
         self, monkeypatch, mock_api, caplog
     ):
-        """When ``/health`` is unreachable, ``init `` logs at INFO
-        that the probe was skipped (does NOT fail init).
+        """When ``/api/v1/capabilities`` is unreachable, ``init ``
+        logs at INFO that the probe was skipped (does NOT fail init).
 
-        Pins the ``logger.info("nullrun.init: could not probe %s/health...")``
-        branch on lines 358-362.
+        Pins the ``logger.info("nullrun.init: could not probe
+        %s/api/v1/capabilities...")`` branch on lines 358-362.
         """
         import logging
 
@@ -251,11 +251,12 @@ class TestInitCapabilityProbeLogging:
 
         monkeypatch.setenv("NULLRUN_API_KEY", "test-key-12345678")
         monkeypatch.setenv("NULLRUN_API_URL", "https://api.test.nullrun.io")
-        # Override the /health mock from `mock_api` to fail. We have
-        # to do this inside the respx.mock context that mock_api opened
-        # so we route through respx again rather than nesting.
+        # Override the /api/v1/capabilities mock from `mock_api` to
+        # fail. We have to do this inside the respx.mock context that
+        # mock_api opened so we route through respx again rather than
+        # nesting.
         with respx.mock:
-            respx.get("https://api.test.nullrun.io/health").mock(
+            respx.get("https://api.test.nullrun.io/api/v1/capabilities").mock(
                 return_value=httpx.Response(503)
             )
             # Re-mock the other endpoints that init hits so the

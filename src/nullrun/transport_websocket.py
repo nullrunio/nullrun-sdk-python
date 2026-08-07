@@ -225,16 +225,17 @@ class WebSocketConnection:
         # survive the at-least-once delivery semantics of the WS
         # channel.
         #
-        # Sprint 1.4 (B2): the previous sentinel of 0 dropped incoming
+        # The previous sentinel of 0 dropped incoming
         # ``version == 0`` on first receive because ``0 <= 0`` is
         # True. The server uses ``version: 0`` for the very first
-        # ``initial_state`` frame after a (re)connect, so the SDK was
-        # silently discarding the server's initial view — meaning a
-        # ``Killed``/``Paused`` state delivered in that first frame
-        # was lost. Sentinel is now -1 so any non-negative version
-        # passes the guard on the first message; subsequent stale
-        # ``version == 0`` re-deliveries are still dropped because
-        # ``last_seen`` will be ``>= 1`` for that workflow.
+        # ``initial_state`` frame after a (re)connect, so the SDK
+        # was silently discarding the server's initial view --
+        # meaning a ``Killed``/``Paused`` state delivered in that
+        # first frame was lost. Sentinel is now -1 so any
+        # non-negative version passes the guard on the first
+        # message; subsequent stale ``version == 0`` re-deliveries
+        # are still dropped because ``last_seen`` will be ``>= 1``
+        # for that workflow.
         self._last_version: dict[str, int] = {}
 
     async def _reconnect_loop(self) -> None:
@@ -454,18 +455,18 @@ class WebSocketConnection:
                     signature,
                     max_age_seconds=300,
                 ):
-                    # Sprint 1.5 (B13): pre-fix this logged at
-                    # WARNING and dropped the message silently. For a
-                    # safety layer whose core contract is "the
-                    # server can always KILL a workflow", a failed
-                    # signature verification on a control plane
-                    # message is a first-class incident — promote to
-                    # ERROR and bump the counter so an SRE can
-                    # alert on ``hmac_verify_failures_total > 0``.
-                    # A signed-but-invalid message means either
+                    # Pre-fix this logged at WARNING and dropped
+                    # the message silently. For a safety layer
+                    # whose core contract is "the server can always
+                    # KILL a workflow", a failed signature
+                    # verification on a control plane message is a
+                    # first-class incident -- promote to ERROR and
+                    # bump the counter so an SRE can alert on
+                    # ``hmac_verify_failures_total > 0``. A
+                    # signed-but-invalid message means either
                     # (a) the secret_key is out of sync (server
-                    # rotated, client missed the rotation event), or
-                    # (b) something is forging traffic. Both are
+                    # rotated, client missed the rotation event),
+                    # or (b) something is forging traffic. Both are
                     # actionable and the operator needs to know.
                     logger.error(
                         f"Invalid HMAC signature for {msg_type} message - "
@@ -567,13 +568,13 @@ class WebSocketConnection:
                         logger.warning(f"Key rotation callback error: {e}")
 
             elif msg_type == "approval_resolved":
-                # Drift section 7 (2026-07-06): human-approval
-                # resolution notification. The dashboard operator
-                # approved or denied a pending approval; the SDK
-                # uses this to release the gate reservation
-                # (approved) or surface WorkflowKilledInterrupt
-                # (denied) so the agent can resume from the same
-                # execution_id without polling /status.
+                # Human-approval resolution notification. The
+                # dashboard operator approved or denied a pending
+                # approval; the SDK uses this to release the gate
+                # reservation (approved) or surface
+                # WorkflowKilledInterrupt (denied) so the agent
+                # can resume from the same execution_id without
+                # polling /status.
                 #
                 # Wire shape (backend WsMessage::ApprovalResolved):
                 # {
@@ -834,8 +835,8 @@ class WebSocketConnection:
         workflow_id = state.get("workflow_id", "")
         incoming_version = state.get("version", 0)
         if workflow_id:
-            # Sprint 1.4 (B2): default -1 (not 0) so version=0 is
-            # accepted on first receive. See __init__ for rationale.
+            # Default -1 (not 0) so version=0 is accepted on first
+            # receive. See __init__ for rationale.
             last = self._last_version.get(workflow_id, -1)
             if incoming_version <= last:
                 logger.debug(

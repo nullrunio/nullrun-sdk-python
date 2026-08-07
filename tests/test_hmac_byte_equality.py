@@ -9,7 +9,7 @@ does NOT match the body the HMAC signature was computed over. The
 signed `/gate` and `/check` calls were rejected with 401 when
 `secret_key` was configured.
 
-Phase 4 introduces `_signed_request_body` (canonical JSON bytes) and
+Introduces `_signed_request_body` (canonical JSON bytes) and
 moves all three signed POSTs to `content=body`.
 """
 

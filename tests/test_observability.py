@@ -190,9 +190,9 @@ BASE_URL = "https://api.test.nullrun.io"
 
 
 # ===========================================================================
-# Sprint 3 follow-up (B23/B24): every metric field must be wired up
+# B23/B24: every metric field must be wired up
 # ===========================================================================
-# Pre-Sprint-3-follow-up: 6 fields were defined on the dataclasses
+# Before the B23/B24 follow-up: 6 fields were defined on the dataclasses
 # but never incremented:
 # - TransportMetrics: retries_total, circuit_breaker_opens
 # fallback_mode_activations, timeouts, last_error

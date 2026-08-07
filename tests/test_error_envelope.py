@@ -1,5 +1,5 @@
 """
-tests/test_error_envelope.py — Phase 4 production-readiness.
+tests/test_error_envelope.py.
 
 Verifies ``_parse_error_envelope`` maps 4xx / 5xx / 429 to the
 right exception subclass per the canonical ``contracts/errors.ts``

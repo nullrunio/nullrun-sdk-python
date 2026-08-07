@@ -21,8 +21,8 @@ Why this lives in `toolbox/`, not `instrumentation/`:
     to from the LangGraph integration docs.
 
 The previous location `nullrun.instrumentation.langgraph.instrument`
-is removed as of Phase 1 Commit 6. Users who imported it should
-switch to `nullrun.toolbox.langgraph.wrapper`.
+has been removed. Users who imported it should switch to
+`nullrun.toolbox.langgraph.wrapper`.
 """
 from __future__ import annotations
 

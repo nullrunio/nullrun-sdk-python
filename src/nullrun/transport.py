@@ -76,10 +76,11 @@ __api_version__ = "1.0"
 #
 # Bumping `NULLRUN_PROTOCOL_VERSION` here must be coordinated with
 # the backend's `proxy::http::gate::protocol` constant and the
-# `/health` endpoint's `current_protocol_version`. /health also
-# publishes `min_protocol_version` (the floor — older SDKs get
-# `PROTOCOL_TOO_OLD`) and `max_protocol_version` (the ceiling —
-# newer SDKs get `PROTOCOL_TOO_NEW`).
+# `/api/v1/capabilities` endpoint's `protocol_version`.
+# `/api/v1/capabilities` also publishes `min_protocol_version`
+# (the floor — older SDKs get `PROTOCOL_TOO_OLD`) and
+# `max_protocol_version` (the ceiling — newer SDKs get
+# `PROTOCOL_TOO_NEW`).
 NULLRUN_PROTOCOL_VERSION: int = 3
 HEADER_PROTOCOL: str = "X-NULLRUN-PROTOCOL"
 
@@ -328,11 +329,11 @@ def _retry_with_backoff(
                     )
                     raise err
                 if result.status_code >= 500 and on_transport_error == "raise":
-                    # Round 3 (Phase 0.4.0): 5xx is a classified
-                    # GATEWAY_ERROR. Don't retry -- this is a server
-                    # bug, not a network blip. Only raise when the
-                    # caller has opted into the typed-error contract
-                    # via on_transport_error="raise".
+                    # 5xx is a classified GATEWAY_ERROR. Don't
+                    # retry -- this is a server bug, not a network
+                    # blip. Only raise when the caller has opted
+                    # into the typed-error contract via
+                    # on_transport_error="raise".
                     from nullrun.breaker.exceptions import NullRunBackendError
 
                     err = NullRunBackendError(
@@ -357,11 +358,11 @@ def _retry_with_backoff(
 
         except Exception as exc:
             last_exc = exc
-            # Sprint 3 follow-up (B24): bump ``last_error`` so the
-            # operator can read the most recent failure type without
-            # grepping logs. The string is the exception class
-            # name plus the message — short, searchable, and
-            # doesn't leak request bodies.
+            # Bump ``last_error`` so the operator can read the
+            # most recent failure type without grepping logs.
+            # The string is the exception class name plus the
+            # message -- short, searchable, and doesn't leak
+            # request bodies.
             metrics.set_transport("last_error", f"{type(exc).__name__}: {exc}")
             # ``timeouts`` is a specific subcategory of retry
             # trigger — distinguished so an SRE can alert on
@@ -412,7 +413,7 @@ def _retry_with_backoff(
 
 
 # =============================================================================
-# Fallback Modes (Phase 1 - SDK Resilience)
+# Fallback Modes (SDK Resilience)
 # =============================================================================
 
 
@@ -526,9 +527,9 @@ class Transport:
         self.api_key = api_key
         self.secret_key = secret_key  # HMAC signing key
         self.config = config or FlushConfig()
-        # Phase 8 #8.4: allow env-var override of batch size and
-        # flush interval. Useful for tuning high-throughput agents
-        # without subclassing.
+        # Allow env-var override of batch size and flush interval.
+        # Useful for tuning high-throughput agents without
+        # subclassing.
         if "NULLRUN_BATCH_SIZE" in os.environ:
             try:
                 self.config.batch_size = int(os.environ["NULLRUN_BATCH_SIZE"])
@@ -941,8 +942,8 @@ class Transport:
             metrics.inc_transport("batches_failed")
 
     def _drain_batch(self) -> list[dict[str, Any]] | None:
-        """Round 2 (Phase 0.4.0): public, lock-acquiring snapshot of
-        the current buffer. Returns ``None`` when empty.
+        """Public, lock-acquiring snapshot of the current buffer.
+        Returns ``None`` when empty.
 
         Used by ``tests/test_buffer_invariants.py``. The full flush
         logic (CB, re-queue, metrics) lives in ``_do_flush_locked``
@@ -1060,9 +1061,9 @@ class Transport:
     ) -> dict[str, str]:
         """Build the canonical signed-headers dict for a request.
 
-        Round 2 (Phase 0.4.0): the canonical one-call helper used
-        by every signed POST. Mirrors the contract the test
-        framework in ``tests/test_hmac_signing.py`` expects.
+        The canonical one-call helper used by every signed POST.
+        Mirrors the contract the test framework in
+        ``tests/test_hmac_signing.py`` expects.
 
         Always includes:
         - Content-Type: application/json
@@ -1319,7 +1320,7 @@ class Transport:
         self._do_flush()
 
     # =============================================================================
-    # Execute (Strict Mode) - Phase 1
+    # Execute (Strict Mode)
     # =============================================================================
 
     def execute(
@@ -1333,26 +1334,20 @@ class Transport:
         fallback_mode: str = FallbackMode.PERMISSIVE,
         operation_id: str | None = None,
         approval_id: str | None = None,
-        # Phase 1 / MVP 1.0: typed-impact + digest-bound approval.
-        # The runtime.execute() helper builds these kwargs and the
-        # transport includes them on the wire so the backend can
-        # stamp the approval row with the digest and verify it on
-        # the post-approval re-check. Pre-fix these kwargs were
-        # constructed in runtime.execute but never accepted by
-        # Transport.execute (which raised TypeError and was
-        # classified as a transport error by the on_transport_error
-        # arm below — the body was blocked even though no real
-        # policy violation happened).
+        # Typed-impact + digest-bound approval. The runtime.execute()
+        # helper builds these kwargs and the transport includes them
+        # on the wire so the backend can stamp the approval row with
+        # the digest and verify it on the post-approval re-check.
+        # These kwargs must be accepted by Transport.execute so the
+        # typed payload reaches the wire; otherwise the call would be
+        # classified as a transport error.
         business_impact: dict[str, Any] | None = None,
         action_digest: str | None = None,
-        # Разрыв 4 (T5.6, 2026-07-31): tool-call
-        # argument bag forwarded on /execute so the
-        # gate can compute a schema fingerprint and
-        # write it to mcp_tool_signatures. Optional
-        # — legacy SDKs (≤ 0.14.4) do not pass this;
-        # the gate's T5.6 fallback chain reads
-        # `tool_params` (Разрыв 2) when this is
-        # absent.
+        # Tool-call argument bag forwarded on /execute so the gate
+        # can compute a schema fingerprint and write it to
+        # mcp_tool_signatures. Optional -- legacy SDKs do not pass
+        # this; the gate's fallback chain reads `tool_params` when
+        # this is absent.
         tool_arguments: dict[str, Any] | None = None,
         on_transport_error: Callable[[Exception], dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
@@ -1379,12 +1374,12 @@ class Transport:
             fallback_mode: What to do if Gateway unavailable
             operation_id: Optional idempotency key
             on_transport_error: Optional callback invoked on
-                ``BreakerTransportError`` (Phase 5 #5.10). When set, the
-                callback's return value is returned verbatim; otherwise
-                the request falls through to the ``fallback_mode``
+                ``BreakerTransportError``. When set, the callback's
+                return value is returned verbatim; otherwise the
+                request falls through to the ``fallback_mode``
                 default. The decorator's ``_enforce_sensitive_tool``
-                sets this to a closure that converts the error into a
-                ``NullRunBlockedException`` (fail-CLOSED).
+                sets this to a closure that converts the error into
+                a ``NullRunBlockedException`` (fail-CLOSED).
 
         Returns:
             Dict with:
@@ -1414,22 +1409,20 @@ class Transport:
         }
         if approval_id is not None:
             gate_request["approval_id"] = approval_id
-        # Phase 1 / MVP 1.0: typed-impact + digest-bound approval.
-        # Forward both fields on the wire when supplied. The backend
-        # stamps the approval row with the digest and verifies it on
-        # the post-approval re-check. The keys are only included
-        # when the runtime layer actually built them (i.e. when
-        # ``@sensitive(impact=...)`` was applied) so the wire stays
-        # quiet for legacy Phase 0 callers.
+        # Typed-impact + digest-bound approval. Forward both
+        # fields on the wire when supplied. The backend stamps the
+        # approval row with the digest and verifies it on the
+        # post-approval re-check. The keys are only included when
+        # the runtime layer actually built them (i.e. when
+        # ``@sensitive(impact=...)`` was applied) so the wire
+        # stays quiet for callers that don't use the typed payload.
         if business_impact is not None:
             gate_request["business_impact"] = business_impact
         if action_digest is not None:
             gate_request["action_digest"] = action_digest
-        # Разрыв 4 (T5.6, 2026-07-31): same forwarding
-        # on the /execute path. The tool_arguments
-        # field is the same wire-shape as on /check.
-        # Re-using the call site identity so the
-        # field name is the canonical one across all
+        # Tool-call argument bag forwarded on /execute. The
+        # tool_arguments field uses the same wire shape as on
+        # /check so the field name stays canonical across all
         # gate endpoints.
         if tool_arguments is not None:
             gate_request["tool_arguments"] = tool_arguments
@@ -1482,9 +1475,9 @@ class Transport:
                 }
 
         except BreakerTransportError as exc:
-            # Phase 5 #5.10: ADR-008 lets callers opt into a
-            # classified-error handler. Round 3 (Phase 0.4.0):
-            # on_transport_error accepts both callables AND strings:
+            # ADR-008 lets callers opt into a classified-error
+            # handler. on_transport_error accepts both callables
+            # AND strings:
             # "raise" -> raise NullRunTransportError (classified)
             # "open" -> return synthetic allow with FALLBACK_* source
             # "closed" -> return synthetic block with FALLBACK_* source
@@ -1521,7 +1514,7 @@ class Transport:
         except NullRunTransportError:
             raise  # Already classified -- propagate as-is
         except httpx.RequestError as exc:
-            # Round 3: classify httpx network errors at the call site.
+            # Classify httpx network errors at the call site.
             # isinstance guard narrows the type so the second string
             # comparison below no longer overlaps with Callable | None.
             if callable(on_transport_error):
@@ -1536,11 +1529,10 @@ class Transport:
         except NullRunAuthenticationError:
             raise  # Don't fall back on auth errors
 
-        # All attempts failed - apply fallback mode
-        # Sprint 3 follow-up (B24): bump ``fallback_mode_activations``
-        # every time we reach this branch (gateway unreachable).
-        # The operator alerts on a spike here as a proxy for
-        # backend unavailability.
+        # All attempts failed - apply fallback mode.
+        # Bump ``fallback_mode_activations`` every time we reach
+        # this branch (gateway unreachable). The operator alerts
+        # on a spike here as a proxy for backend unavailability.
         metrics.inc_transport("fallback_mode_activations")
         if fallback_mode == FallbackMode.STRICT:
             return {
@@ -1561,6 +1553,7 @@ class Transport:
         self,
         check_request: dict[str, Any],
         on_transport_error: Callable[[Exception], dict[str, Any]] | str | None = None,
+        parent_execution_id: str | None = None,
     ) -> dict[str, Any]:
         """
         Call /api/v1/gate endpoint for pre-execution budget checking.
@@ -1600,20 +1593,19 @@ class Transport:
             "model": check_request.get("model"),
             "estimated_tokens": check_request.get("estimated_tokens"),
             "operation_id": check_request.get("operation_id") or str(uuid.uuid4()),
-            # T4 (2026-06-27): forward the per-call `tools` list so the
-            # backend's `gate/internal.rs::check_tool_block` can match
-            # each tool against the workflow's effective `blocked_tools`
-            # aggregate. Pre-T4 this key was silently dropped here, so
-            # `set_call_context(tools=[...])` had no effect on /gate.
-            # When unset (None) we omit the key entirely — the backend
-            # distinguishes "no tools sent" from "explicit []".
+            # Forward the per-call `tools` list so the backend's
+            # `gate/internal.rs::check_tool_block` can match each
+            # tool against the workflow's effective `blocked_tools`
+            # aggregate. When unset (None) we omit the key entirely
+            # -- the backend distinguishes "no tools sent" from
+            # "explicit []".
             **({"tools": check_request["tools"]} if "tools" in check_request else {}),
         }
 
-        # 2026-07-02 (v0.11.0): wire-protocol v3 fields (
-        # ). Forwarded only when present so legacy /gate callers
-        # (which never set chain_id) keep their previous payload
-        # shape. The backend treats missing as "single-shot Hard".
+        # Wire-protocol v3 fields. Forwarded only when present so
+        # legacy /gate callers (which never set chain_id) keep
+        # their previous payload shape. The backend treats missing
+        # as "single-shot Hard".
         if check_request.get("chain_id") is not None:
             gate_request["chain_id"] = check_request["chain_id"]
         if check_request.get("chain_op") is not None:
@@ -1622,20 +1614,39 @@ class Transport:
             gate_request["idempotency_key"] = check_request["idempotency_key"]
         if "stream" in check_request:
             gate_request["stream"] = bool(check_request["stream"])
-        # Разрыв 4 (T5.6, 2026-07-31): forward the
-        # `tool_arguments` bag alongside `tool` so the
-        # gate can hash it via `signature::compute_schema_hash`
-        # and write the fingerprint into
-        # `mcp_tool_signatures` (T5.6). Pre-T5.6 SDKs
-        # never set this; the backend's gate falls
-        # back to `tool_params` (Разрыв 2) when the
-        # field is missing, so legacy callers do not
-        # regress. The shape is `Optional[dict[str,
-        # Any]]` — the backend canonicalises the JSON
-        # before hashing, so field ordering inside
-        # the dict does not affect the fingerprint.
+        # Forward the `tool_arguments` bag alongside `tool` so
+        # the gate can hash it via `signature::compute_schema_hash`
+        # and write the fingerprint into `mcp_tool_signatures`.
+        # Legacy SDKs never set this; the backend's gate falls
+        # back to `tool_params` when the field is missing, so
+        # legacy callers do not regress. The shape is
+        # `Optional[dict[str, Any]]` -- the backend
+        # canonicalises the JSON before hashing, so field
+        # ordering inside the dict does not affect the
+        # fingerprint.
         if "tool_arguments" in check_request and check_request["tool_arguments"] is not None:
             gate_request["tool_arguments"] = check_request["tool_arguments"]
+        # Execution Graph v0 (2026-08-06, backend): additive
+        # `parent_execution_id` wire field on /gate. A sub-agent SDK
+        # call to a child execution names the parent execution here;
+        # the backend validates ownership against the parent's
+        # `execution:{id}` Redis binding (mirrors the /cancel
+        # ownership check at `backend/src/proxy/http/cancel.rs:258-329`)
+        # and rejects cross-org / cross-key / not-found with 403
+        # PARENT_EXECUTION_*. Forwarded only when the caller passes
+        # a non-None string -- unset (legacy / single-shot) callers
+        # keep the previous payload shape. Resolution order:
+        # 1. `check_request["parent_execution_id"]` (preferred --
+        #    lets the runtime layer stamp it from a captured
+        #    server-minted execution_id via
+        #    `nullrun.capture_current_execution_id()`).
+        # 2. `parent_execution_id` kwarg (caller-supplied; useful
+        #    for fan-out where the parent is not the current
+        #    execution).
+        # 3. None / omitted entirely (legacy / single-shot).
+        _parent_execution_id = check_request.get("parent_execution_id", parent_execution_id)
+        if _parent_execution_id is not None:
+            gate_request["parent_execution_id"] = _parent_execution_id
 
         # 2026-07-02 (v0.11.0 refactor): route through the canonical
         # signed-headers helper — produces Content-Type + X-API-Key +
@@ -1678,9 +1689,9 @@ class Transport:
                     "suggestions": ["Check API availability"],
                 }
         except httpx.RequestError as e:
-            # Round 3: classify network errors. By default fall
-            # through to synthetic block (legacy); raise only when
-            # the caller opted in via on_transport_error="raise".
+            # Classify network errors. By default fall through
+            # to synthetic block (legacy); raise only when the
+            # caller opted in via on_transport_error="raise".
             if on_transport_error == "raise":
                 raise NullRunTransportError(
                     f"Network error on /check: {e}",
@@ -1699,7 +1710,7 @@ class Transport:
             }
 
     # =============================================================================
-    # WebSocket Connection (Task 6 - WebSocket Push)
+    # WebSocket Connection
     # =============================================================================
 
     async def connect_websocket(
@@ -1733,8 +1744,8 @@ class Transport:
         Raises:
             ConnectionError: If WebSocket connection fails
         """
-        # Phase 6 #6.6: build the WS URL via urllib.parse instead of
-        # string replace. Reject unknown schemes with a clear error.
+        # Build the WS URL via urllib.parse instead of string
+        # replace. Reject unknown schemes with a clear error.
         from urllib.parse import urlparse, urlunparse
 
         from nullrun.transport_websocket import WebSocketConnection
@@ -1811,14 +1822,14 @@ class Transport:
         our HMAC secret_key has been rotated. We need to get the new
         secret_key from the /auth/verify endpoint.
 
-        Sprint 2.4 (B20): the previous implementation used
-        ``import requests`` and bypassed every transport-layer
-        invariant — the shared ``httpx.Client`` (mTLS, connection
-        pool), the circuit breaker, the HMAC body signature, and
-        the retry policy. It also pulled in ``requests`` as a new
-        dependency that is not in ``pyproject.toml`` (a runtime
-        ImportError waiting to happen on any environment where
-        ``requests`` is not installed transitively).
+        The previous implementation used ``import requests`` and
+        bypassed every transport-layer invariant -- the shared
+        ``httpx.Client`` (mTLS, connection pool), the circuit
+        breaker, the HMAC body signature, and the retry policy.
+        It also pulled in ``requests`` as a new dependency that
+        is not in ``pyproject.toml`` (a runtime ImportError
+        waiting to happen on any environment where ``requests``
+        is not installed transitively).
 
         Post-fix: route through ``self._client`` so the same TLS
         configuration, connection pool, and HMAC signing path
@@ -2422,6 +2433,7 @@ def _parse_v3_error_envelope(
     # would create a cycle. The price is one extra import
     # non-2xx response — irrelevant for the failure path.
     from nullrun.breaker.exceptions import (
+        NullRunAuthError,
         NullRunBackendError,
         NullRunBudgetError,
         NullRunChainError,
@@ -2583,8 +2595,35 @@ def _parse_v3_error_envelope(
             return catalog(full_message)
         if catalog is NullRunProtocolError:
             return catalog(full_message)
+        # NullRunAuthError — surface the wire error_code (one of
+        # v3.38's API_KEY_REVOKED / API_KEY_EXPIRED / API_KEY_DISABLED
+        # / API_KEY_INVALID / API_KEY_MISSING / API_KEY_MALFORMED) on
+        # ``self.wire_code`` so callers can branch on granular
+        # lifecycle state without clobbering the SDK-side
+        # ``error_code`` taxonomy (NR-A003). Mirrors the
+        # ``NullRunChainError.backend_code`` pattern.
+        #
+        # Filter ``details`` to the kwargs the base NullRunError
+        # constructor accepts — the envelope's ``details`` dict can
+        # carry arbitrary keys (``expires_at``, ``ttl_seconds``, ...)
+        # and the base class rejects unknown kwargs with TypeError.
+        # Unknown fields are stored on ``self.details`` for caller
+        # introspection instead.
+        if catalog is NullRunAuthError:
+            allowed = {"error_code", "user_action", "retryable", "docs_url", "cause"}
+            forwarded = {k: v for k, v in details.items() if k in allowed}
+            extra = {k: v for k, v in details.items() if k not in allowed}
+            instance = NullRunAuthError(
+                full_message,
+                wire_code=backend_code,
+                **forwarded,
+            )
+            if extra:
+                instance.details = extra  # type: ignore[attr-defined]
+            return cast(Exception, instance)
         # Final fallback for catalog classes with a generic
-        # (message, **details) signature (NullRunAuthError).
+        # (message, **details) signature (NullRunWorkflowInactiveError
+        # and any future addition).
         # The details payload is forwarded as a positional kwarg
         # via **details (typed as Any to satisfy mypy since
         # type[BaseException] does not expose the kwargs the
@@ -2595,7 +2634,9 @@ def _parse_v3_error_envelope(
         # _V3_ERROR_CODE_MAP is a real Exception subclass. Cast
         # to Exception so mypy stops flagging the return value
         # as BaseException (the helper declares -> Exception).
-        instance = catalog(full_message, **details)  # type: ignore[call-arg]
+        allowed = {"error_code", "user_action", "retryable", "docs_url", "cause"}
+        forwarded = {k: v for k, v in details.items() if k in allowed}
+        instance = catalog(full_message, **forwarded)  # type: ignore[call-arg]
         return cast(Exception, instance)
 
     # Fallback — use HTTP status. The catalog may not yet cover
@@ -2643,6 +2684,7 @@ def _build_v3_error_code_map() -> dict[str, type[BaseException]]:
     from nullrun.breaker.exceptions import (
         NullRunAuthError,
         NullRunBackendError,
+        NullRunBlockedException,
         NullRunBudgetError,
         NullRunChainError,
         NullRunConsumeOverbudgetError,
@@ -2667,9 +2709,33 @@ def _build_v3_error_code_map() -> dict[str, type[BaseException]]:
         # 403 — chain security + workflow state
         "CHAIN_CROSS_ORG": NullRunChainError,
         "CHAIN_ORG_MISMATCH": NullRunChainError,
+        # 403 — Execution Graph v0 (2026-08-06, backend). Sub-agent
+        # ownership validation against the parent's
+        # `execution:{id}` Redis binding (mirrors the /cancel
+        # ownership check). Fail-CLOSED — the sub-agent call does
+        # NOT proceed. Same diagnostic class as CHAIN_CROSS_ORG /
+        # CHAIN_ORG_MISMATCH: 403-class security errors with
+        # `(org_id, api_key_id)` ownership semantics. Diagnostic
+        # clarity wins over a new exception class per CLAUDE.md §13
+        # philosophy.
+        "PARENT_EXECUTION_NOT_FOUND": NullRunChainError,
+        "PARENT_EXECUTION_ORG_MISMATCH": NullRunChainError,
+        "PARENT_EXECUTION_KEY_MISMATCH": NullRunChainError,
         "WORKFLOW_INACTIVE": NullRunWorkflowInactiveError,
-        # 401/403 — auth
+        # 401/403 — auth (v3.38 distinct lifecycle states).
+        # The backend splits the v3.36 ``API_KEY_REVOKED`` bucket into
+        # five distinct wire codes so SDKs can branch on each state
+        # (e.g. surface "rotate this key" vs "this key was admin-
+        # disabled" vs "no Authorization header was sent"). All map
+        # to NullRunAuthError — diagnostic class is preserved; the
+        # granular codes live in ``details.error_code`` and are
+        # surfaced via NullRunAuthError.code for handler dispatch.
         "API_KEY_REVOKED": NullRunAuthError,
+        "API_KEY_EXPIRED": NullRunAuthError,
+        "API_KEY_DISABLED": NullRunAuthError,
+        "API_KEY_INVALID": NullRunAuthError,
+        "API_KEY_MISSING": NullRunAuthError,
+        "API_KEY_MALFORMED": NullRunAuthError,
         # 422 — consume invariant violation
         "CONSUME_OVERBUDGET": NullRunConsumeOverbudgetError,
         # 429 — rate limit
@@ -2677,6 +2743,22 @@ def _build_v3_error_code_map() -> dict[str, type[BaseException]]:
         # 503 — backend availability
         "RATE_LIMIT_REDIS_UNAVAILABLE": NullRunRateLimitRedisError,
         "BUDGET_DATA_UNAVAILABLE": NullRunBackendError,
+        # 402 — approval-create failure family (DEF-ARFLOW-TOOLNAME-01,
+        # E2E 2026-08-05). Backend's
+        # ``classify_approval_create_error`` exposes these as
+        # ``details.error_code`` on the gate response so operators
+        # can tell a Postgres outage (retry-friendly) from a data
+        # integrity bug (rebuild-and-retry) from a config bug
+        # (operator fix). All map to ``NullRunBlockedException``
+        # because they are hard-rejects -- the body did NOT run,
+        # the approval row could NOT be created, and the
+        # fail-CLOSED posture is preserved.
+        "APPROVAL_DB_UNAVAILABLE": NullRunBlockedException,
+        "APPROVAL_PERSISTENCE_FAILED": NullRunBlockedException,
+        "APPROVAL_VALIDATION_FAILED": NullRunBlockedException,
+        "APPROVAL_CONFLICT": NullRunBlockedException,
+        "APPROVAL_NOT_FOUND": NullRunBlockedException,
+        "APPROVAL_CREATE_FAILED": NullRunBlockedException,
     }
 
 

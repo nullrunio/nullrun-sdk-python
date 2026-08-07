@@ -2,7 +2,7 @@
 
 Wraps a connected MCP server so every tool invocation forwards
 the cached canonical class + per-tool `annotations` to the gate
-on `/check`. The v3.31 (Разрыв 3) gate honors
+on `/check`. The v3.31 gate honors
 `mcp_destructive_policy` / `mcp_readonly_policy` against these
 annotations — without an adapter, no SDK on the planet calls
 ``set_mcp_tool_context()`` and the umbrella policies stay
@@ -18,8 +18,7 @@ exposes ``list_tools()`` / ``call_tool(name, args)``.
 
 Scope (kept deliberately small):
   * Cache `tools/list` for ``MCP_ADAPTER_CACHE_SECONDS``
-    (default 300s, matches the gate's ``heartbeat`` cadence in
-    CLAUDE.md §6).
+    (default 300s, matches the gate's ``heartbeat`` cadence).
   * On every ``call_tool(name, args)``, set
     ``call_mcp_class='mcp'`` + ``call_mcp_annotations=...`` via
     the public ``context`` helpers so the runtime's
@@ -40,15 +39,14 @@ Out of scope (deferred):
   * Negotiating JSON-RPC frames. The user brings their own
     MCP client (e.g. ``mcp`` PyPI, or the official
     ``modelcontextprotocol/python-sdk``).
-  * Server-side discovery polling. That's NULLRUN's Phase C
-    cron worker (table migration 239 already exists, the
-    worker itself is a follow-up PR).
+  * Server-side discovery polling. That's NULLRUN's cron
+    worker responsibility (table migration 239 already exists,
+    the worker itself is a follow-up PR).
   * Tools / Resources / Prompts distinction — only ``tools``
     is forwarded. Resources (``mcp://server/resource/...``)
     and Prompts (``mcp://server/prompt/...``) are MCP
-    primitives we don't model on the wire yet
-    (CLAUDE.md §8 / v3.31 still classifies them by string
-    shape).
+    primitives we don't model on the wire yet; v3.31 still
+    classifies them by string shape.
 """
 
 from __future__ import annotations
@@ -68,10 +66,10 @@ logger = logging.getLogger(__name__)
 
 
 # Cache TTL for the ``tools/list`` discovery response. Matches
-# the v3.31 gate's ``heartbeat`` cadence (CLAUDE.md §6) so the
-# adapter and the gate see roughly the same version of the
-# server's tool inventory over time. Operators who need a
-# tighter or looser TTL can override it via the constructor.
+# the v3.31 gate's ``heartbeat`` cadence so the adapter and the
+# gate see roughly the same version of the server's tool inventory
+# over time. Operators who need a tighter or looser TTL can
+# override it via the constructor.
 DEFAULT_CACHE_SECONDS = 300
 
 

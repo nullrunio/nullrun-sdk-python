@@ -24,7 +24,7 @@ def reset_runtime():
 
     # Disable polling for all tests via the runtime's internal `polling` flag
     # (see make_runtime below — passes polling=False by default). The legacy
-    # NULLRUN_DISABLE_POLLING env var is gone as of Commit 5.
+    # NULLRUN_DISABLE_POLLING env var is no longer consulted.
 
     # Reset before test only - don't call shutdown in teardown
     # because mock_api fixture already cleaned up its respx context
@@ -134,8 +134,26 @@ def mock_api():
         )
         # 0.7.0: SDK no longer fetches /policies on init (backend
         # owns all policy state; SDK is a thin client).
-        # Health endpoint
-        respx.get(f"{BASE_URL}/health").mock(return_value=Response(200, json={"status": "ok"}))
+        # Capabilities endpoint (canonical /api/v1/capabilities,
+        # mirrors backend/src/proxy/http/protocol.rs:189).
+        # Empty capabilities object — SDK treats this as a non-v3
+        # backend and continues in compatibility mode.
+        respx.get(f"{BASE_URL}/api/v1/capabilities").mock(
+            return_value=Response(
+                200,
+                json={
+                    "min_protocol_version": 1,
+                    "max_protocol_version": 1,
+                    "protocol_version": 1,
+                    "capabilities": {
+                        "server_minted_execution_id": False,
+                        "per_execution_reservations": False,
+                        "enforcement_modes_soft": False,
+                        "heartbeat_time_based": False,
+                    },
+                },
+            )
+        )
         yield
 
 
@@ -217,7 +235,7 @@ def make_test_runtime(monkeypatch, tmp_path):
 
 @pytest.fixture(autouse=True)
 def _fast_sleep(monkeypatch, request):
-    # Sprint 0 (coverage): neutralise time.sleep in test code so the suite
+    # (coverage): neutralise time.sleep in test code so the suite
     # is no longer gated on the retry loop's real wall-clock wait. The
     # three TestCircuitBreaker tests in tests/test_transport.py
     # (test_open_transitions_to_half_open_after_timeout and its two
@@ -280,7 +298,7 @@ def _fast_sleep(monkeypatch, request):
 
 @pytest.fixture(autouse=True)
 def _isolated_wal(monkeypatch, tmp_path):
-    # CI flakefix (Sprint 0 follow-up): every test gets a private
+    # CI flakefix: every test gets a private
     # ``NULLRUN_WAL_PATH`` so ``Transport._replay_from_wal`` cannot
     # replay events from a previous run / parallel xdist worker /
     # failed teardown against the real backend.

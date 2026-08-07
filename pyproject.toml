@@ -152,11 +152,40 @@ name = "nullrun"
 # startup. The strip normalises the value before storage so the
 # HMAC signing path and the Authorization header see the same
 # canonical form on both sides of the wire.
-version = "0.14.7"
+# 0.14.9 (2026-08-07): v3.38 wire-drift close — three real
+# contract bugs that diverged from backend source. (1)
+# ``nullrun.capabilities.CAPABILITIES_PATH`` was ``/health`` (a
+# generic liveness endpoint) instead of the canonical
+# ``/api/v1/capabilities``; pre-fix every ``init()`` probe
+# returned None and ``is_v3_ready()`` was always False, leaving
+# the v3 capability flags as runtime no-ops. (2) Backend v3.38
+# split the ``API_KEY_REVOKED`` bucket into five distinct wire
+# codes (``API_KEY_EXPIRED`` / ``API_KEY_DISABLED`` /
+# ``API_KEY_INVALID`` / ``API_KEY_MISSING`` /
+# ``API_KEY_MALFORMED``) — pre-fix only ``API_KEY_REVOKED`` was
+# mapped in ``_V3_ERROR_CODE_MAP``, so the other five silently
+# fell through to the generic HTTP-status fallback and never
+# surfaced as ``NullRunAuthError``, losing both the exception
+# class and the diagnostic ``wire_code``. (3) Backend returns
+# ``decision == "soft_pass"`` for soft-mode calls that proceed
+# via the chain's overdraft cap (CLAUDE.md §5); pre-fix
+# ``check_workflow_budget`` had no branch for ``soft_pass`` and
+# it fell through the default allow path with no log line and
+# no ``soft_overdraft_used`` counter increment — silent budget
+# drift. The new soft_pass branch increments the counter via
+# ``metrics.inc_runtime("soft_overdraft_used")`` and logs at
+# WARNING with ``overdraft_used_cents`` so operators have
+# visibility into which chains are burning overdraft. Three
+# real bugs closed; no SDK_MIN_VERSION bump; no on-wire change.
+version = "0.14.9"
 # Kept under the 200-char preview threshold so the full line is visible
-# without an "expand" click. Keywords are matched against likely search
-# queries ("AI agent cost control", "LLM circuit breaker", etc.).
-description = "NullRun Python SDK — enforcement gateway for AI agents. Circuit-breaker, policy enforcement and observability for OpenAI, Anthropic, LangGraph, LlamaIndex, CrewAI, AutoGen."
+# without an "expand" click. The headline is the canonical §1 statement
+# from positioning.md — "runtime decision layer for tool-using AI agents"
+# (not "enforcement gateway", which undersells Phase 1 typed action
+# predicates and 3 MCP-aware enforcement). Vendor list kept for
+# searchability; "BusinessImpact" + "MCP-aware" surface the two newest
+# differentiators. Keywords below match the likely search queries.
+description = "NullRun Python SDK — runtime decision layer for tool-using AI agents."
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.10"

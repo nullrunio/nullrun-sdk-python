@@ -142,13 +142,13 @@ ErrorHook = Callable[["Any", ErrorContext], None]
 # from one thread and fired from another (e.g. register at app
 # startup, fire from a transport background thread).
 #
-# Phase 4 (2026-07-05): the hot path is has_hooks(), which
-# previously took an RLock.acquire on every call (100+ raises/min
-# in a busy agent is enough to show up in profiles). We now keep
-# the hook list under the same RLock but expose has_hooks()
-# as a lock-free len() check. The list itself is private;
-# callers always go through the public functions (which take
-# the lock for the read snapshot during dispatch).
+# The hot path is has_hooks(), which previously took an
+# RLock.acquire on every call (100+ raises/min in a busy agent
+# is enough to show up in profiles). We now keep the hook list
+# under the same RLock but expose has_hooks() as a lock-free
+# len() check. The list itself is private; callers always go
+# through the public functions (which take the lock for the read
+# snapshot during dispatch).
 _lock = threading.RLock()
 _hooks: list[ErrorHook] = []
 

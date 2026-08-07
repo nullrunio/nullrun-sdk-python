@@ -116,7 +116,7 @@ def test_workflow_contextmanager_still_works():
 
     with workflow("explicit-id") as wid:
         assert wid == "explicit-id"
-    # Phase 5 #5.6: workflow now emits a real UUID4 (matching the
+    # workflow now emits a real UUID4 (matching the
     # rest of the SDK's id generation).
     with workflow() as wid:
         _uuid.UUID(wid)  # raises ValueError if not a UUID
@@ -160,7 +160,7 @@ def test_adaptive_pool_removed():
 # ===========================================================================
 # Decision-history removals
 # ===========================================================================
-# Sprint 2.1: the entire ``nullrun.decision_history`` module was
+# The entire ``nullrun.decision_history`` module was
 # deleted because the feature moved to the backend dashboard. The
 # SDK does not (and cannot) replay LLM calls because the platform
 # does not store request/response payloads. The ``start_recording``
@@ -172,7 +172,7 @@ def test_decision_history_module_removed():
     """The entire ``nullrun.decision_history`` module was deleted in 0.4.0.
 
     Previously a separate ``test_event_recorder_removed`` tested that
-    a single symbol was gone; after Sprint 2.1 the whole module is
+    a single symbol was gone; after this deletion the whole module is
     gone, so the import fails at the module level (not the
     attribute level). Both ``from nullrun.decision_history import X``
     and ``import nullrun.decision_history`` must now raise.
@@ -188,7 +188,7 @@ def test_decision_history_module_removed():
 
 
 # ===========================================================================
-# Sprint 2.2: zombie exception classes removed
+# Zombie exception classes removed
 # ===========================================================================
 # Six exception classes had zero in-tree callers — they were defined
 # but never raised. They were public surface, so external callers
@@ -219,7 +219,7 @@ def test_zombie_exception_removed_from_breaker(name: str):
 
     assert not hasattr(exceptions, name), (
         f"{name} is still defined in nullrun.breaker.exceptions. "
-        "It was marked as a zombie class in Sprint 2.2 — it has "
+        "It was marked as a zombie class — it has "
         "no in-tree callers. Re-add it only when a real use case "
         "appears, with a regression test for the raise path."
     )
@@ -245,7 +245,7 @@ def test_zombie_exception_not_in_lazy_exports(name: str):
 
 
 # ===========================================================================
-# Sprint 2.7 (B27): dead tenant contextvars / getters
+# B27: dead tenant contextvars / getters
 # ===========================================================================
 # Pre-fix: ``_organization_id_var`` and ``_api_key_id_var`` were
 # defined but never written, so ``get_organization_id `` and
@@ -293,7 +293,7 @@ def test_dir_size_unchanged():
     import is a regression.
 
     History:
-      * Phase 3.4 — surface was 6: ``__version__``, ``init``
+      * Initial curated surface was 6: ``__version__``, ``init``
         ``protect``, ``track_event``, ``track_llm``, ``track_tool``.
       * Layer 2 (``on_error``) and Layer 3 (``status``) — added
         because users need to know they exist (discoverability
@@ -312,7 +312,7 @@ def test_dir_size_unchanged():
     # contains — no auto-imported submodules, no lazy-resolved
     # names bleeding in.
     assert nullrun.__all__[0] == "__version__"
-    # The five Phase-3.4 anchors are still on the surface.
+    # The five original anchors are still on the surface.
     for anchor in ("init", "protect", "track_event", "track_llm", "track_tool"):
         assert anchor in nullrun.__all__, f"{anchor} missing from __all__"
 
@@ -324,7 +324,7 @@ def test_wrap_symbol_absent():
 
 
 # ===========================================================================
-# Sprint 1.2 (B11, B12): patch_openai / unpatch_openai lazy exports
+# B11, B12: patch_openai / unpatch_openai lazy exports
 # ===========================================================================
 # These were entries in `_LAZY_EXPORTS` pointing at
 # `("nullrun.instrumentation", "patch_openai")` /

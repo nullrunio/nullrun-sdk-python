@@ -1,5 +1,33 @@
 """NullRun Platform SDK.
 
+v3.38 / 0.14.9 (2026-08-07) — wire-drift close: three real
+contract bugs that diverged from backend source code.
+(1) ``nullrun.capabilities.CAPABILITIES_PATH`` was ``/health``
+(legacy liveness endpoint) instead of the canonical
+``/api/v1/capabilities``. Pre-fix every ``init()`` probe
+returned None and ``is_v3_ready()`` was always False, leaving
+the v3 capability flags as runtime no-ops.
+(2) Backend v3.38 split the ``API_KEY_REVOKED`` bucket into
+five distinct wire codes (``API_KEY_EXPIRED`` /
+``API_KEY_DISABLED`` / ``API_KEY_INVALID`` /
+``API_KEY_MISSING`` / ``API_KEY_MALFORMED``) — pre-fix only
+``API_KEY_REVOKED`` was mapped in ``_V3_ERROR_CODE_MAP``, so
+the other five silently fell through to the generic
+HTTP-status fallback and never surfaced as
+``NullRunAuthError``, losing both the exception class and the
+diagnostic ``wire_code``.
+(3) Backend returns ``decision == "soft_pass"`` for soft-mode
+calls that proceed via the chain's overdraft cap (CLAUDE.md
+§5); pre-fix ``check_workflow_budget`` had no branch for
+``soft_pass`` and it fell through the default allow path with
+no log line and no ``soft_overdraft_used`` counter increment
+— silent budget drift. The new soft_pass branch increments
+the counter via ``metrics.inc_runtime("soft_overdraft_used")``
+and logs at WARNING with ``overdraft_used_cents`` so
+operators have visibility into which chains are burning
+overdraft.
+Recommended upgrade path: 0.14.8 -> 0.14.9 (or 0.14.7 -> 0.14.9).
+
 v3.31.6 / 0.14.7 (2026-08-04) — init contract hardening: strip
 whitespace from ``api_key`` before the truthiness check.
 
@@ -79,8 +107,8 @@ GitHub Actions runners after the 0.14.5 release:
    window turned the run red even when the ``test`` (3.10/3.11/3.12)
    matrix was fully green. The marker itself
    (``reruns=2``, ``release_after_ms=200``) was already in place
-   from the Sprint 0 audit — the missing piece was the plugin on
-   the coverage leg. This release matches the install on
+   from the audit — the missing piece was the plugin on the
+   coverage leg. This release matches the install on
    ``ci.yml:41-45``.
 
 2. ``tests/test_actions.py::TestPauseAction::test_is_paused_respects_cooldown``
@@ -143,7 +171,7 @@ not auto-collect arguments for arbitrary callers.
 ---
 
 v3.30 / 0.14.4 (2026-07-27) — ToolParameters Approval Rules
-wire contract (Tier 2 / Разрыв 2 follow-up).
+wire contract.
 
 Pre-fix 0.14.0, a ``track_tool`` event payload containing a
 ``Decimal`` (e.g. ``refund_amount`` from a
@@ -200,7 +228,7 @@ bytes); the Decimal serialisation is a strict superset.
 
 v3.28 / 0.14.0 (2026-07-23) — hardening pass on the money contract.
 
-Closes the four review gaps from the Phase 1.1 / UX follow-up:
+Closes the four review gaps from the UX follow-up:
 
   1. **Dedicated error types** -- ``InvalidMoneyPrecisionError``
      and ``InvalidMoneyAmountError`` (both subclass
@@ -247,7 +275,7 @@ Side fixes (covered by the same audit pass):
   * Server's ``approval_timeout`` is clamped to ``[1, 3600]s``
     on the SDK side as defence against a malformed /
     overshooting backend that returns ``0`` or ``2147483647``
-    in the Разрыв 1c field.
+    in the server approval-timeout field.
 
 Public API change (additive only, backward-compatible):
 
@@ -303,16 +331,16 @@ them.
 
 ---
 
-v3.27 / 0.13.13 (2026-07-21) — Разрыв 1c SDK sync.
+v3.27 / 0.13.13 (2026-07-21) — approval-timeout wire sync.
 
-Backend commit ``0ad03b9`` (Разрыв 1c, gate hot-path trigger)
-added ``approval_timeout_seconds: Option<i64>`` and
-``approval_expires_at: Option<String>`` to the GateResponse
+Backend commit ``0ad03b9`` (gate hot-path trigger that prompted
+this SDK sync) added ``approval_timeout_seconds: Option<i64>``
+and ``approval_expires_at: Option<String>`` to the GateResponse
 wire format. Before this SDK fix, the approval wait path used
 ``NULLRUN_APPROVAL_TIMEOUT_SECONDS`` env default (default
 300s) as the ONLY source of wait duration — which is exactly
-the Разрыв 3 class of bug that the backend sweeper was written
-to prevent on the backend side.
+the silent-desync class of bug that the backend sweeper was
+written to prevent on the backend side.
 
 Concretely: a backend approval rule configured with
 ``expires_in_seconds=20`` (short-approval use case) would
@@ -328,11 +356,11 @@ Fix (no on-wire change, backward-compatible API):
     kwarg ``timeout_seconds: float | None = None``. When set
     to a positive number, used as the event.wait() timeout
     (server-authoritative, takes precedence over the env
-    default). When ``None`` (legacy backend without Разрыв 1c
-    field, or malformed response), falls back to
-    ``self._approval_timeout_seconds`` (env default) —
-    pre-Разрыв 1c behaviour preserved. When set to a
-    non-positive number (0 or negative), also falls back to
+    default). When ``None`` (legacy backend without the
+    server-side approval-timeout field, or malformed response),
+    falls back to ``self._approval_timeout_seconds`` (env
+    default) — pre-server-side behaviour preserved. When set
+    to a non-positive number (0 or negative), also falls back to
     env default; we explicitly reject these because
     ``event.wait(timeout=0)`` deadlocks on the very first call.
 
@@ -643,7 +671,7 @@ re-capture.
      /track single-event path. Chain-mode loops that re-use
      the *same* chain_id across many gate calls still rely on
      the cache collapsing to one roundtrip, which is the
-     intentional design (CLAUDE.md §18 BUG #5 — gate_cache
+     intentional design (BUG #5 — gate_cache
      debounce). Operators who need a fresh ``/gate`` call on
      every ``@protect`` invocation can opt out via
      ``NULLRUN_GATE_CACHE_DISABLE=1`` (env var, no code
@@ -1160,5 +1188,5 @@ Recommended upgrade path: 0.13.4 -> 0.13.5.
 
 """
 
-__version__ = "0.14.7"
+__version__ = "0.14.9"
 __platform_version__ = "1.0.0"

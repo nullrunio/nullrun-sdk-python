@@ -76,7 +76,7 @@ def test_clear_history_empties_list():
 
 
 def test_handle_unknown_action_does_not_invoke_handler():
-    """Sprint 1.5 (B14): unknown action logs ERROR + records BLOCK but
+    """B14: unknown action logs ERROR + records BLOCK but
     does NOT invoke any handler (fail-open). Pre-fix this degraded
     to BLOCK → DoS amplifier.
     """

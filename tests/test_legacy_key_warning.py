@@ -1,7 +1,7 @@
 """
 Regression test for the legacy-API-key kill-switch warning.
 
-Pre-Phase-139 API keys do not return ``workflow_id`` from
+Pre-0.3.x API keys do not return ``workflow_id`` from
 ``/auth/verify``. When the SDK has no workflow bound, every
 ``check_control_plane`` call is a silent no-op — the dashboard's
 KILL/PAUSE button has no effect on the running agent. This is a
@@ -26,7 +26,7 @@ BASE_URL = "https://api.test.nullrun.io"
 
 class TestLegacyApiKeyWarning:
     def test_legacy_key_emits_kill_switch_warning(self, monkeypatch, caplog):
-        """A pre-Phase-139 key (no workflow_id in auth response)
+        """A pre-0.3.x key (no workflow_id in auth response)
         must emit a WARNING explaining that kill/pause will not
         be honoured.
         """
@@ -37,7 +37,7 @@ class TestLegacyApiKeyWarning:
                     200,
                     json={
                         "organization_id": "00000000-0000-0000-0000-000000000000",
-                        # NO workflow_id — pre-Phase-139 key
+                        # NO workflow_id — pre-0.3.x key
                         "plan": "pro",
                         "features": [],
                         "limits": {"max_cost_cents": 10000},

@@ -1,6 +1,5 @@
 """
-Auto-instrumentation for the `requests` library — Phase P2 of the audit
-fix plan.
+Auto-instrumentation for the `requests` library.
 
 Mirrors `auto.py` (the httpx transport hook) for the `requests` HTTP
 client. The motivation: 30-50% of real codebases use `requests` directly
@@ -27,7 +26,8 @@ What this module owns:
 - Double-emission guard: `request._nullrun_tracked = True` is set on
   the PreparedRequest after a successful track, so a future
   `urllib3` patch (which `requests` uses under the hood) can skip
-  already-tracked requests. See plan section P2 / "requests ↔ urllib3".
+  already-tracked requests. See the "requests ↔ urllib3" section of
+  the audit notes.
 
 0.9.0: counter-bump helpers (`_safe_bump_coverage`
 `_bump_streaming_skipped`) are gone — coverage is now derived from
@@ -35,8 +35,8 @@ llm_call span metadata. Each emit site tags `metadata.tracked: bool`
 and `metadata.streaming_skipped: bool` so the backend can compute
 coverage_pct from `spans.metadata` directly.
 
-`aiohttp` is deliberately out of scope for this phase — see
-`docs/known-limitations.md` and the plan's open questions.
+`aiohttp` is deliberately out of scope — see
+`docs/known-limitations.md` for the rationale.
 """
 
 from __future__ import annotations

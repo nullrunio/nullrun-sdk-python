@@ -2,7 +2,7 @@
 Additional tests for ``nullrun.decorators`` — branch coverage for the
 ``_safe_args`` / ``_strip_details_balanced`` / ``_enforce_sensitive_tool``
 helpers, the fail-CLOSED / fail-OPEN contract, the KILL→BlockedException
-unification (Round 3), and the ``@protect `` paren-form.
+unification, and the ``@protect `` paren-form.
 """
 
 from __future__ import annotations
@@ -400,7 +400,7 @@ def test_protect_without_parens_wraps_directly(test_runtime):
     assert f(3) == 6
 
 
-# ─── KILL→BlockedException unification (Round 3) ──────────────────────
+# ─── KILL→BlockedException unification ──────────────────────
 
 
 def test_protect_sync_kill_raises_NullRunBlockedException(test_runtime):

@@ -67,8 +67,8 @@ class TransportMetrics:
     circuit_half_open_count: int = 0
     circuit_closed_count: int = 0
     fallback_mode_activations: int = 0
-    # Sprint 1.5 (B13): HMAC verification failures on the control
-    # plane WebSocket. Pre-fix, a signature mismatch on a signed
+    # HMAC verification failures on the control plane WebSocket
+    # (B13). Pre-fix, a signature mismatch on a signed
     # ``state_change`` / ``key_rotated`` / ``policy_invalidated``
     # message was logged at WARNING and the message was silently
     # dropped — meaning a forged or mis-rotated kill command could

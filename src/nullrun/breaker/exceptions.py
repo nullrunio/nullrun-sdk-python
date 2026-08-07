@@ -320,7 +320,7 @@ class RateLimitError(NullRunTransportError):
     """Raised when the gateway returns HTTP 429 with a ``Retry-After``
     header (or JSON body field).
 
-    Phase 4: subclass of ``NullRunTransportError`` so
+    Subclass of ``NullRunTransportError`` so
     ``except NullRunTransportError`` keeps catching it. Surfaces
     ``retry_after`` (seconds) and ``upgrade_url`` so callers can
     schedule a retry or surface a billing upgrade prompt.
@@ -397,17 +397,25 @@ class NullRunProtocolError(NullRunInfrastructureError):
 class NullRunChainError(NullRunDecision):
     """Chain-related failure.
 
-    Covers four backend codes: ``CHAIN_MAX_DURATION_EXCEEDED`` (402)
-    ``CHAIN_CROSS_ORG`` (403), ``CHAIN_ORG_MISMATCH`` (403), and
-    ``CHAIN_NOT_FOUND`` / ``CHAIN_EXPIRED`` (404). Splitting the
-    chain codes into their own class (rather than reusing
+    Covers backend codes: ``CHAIN_MAX_DURATION_EXCEEDED`` (402),
+    ``CHAIN_CROSS_ORG`` (403), ``CHAIN_ORG_MISMATCH`` (403),
+    ``CHAIN_NOT_FOUND`` / ``CHAIN_EXPIRED`` (404), and the
+    Execution Graph v0 (2026-08-06) trio:
+    ``PARENT_EXECUTION_NOT_FOUND`` / ``PARENT_EXECUTION_ORG_MISMATCH``
+    / ``PARENT_EXECUTION_KEY_MISMATCH`` (all 403). Splitting the
+    chain-and-lineage codes into their own class (rather than reusing
     NullRunBlockedException) gives cookbook code a clean way to
     distinguish "you forgot to start a chain" from "your tool is
-    blocked" without string-matching the message.
+    blocked" from "your sub-agent references an execution you do not
+    own" without string-matching the message.
 
     Attributes:
         chain_id: Chain that triggered the error (may be None on a
             cross-org collision).
+        parent_execution_id: Execution Graph v0 (2026-08-06) — the
+            parent execution_id from the rejected sub-agent call.
+            Distinct from chain_id (lifecycle of one SDK run) — the
+            Execution Graph tracks spawn topology across runs.
     """
 
     error_code = "NR-CH001"
@@ -424,12 +432,19 @@ class NullRunChainError(NullRunDecision):
         message: str,
         *,
         chain_id: str | None = None,
+        parent_execution_id: str | None = None,
         backend_code: str | None = None,
         details: dict[str, Any] | None = None,
         status_code: int | None = None,
         **kwargs: Any,
     ) -> None:
         self.chain_id = chain_id
+        # Execution Graph v0 (2026-08-06): when the backend rejects
+        # a sub-agent call with PARENT_EXECUTION_*, the offending
+        # parent_execution_id is preserved on the exception so
+        # cookbook code can log / surface it without re-parsing the
+        # message string. ``None`` for non-lineage chain errors.
+        self.parent_execution_id = parent_execution_id
         self.backend_code = backend_code or self.error_code
         self.details = details or {}
         # 2026-07-04: preserve the wire HTTP
@@ -466,7 +481,7 @@ class NullRunConsumeOverbudgetError(NullRunDecision):
     user_action = (
         "The actual cost exceeded the reservation by more than the "
         "epsilon_cents tolerance. The reservation was NOT silently "
-        "re-reserved (CLAUDE.md §25). Either reduce the call's "
+        "re-reserved. Either reduce the call's "
         "expected cost before /check (model downgrade, fewer tokens) "
         "or increase the per-policy ``epsilon_cents`` after manual "
         "review — never bypass the invariant by retrying."
@@ -498,13 +513,12 @@ class NullRunConsumeOverbudgetError(NullRunDecision):
 
 
 class NullRunWorkflowInactiveError(NullRunDecision):
-    """Workflow soft-deleted; gate blocks per-key traffic (
- — Sprint 6 v1 12.2 hot-path wiring).
+    """Workflow soft-deleted; gate blocks per-key traffic.
 
     Raised when the workflow's ``is_active`` flag is false (soft
     delete + ``killed_at`` not null) AND an active API key still
-    tries to drive traffic against it. Per the fail-CLOSED contract
-    in, the SDK must not let the agent body run in
+    tries to drive traffic against it. Per the fail-CLOSED contract,
+    the SDK must not let the agent body run in
     this state — a soft-deleted workflow implies the operator
     intentionally revoked it.
     """
@@ -550,10 +564,10 @@ class NullRunRateLimitRedisError(NullRunInfrastructureError):
     error_code = "NR-R002"
     user_action = (
         "The NullRun backend cannot reach Redis for the aggregate "
-        "rate limit. The request was rejected (fail-CLOSED per "
-        "CLAUDE.md §4) because the rate limit is the authoritative "
-        "gate, not a soft advisory. Retry after the operator "
-        "confirms Redis is healthy — check status.nullrun.io."
+        "rate limit. The request was rejected (fail-CLOSED) because "
+        "the rate limit is the authoritative gate, not a soft "
+        "advisory. Retry after the operator confirms Redis is "
+        "healthy — check status.nullrun.io."
     )
     retryable = True
 
@@ -656,6 +670,14 @@ class NullRunAuthError(NullRunAuthenticationError):
 
     Subclass of:class:`NullRunAuthenticationError` so existing
     ``except NullRunAuthenticationError`` clauses keep matching.
+
+    The wire error code (one of ``API_KEY_REVOKED`` /
+    ``API_KEY_EXPIRED`` / ``API_KEY_DISABLED`` / ``API_KEY_INVALID``
+    / ``API_KEY_MISSING`` / ``API_KEY_MALFORMED`` per v3.38) is
+    stored on ``self.wire_code`` so callers can branch on the
+    granular lifecycle state without clobbering the SDK-side
+    ``error_code`` taxonomy (``NR-A003``). Pattern mirrors
+    :class:`NullRunChainError.backend_code`.
     """
 
     error_code = "NR-A003"
@@ -665,6 +687,19 @@ class NullRunAuthError(NullRunAuthenticationError):
         "and rotate it if it has been revoked."
     )
     retryable = False
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        wire_code: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        self.wire_code = wire_code or "API_KEY_REVOKED"
+        # Preserve the historical ``self.message`` attribute — some
+        # user code reads ``exc.message`` instead of ``str(exc)``.
+        self.message = message
+        super().__init__(message, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -712,9 +747,7 @@ class NullRunBlockedException(NullRunDecision):
             storm) where there was no wire response. Lets FastAPI /
             Starlette exception handlers map to the correct HTTP
             status without re-deriving it from
-            ``type(exc).__name__``. Drift fix 2026-07-04
-            (P1-1: SDK_README's NR-B004 → 429 claim was
-            wrong; the real wire status is 402).
+            ``type(exc).__name__``.
     """
 
     error_code = "NR-X001"  # generic block; subclasses override
@@ -798,12 +831,12 @@ class NullRunToolBlockedError(NullRunBlockedException):
     retryable = False
 
 
-# NOTE (Sprint 2.2): the following six exception classes were removed
-# in 0.4.0 because they had no callers in the SDK or in any
-# test. They were zombie public surface — defined but never raised.
-# If a real use case emerges in the future, they should be re-added
-# with at least one in-tree caller and a regression test that
-# exercises the raise path:
+# NOTE: the following six exception classes were removed in 0.4.0
+# because they had no callers in the SDK or in any test. They were
+# zombie public surface — defined but never raised. If a real use
+# case emerges in the future, they should be re-added with at least
+# one in-tree caller and a regression test that exercises the raise
+# path:
 # - CostLimitExceeded
 # - ApprovalRequired
 # - BreakerTimeout

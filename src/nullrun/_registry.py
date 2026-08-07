@@ -16,7 +16,7 @@ slot. Concurrent ``init()`` + ``@protect`` could race and leave one
 of the three pointing at a dead runtime, dropping ``span_start`` /
 ``span_end`` events on the floor (see audit 2026-07-05 H2).
 
-Phase 3 unifies the three writers behind a single
+The three writers are unified behind a single
 :class:`RuntimeRegistry` so every consumer reads from one place.
 The class-level ``NullRunRuntime._instance`` is preserved as a
 proxy for backward compatibility (test fixtures, third-party
@@ -27,7 +27,7 @@ Thread safety
 -------------
 The registry uses an ``RLock`` because the same thread can re-enter
 during a ``get_instance`` -> ``shutdown`` -> ``get_instance`` sequence
-(Phase 5 #5.3 documented the original deadlock from a plain Lock).
+(B5 #5.3 documented the original deadlock from a plain Lock).
 Readers (the hot path on every ``@protect`` call) take a snapshot
 of the instance pointer once and release the lock immediately;
 they do NOT hold the lock across downstream calls (e.g. ``runtime

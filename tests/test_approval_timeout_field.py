@@ -1,24 +1,24 @@
 """
-Разрыв 1c (2026-07-21) — SDK reads `approval_timeout_seconds`
+Server-timeout-vs-env-default (2026-07-21) — SDK reads `approval_timeout_seconds`
 from the /gate response, not its own env default.
 
-До этой правки SDK использовал `NULLRUN_APPROVAL_TIMEOUT_SECONDS`
-env default (300s) как единственный источник wait duration. Если
-backend row имел другой `expires_in_seconds` (например, 20s для
-коротких approval-правил или 1800s для длинных), SDK timeout'ил
-раньше или позже чем backend sweeper — exactly the Разрыв 3 desync
+Before this fix the SDK used `NULLRUN_APPROVAL_TIMEOUT_SECONDS`
+env default (300s) as the only source of wait duration. If
+a backend row had a different `expires_in_seconds` (e.g. 20s for
+short approval rules or 1800s for long ones), the SDK timed out
+earlier or later than the backend sweeper — the same desync
 class of bug.
 
-Backend commit 0ad03b9 добавил `approval_timeout_seconds: Option<i64>`
-поле в `GateResponse`. SDK теперь:
+Backend commit 0ad03b9 added `approval_timeout_seconds: Option<i64>`
+field in `GateResponse`. The SDK now:
 - prefers `response["approval_timeout_seconds"]` (server-authoritative)
-- falls back to env default только когда поле отсутствует/невалидно
+- falls back to env default only when the field is missing/invalid
 
-Тесты ниже пинят этот контракт: при валидном server timeout
-используется он, при отсутствующем — env default, при
-невалидном — env default + WARN log.
+The tests below pin this contract: a valid server timeout
+is used as-is, a missing one falls back to env default, and an
+invalid one falls back to env default + WARN log.
 
-# Test mechanics (Разрыв 1c, 2026-07-21)
+# Test mechanics
 
 `_wait_for_approval_resolution` creates a NEW `threading.Event()`
 inside the function and waits on it. Pre-setting an event from
@@ -132,7 +132,7 @@ def _run_wait_and_timeout(
 
 
 class TestApprovalTimeoutResolution:
-    """Pin the Разрыв 1c contract: server timeout wins, env is fallback."""
+    """Pin the server-timeout-vs-env-default contract: server timeout wins, env is fallback."""
 
     def test_server_timeout_used_when_response_has_valid_value(self):
         """DoD #1: server-supplied timeout=15s is the value passed
@@ -155,7 +155,7 @@ class TestApprovalTimeoutResolution:
                 "wait should have released on the WS push, not timed out"
             )
             assert result_box["result"]["timeout_seconds"] == 15.0, (
-                "Разрыв 1c: server timeout (15s) must be stored on the "
+                "Server timeout (15s) must be stored on the "
                 f"entry; got {result_box['result']['timeout_seconds']}"
             )
             # Sanity: the wait did NOT consume 15s.
@@ -193,7 +193,7 @@ class TestApprovalTimeoutResolution:
         # on the very first event.wait(), so we explicitly reject
         # non-positive values.
         #
-        # Sprint 0 (coverage): this test was rare-flaky under
+        # (coverage): this test was rare-flaky under
         # pytest-xdist on CI (linux, Python 3.12) — the spawned
         # wait thread occasionally missed the 50ms release window
         # when the main thread was mid-test-collection, and the
@@ -208,7 +208,7 @@ class TestApprovalTimeoutResolution:
         #    thread missed the 200ms release window twice in a
         #    row on the shared Linux runner.
         # 2. ``release_after_ms=400`` widens the release window
-        #    from 200ms (Sprint 0) to 400ms — still well below
+        #    from 200ms to 400ms — still well below
         #    the 120s env default timeout so the test runs fast
         #    on CI, but enough headroom that the spawned thread
         #    reliably reaches ``event.wait()`` before the release
@@ -262,7 +262,7 @@ class TestApprovalTimeoutResolution:
         a fresh dict, not the entry) — only `outcome`,
         `timed_out`, `approval_id`.
 
-        Phase 0 review (2026-07-23): the test used
+        Initial review (2026-07-23): the test used
         `timeout_seconds=0.1` to keep the suite fast. After the
         clamp to `[MIN_APPROVAL_TIMEOUT_SECONDS=1,
         MAX_APPROVAL_TIMEOUT_SECONDS=3600]`, sub-1s values now
@@ -308,7 +308,7 @@ class TestApprovalTimeoutResolution:
                 if r.levelname == "DEBUG" and "using server timeout" in r.message
             ]
             assert len(debug_messages) >= 1, (
-                "Разрыв 1c: diverging server timeout should emit a DEBUG log. "
+                "Diverging server timeout should emit a DEBUG log. "
                 f"Got caplog records: {[r.message for r in caplog.records]}"
             )
         finally:
@@ -316,7 +316,7 @@ class TestApprovalTimeoutResolution:
 
 
 # ---------------------------------------------------------------------------
-# Phase 0 review (2026-07-23): server-timeout clamp to
+# Initial review (2026-07-23): server-timeout clamp to
 # [MIN_APPROVAL_TIMEOUT_SECONDS, MAX_APPROVAL_TIMEOUT_SECONDS].
 # Pre-fix only `> 0` was rejected, so a server advertising
 # 1e9 seconds would lock the calling thread for years. The

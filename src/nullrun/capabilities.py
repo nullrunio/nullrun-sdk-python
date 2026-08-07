@@ -40,7 +40,7 @@ operator sees the mismatch BEFORE the first /check fails with 503.
 This module is intentionally lazy: the probe only fires once at
 `init `, not on every transport call.
 
-## Drift history
+## Capability history
 
 * 2026-07-06 — fixed P0 (audit §1 capabilities):
   - probe URL was ``/health`` (legacy v1/v2); backend exposes the
@@ -74,20 +74,20 @@ logger = logging.getLogger("nullrun.capabilities")
 SDK_MIN_VERSION_FOR_V3 = "0.12.0"
 
 
-# Wire path for the canonical capabilities endpoint. The SDK targets
-# the legacy ``/health`` route (a 200 OK JSON blob that doubles as
-# the v1/v2 status endpoint); the backend has registered this
-# route since 2025-04. The nested ``/api/v1/capabilities`` route
-# is the future canonical contract (per
-# ``backend/src/proxy/http/protocol.rs:189``) but is opt-in for
-# backends < 1.0.0 — we probe the older URL so the SDK works
-# against any 1.0.0-rc.0+ backend without coordination.
-CAPABILITIES_PATH = "/health"
+# Wire path for the canonical capabilities endpoint. The backend
+# exposes this at ``/api/v1/capabilities`` (per
+# ``backend/src/proxy/http/protocol.rs:189``) since 2025-04. The
+# legacy ``/health`` route returns a generic liveness payload —
+# it does NOT carry the v3-gating fields, so probing there always
+# returned None and ``is_v3_ready()`` was always False, leaving
+# every capability flag a no-op at runtime. See capability
+# history note in module docstring (2026-07-06 fix).
+CAPABILITIES_PATH = "/api/v1/capabilities"
 
 
 @dataclass(frozen=True)
 class RateLimitFailScope:
-    """Per CLAUDE.md §9 — fail-OPEN/CLOSED matrix for rate limiting.
+    """Fail-OPEN/CLOSED matrix for rate limiting.
 
     ``aggregate`` controls the per-org aggregate bucket; ``per_key``
     controls the per-API-key bucket. Each is either ``"open"`` (fail-OPEN:
@@ -133,6 +133,15 @@ class ServerCapabilities:
     decision_log: bool = False
     outbox_async_drain: bool = False
     idempotency_keys: bool = False
+    # Execution Graph v0 (2026-08-06, backend): additive
+    # `parent_execution_id` wire field on /gate. SDKs probe this
+    # flag before sending the field; pre-Graph backends silently
+    # ignore unknown fields, but the probe lets SDKs surface a
+    # clean diagnostic at `init()` ("sub-agent mode requires
+    # server v0.5+") instead of a 400 on the first call. NOT
+    # included in `is_v3_ready()` -- it's informational, not a
+    # hard gate.
+    execution_graph: bool = False
     rate_limit_fail_scope: RateLimitFailScope = field(
         default_factory=lambda: RateLimitFailScope()
     )
@@ -173,6 +182,7 @@ class ServerCapabilities:
                 "decision_log": self.decision_log,
                 "outbox_async_drain": self.outbox_async_drain,
                 "idempotency_keys": self.idempotency_keys,
+                "execution_graph": self.execution_graph,
                 "rate_limit_fail_scope": {
                     "aggregate": self.rate_limit_fail_scope.aggregate,
                     "per_key": self.rate_limit_fail_scope.per_key,
@@ -252,6 +262,11 @@ def parse_capabilities(payload: dict[str, Any]) -> ServerCapabilities:
         decision_log=_v3_flag("decision_log"),
         outbox_async_drain=_v3_flag("outbox_async_drain"),
         idempotency_keys=_v3_flag("idempotency_keys"),
+        # Execution Graph v0 (2026-08-06, backend): additive flag
+        # -- defaults to False so pre-Graph backends (which omit
+        # the field entirely) yield a fail-closed view where the
+        # SDK does NOT send `parent_execution_id`.
+        execution_graph=_v3_flag("execution_graph"),
         rate_limit_fail_scope=_parse_rate_limit_scope(caps.get("rate_limit_fail_scope")),
     )
 

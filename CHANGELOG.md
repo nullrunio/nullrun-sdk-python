@@ -7,6 +7,70 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [0.14.9] - 2026-08-07
+
+v3.38 wire-drift close — three real contract bugs that diverged from backend source code. Verified against `backend/src/proxy/http/protocol.rs`, `backend/src/proxy/middleware/auth.rs`, and CLAUDE.md §5 / §13 — not against comments or documentation. No SDK_MIN_VERSION bump. No on-wire change (backend already shipped the matching wire shape; this SDK release closes the consumer side).
+
+### Fixed
+
+- **Capabilities probe route** — `nullrun.capabilities.CAPABILITIES_PATH` was `"/health"` (a generic liveness endpoint) instead of the canonical `"/api/v1/capabilities"`. Pre-fix, every `init()` probe returned `None` and `is_v3_ready()` was always `False`, so every v3 capability flag (`server_minted_execution_id` / `per_execution_reservations` / `enforcement_modes_soft` / `heartbeat_time_based`) was a runtime no-op — even when the backend was v3-ready. The new probe URL matches `backend/src/proxy/http/protocol.rs::capabilities_handler` (canonical wire contract since 2025-04).
+- **API_KEY_* error code granularity (v3.38 backend split)** — backend v3.38 split the `API_KEY_REVOKED` bucket into five distinct wire codes: `API_KEY_EXPIRED` / `API_KEY_DISABLED` / `API_KEY_INVALID` / `API_KEY_MISSING` / `API_KEY_MALFORMED` (mirrors CLAUDE.md §13 vocabulary). Pre-fix, only `API_KEY_REVOKED` was mapped in `_V3_ERROR_CODE_MAP`; the other five silently fell through to the generic HTTP-status fallback at `transport.py:~2616` and never surfaced as `NullRunAuthError`, losing both the exception class and the diagnostic `wire_code`. The map now covers all six wire codes. The envelope parser filters unknown `details` keys to a known kwargs set (`{error_code, user_action, retryable, docs_url, cause}`) and parks extras on `self.details` — the pre-fix behaviour was to forward every detail as a kwarg and raise `TypeError` on the first unknown key (the regression appeared once v3.38 EXPIRED responses started emitting `expires_at` in details).
+- **`NullRunAuthError.wire_code`** — the exception class gains a `wire_code: str | None = None` constructor kwarg that defaults to `"API_KEY_REVOKED"` for backwards compat. Mirrors the existing `NullRunChainError.backend_code` pattern at `breaker/exceptions.py:448`. Handlers can now branch on the granular lifecycle signal instead of inferring from message strings.
+
+### Added
+
+- **`decision == "soft_pass"` handler in `check_workflow_budget`** — the runtime's `/gate` decision dispatcher gains a `soft_pass` branch (currently the only branch missing from the source). Pre-fix the branch was absent, so soft-mode calls that proceeded via the chain's overdraft cap fell through the default allow path with no log line and no `soft_overdraft_used` counter increment — silent budget drift. The new branch:
+  - calls `metrics.inc_runtime("soft_overdraft_used")` so the dashboard can graph soft-cap pressure
+  - logs at WARNING with `overdraft_used_cents` / `max_overdraft_cents` / `remaining_overdraft_cents` from the backend response so operators can see which chains are burning overdraft
+  - returns normally (the `allow` semantic is correct — the gate already authorised the call via the chain's overdraft cap)
+
+### Tests
+
+- `tests/test_v3_38_drift_fixes.py` — 14 new regression tests across three classes:
+  - `CAPABILITIES_PATH` is `"/api/v1/capabilities"` (constant pin); probe against canonical route with v3 payload yields `is_v3_ready() == True` (negative pin against `/health` mocks).
+  - `_V3_ERROR_CODE_MAP` covers all six wire codes (6-case parametrise); `NullRunAuthError.wire_code` surfaces the granular backend code (default to `API_KEY_REVOKED`); envelope parser filters unknown details without raising `TypeError`.
+  - Static-source scan pins the `soft_pass` branch structure (counter increment, WARNING log, `overdraft_used_cents` reference) — mirroring the `migration_drift_tests` pattern used elsewhere in the SDK and backend. A future refactor that drops the branch fails the test in CI rather than at first production `/check`.
+- `tests/conftest.py` / `tests/test_capabilities.py` / `tests/test_init_contract.py` updated to mock `/api/v1/capabilities` (was `/health`).
+
+### Compatibility
+
+- **No SDK_MIN_VERSION bump.** All three fixes are consumer-side; the backend already shipped the matching wire shape.
+- **No public API change.** `CAPABILITIES_PATH` / `_V3_ERROR_CODE_MAP` / `NullRunAuthError` are internal implementation details; the public surface (`nullrun.init(...)`, `@protect`, `decision`-keyed `GateResponse` parsing) is unchanged.
+- **Test suite: 1457 passed, 7 skipped** (no regressions from the wire-drift close; pre-fix the affected tests were passing on the wrong-shape mock responses).
+
+---
+
+## [0.14.8] - 2026-08-06
+
+Execution Graph v0 — additive sub-agent lineage. The backend landed `parent_execution_id` as an optional wire field on `/api/v1/gate` (backend commit `87fae759`, not pushed yet) so an SDK spawning a sub-agent can name the parent's `execution_id`. Backend validates ownership against the parent's `execution:{id}` Redis binding (mirrors the `/cancel` ownership check) and rejects cross-org / cross-key / not-found with `403 PARENT_EXECUTION_*`. This release ships the SDK-side forward path, the matching capability flag, and the three-way error-code mapping. Wire change is strictly additive (omitted when `None`); no SDK_MIN_VERSION bump.
+
+### Added
+
+- **`parent_execution_id` on `/check` (gate)** — `Transport.check(check_request=...)` forwards the optional `parent_execution_id` field from `check_request` onto the wire when the caller passes a non-None string. Omitted entirely when absent or explicitly `None`, so legacy / single-shot callers keep the previous payload shape. Mirrors the additive forward pattern used by `chain_id` / `tool_arguments` / `idempotency_key` at `src/nullrun/transport.py:1607-1626`. Sub-agent SDKs stamp the field manually from a caller-supplied UUID; auto-injection from a "current execution_id" contextvar is deferred (v0 is intentionally caller-owned).
+- **`execution_graph` capability flag** — `parse_capabilities` reads the new `execution_graph: bool` from `/api/v1/capabilities` (nested under `capabilities:` with top-level fallback for pre-1.0.0 backends). `ServerCapabilities.execution_graph` exposes the flag so SDKs can probe whether the deployment supports sub-agent lineage before sending the field. Pre-Graph backends silently ignore unknown fields, but the probe lets SDKs surface a clean diagnostic at `init()` rather than a 400 on the first call.
+- **`NullRunChainError.parent_execution_id`** — the chain error class gains an optional `parent_execution_id: str | None = None` constructor kwarg (mirroring the existing `chain_id` kwarg at `breaker/exceptions.py:425`). When the backend rejects a sub-agent call with `PARENT_EXECUTION_*`, the offending parent id is preserved on the exception so cookbook code can log / surface it without re-parsing the message string.
+
+### Changed
+
+- **Three new error codes mapped to `NullRunChainError`** — `PARENT_EXECUTION_NOT_FOUND`, `PARENT_EXECUTION_ORG_MISMATCH`, `PARENT_EXECUTION_KEY_MISMATCH` (all 403) are added to `_V3_ERROR_CODE_MAP` at `src/nullrun/transport.py:2675-2685`. Mapped to `NullRunChainError` (not a new class) because the diagnostic profile is identical to `CHAIN_CROSS_ORG` / `CHAIN_ORG_MISMATCH` — 403-class security errors with `(org_id, api_key_id)` ownership semantics. Diagnostic clarity wins over a new exception class per CLAUDE.md §13 philosophy.
+
+### Tests
+
+- `tests/test_transport.py::TestParentExecutionIdForwarding` — 3 new tests: `test_check_forwards_parent_execution_id_when_present` (round-trips from `check_request` → wire JSON), `test_check_omits_parent_execution_id_when_absent` (legacy / single-shot callers keep the old payload shape), `test_check_omits_parent_execution_id_when_none_explicit` (explicit `None` is treated as "no parent" / single-shot).
+
+### Compatibility
+
+- **Backward-compatible additive wire change.** Pre-Execution-Graph SDKs that never set `parent_execution_id` continue to work unchanged — the field is omitted entirely from the wire.
+- **Backward-compatible capability flag.** Pre-Graph backends return `execution_graph: false` (or omit the field entirely); the SDK treats both as "don't send the parent field". `is_v3_ready()` is unchanged — the flag is informational, not a hard gate.
+- **Backward-compatible exception class.** `NullRunChainError` gains a kwarg with a default; the existing 4-arg call sites (CHAIN_MAX_DURATION_EXCEEDED, CHAIN_CROSS_ORG, CHAIN_ORG_MISMATCH, CHAIN_NOT_FOUND/EXPIRED) continue to work unchanged.
+- No on-wire change for legacy callers. No SDK_MIN_VERSION bump. The `parent_execution_id` field is omitted on the wire whenever the caller does not pass it explicitly.
+
+### Refs
+
+- Backend commit `87fae759` (not pushed; awaiting local review + push authorisation). Additive wire contract at `backend/src/proxy/http/gate/schemas.rs:62-73`; ownership validation at `backend/src/proxy/http/gate/internal.rs` (lifts `parent_execution_id` parsing before the validation block + persistence call site); migration 266 adds `execution_records.parent_execution_id` + partial index for graph queries (Tasks #11-14, not in v0).
+
+---
+
 ## [0.14.7] - 2026-08-04
 
 Init contract hardening — strip leading and trailing whitespace from `api_key` (and the `NULLRUN_API_KEY` env fallback) BEFORE the truthiness check in `nullrun.init()` and `NullRunRuntime.__init__`. Pre-fix, whitespace-only strings (`"   "`, `"\t"`, `"\n"`) are TRUTHY in Python and silently slipped past the empty-key guard; they were stored on the runtime and reached the gateway as a malformed `Authorization: Bearer   ***` header, surfacing as a backend 401 only on the first `/gate` call rather than at startup.

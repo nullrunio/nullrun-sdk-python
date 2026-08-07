@@ -346,7 +346,7 @@ class TestEnforceSensitiveToolFailClosed:
 class TestProtectCallsControlPlaneFirst:
     @pytest.mark.skip(
         reason=(
-            "Round 3 (Phase 0.4.0): @protect unifies WorkflowKilledInterrupt "
+            "@protect unifies WorkflowKilledInterrupt "
             "into NullRunBlockedException at the decorator boundary. This test "
             "expects the original WorkflowKilledInterrupt type, which is the "
             "direct-call contract preserved by check_workflow_budget(). Both "
@@ -412,7 +412,7 @@ class TestProtectCallsControlPlaneFirst:
 
     @pytest.mark.skip(
         reason=(
-            "Round 3 (Phase 0.4.0): @protect unifies WorkflowKilledInterrupt "
+            "@protect unifies WorkflowKilledInterrupt "
             "into NullRunBlockedException. This test asserts span_end is emitted "
             "with the original WorkflowKilledInterrupt type, but the decorator "
             "now raises NullRunBlockedException. Re-enable when span_end payload "
@@ -462,7 +462,7 @@ class TestProtectCallsControlPlaneFirst:
 class TestTransportClassification:
     @pytest.mark.skip(
         reason=(
-            "Round 3 (Phase 0.4.0): Transport.check() now requires "
+            "Transport.check() now requires "
             'on_transport_error="raise" to surface classified errors '
             "(preserves legacy fail-OPEN behaviour by default so "
             "check_workflow_budget can treat network errors as transient). "

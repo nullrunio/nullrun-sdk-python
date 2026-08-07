@@ -186,13 +186,13 @@ class ActionHandler:
         try:
             action_type = ActionType(action.lower())
         except ValueError:
-            # Sprint 1.5 (B14): pre-fix this degraded silently to
-            # ``ActionType.BLOCK`` and triggered ``_default_block``
-            # which raises ``NullRunBlockedException``. That made
-            # the SDK into a DoS amplifier: a single malformed
-            # ``action`` from the server (or a MITM, or a server
-            # schema regression) would block every subsequent tool
-            # call in the workflow with no actionable error.
+            # Pre-fix this degraded silently to ``ActionType.BLOCK``
+            # (B14) and triggered ``_default_block`` which raises
+            # ``NullRunBlockedException``. That made the SDK into a
+            # DoS amplifier: a single malformed ``action`` from the
+            # server (or a MITM, or a server schema regression)
+            # would block every subsequent tool call in the workflow
+            # with no actionable error.
             #
             # Post-fix: log at ERROR, record the event for forensic
             # visibility, and DO NOT invoke any handler. The

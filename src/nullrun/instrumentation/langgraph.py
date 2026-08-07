@@ -157,7 +157,7 @@ def extract_usage_from_response(response: Any, provider: str, model: str) -> dic
     Returns raw usage dict - backend will normalize and compute cost.
     SDK does NOT compute cost - this is intentional (backend is source of truth).
 
-    Phase 4.1: also extracts cache_read_tokens, cache_write_tokens
+    Also extracts cache_read_tokens, cache_write_tokens,
     reasoning_tokens, finish_reason, and tool_names so the backend's
     gate/budget/loop detection can see them as first-class columns.
     Fields are best-effort — different LangChain providers expose
@@ -302,8 +302,8 @@ def extract_usage_from_response(response: Any, provider: str, model: str) -> dic
         # Final response should have usage_metadata
         pass
 
-    # Phase 4.1: extract the second-tier fields the backend gate/budget
-    # loop detection now needs. We pull from the same response object
+    # Extract the second-tier fields the backend gate/budget loop
+    # detection now needs. We pull from the same response object
     # LangChain already loaded — no extra HTTP, no schema surprise.
     # All five fields are best-effort: any provider that doesn't expose
     # them simply leaves the default value (0 / None / []).
@@ -645,8 +645,8 @@ class NullRunCallback(BaseCallbackHandler):
                     pass
 
             # Build event with RAW usage data (no cost computation in SDK!)
-            # Phase 4.1: lift cache / reasoning / finish / tool names out
-            # of raw_usage onto the event itself, mirroring the httpx
+            # Lift cache / reasoning / finish / tool names out of
+            # raw_usage onto the event itself, mirroring the httpx
             # transport shape so the dedup key space stays unified.
             # 0.9.0: tag metadata.tracked based on whether the model
             # extraction produced a real value (not the literal

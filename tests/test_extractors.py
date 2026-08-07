@@ -566,16 +566,16 @@ def test_provider_table_covers_seven_hosts():
 
 
 # ---------------------------------------------------------------------------
-# Phase 4.1: new fields (cache / reasoning / finish / tool_names) and
+# New fields (cache / reasoning / finish / tool_names) and
 # the privacy boundary that strips them at the wire.
 # ---------------------------------------------------------------------------
 
 
 def test_openai_no_tool_calls_returns_empty_list():
     """A response without tool_calls must not break the extractor — we
-    get an empty list and a normalized finish_reason. Pre-Phase-4.1
-    this would have KeyError'd on `tool_calls` because the loop
-    iterated over None."""
+    get an empty list and a normalized finish_reason. Before these
+    extractor additions this would have KeyError'd on `tool_calls`
+    because the loop iterated over None."""
     body = json.dumps(
         {
             "choices": [

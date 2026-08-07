@@ -1,5 +1,5 @@
 """
-Tests for `@protect` with automatic span hierarchy (Phase 2 Commit 4).
+Tests for `@protect` with automatic span hierarchy.
 
 The decorator must:
   - Create a root span (parent_span_id=None, depth=0) on the outermost call
