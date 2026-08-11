@@ -1,3 +1,33 @@
+## [0.14.10] - 2026-08-11
+
+Sprint 5 internal cleanup — no behavioural change, no SDK_MIN_VERSION bump, no wire-format change. Three release-blocks of dead code, dedup, and developer-experience hygiene. Backward-compatible patch.
+
+### Removed
+
+- **Dead code in `src/nullrun/`** — `extractor._cached_signature` + `compute_impact_digest` + unused imports; duplicate `compute_hmac_signature` / `verify_hmac_signature` in `transport_websocket` (re-exported from `transport`); `_singleton.install_module_proxy`; `_registry.replace_for_test`; `context.set_trace_id` / `reset_trace_id` / `clear_trace_id`; `runtime._start_transport` / `_trigger_action` / `get_org_status` / `_workflow_start_time`. 383 lines deleted across 6 files.
+- **`Makefile run-example` target** — referenced `examples/basic.py` deleted in 0.3.1 with the gRPC transport. Local smoke testing now goes through `make smoke-test`.
+- **CHANGELOG WIP `[0.10.0]` stub** + 13 `_(Trimmed; see git log X.Y.Z)_` placeholders. Net -29 lines.
+
+### Changed
+
+- **Sync/async transport dedup** — `NullRunSyncTransport` and `NullRunAsyncTransport` now share `_rebuild_response` (byte-identical rebuild path) and `_build_llm_call_event` (shared event-dict so the dedup fingerprint stays identical across sync + async httpx paths). 177 tests pass unchanged.
+- **`@protect` sync/async wrapper dedup** — both paths now share a `_protect_body` context manager for the four pre-execution gates. Sync path keeps `unify_block=True` (kill/pause → `NullRunBlockedException`); async path keeps `unify_block=False` (propagates `WorkflowKilledInterrupt` so `asyncio` cancellation works). 114 tests pass.
+- **LangChain usage extraction dedup** — `extract_usage_from_response` collapsed from 5 sequential `if` branches into a single `_read_token_attrs` + `_apply_usage` helper loop. 42 tests pass.
+- **Decorator chain-walk dedup** — `_stamp_extractor_on_innermost` + `_find_extractor_in_chain` consolidated behind a `_walk_wrapped_chain` generator with a 32-hop cycle guard.
+- **`Makefile coverage` target** — was `coverage run -m pytest tests/` (only traced xdist coordinator → 0-hit uploads); now `pytest tests/ --cov=src/nullrun --cov-branch --cov-report=xml:coverage.xml`, matching `.github/workflows/ci.yml:82`.
+
+### Added
+
+- **9 missing error-code docs** in `docs/errors/`: `NR-A004` (approval flow anomaly), `NR-B003` (sensitive-tool impact extractor failure), `NR-C000` (generic config default), `NR-C004` (status before init), `NR-CH001` (chain context invalid), `NR-O001` (overbudget on consume), `NR-P001` (wire-protocol version mismatch), `NR-R002` (aggregate-rate-limiter Redis outage), `NR-W004` (workflow soft-deleted). Three new catalogue categories: **P**rotocol, **Ch**ain, **O**verbudget.
+
+### Fixed
+
+- **CHANGELOG sort order** — release blocks now strictly descending by version (was `0.9.1 → 0.11.0 → 0.9.0`; now `0.11.0 → 0.9.1 → 0.9.0`. Lower section was `0.3.1 → 0.5.2 → 0.4.0`; now `0.5.2 → 0.4.0 → 0.3.1`).
+
+_Tests: 1334 pass, 2 skip (pre-existing); 23/23 exception hierarchy pass._
+
+_Compatibility:_ **No SDK_MIN_VERSION bump.** Strictly internal cleanup; no public API change, no wire-format change, no behavioural change. Drop-in replacement for 0.14.9.
+
 ## [0.14.9] - 2026-08-07
 
 v3.38 wire-drift close — three real contract bugs that diverged from backend source code. Verified against `backend/src/proxy/http/protocol.rs`, `backend/src/proxy/middleware/auth.rs`, and CLAUDE.md §5 / §13 — not against comments or documentation. No SDK_MIN_VERSION bump. No on-wire change (backend already shipped the matching wire shape; this SDK release closes the consumer side).

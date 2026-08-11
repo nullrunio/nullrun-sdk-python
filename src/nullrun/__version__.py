@@ -5,5 +5,5 @@ this module is the single source of truth for the runtime version
 string and the SDK_MIN_VERSION constant.
 """
 
-__version__ = "0.14.9"
+__version__ = "0.14.10"
 __platform_version__ = "1.0.0"
