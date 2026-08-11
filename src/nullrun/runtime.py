@@ -839,11 +839,31 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
 
                 logger.info(f"Authenticated: organization_id={self.organization_id}")
             else:
-                # Auth failed - raise exception instead of silent fallback
-                err = NullRunAuthenticationError(
-                    f"Auth failed with status {response.status_code}. "
-                    f"API key may be invalid or expired. Not operating in unsafe mode.",
-                    error_code=("NR-A003" if response.status_code == 401 else "NR-A001"),
+                # Auth did not return 200. Route through the canonical
+                # envelope parser (transport._parse_v3_error_envelope)
+                # so /auth/verify uses the same dispatch table as
+                # /check and /track — previously the auth path open-
+                # coded a blanket NullRunAuthenticationError with
+                # NR-A001, which misclassified 5xx as auth failures
+                # and misled operators to rotate valid keys during
+                # backend outages (DEF-ERRHDL-AUTH-PATH-CODE-PIN-01,
+                # RUN_ID 20260811-1).
+                #
+                # Mapping after the fix:
+                #   401  -> NullRunAuthError (NR-A003, wire_code=
+                #          API_KEY_REVOKED/EXPIRED/DISABLED/INVALID
+                #          per v3.38) — subclass of
+                #          NullRunAuthenticationError, so existing
+                #          ``except NullRunAuthenticationError``
+                #          clauses still catch it.
+                #   5xx  -> NullRunBackendError (NR-B002, retryable).
+                #   429  -> RateLimitError (NR-R001).
+                #   other -> NullRunBackendError with status_code set.
+                from nullrun.transport import _parse_v3_error_envelope
+
+                err = _parse_v3_error_envelope(
+                    response,
+                    endpoint="/api/v1/auth/verify",
                 )
                 self._emit_sdk_error(
                     err,

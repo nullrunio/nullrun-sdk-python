@@ -899,6 +899,77 @@ def test_authenticate_non_200_raises():
         rt._authenticate()
 
 
+@pytest.mark.parametrize("status_code", [500, 502, 503, 504])
+def test_authenticate_5xx_raises_backend_error_not_auth_error(status_code):
+    """Regression for DEF-ERRHDL-AUTH-PATH-CODE-PIN-01 (RUN_ID 20260811-1).
+
+    Previously, /auth/verify 5xx was misclassified as
+    NullRunAuthenticationError (NR-A001), misleading operators to
+    rotate valid keys during backend outages. After the fix the
+    canonical envelope parser routes 5xx to NullRunBackendError
+    (NR-B002, retryable), matching /check and /track.
+    """
+    from nullrun.breaker.exceptions import (
+        NullRunAuthenticationError,
+        NullRunBackendError,
+    )
+
+    rt = _make_runtime_with_mocked_auth()
+    fake_response = MagicMock()
+    fake_response.status_code = status_code
+    fake_response.json.return_value = {}
+    fake_response.headers = {}
+    rt._transport._client.post.return_value = fake_response
+
+    with pytest.raises(NullRunBackendError) as exc_info:
+        rt._authenticate()
+
+    assert exc_info.value.error_code == "NR-B002"
+    # status_code is forwarded as a detail kwarg (see
+    # NullRunTransportError.__init__) — same convention as
+    # tests/test_transport.py::test_parse_error_envelope_5xx_raises_gateway_error.
+    assert exc_info.value.details.get("status_code") == status_code
+    assert not isinstance(exc_info.value, NullRunAuthenticationError) or isinstance(
+        exc_info.value, NullRunBackendError
+    ), (
+        "5xx must not surface as NullRunAuthenticationError — that's the "
+        "DEF-ERRHDL-AUTH-PATH-CODE-PIN-01 misclassification the fix closes."
+    )
+
+
+def test_authenticate_401_with_wire_envelope_surfaces_wire_code():
+    """Regression for DEF-ERRHDL-AUTH-PATH-CODE-PIN-01 / v3.38 close.
+
+    /auth/verify 401 with a wire envelope carrying
+    ``error_code: "API_KEY_REVOKED"`` should surface as
+    NullRunAuthError with ``wire_code`` set so callers can branch
+    on granular lifecycle state without clobbering the SDK-side
+    error_code taxonomy.
+    """
+    from nullrun.breaker.exceptions import (
+        NullRunAuthError,
+        NullRunAuthenticationError,
+    )
+
+    rt = _make_runtime_with_mocked_auth()
+    fake_response = MagicMock()
+    fake_response.status_code = 401
+    fake_response.json.return_value = {
+        "error_code": "API_KEY_REVOKED",
+        "error_message": "API key revoked by operator.",
+        "details": {},
+    }
+    fake_response.headers = {}
+    rt._transport._client.post.return_value = fake_response
+
+    with pytest.raises(NullRunAuthError) as exc_info:
+        rt._authenticate()
+
+    # Existing ``except NullRunAuthenticationError`` clauses still match.
+    assert isinstance(exc_info.value, NullRunAuthenticationError)
+    assert exc_info.value.wire_code == "API_KEY_REVOKED"
+
+
 def test_authenticate_network_error_raises():
     import httpx
 
