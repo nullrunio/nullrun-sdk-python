@@ -264,43 +264,6 @@ Server-minted execution_id default ON. Per CLAUDE.md section 24, every /check no
 - __version__ bumped from 0.11.0 to 0.12.0.
 
 
-## [0.9.1] - 2026-06-29
-
-### Added
-
-- `nullrun.uuid7` module - RFC 9562 section 5.7 time-ordered ID generator. Used internally for trace_id and span IDs.
-- `nullrun.capabilities` module - probe_capabilities(), parse_capabilities(), validate_sdk_version(). Wired into nullrun.init().
-
-### Changed
-
-- __version__ bumped from 0.11.0 to 0.12.0.
-
-Patch on top of 0.9.0. Unifies the LLM-call fingerprint scheme so the
-dedup LRU at `runtime.track()` can collapse sibling emissions from the
-httpx transport and the LangChain callback for the same real call.
-
-### Fixed
-
-- **Double-emission of llm_call events.** Pre-0.9.1 the httpx transport
-  (`NullRunSyncTransport._emit`) and the LangChain callback
-  (`NullRunCallback.on_llm_end`) each computed their own `_fingerprint`
-  from different inputs — `sha256(host|status|body)` vs
-  `sha256(json({path:"langchain_callback", run_id, response_id, model,
-  provider, invocation_params}))`. The two fingerprints never
-  collided, so the dedup LRU at `runtime.track()` could not collapse
-  the two emissions for the same call. On a typical `app.invoke()`
-  with 6 LLM calls the backend saw ~12 `llm_call` events on the wire
-  (2 per real call), doubling `llm_call_count` and skewing
-  `cost_events` aggregates.
-
-  Post-fix both observers call the same helper
-  `_fingerprint_for_llm_call(model, provider, response_id)` with the
-  three signals reachable from every observation path:
-  - httpx transport reads `model` and `id` straight out of the
-    OpenAI-style response body (`payload["model"]`,
-    `payload["id"]`). `_openai_extractor` now also carries `"id"` on
-
-_(Trimmed; see git log 0.9.1 for full change set.)_
 ## [0.11.0] - 2026-07-02
 
 Wire-protocol v3 alignment with the backend's Sprint 6 v1 cut
@@ -337,12 +300,42 @@ cancel / budget-estimate surface.
   replacement for `/gate`. Adds three optional wire fields
   (CLAUDE.md §16):
 
-_(Trimmed; see git log 0.11.0 for full change set.)_
-## [0.10.0] - 2026-06-29
 
-(Unreleased — work-in-progress; will be backfilled once 0.11.0
-ships.)
+## [0.9.1] - 2026-06-29
 
+### Added
+
+- `nullrun.uuid7` module - RFC 9562 section 5.7 time-ordered ID generator. Used internally for trace_id and span IDs.
+- `nullrun.capabilities` module - probe_capabilities(), parse_capabilities(), validate_sdk_version(). Wired into nullrun.init().
+
+### Changed
+
+- __version__ bumped from 0.11.0 to 0.12.0.
+
+Patch on top of 0.9.0. Unifies the LLM-call fingerprint scheme so the
+dedup LRU at `runtime.track()` can collapse sibling emissions from the
+httpx transport and the LangChain callback for the same real call.
+
+### Fixed
+
+- **Double-emission of llm_call events.** Pre-0.9.1 the httpx transport
+  (`NullRunSyncTransport._emit`) and the LangChain callback
+  (`NullRunCallback.on_llm_end`) each computed their own `_fingerprint`
+  from different inputs — `sha256(host|status|body)` vs
+  `sha256(json({path:"langchain_callback", run_id, response_id, model,
+  provider, invocation_params}))`. The two fingerprints never
+  collided, so the dedup LRU at `runtime.track()` could not collapse
+  the two emissions for the same call. On a typical `app.invoke()`
+  with 6 LLM calls the backend saw ~12 `llm_call` events on the wire
+  (2 per real call), doubling `llm_call_count` and skewing
+  `cost_events` aggregates.
+
+  Post-fix both observers call the same helper
+  `_fingerprint_for_llm_call(model, provider, response_id)` with the
+  three signals reachable from every observation path:
+  - httpx transport reads `model` and `id` straight out of the
+    OpenAI-style response body (`payload["model"]`,
+    `payload["id"]`).
 
 ## [0.9.0] - 2026-06-29
 
@@ -413,8 +406,6 @@ reach. Promotes the missing-model wire failure from WARN to fail-LOUD.
   sent (not fail-CLOSED) so the backend can audit; the flag is
   wire-private and stripped before persisting. Activated only for
   `llm_call`; other event types are silent.
-
-_(Trimmed; see git log 0.8.3 for full change set.)_
 ## [0.8.2] - 2026-06-29
 
 Additive patch on top of 0.8.0. No public-API break. Continues the
@@ -480,8 +471,6 @@ payload hygiene.
   stopped forwarding `invocation_params` to `on_llm_end`, every
   LangChain-callback track event carried `model="unknown"` and
   the backend cost pipeline fell through to `DEFAULT_RATE`. The
-
-_(Trimmed; see git log 0.8.0 for full change set.)_
 ## [0.7.8] - 2026-06-28
 
 Additive patch on top of 0.7.7. Converts two silent fail-OPEN footguns
@@ -535,8 +524,6 @@ default to `None` / empty so existing call sites keep working.
     Backend matches each against the workflow's effective
     `blocked_tools` aggregate and returns `block` on any match.
     `None` leaves whatever was previously set; `[]` clears.
-
-_(Trimmed; see git log 0.7.7 for full change set.)_
 ## [0.7.6] - 2026-06-27
 
 Additive patch on top of the 0.7.0 thin-client refactor. Brings a
@@ -572,8 +559,6 @@ small transport consistency fixes. No breaking changes.
     "category": "decision"
   }
   ```
-
-_(Trimmed; see git log 0.7.6 for full change set.)_
 ## [0.7.0] - 2026-06-26
 
 ### BREAKING CHANGES
@@ -609,8 +594,6 @@ enforcement, its dataclass, and its hardcoded thresholds are removed.
   init)
 - WS `on_policy_invalidated` callback (no local policy to invalidate)
 
-
-_(Trimmed; see git log 0.7.0 for full change set.)_
 ## [0.6.1] — 2026-06-24
 
 Additive release — Layers 1, 2, and 3 of the "give the user a chance"
@@ -646,8 +629,6 @@ of parsing the message string.
   the existing user-facing class, so existing `except` clauses
   keep matching):
 
-
-_(Trimmed; see git log 0.6.1 for full change set.)_
 ## [0.6.0] — 2026-06-23
 
 Hardening pass driven by the 2026-06-22 SDK↔backend integration audit.
@@ -683,45 +664,6 @@ jumped from ~76% to **84.59%** (branch = true).
 
 - **Policy fetch is now fail-CLOSED (F-R2-02).** Pre-fix, any HTTP
   exception, non-200 status, or empty `{"data": []}` response silently
-
-_(Trimmed; see git log 0.6.0 for full change set.)_
-## [0.3.1] — 2026-06-17
-
-Production-readiness hardening. No public-API changes; the curated 6-symbol
-surface is unchanged. Aligns the SDK with the contracts in
-`NULLRUN/docs/adr/008-sdk-preflight-fail-policy.md` and
-`NULLRUN/docs/kill-contract.md`.
-
-- **gRPC transport code path removed.** `create_grpc_transport` was
-  referenced but never defined, so setting `NULLRUN_USE_GRPC=1` raised
-  `NameError` at init. The gRPC server at the platform is intentionally
-  frozen until the activation checklist (TLS, auth, proto extensions,
-  cost pipeline parity, tests) is complete. The SDK now logs an
-  INFO line on `NULLRUN_USE_GRPC=1` and silently falls back to
-  HTTP. The `grpcio` hard dependency has been dropped from
-  `pyproject.toml`. If/when gRPC is unblocked, the SDK will add it back
-  as a separate optional extra.
-- **`InsecureTransportError` URL check hardened.** Replaced the
-  `startswith("http://127.0.0.1")` chain with a `urllib.parse.urlparse`
-  + `ipaddress.ip_address` check. The previous check let
-  `http://127.0.0.1.attacker.com` and `http://localhost.evil.com`
-  through (homograph attacks) and rejected `http://[::1]:8080`
-  (IPv6 loopback). The new check allows the full `127.0.0.0/8`
-  IPv4 loopback range, `::1`, and `localhost` (case-insensitive).
-- **`signal.signal` global hijack removed.** `Transport.__init__` no
-  longer installs a process-wide `SIGTERM` / `SIGINT` handler
-  that called `sys.exit(0)` from inside the signal context.
-  The fix contract was already pinned in `tests/test_signal_safety.py`
-  and is now applied to the source.
-- **`atexit.register` replaced with `weakref.finalize`.** The
-  per-Transport `atexit` chain was growing without bound in
-  long-running deployments; weakref finalizers only fire if the
-  transport is still alive at process exit.
-- **`Transport` is now a context manager.** `with Transport(...) as t:`
-  starts the flush thread on enter and stops it on exit. Replaces
-  the manual `start() / stop()` pair that was easy to forget.
-
-_(Trimmed; see git log 0.3.1 for full change set.)_
 ## [0.5.2] — 2026-06-19
 
 This release bundles the Sprint 2.5 production-readiness hardening
@@ -757,8 +699,6 @@ exactly once.
 
   **Outgoing WebSocket ACK is plain JSON, not signed.** Earlier
   documentation overstated this — `transport_websocket._send_ack`
-
-_(Trimmed; see git log 0.5.2 for full change set.)_
 ## [0.4.0] — 2026-06-17
 
 Production-readiness release. Resolves all BLOCKER + HIGH + MEDIUM + LOW
@@ -794,8 +734,41 @@ line.
   now defined in `auto.py`. The whole module imports cleanly and the
   coverage dashboard counter is reachable.
 - **`auto_instrument()` now calls `patch_requests`.** The `requests`
+## [0.3.1] — 2026-06-17
 
-_(Trimmed; see git log 0.4.0 for full change set.)_
+Production-readiness hardening. No public-API changes; the curated 6-symbol
+surface is unchanged. Aligns the SDK with the contracts in
+`NULLRUN/docs/adr/008-sdk-preflight-fail-policy.md` and
+`NULLRUN/docs/kill-contract.md`.
+
+- **gRPC transport code path removed.** `create_grpc_transport` was
+  referenced but never defined, so setting `NULLRUN_USE_GRPC=1` raised
+  `NameError` at init. The gRPC server at the platform is intentionally
+  frozen until the activation checklist (TLS, auth, proto extensions,
+  cost pipeline parity, tests) is complete. The SDK now logs an
+  INFO line on `NULLRUN_USE_GRPC=1` and silently falls back to
+  HTTP. The `grpcio` hard dependency has been dropped from
+  `pyproject.toml`. If/when gRPC is unblocked, the SDK will add it back
+  as a separate optional extra.
+- **`InsecureTransportError` URL check hardened.** Replaced the
+  `startswith("http://127.0.0.1")` chain with a `urllib.parse.urlparse`
+  + `ipaddress.ip_address` check. The previous check let
+  `http://127.0.0.1.attacker.com` and `http://localhost.evil.com`
+  through (homograph attacks) and rejected `http://[::1]:8080`
+  (IPv6 loopback). The new check allows the full `127.0.0.0/8`
+  IPv4 loopback range, `::1`, and `localhost` (case-insensitive).
+- **`signal.signal` global hijack removed.** `Transport.__init__` no
+  longer installs a process-wide `SIGTERM` / `SIGINT` handler
+  that called `sys.exit(0)` from inside the signal context.
+  The fix contract was already pinned in `tests/test_signal_safety.py`
+  and is now applied to the source.
+- **`atexit.register` replaced with `weakref.finalize`.** The
+  per-Transport `atexit` chain was growing without bound in
+  long-running deployments; weakref finalizers only fire if the
+  transport is still alive at process exit.
+- **`Transport` is now a context manager.** `with Transport(...) as t:`
+  starts the flush thread on enter and stops it on exit. Replaces
+  the manual `start() / stop()` pair that was easy to forget.
 ## [0.3.0] — 2026-06-15
 
 ### Breaking
@@ -831,8 +804,6 @@ _(Trimmed; see git log 0.4.0 for full change set.)_
   (`from nullrun.runtime import Policy`,
   `from nullrun.transport import FallbackMode, PoolConfig`) remain
   available. Audited for 0 external callers.
-
-_(Trimmed; see git log 0.3.0 for full change set.)_
 ## [0.1.1] — 2026-05-20
 
 ### Fixed
