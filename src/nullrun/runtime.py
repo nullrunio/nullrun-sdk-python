@@ -24,36 +24,12 @@ the authoritative table; deviations require an ADR amendment (Rule 5).
 | `_emit_span_start` / `_emit_span_end` | n/a -- never blocks | n/a | n/a |
 | `/track` batch path (legacy) | OPEN-on-network-error (event dropped, no retry) | n/a -- circuit breaker backoff applies | none |
 
-**Readme correction (2026-07-04):** the SDK_README.md claim
-"Fail-OPEN на инфраструктурных сбоях. Если backend недоступен, бюджет
-не блокирует агента" is **partially wrong** — it conflates SDK-side
-transport failure with backend-side budget-enforcement failure. The
-honest split is:
-
-* **SDK-side transport failure** (network timeout, 5xx, breaker open)
-  → fail-OPEN on the *check* path so a dead backend doesn't freeze
-  the user's agent loop (this is what the README describes).
-* **Backend-side budget-enforcement failure** (the /gate or /track
-  handler actually returned a wire response, just one indicating a
-  Redis outage or aggregate rate-limit Redis unavailable) → the
-  wire response is what it is, and the SDK raises the corresponding
-  exception. ``BUDGET_REDIS_UNAVAILABLE`` → 402 ``NullRunBudgetError``
-  (fail-CLOSED, the backend rejected the request because Redis was
-  unreachable for the budget counter — this is the authoritative
-  enforcement signal, not a transport blip). ``RATE_LIMIT_REDIS_UNAVAILABLE``
-  → 503 ``NullRunRateLimitRedisError`` (fail-CLOSED for the same
-  reason). The SDK does NOT silently fall-OPEN on a wire 4xx/5xx
-  that names an enforcement failure.
-
-The table above is authoritative; if any of these change, the
-README claim must be updated in lockstep.
-
-The "Opt-out" column makes it explicit that `NULLRUN_SKIP_BUDGET_CHECK=1`
-is a **different category** of action than
-`NULLRUN_SENSITIVE_FAIL_OPEN=1` (bypass vs. change semantics), despite
-the similar naming. See `docs/adr/008-sdk-preflight-fail-policy.md`
-for the full rules, including transport error classification
-(`FALLBACK_NETWORK_ERROR` / `FALLBACK_GATEWAY_ERROR` / `FALLBACK_BREAKER_OPEN`).
+SDK-side transport failure (network timeout, 5xx, breaker open) is
+fail-OPEN on the *check* path so a dead backend does not freeze the
+user's agent loop. Backend-side enforcement failures (the wire
+returned `BUDGET_REDIS_UNAVAILABLE` / `RATE_LIMIT_REDIS_UNAVAILABLE`,
+etc.) are respected as fail-CLOSED wire responses. See
+`docs/adr/008-sdk-preflight-fail-policy.md` for the full rules.
 """
 
 import asyncio
@@ -137,7 +113,6 @@ def is_strict_mode_forced(tool_name: str) -> bool:
     return tool_name in _STRICT_MODE_FORCED
 
 
-# 2026-07-04 (v0.12.0 wiring fix — ):
 SERVER_MINTED_RESERVATION_MAX_AGE_SECONDS: float = 295.0
 
 # Hard cap on server-supplied approval_timeout_seconds. The
@@ -347,12 +322,9 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         self._debug = debug
         self._transport: Transport | None = None
 
-        # Local enforcement state
-        # The BoundedDict-based per-workflow cost / loop / retry
-        # counters have been removed alongside ``_check_local_limits``.
-        # As of 0.7.0 ALL local enforcement (LoopTracker / RateTracker
-        # / _local_check / hardcoded thresholds) has been removed --
-        # the SDK is a thin client, the backend is authoritative.
+        # Local enforcement is the backend's job as of 0.7.0; the SDK
+        # is a thin client. The BoundedDict / LoopTracker / RateTracker
+        # machinery has been removed alongside ``_check_local_limits``.
         self._workflow_start_time: float = time.time()
 
         # Layer 3: ring buffer for the ``nullrun.status `` recent
@@ -387,22 +359,12 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         self._states_lock = threading.RLock()
 
         # Human-approval pending registry. When a /gate response
-        # carries decision="require_approval",
-        # the SDK stores the (approval_id, workflow_id, execution_id)
-        # tuple here and blocks until either:
-        #   - the WS push arrives with outcome="approved" (release
-        #     the gate, resume from the same execution_id), or
-        #   - the WS push arrives with outcome="denied" (surface
-        #     WorkflowKilledInterrupt), or
-        #   - the per-approval timeout elapses (fall back to the
-        #     /status poll path; emit a warning so the operator
-        #     knows WS push is silent).
-        #
+        # carries decision="require_approval", the SDK stores the
+        # (approval_id, workflow_id, execution_id) tuple here and
+        # blocks until the WS push resolves it (approved / denied)
+        # or the per-approval timeout falls back to the /status poll.
         # Keyed by approval_id because the WS push carries the
-        # approval id, not the execution id. The execution_id
-        # lets the SDK distinguish "approval for THIS gate call"
-        # from a stale pending approval for a different execution
-        # in the same workflow.
+        # approval id, not the execution id.
         self._approval_pending: dict[str, dict[str, Any]] = {}
         self._approval_lock = threading.RLock()
         # Default timeout for WS approval push. Set to None to
@@ -440,7 +402,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             ),
         )
 
-        # Note: a gRPC transport was prototyped in earlier SDK versions but the
+        # Reserved env-var for a future gRPC transport; fail loud if set.
         if os.getenv("NULLRUN_USE_GRPC"):
             raise RuntimeError(
                 "NULLRUN_USE_GRPC is set but the gRPC transport is not "
@@ -519,17 +481,9 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # register_sensitive_tools calls rebuild this snapshot.
         self._sensitive_tools_lower = frozenset(t.lower() for t in self._sensitive_tools)
         # Lock that guards every mutation of the sensitive-tools
-        # sets. Reads and writes to these sets are guarded so a
-        # concurrent reader cannot observe a mid-mutation snapshot
-        # on a free-threaded build. The lock is uncontended on the
-        # read path so the cost is one acquire per call.
-        # Under CPython's GIL the set mutation is atomic at the
-        # bytecode level, but the snapshot you read can still be
-        # stale mid-mutation (a single-threaded read can see the
-        # new value fine, but a multi-threaded read can race with
-        # a concurrent ``add`` if both interleave on a free-threaded
-        # build). The lock is uncontended on the read path so the
-        # cost is one acquire per call.
+        # sets so a concurrent reader cannot observe a mid-mutation
+        # snapshot on a free-threaded build. Uncontended on the read
+        # path so the cost is one acquire per call.
         self._tools_lock = threading.Lock()
 
         logger.info("NullRun Runtime initialized: mode=cloud")
@@ -746,12 +700,10 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         the hook) and AFTER the call-stack is built (so the
         ring buffer sees the resolved workflow_id).
 
-        Hot path: the no-hooks case is skipped via ``has_hooks ``
-        so the call cost when nobody is listening is one boolean
-        check + an attribute access on ``self`` (no allocation
-        no lock — the hook registry short-circuits inside
-        ``emit_error``). The Layer-3 ring-buffer push is ALWAYS
-        done — it is the no-instrumentation path to introspection.
+        Hot path: the no-hooks case is skipped via ``has_hooks`` so the
+        call cost when nobody is listening is a single boolean check.
+        The Layer-3 ring-buffer push is always done — it is the
+        no-instrumentation path to introspection.
         """
         from nullrun.observability.error_hooks import (
             ErrorContext,
@@ -1140,25 +1092,14 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
     def _fetch_remote_state(self, workflow_id: str) -> None:
         """Fetch remote state for a specific workflow.
 
-        2026-06-27: target endpoint swapped from
-        ``GET /api/v1/orgs/{org_id}/workflows/{workflow_id}`` (the
-        DASHBOARD route — requires Bearer session cookie, returns 401
-        to SDK clients that only send X-API-Key) to
-        ``GET /api/v1/status/{workflow_id}`` (the SDK-polling route —
-        backend/src/proxy/handlers.rs:9758, accepts X-API-Key OR
-        Authorization: Bearer). Pre-swap the HTTP-poll path silently
-        401'd on every poll, so the legacy HTTP-poll fallback never
-        observed a remote kill/pause. WS push (the default mode)
-        does NOT go through this code path, so the WS control plane
-        is unaffected.
+        Polls ``GET /api/v1/status/{workflow_id}`` (the SDK-polling route,
+        accepts X-API-Key OR Authorization: Bearer). WS push is the default
+        control-plane mode and does not go through this code path; the HTTP
+        poll here is the legacy fallback.
 
-        Backend ``StatusResponse`` (handlers.rs:9747-9756) returns
-        ``workflow_id, state, version, reason?, updated_at
-        current_cost, rate_per_minute``. We only consume ``state`` —
-        ``version`` and ``reason`` are SDK-local fields and remain at
-        their cached values (mirroring the prior behaviour). This is
-        sufficient for ``check_control_plane`` which only reads
-        ``state``.
+        Only the ``state`` field is consumed; ``version`` and ``reason``
+        remain at their cached values (SDK-local fields not on the wire),
+        which is sufficient for ``check_control_plane``.
         """
         try:
             response = self._transport._client.get(
@@ -1425,16 +1366,14 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             "allow" → return
 
         Fail-OPEN: any transport error (network, timeout, 5xx) is logged
-        at warning level and the caller proceeds. This mirrors the
-        pattern in `check_control_plane` -- a transient backend outage
-        must never freeze the user's agent. The /track fast path also
-        does not gate on budget, so the worst case under /gate failure
-        is that we revert to the pre-C behaviour: budget enforcement is
-        advisory until the gateway recovers.
+        at warning level and the caller proceeds. This mirrors
+        `check_control_plane` — a transient backend outage must never
+        freeze the user's agent. Under /gate failure we revert to the
+        pre-flight advisory state until the gateway recovers.
 
         Uses `estimated_tokens=1` (the minimum the API accepts). Goal
         is the binary question "is there any budget left?", not cost
-        prediction -- the backend recomputes the authoritative cost on
+        prediction — the backend recomputes the authoritative cost on
         /track from the real token count.
 
         Opt-out: set `NULLRUN_SKIP_BUDGET_CHECK=1` to disable the
@@ -1570,7 +1509,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 logger.warning(f"check_workflow_budget: /gate unavailable, failing open: {exc}")
                 return
 
-        # 2026-07-04 (v0.12.0 wiring fix — ):
+        # Capture the server-minted execution_id from the /check response.
         _capture_server_minted_execution_id(response)
 
         decision = response.get("decision", "allow")
@@ -1843,21 +1782,12 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         return self._transport.cancel(execution_id, reason=reason)
 
     def chain_end(self, chain_id: str) -> dict[str, Any]:
-        """Close a chain explicitly via /api/v1/chain/end
-        .
+        """Close a chain explicitly via /api/v1/chain/end.
 
-                Idempotent on the server — a no-op 200 for unknown
-                chain_ids is the documented success path. Prefer using the
-                ``with chain(...)`` contextmanager for normal flows; this
-                helper is for the case where the chain was opened in a
-                prior request and you need to close it from a different
-                one.
-
-                Args:
-                    chain_id: Chain to close.
-
-                Returns:
-                    Parsed JSON dict.
+        Idempotent on the server — a no-op 200 for unknown chain_ids
+        is the documented success path. Prefer ``with chain(...)`` for
+        normal flows; this helper is for closing a chain opened in a
+        prior request.
         """
         return self._transport.chain_end(chain_id)
 
@@ -1888,12 +1818,10 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
     def _auth_headers(self) -> dict[str, str]:
         """Get authentication headers.
 
-         the wire-protocol handshake header is
-        required on every signed POST. The three direct callers of
-        this helper — ``_post_auth_with_retry``, ``_fetch_remote_state``
-        and ``get_org_status`` — all go through the backend's protocol
-        middleware, so the header has to be present here rather than
-        at every call site.
+        The wire-protocol handshake header is required on every signed
+        POST, so the three direct callers (``_post_auth_with_retry``,
+        ``_fetch_remote_state``, ``get_org_status``) all go through
+        this helper instead of wiring the header at each call site.
         """
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -2023,18 +1951,13 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             self._remote_state_for(workflow_id)
 
         # The local cost / loop / retry-storm check
-        # (``_check_local_limits``) has been removed. It read
-        # ``event.get("cost_cents", 0)`` and accumulated into a
-        # per-workflow counter, but ``track_llm`` /
-        # ``track_tool`` / ``track_event`` never set ``cost_cents``
-        # (the SDK does not estimate cost -- the backend does). The
-        # local check therefore never fired for the public API
-        # and silently drifted from the backend's authoritative
-        # cost. The local loop / rate checks (``_local_check``)
-        # are independent and stay -- they do not depend on cost.
-        # Budget enforcement is now exclusively the backend's
-        # job: ``check_workflow_budget`` (pre-flight) + the
-        # server-side /track cost ledger reconciliation.
+        # (``_check_local_limits``) has been removed: per the
+        # ADR-008 split, the SDK does not estimate cost (the
+        # backend does), and the local check therefore never
+        # fired for the public API. Budget enforcement is the
+        # backend's job exclusively — ``check_workflow_budget``
+        # (pre-flight) plus the server-side /track cost ledger
+        # reconciliation.
 
         # Check remote control plane (after local enforcement)
         # This catches server-initiated pause/kill. Resolves
@@ -2471,22 +2394,13 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 else:
                     block_code, block_action = "NR-X001", "block"
                     block_cls = "NullRunBlockedException"
-            # Note: we still raise the base ``NullRunBlockedException``
-            # for non-budget/tool cases to keep the construction
-            # shape simple — the catalogue code is what the user
-            # reads, and they can branch on it via ``except
-            # NullRunBudgetError:`` for the budget case if they need
-            # to handle it specifically. We could instantiate the
-            # subclass per branch above; keeping one raise here is
-            # easier to reason about and matches the way the rest of
-            # the codebase handles backend blocks.
-            #
-            # ``details`` carries the wire ``details`` payload so the
-            # caller can introspect ``exc.details["error_code"]`` and
-            # ``exc.details["decision_source"]`` for diagnostic
-            # routing. ``mapped_class`` is preserved as a backwards-
-            # compat shim for callers that branched on the keyword
-            # path; new code should branch on ``exc.error_code``.
+            # We raise the base ``NullRunBlockedException`` for non-budget / non-tool
+            # cases so the construction shape stays simple. The user-facing
+            # ``error_code`` is what callers branch on (e.g. ``except
+            # NullRunBudgetError:`` for the budget case). ``details`` carries
+            # the wire payload so callers can introspect ``error_code`` and
+            # ``decision_source``; ``mapped_class`` is a back-compat shim for
+            # legacy callers that branched on the keyword path.
             merged_details = dict(wire_details)
             merged_details["mapped_class"] = block_cls
             err = NullRunBlockedException(
@@ -2547,7 +2461,8 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             if attempt_index > 0:  # Only add if not default (first attempt)
                 enriched["attempt_index"] = attempt_index
 
-        # 2026-07-04 (v0.12.0 wiring fix — ):
+        # Re-use the server-minted execution_id from /check when the
+        # caller didn't supply one explicitly.
         if "execution_id" not in enriched:
             import time as _time
 
@@ -2613,42 +2528,21 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         return enriched
 
     def _route_track(self, wire_event: dict[str, Any]) -> None:
-        """Route a tracked event to v3 single-event /track or
-               legacy batch /track/batch.
+        """Route a tracked event to v3 single-event /track or legacy batch /track/batch.
 
-               Why this exists
-               ---------------
-               Pre-0.12.0 wiring the SDK always called
-               ``self._transport.track(wire_event)`` which posts to the
-               legacy ``/api/v1/track/batch`` (the ``process_span_event``
-               pipeline). That pipeline reads the org's lifetime
-               ``monthly_cost`` counter — drift with the dashboard's
-               period-bound ``bp:{ts}:cost_cents`` per G1
-               and never exercises v3 ``consume_budget_v3`` so the
-               consume ≤ reserve + ε invariant is never validated.
+        Events with a paired ``/check`` reservation (currently ``llm_call``)
+        go through ``track_single`` so the backend's ``consume_budget_v3``
+        can validate the consume ≤ reserve invariant. Span / heartbeat /
+        tool events have no reservation and continue to ride the batch
+        path.
 
-               The fix: route events that have a paired ``/check``
-               reservation (currently: ``llm_call``) to
-               ``track_single`` which posts to ``/api/v1/track``. The
-               backend's consume takes the server-minted execution_id
-               from the request, looks up
-               ``reservation:{execution_id}`` and runs the invariant.
-               Span events still ride /track/batch — they have no
-               reservation to release.
+        Opt-out: ``NULLRUN_V3_TRACK_DISABLE=1`` forces every event to the
+        legacy batch path. Use on backends that haven't flipped
+        ``NULLRUN_CONSUME_V3_ENABLED=1`` yet.
 
-               Opt-out
-               -------
-               ``NULLRUN_V3_TRACK_DISABLE=1`` forces every event
-               through the legacy batch path. Use it on backends that
-               haven't flipped ``NULLRUN_CONSUME_V3_ENABLED=1`` yet.
-
-               Failure mode
-               ------------
-               ``track_single`` raises on 422 / 503 / 5xx (see
-               ``nullrun.breaker.exceptions``). We catch and log at
-               WARNING level; the event is dropped (NOT retried via
-               the batch path — that would risk double-billing
-        idempotency contract).
+        On failure ``track_single`` raises on 422 / 503 / 5xx; we catch
+        and log at WARNING (the event is dropped — falling back to the
+        batch path risks double-billing).
         """
         from nullrun.context import get_server_minted_execution_id
 
@@ -3003,25 +2897,24 @@ def _capture_server_minted_execution_id(response: dict[str, Any]) -> str | None:
     return raw
 
 
-# 2026-07-04 (v0.12.0 wiring fix — ): build the
+# Required fields on the v3 /track payload (the backend's
+# consume_budget_v3 rejects a payload that omits them).
+_V3_TRACK_REQUIRED_FIELDS = ("workflow_id", "tokens")
+
+
 def _build_v3_track_payload(
     wire_event: dict[str, Any],
     reservation_id: str,
 ) -> dict[str, Any] | None:
     """Map an enriched llm_call event onto the v3 /track schema.
 
-    Returns ``None`` when the event cannot be mapped (caller
-    falls back to legacy batch path). Required ``tokens`` /
-    ``workflow_id`` absence is the only failure mode today.
+    Returns ``None`` when the event cannot be mapped (caller falls
+    back to the legacy batch path). Required fields are
+    ``workflow_id`` and ``tokens``; their absence is the only failure
+    mode today.
     """
     wf_id = wire_event.get("workflow_id")
     if not wf_id:
-        # The backend's consume_budget_v3 needs a workflow_id to
-        # attribute the consume to a key+workflow counter; without
-        # one the consume becomes unattributable.
-        # ownership binding). A missing workflow_id means the
-        # SDK never bound the API key to a workflow (legacy
-        # legacy-no-binding). Fall back.
         logger.debug(
             "_build_v3_track_payload: missing workflow_id — cannot shape v3 /track payload"
         )
@@ -3029,8 +2922,6 @@ def _build_v3_track_payload(
 
     tokens = wire_event.get("tokens")
     if tokens is None:
-        # Same as llm_call missing required fields — the backend
-        # would 422 anyway. Fall back to batch.
         logger.debug("_build_v3_track_payload: missing tokens — cannot shape v3 /track payload")
         return None
 
@@ -3039,7 +2930,7 @@ def _build_v3_track_payload(
         "workflow_id": wf_id,
         "tokens": int(tokens),
         "cost_cents": 0,
-        "cost_source": "provisional",  #
+        "cost_source": "provisional",
     }
     if "input_tokens" in wire_event and wire_event["input_tokens"] is not None:
         payload["input_tokens"] = int(wire_event["input_tokens"])
@@ -3055,14 +2946,11 @@ def _build_v3_track_payload(
         payload["trace_id"] = wire_event["trace_id"]
     if "span_id" in wire_event and wire_event["span_id"]:
         payload["span_id"] = wire_event["span_id"]
-    # 2026-07-12 (multi-agent span attachment): the orchestration
     if "parent_trace_id" in wire_event and wire_event["parent_trace_id"]:
         payload["parent_trace_id"] = wire_event["parent_trace_id"]
 
-    # Optional downstream fields preserved verbatim (workflow-level
-    # cost attribution, agent_id, etc.). Backend ignores unknown
-    # fields, so unknown keys are safe — we just surface the ones
-    # the SDK actually emits.
+    # Optional downstream fields preserved verbatim. The backend
+    # ignores unknown keys, so we only surface the ones the SDK emits.
     for k in (
         "agent_id",
         "environment",
@@ -3073,7 +2961,6 @@ def _build_v3_track_payload(
         if k in wire_event and wire_event[k] is not None:
             payload[k] = wire_event[k]
 
-    # 2026-07-13 (vendor-extractor edge cases, SDK counterpart at
     for k in (
         "cache_read_tokens",
         "cache_write_tokens",

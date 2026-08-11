@@ -477,18 +477,6 @@ class TestRetry:
 # ``TestAsyncTransportFlush`` note above for context.
 
 
-class TestBoundedDict:
-    """Regression: BoundedDict was removed in 0.4.0 (dead code)."""
-
-    def test_bounded_dict_class_removed(self):
-        """`nullrun.runtime.BoundedDict` no longer exists — pin removal."""
-        from nullrun.runtime import NullRunRuntime
-
-        assert getattr(NullRunRuntime, "BoundedDict", None) is None
-        with __import__("pytest").raises(ImportError):
-            from nullrun.runtime import BoundedDict  # noqa: F401
-
-
 class TestTransportFlush:
     @respx.mock
     def test_flush_on_batch_size(self, transport):

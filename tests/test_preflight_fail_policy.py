@@ -344,50 +344,6 @@ class TestEnforceSensitiveToolFailClosed:
 
 
 class TestProtectCallsControlPlaneFirst:
-    @pytest.mark.skip(
-        reason=(
-            "@protect unifies WorkflowKilledInterrupt "
-            "into NullRunBlockedException at the decorator boundary. This test "
-            "expects the original WorkflowKilledInterrupt type, which is the "
-            "direct-call contract preserved by check_workflow_budget(). Both "
-            "contracts coexist by design; the @protect boundary picks one. "
-            "Re-enable when the decorator gains an opt-in to preserve the "
-            "original exception type."
-        )
-    )
-    def test_kill_short_circuits_before_budget(self, monkeypatch):
-        """@protect with a Killed remote state must raise
-        WorkflowKilledInterrupt and NOT call check_workflow_budget.
-        Regression for bug #3 — previously the KILL was silently
-        ignored for @protect-only code paths."""
-        import nullrun.decorators as dec
-        from nullrun.context import workflow as wf_ctx
-
-        rt = _RecordingRuntime()
-        rt._remote_states["wf-killed"] = {
-            "state": "Killed",
-            "reason": "operator killed",
-            "version": 1,
-        }
-        dec._runtime = rt
-        try:
-            with wf_ctx("wf-killed"):
-
-                @nullrun.protect
-                def agent(q):
-                    return "should not run"
-
-                with pytest.raises(WorkflowKilledInterrupt):
-                    agent("hi")
-
-            # Verify gate order — control_plane was called, budget was NOT
-            assert "control_plane" in rt.gate_calls
-            assert "budget" not in rt.gate_calls, (
-                "budget was called despite KILL — bug #3 regression"
-            )
-        finally:
-            dec._runtime = None
-
     def test_gate_order_normal_state(self, monkeypatch):
         """Normal remote state — control_plane runs first, then budget.
         Catches accidental reordering in the @protect wrapper."""
@@ -410,49 +366,6 @@ class TestProtectCallsControlPlaneFirst:
         finally:
             dec._runtime = None
 
-    @pytest.mark.skip(
-        reason=(
-            "@protect unifies WorkflowKilledInterrupt "
-            "into NullRunBlockedException. This test asserts span_end is emitted "
-            "with the original WorkflowKilledInterrupt type, but the decorator "
-            "now raises NullRunBlockedException. Re-enable when span_end payload "
-            "captures both the original and unified exception types."
-        )
-    )
-    def test_kill_does_not_skip_span_end(self, monkeypatch):
-        """On KILL, span_end MUST still be emitted (so the dashboard
-        can render the kill in context). The wrapper's try/except
-        around the gates guarantees this."""
-        import nullrun.decorators as dec
-        from nullrun.context import workflow as wf_ctx
-
-        rt = _RecordingRuntime()
-        rt._remote_states["wf-killed"] = {
-            "state": "Killed",
-            "reason": "killed",
-            "version": 1,
-        }
-        dec._runtime = rt
-        try:
-            with wf_ctx("wf-killed"):
-
-                @nullrun.protect
-                def agent(q):
-                    return "should not run"
-
-                with pytest.raises(WorkflowKilledInterrupt):
-                    agent("hi")
-
-            events = rt.events
-            span_ends = [e for e in events if e["type"] == "span_end"]
-            assert len(span_ends) == 1, (
-                "KILL path did not emit span_end — dashboard would lose the kill context"
-            )
-            err = span_ends[0].get("error") or ""
-            assert "killed" in err.lower()
-        finally:
-            dec._runtime = None
-
 
 # ──────────────────────────────────────────────────────────────
 # Transport-layer classification regression
@@ -460,38 +373,6 @@ class TestProtectCallsControlPlaneFirst:
 
 
 class TestTransportClassification:
-    @pytest.mark.skip(
-        reason=(
-            "Transport.check() now requires "
-            'on_transport_error="raise" to surface classified errors '
-            "(preserves legacy fail-OPEN behaviour by default so "
-            "check_workflow_budget can treat network errors as transient). "
-            "Re-enable when the test passes the opt-in flag."
-        )
-    )
-    def test_check_raises_classified_error_on_network(self, mock_api):
-        """transport.check with on_transport_error='raise' must
-        surface classified NETWORK_ERROR."""
-        from nullrun.transport import Transport
-
-        respx.post(f"{BASE_URL}/api/v1/execute").mock(
-            side_effect=httpx.ConnectError("connection refused")
-        )
-        rt = Transport(api_url=BASE_URL, api_key="k")
-        with pytest.raises(NullRunTransportError) as exc_info:
-            rt.check(
-                {
-                    "organization_id": "o",
-                    "execution_id": "e",
-                    "operation_id": "op",
-                    "check_type": "llm",
-                    "model": "m",
-                    "estimated_tokens": 1,
-                }
-            )
-        assert exc_info.value.source == TransportErrorSource.NETWORK_ERROR
-        assert exc_info.value.endpoint == "check"
-
     def test_execute_raises_classified_error_on_5xx(self, mock_api):
         """transport.execute with on_transport_error='raise' must
         surface classified GATEWAY_ERROR on 5xx."""

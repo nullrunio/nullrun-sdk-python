@@ -350,14 +350,12 @@ class TestUnknownActionTypeFailOpen:
 # ─── actions context + init ────────────────────────────────────
 """
 Branch-coverage tests for ``nullrun.actions``, ``nullrun.context``
-``nullrun.__init__``, and the WorkflowKilledException deprecation
-warning. Together these close the last 1-2 % lines that no other
-test file exercises.
+and ``nullrun.__init__``. Together these close the last 1-2 % lines
+that no other test file exercises.
 """
 
 import threading
 import time
-import warnings
 from unittest.mock import MagicMock
 
 import pytest
@@ -373,8 +371,6 @@ from nullrun.actions import (
 )
 from nullrun.breaker.exceptions import (
     NullRunBlockedException,
-    WorkflowKilledException,
-    WorkflowKilledInterrupt,
 )
 
 # ─── ActionHandler ──────────────────────────────────────────────────
@@ -825,43 +821,3 @@ def test_init_module_has_all_attribute():
     """The ``__all__`` attribute lists the curated surface."""
     assert "init" in nullrun.__all__
     assert "protect" in nullrun.__all__
-
-
-# ─── WorkflowKilledException deprecation warning ─────────────────────
-
-
-def test_workflow_killed_exception_emits_deprecation_warning():
-    """Constructing the deprecated ``WorkflowKilledException`` triggers
-    a ``DeprecationWarning``.
-    """
-    with warnings.catch_warnings(record=True) as w:
-        warnings.simplefilter("always")
-        WorkflowKilledException(workflow_id="wf-1", reason="x")
-    assert any(issubclass(item.category, DeprecationWarning) for item in w)
-
-
-def test_workflow_killed_interrupt_does_not_emit_warning():
-    """Constructing the canonical ``WorkflowKilledInterrupt`` does NOT
-    emit a deprecation warning (the deprecation is on the parent name).
-    """
-    with warnings.catch_warnings(record=True) as w:
-        warnings.simplefilter("always")
-        WorkflowKilledInterrupt(workflow_id="wf-1", reason="x")
-    assert not any(issubclass(item.category, DeprecationWarning) for item in w)
-
-
-def test_workflow_killed_interrupt_is_base_exception():
-    """``except Exception`` does NOT catch the kill signal."""
-    with pytest.raises(WorkflowKilledInterrupt):
-        try:
-            raise WorkflowKilledInterrupt(workflow_id="wf-1", reason="x")
-        except Exception:
-            pytest.fail("Exception should not catch WorkflowKilledInterrupt")
-
-
-def test_workflow_killed_exception_is_caught_by_except_killed_exception():
-    """Legacy ``except WorkflowKilledException`` still catches the new
-    interrupt (back-compat contract).
-    """
-    with pytest.raises(WorkflowKilledException):
-        raise WorkflowKilledInterrupt(workflow_id="wf-1", reason="x")

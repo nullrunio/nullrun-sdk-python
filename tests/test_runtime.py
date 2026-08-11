@@ -1,6 +1,6 @@
 """
-tests/test_runtime.py — покрытие NullRunRuntime и @protect
-Зависимости: pip install pytest pytest-asyncio respx httpx
+tests/test_runtime.py — coverage for NullRunRuntime and @protect.
+Dependencies: pip install pytest pytest-asyncio respx httpx
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ BASE_URL = "https://api.test.nullrun.io"
 
 
 # ──────────────────────────────────────────────────────────────
-# NullRunRuntime — инициализация
+# NullRunRuntime — initialization
 # ──────────────────────────────────────────────────────────────
 
 
@@ -60,28 +60,28 @@ class TestNullRunRuntimeInit:
         from nullrun import reset
 
         reset()
-        # после reset get_instance либо создает новый, либо вернет None
+        # After reset, get_instance either creates a new runtime or returns None.
 
 
 # ──────────────────────────────────────────────────────────────
-# NullRunRuntime — track 
+# NullRunRuntime — track
 # ──────────────────────────────────────────────────────────────
 
 
 class TestNullRunRuntimeTrack:
     def test_track_enqueues_event(self, make_runtime):
-        """track() не блокирует и ставит событие в буфер."""
+        """track() is non-blocking and queues the event on the buffer."""
         rt = make_runtime()
-        # track fire-and-forget — не должен бросать
+        # track fire-and-forget — must not raise
         rt.track({"event_type": "llm_call", "model": "gpt-4", "tokens": 100})
         rt.track({"event_type": "tool_call", "tool": "search"})
-        # нет исключений — ок
+        # no exceptions — ok
 
     def test_track_does_not_raise_on_server_error(self, make_runtime, mock_api):
-        """track() fire-and-forget — ошибка сервера не должна падать в calling code."""
+        """track() fire-and-forget — a server error must not propagate into the calling code."""
         respx.post(f"{BASE_URL}/track/batch").mock(return_value=httpx.Response(500))
         rt = make_runtime()
-        # Не должно бросить исключение
+        # Must not raise.
         rt.track({"event_type": "test"})
 
     def test_wire_payload_strips_sensitive_fields(self, make_runtime):
@@ -219,31 +219,6 @@ class TestNullRunRuntimeExecute:
         # populated so any caller that branched on it pre-fix keeps working.
         assert wire_details.get("mapped_class") == "NullRunBlockedException"
 
-    @pytest.mark.skip(
-        reason=(
-            "runtime.execute now requires "
-            'on_transport_error="raise" to surface classified errors '
-            "(preserves legacy fail-OPEN behaviour by default so "
-            "check_workflow_budget can treat network errors as transient). "
-            "Re-enable when the test passes the opt-in flag."
-        )
-    )
-    def test_execute_network_error_raises_classified(self, make_runtime, mock_api):
-        """Network error during execute surfaces as classified NullRunTransportError (ADR-008)."""
-        from nullrun.breaker.exceptions import (
-            NullRunTransportError,
-            TransportErrorSource,
-        )
-
-        respx.post(f"{BASE_URL}/api/v1/gate").mock(
-            side_effect=httpx.ConnectError("connection refused")
-        )
-        rt = make_runtime()
-        with pytest.raises(NullRunTransportError) as exc_info:
-            rt.execute(tool_name="gpt-4", input_data={}, mode="strict")
-        assert exc_info.value.source == TransportErrorSource.NETWORK_ERROR
-        assert exc_info.value.endpoint == "execute"
-
     # T3-S2 (0.3.0): `test_execute_local_mode_allows` was removed along
     # with the `local_mode` field. The execute path now always hits
     # the /execute endpoint — there is no local stub to test.
@@ -256,7 +231,7 @@ class TestNullRunRuntimeExecute:
 
 class TestProtectDecorator:
     def test_protect_calls_wrapped_function(self, make_runtime, mock_api):
-        """@protect не ломает вызов функции."""
+        """@protect must not break the wrapped function call."""
         make_runtime()
 
         @protect
@@ -278,7 +253,7 @@ class TestProtectDecorator:
         assert identity({"a": 1}) == {"a": 1}
 
     def test_protect_preserves_function_metadata(self, make_runtime, mock_api):
-        """@protect сохраняет __name__ и __doc__ обёртываемой функции."""
+        """@protect preserves the wrapped function's __name__ and __doc__."""
         make_runtime()
 
         @protect
@@ -291,7 +266,7 @@ class TestProtectDecorator:
 
     @pytest.mark.asyncio
     async def test_protect_async_function(self, make_runtime, mock_api):
-        """@protect работает с async функциями."""
+        """@protect works with async functions."""
         make_runtime()
 
         @protect
@@ -349,7 +324,7 @@ class TestProtectDecorator:
             tool()
 
     def test_protect_sensitive_args_not_logged(self, make_runtime, mock_api, caplog):
-        """Чувствительные аргументы не попадают в логи."""
+        """Sensitive arguments must not appear in logs."""
         import logging
 
         make_runtime()
@@ -361,7 +336,7 @@ class TestProtectDecorator:
         with caplog.at_level(logging.DEBUG):
             login(username="user", password="super-secret-password")
 
-        # Пароль не должен быть в логах
+        # The password must not appear in the logs.
         assert "super-secret-password" not in caplog.text
 
     def test_protect_loop_detection(self, make_runtime, mock_api):
@@ -382,7 +357,7 @@ class TestProtectDecorator:
         assert call_count == 5
 
     def test_protect_decorator_chaining(self, make_runtime, mock_api):
-        """@protect можно чейнить с другими декораторами."""
+        """@protect can be chained with other decorators."""
         make_runtime()
 
         def my_custom_decorator(func):
