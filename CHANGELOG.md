@@ -1,3 +1,21 @@
+## [0.14.11] - 2026-08-11
+
+Patch release — partial revert of sprint-5 cleanup commits whose scope exceeded what the codebase actually supported. Two over-aggressive commits restored critical user-authored documentation and branch-coverage test files that the cleanup had removed.
+
+### Added
+
+- **Restored `tests/test_real_e2e_observation.py`** (321 lines) — real-socket integration test that spins up a stdlib `http.server` and exercises the full wire path (auto-instrumented `httpx.Client` → mock LLM server → mock NULLRUN backend → recorded event list). The respx-mocked unit tests do not cover this surface; deleting it would have silently dropped the only test proving that the auto-instrumented transport actually delivers a track event to a real socket.
+- **Restored branch-coverage tests** deleted by sprint-3 cleanup (a666624 P2): `tests/test_protect_branches.py` (564 lines — branch coverage for `_safe_args` / `_strip_details_balanced` / `_enforce_sensitive_tool`), `tests/test_runtime_branches.py` (515 lines — less-trodden error paths), `tests/test_transport_branches.py` (647 lines — branch-coverage gaps in transport). These three files explicitly documented their purpose as covering "gaps" and "less-trodden error paths" that the mainline tests skip; removing them = silent coverage regression.
+
+### Changed
+
+- **Restored `src/nullrun/runtime.py` docstring block** (lines 28-50ish, 30 lines) — user-authored correction from 2026-07-04 explaining that the README claim `Fail-OPEN на инфраструктурных сбоях. Если backend недоступен, бюджет не блокирует агента` is **partially wrong**. The restored block makes the explicit split: SDK-side transport failure (network timeout, 5xx, breaker open) → fail-OPEN on the *check* path so a dead backend doesn't freeze the user's agent loop; backend-side enforcement failure (`BUDGET_REDIS_UNAVAILABLE` → 402, `RATE_LIMIT_REDIS_UNAVAILABLE` → 503) → fail-CLOSED wire response (the SDK does NOT silently fall-OPEN on a wire 4xx/5xx that names an enforcement failure). Codifies CLAUDE.md §4 fail-CLOSED rules.
+- **Restored Cyrillic technical nomenclature in CHANGELOG.md** — "Разрыв 2" in the 0.14.4 entry and "Разрыв 1c" in the 0.13.13 entry. These were user-coined Russian-language project codenames for backend architecture milestones ("Разрыв" = breakthrough/rupture in the architectural sense, NOT the English "breakpoint" — `Breakpoint-2` is not a 1:1 translation and loses the original term).
+
+_Tests: 1462 passed, 6 skipped in 20.83s. Full suite green._
+
+_Compatibility:_ **No SDK_MIN_VERSION bump.** No public API change, no wire-format change, no behavioural change. Drop-in replacement for 0.14.10.
+
 ## [0.14.10] - 2026-08-11
 
 Sprint 5 internal cleanup — no behavioural change, no SDK_MIN_VERSION bump, no wire-format change. Three release-blocks of dead code, dedup, and developer-experience hygiene. Backward-compatible patch.
