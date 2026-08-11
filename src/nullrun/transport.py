@@ -2125,6 +2125,41 @@ def _extract_error_envelope(
     return ("", raw_text or str(body), dict(body) if isinstance(body, dict) else {})
 
 
+def _safe_json(response: httpx.Response, endpoint: str) -> Any:
+    """Parse a response body as JSON, wrapping parse failures.
+
+    DEF-ERRHDL-INVALID-JSON-01 (2026-08-11, RUN_ID 20260811-1): the SDK
+    previously propagated ``json.JSONDecodeError`` unchanged to user
+    code, which leaks internal file paths and the raw broken payload
+    fragment in tracebacks. This helper wraps the parse failure in
+    NullRunTransportError with a stable ``error_code`` so callers can
+    ``except`` cleanly and the user sees a short NullRun-family
+    message instead of a Python traceback.
+
+    ``body_preview`` is intentionally truncated to 200 chars and the
+    raw ``JSONDecodeError.lineno/colno`` are NOT included in the
+    surfaced message -- both are info-leak surface (line numbers
+    hint at response shape; partial body may carry PII like
+    organization_id fragments).
+    """
+    try:
+        return response.json()
+    except (json.JSONDecodeError, ValueError) as exc:
+        # Body preview capped at 200 chars; truncated to avoid
+        # flooding logs / exception chain.
+        try:
+            body_preview = (response.text or "")[:200]
+        except Exception:
+            body_preview = "<unreadable>"
+        raise NullRunTransportError(
+            f"Received malformed JSON from {endpoint} "
+            f"(status={response.status_code}): {type(exc).__name__}",
+            source=TransportErrorSource.GATEWAY_ERROR,
+            endpoint=endpoint,
+            error_code="NR-T001",
+        ) from exc
+
+
 def _parse_v3_error_envelope(
     response: httpx.Response,
     endpoint: str,

@@ -84,8 +84,10 @@ from nullrun.audit import (  # ADR-009 P1 — governance audit surface
 from nullrun.breaker.exceptions import (
     BreakerError,
     NullRunAuthenticationError,
+    NullRunBackendError,
     NullRunBlockedException,
     NullRunError,
+    NullRunTransportError,
     WorkflowKilledInterrupt,
     WorkflowPausedException,
 )
@@ -109,6 +111,7 @@ from nullrun.transport import (
     TransportErrorSource,
     _emit_for_transport_error,
     _protocol_header_value,
+    _safe_json,
 )
 from nullrun.uuid7 import uuid7_str  # 2026-07-04 BUG #4
 
@@ -459,6 +462,13 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         debug: bool = False,
         _test_mode: bool = False,
         polling: bool = True,
+        # DEF-ERRHDL-NO-TIMEOUT-01 (2026-08-11, RUN_ID 20260811-1):
+        # expose request_timeout so operators can tune the httpx read
+        # timeout for slow-network scenarios. Pre-fix the SDK hardcoded
+        # 30s read timeout in transport.py with no config surface.
+        # Precedence: kwarg > NULLRUN_REQUEST_TIMEOUT env var > 30.0
+        # (the pre-fix default).
+        request_timeout: float | None = None,
     ):
         """
         Initialize NullRun Runtime.
@@ -531,7 +541,18 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             self._fallback_mode = FallbackMode.STRICT
         else:
             self._fallback_mode = FallbackMode.PERMISSIVE
-        self._timeout = 30
+        # DEF-ERRHDL-NO-TIMEOUT-01: precedence kwarg > env > default(30)
+        env_timeout = os.getenv("NULLRUN_REQUEST_TIMEOUT")
+        try:
+            self._timeout = float(
+                request_timeout
+                if request_timeout is not None
+                else (env_timeout if env_timeout else 30)
+            )
+        except (TypeError, ValueError):
+            # Malformed env var -- fall back to default rather than
+            # crash init() with a confusing config error.
+            self._timeout = 30.0
         self._max_retries = 3
         self._debug = debug
         self._transport: Transport | None = None
@@ -1019,12 +1040,24 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             )
 
             if response.status_code == 200:
-                data = response.json()
+                # DEF-ERRHDL-INVALID-JSON-01 (2026-08-11, RUN_ID 20260811-1):
+                # route 200-OK JSON parse through _safe_json so a malformed
+                # body raises NullRunTransportError (NR-T001) instead of
+                # leaking json.JSONDecodeError to user code. The
+                # /check/track/... paths already use _safe_json (transport.py).
+                data = _safe_json(response, "auth")
                 # STRICT MODE: organization_id is REQUIRED, no fallback
                 org_id = data.get("organization_id")
                 if not org_id:
+                    # DEF-ERRHDL-MALFORMED-MSG-01 (2026-08-11, RUN_ID 20260811-1):
+                    # drop "compromised" wording. "compromised" is a
+                    # security-incident term that triggers SOC alerts in
+                    # observability stacks; using it for a routine schema
+                    # mismatch is misleading. Wording now attributes the
+                    # failure to a wire-shape mismatch without making a
+                    # security claim.
                     err = NullRunAuthenticationError(
-                        "Auth response missing organization_id - server may be outdated or compromised. "
+                        "Auth response missing organization_id -- server returned an unexpected response shape. "
                         "Refusing to operate with legacy identity.",
                         error_code="NR-A002",
                         user_action=(
@@ -1085,17 +1118,42 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
 
                 logger.info(f"Authenticated: organization_id={self.organization_id}")
             else:
-                # Auth failed - raise exception instead of silent fallback
-                err = NullRunAuthenticationError(
-                    f"Auth failed with status {response.status_code}. "
-                    f"API key may be invalid or expired. Not operating in unsafe mode.",
-                    error_code=("NR-A003" if response.status_code == 401 else "NR-A001"),
-                )
+                # DEF-ERRHDL-AUTH-PATH-CODE-PIN-01 (2026-08-11, RUN_ID 20260811-1):
+                # route 5xx to NullRunBackendError so the auth path uses the same
+                # error envelope classification as /check/track. Per CLAUDE.md
+                # §13 5xx is a backend-class error, not auth-class. Without this
+                # split, operators are nudged to rotate valid keys during backend
+                # outages ("API key may be invalid or expired" for status=500 is
+                # misleading).
+                #
+                # - 401 -> NullRunAuthenticationError + NR-A003 (key was actually
+                #   rejected; this stays a true auth failure).
+                # - All other 4xx -> NullRunAuthenticationError + NR-A001 (the
+                #   prior code; covers 403 etc.).
+                # - 5xx -> NullRunBackendError + NR-B002 (the existing transport
+                #   envelope's error_code, so 5xx is classified the same as 5xx
+                #   from /check/track).
+                status = response.status_code
+                correlation_id = response.headers.get("x-correlation-id")
+                if 500 <= status < 600:
+                    err = NullRunBackendError(
+                        f"Auth backend returned status {status}. "
+                        f"The API key may still be valid -- this is a "
+                        f"backend-side failure, not an auth failure.",
+                        endpoint="auth",
+                        status_code=status,
+                    )
+                else:
+                    err = NullRunAuthenticationError(
+                        f"Auth failed with status {status}. "
+                        f"API key may be invalid or expired. Not operating in unsafe mode.",
+                        error_code=("NR-A003" if status == 401 else "NR-A001"),
+                    )
                 self._emit_sdk_error(
                     err,
                     stage="auth",
-                    correlation_id=response.headers.get("x-correlation-id"),
-                    extra={"status_code": response.status_code},
+                    correlation_id=correlation_id,
+                    extra={"status_code": status},
                 )
                 raise err
         except httpx.RequestError as e:
