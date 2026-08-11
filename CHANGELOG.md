@@ -1,44 +1,23 @@
-# Changelog
-
-All notable changes to `nullrun-sdk` will be documented here.
-
-Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
-Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
-
----
-
 ## [0.14.9] - 2026-08-07
 
 v3.38 wire-drift close — three real contract bugs that diverged from backend source code. Verified against `backend/src/proxy/http/protocol.rs`, `backend/src/proxy/middleware/auth.rs`, and CLAUDE.md §5 / §13 — not against comments or documentation. No SDK_MIN_VERSION bump. No on-wire change (backend already shipped the matching wire shape; this SDK release closes the consumer side).
 
 ### Fixed
 
-- **Capabilities probe route** — `nullrun.capabilities.CAPABILITIES_PATH` was `"/health"` (a generic liveness endpoint) instead of the canonical `"/api/v1/capabilities"`. Pre-fix, every `init()` probe returned `None` and `is_v3_ready()` was always `False`, so every v3 capability flag (`server_minted_execution_id` / `per_execution_reservations` / `enforcement_modes_soft` / `heartbeat_time_based`) was a runtime no-op — even when the backend was v3-ready. The new probe URL matches `backend/src/proxy/http/protocol.rs::capabilities_handler` (canonical wire contract since 2025-04).
-- **API_KEY_* error code granularity (v3.38 backend split)** — backend v3.38 split the `API_KEY_REVOKED` bucket into five distinct wire codes: `API_KEY_EXPIRED` / `API_KEY_DISABLED` / `API_KEY_INVALID` / `API_KEY_MISSING` / `API_KEY_MALFORMED` (mirrors CLAUDE.md §13 vocabulary). Pre-fix, only `API_KEY_REVOKED` was mapped in `_V3_ERROR_CODE_MAP`; the other five silently fell through to the generic HTTP-status fallback at `transport.py:~2616` and never surfaced as `NullRunAuthError`, losing both the exception class and the diagnostic `wire_code`. The map now covers all six wire codes. The envelope parser filters unknown `details` keys to a known kwargs set (`{error_code, user_action, retryable, docs_url, cause}`) and parks extras on `self.details` — the pre-fix behaviour was to forward every detail as a kwarg and raise `TypeError` on the first unknown key (the regression appeared once v3.38 EXPIRED responses started emitting `expires_at` in details).
-- **`NullRunAuthError.wire_code`** — the exception class gains a `wire_code: str | None = None` constructor kwarg that defaults to `"API_KEY_REVOKED"` for backwards compat. Mirrors the existing `NullRunChainError.backend_code` pattern at `breaker/exceptions.py:448`. Handlers can now branch on the granular lifecycle signal instead of inferring from message strings.
+- **Capabilities probe route** — `nullrun.capabilities.CAPABILITIES_PATH` was `"/health"` (a generic liveness endpoint) instead of the canonical `"/api/v1/capabilities"`. [...]
+- **API_KEY_* error code granularity (v3.38 backend split)** — backend v3.38 split the `API_KEY_REVOKED` bucket into five distinct wire codes: `API_KEY_EXPIRED` / `API_KEY_DISABLED [...]
+- **`NullRunAuthError.wire_code`** — the exception class gains a `wire_code: str | None = None` constructor kwarg that defaults to `"API_KEY_REVOKED"` for backwards compat. [...]
 
 ### Added
 
-- **`decision == "soft_pass"` handler in `check_workflow_budget`** — the runtime's `/gate` decision dispatcher gains a `soft_pass` branch (currently the only branch missing from the source). Pre-fix the branch was absent, so soft-mode calls that proceeded via the chain's overdraft cap fell through the default allow path with no log line and no `soft_overdraft_used` counter increment — silent budget drift. The new branch:
+- **`decision == "soft_pass"` handler in `check_workflow_budget`** — the runtime's `/gate` decision dispatcher gains a `soft_pass` branch (currently the only branch missing from th [...]
   - calls `metrics.inc_runtime("soft_overdraft_used")` so the dashboard can graph soft-cap pressure
   - logs at WARNING with `overdraft_used_cents` / `max_overdraft_cents` / `remaining_overdraft_cents` from the backend response so operators can see which chains are burning overdraft
   - returns normally (the `allow` semantic is correct — the gate already authorised the call via the chain's overdraft cap)
 
-### Tests
+_Tests: 4 additions (tests/conftest.py, tests/test_capabilities.py, tests/test_init_contract.py…)._
 
-- `tests/test_v3_38_drift_fixes.py` — 14 new regression tests across three classes:
-  - `CAPABILITIES_PATH` is `"/api/v1/capabilities"` (constant pin); probe against canonical route with v3 payload yields `is_v3_ready() == True` (negative pin against `/health` mocks).
-  - `_V3_ERROR_CODE_MAP` covers all six wire codes (6-case parametrise); `NullRunAuthError.wire_code` surfaces the granular backend code (default to `API_KEY_REVOKED`); envelope parser filters unknown details without raising `TypeError`.
-  - Static-source scan pins the `soft_pass` branch structure (counter increment, WARNING log, `overdraft_used_cents` reference) — mirroring the `migration_drift_tests` pattern used elsewhere in the SDK and backend. A future refactor that drops the branch fails the test in CI rather than at first production `/check`.
-- `tests/conftest.py` / `tests/test_capabilities.py` / `tests/test_init_contract.py` updated to mock `/api/v1/capabilities` (was `/health`).
-
-### Compatibility
-
-- **No SDK_MIN_VERSION bump.** All three fixes are consumer-side; the backend already shipped the matching wire shape.
-- **No public API change.** `CAPABILITIES_PATH` / `_V3_ERROR_CODE_MAP` / `NullRunAuthError` are internal implementation details; the public surface (`nullrun.init(...)`, `@protect`, `decision`-keyed `GateResponse` parsing) is unchanged.
-- **Test suite: 1457 passed, 7 skipped** (no regressions from the wire-drift close; pre-fix the affected tests were passing on the wrong-shape mock responses).
-
----
+_Compatibility:_ **No SDK_MIN_VERSION bump.** All three fixes are consumer-side; the backend already shipped the matching wire shape.
 
 ## [0.14.8] - 2026-08-06
 
@@ -46,30 +25,17 @@ Execution Graph v0 — additive sub-agent lineage. The backend landed `parent_ex
 
 ### Added
 
-- **`parent_execution_id` on `/check` (gate)** — `Transport.check(check_request=...)` forwards the optional `parent_execution_id` field from `check_request` onto the wire when the caller passes a non-None string. Omitted entirely when absent or explicitly `None`, so legacy / single-shot callers keep the previous payload shape. Mirrors the additive forward pattern used by `chain_id` / `tool_arguments` / `idempotency_key` at `src/nullrun/transport.py:1607-1626`. Sub-agent SDKs stamp the field manually from a caller-supplied UUID; auto-injection from a "current execution_id" contextvar is deferred (v0 is intentionally caller-owned).
-- **`execution_graph` capability flag** — `parse_capabilities` reads the new `execution_graph: bool` from `/api/v1/capabilities` (nested under `capabilities:` with top-level fallback for pre-1.0.0 backends). `ServerCapabilities.execution_graph` exposes the flag so SDKs can probe whether the deployment supports sub-agent lineage before sending the field. Pre-Graph backends silently ignore unknown fields, but the probe lets SDKs surface a clean diagnostic at `init()` rather than a 400 on the first call.
-- **`NullRunChainError.parent_execution_id`** — the chain error class gains an optional `parent_execution_id: str | None = None` constructor kwarg (mirroring the existing `chain_id` kwarg at `breaker/exceptions.py:425`). When the backend rejects a sub-agent call with `PARENT_EXECUTION_*`, the offending parent id is preserved on the exception so cookbook code can log / surface it without re-parsing the message string.
+- **`parent_execution_id` on `/check` (gate)** — `Transport.check(check_request=...)` forwards the optional `parent_execution_id` field from `check_request` onto the wire when the  [...]
+- **`execution_graph` capability flag** — `parse_capabilities` reads the new `execution_graph: bool` from `/api/v1/capabilities` (nested under `capabilities:` with top-level fallba [...]
+- **`NullRunChainError.parent_execution_id`** — the chain error class gains an optional `parent_execution_id: str | None = None` constructor kwarg (mirroring the existing `chain_id [...]
 
 ### Changed
 
-- **Three new error codes mapped to `NullRunChainError`** — `PARENT_EXECUTION_NOT_FOUND`, `PARENT_EXECUTION_ORG_MISMATCH`, `PARENT_EXECUTION_KEY_MISMATCH` (all 403) are added to `_V3_ERROR_CODE_MAP` at `src/nullrun/transport.py:2675-2685`. Mapped to `NullRunChainError` (not a new class) because the diagnostic profile is identical to `CHAIN_CROSS_ORG` / `CHAIN_ORG_MISMATCH` — 403-class security errors with `(org_id, api_key_id)` ownership semantics. Diagnostic clarity wins over a new exception class per CLAUDE.md §13 philosophy.
+- **Three new error codes mapped to `NullRunChainError`** — `PARENT_EXECUTION_NOT_FOUND`, `PARENT_EXECUTION_ORG_MISMATCH`, `PARENT_EXECUTION_KEY_MISMATCH` (all 403) are added to `_ [...]
 
-### Tests
+_Tests: 1 additions (tests/test_transport.py)._
 
-- `tests/test_transport.py::TestParentExecutionIdForwarding` — 3 new tests: `test_check_forwards_parent_execution_id_when_present` (round-trips from `check_request` → wire JSON), `test_check_omits_parent_execution_id_when_absent` (legacy / single-shot callers keep the old payload shape), `test_check_omits_parent_execution_id_when_none_explicit` (explicit `None` is treated as "no parent" / single-shot).
-
-### Compatibility
-
-- **Backward-compatible additive wire change.** Pre-Execution-Graph SDKs that never set `parent_execution_id` continue to work unchanged — the field is omitted entirely from the wire.
-- **Backward-compatible capability flag.** Pre-Graph backends return `execution_graph: false` (or omit the field entirely); the SDK treats both as "don't send the parent field". `is_v3_ready()` is unchanged — the flag is informational, not a hard gate.
-- **Backward-compatible exception class.** `NullRunChainError` gains a kwarg with a default; the existing 4-arg call sites (CHAIN_MAX_DURATION_EXCEEDED, CHAIN_CROSS_ORG, CHAIN_ORG_MISMATCH, CHAIN_NOT_FOUND/EXPIRED) continue to work unchanged.
-- No on-wire change for legacy callers. No SDK_MIN_VERSION bump. The `parent_execution_id` field is omitted on the wire whenever the caller does not pass it explicitly.
-
-### Refs
-
-- Backend commit `87fae759` (not pushed; awaiting local review + push authorisation). Additive wire contract at `backend/src/proxy/http/gate/schemas.rs:62-73`; ownership validation at `backend/src/proxy/http/gate/internal.rs` (lifts `parent_execution_id` parsing before the validation block + persistence call site); migration 266 adds `execution_records.parent_execution_id` + partial index for graph queries (Tasks #11-14, not in v0).
-
----
+_Compatibility:_ **Backward-compatible additive wire change.** Pre-Execution-Graph SDKs that never set `parent_execution_id` continue to work unchanged — the field is omitted entirely from the wire.
 
 ## [0.14.7] - 2026-08-04
 
@@ -77,24 +43,12 @@ Init contract hardening — strip leading and trailing whitespace from `api_key`
 
 ### Fixed
 
-- **`nullrun.init()` now strips whitespace before the truthiness check** — `src/nullrun/__init__.py:249` resolves `raw_key = api_key if api_key is not None else os.getenv("NULLRUN_API_KEY")`, then `resolved_key = raw_key.strip() if isinstance(raw_key, str) else None`, before the empty-key guard. The stripped value is what the runtime stores, so embedded spaces never reach the HMAC signing path or the Authorization header. `NullRunAuthenticationError` is raised synchronously (no runtime constructed) for `api_key=None`, `api_key=""`, `api_key="   "`, `api_key="\t"`, `api_key="\n"`, `NULLRUN_API_KEY=""`, and `NULLRUN_API_KEY="   "`. Error message updated to call out the whitespace-rejection contract.
-- **`NullRunRuntime.__init__` mirrors the strip-then-check** — `src/nullrun/runtime.py:370` applies the same contract so direct construction (used by tests and advanced callers) cannot bypass the check.
+- **`nullrun.init()` now strips whitespace before the truthiness check** — `src/nullrun/__init__.py:249` resolves `raw_key = api_key if api_key is not None else os.getenv("NULLRUN_ [...]
+- **`NullRunRuntime.__init__` mirrors the strip-then-check** — `src/nullrun/runtime.py:370` applies the same contract so direct construction (used by tests and advanced callers) ca [...]
 
-### Tests
+_Tests: 1 additions (tests/test_init_contract.py)._
 
-- `tests/test_init_contract.py::TestInitRejectsWhitespaceApiKey` — 7 new tests covering the 7 reject cases, plus a strip-keep case (a value with surrounding whitespace but real content preserves the canonical form) and a constructor mirror (`NullRunRuntime(api_key=" ")` raises the same error as `init(api_key=" ")`).
-- All 39 pre-existing init + runtime tests still pass — the strip is a strict superset of the empty check (`"".strip() == ""` raises; `"x".strip() == "x"` is unchanged).
-
-### Compatibility
-
-- **Backward-compatible bug fix.** The strip is a strict superset of the empty check: pre-fix callers that passed valid keys continue to work unchanged (`"nr_live_xxx"` strips to itself), and callers that pasted whitespace-only keys now get an immediate `NullRunAuthenticationError` at startup instead of a delayed backend 401 on the first `/gate` call.
-- No on-wire change. No SDK_MIN_VERSION bump. No public API change.
-
-### Refs
-
-- FINAL-REPORT-20260803-1 P2-6.
-
----
+_Compatibility:_ **Backward-compatible bug fix.** The strip is a strict superset of the empty check: pre-fix callers that passed valid keys continue to work unchanged (`"nr_live_xxx"` strips to itself), and callers that pasted whitespace-only keys now  [...]
 
 ## [0.14.5] - 2026-08-01
 
@@ -102,27 +56,17 @@ MCP-aware gate metadata and tool-argument forwarding. The release completes the 
 
 ### Added
 
-- **Per-call MCP context** — `set_mcp_tool_context(...)`, `get_call_mcp_class()`, and `get_call_mcp_annotations()` store and expose the canonical tool class plus normalised MCP annotations. `NullRunRuntime.check_workflow_budget()` forwards populated values as `tool_class` and `mcp_annotations` on `/check`.
-- **`MCPAdapter`** — `nullrun.toolbox.mcp.MCPAdapter` wraps an already-connected synchronous MCP client. It lazily caches `tools/list` for 300 seconds, accepts object- or dict-shaped annotation metadata, maps `readOnlyHint` / `destructiveHint` / `openWorldHint` to the gate's `read_only` / `destructive` / `open_world` shape, marks unadvertised tools as `invalid`, and preserves the wrapped client's return and exception behavior.
-- **`tool_arguments` on `/execute` and `/gate`** — `Transport.execute(...)` accepts an optional argument mapping, while `Transport.check(...)` forwards the same field from `check_request`. The backend can canonicalise this JSON bag into a stable tool-schema fingerprint.
+- **Per-call MCP context** — `set_mcp_tool_context(...)`, `get_call_mcp_class()`, and `get_call_mcp_annotations()` store and expose the canonical tool class plus normalised MCP ann [...]
+- **`MCPAdapter`** — `nullrun.toolbox.mcp.MCPAdapter` wraps an already-connected synchronous MCP client. [...]
+- **`tool_arguments` on `/execute` and `/gate`** — `Transport.execute(...)` accepts an optional argument mapping, while `Transport.check(...)` forwards the same field from `check_r [...]
 
 ### Fixed
 
-- **MCP context tests no longer leak module-level `ContextVar` state** — the release includes isolation fixes for the class and annotation tests that were flaky only during the full suite.
+- **MCP context tests no longer leak module-level `ContextVar` state** — the release includes isolation fixes for the class and annotation tests that were flaky only during the ful [...]
 
-### Tests
+_Tests: 3 additions (tests/test_mcp_adapter.py, tests/test_mcp_context.py, tests/test_transport.py)._
 
-- `tests/test_mcp_context.py` pins context defaults, partial updates, supported tool-class values, and `/check` forwarding.
-- `tests/test_mcp_adapter.py` covers cache behavior, dict- and attribute-shaped MCP metadata, unknown tools, repeated calls, custom discovery, and exception pass-through.
-- `tests/test_transport.py::TestToolArgumentsForwarding` covers exact forwarding and omission of `None` on both gate endpoints.
-
-### Compatibility
-
-- **Backward-compatible additive wire change.** Existing callers do not need to pass any new fields; absent MCP metadata and `tool_arguments=None` are omitted.
-- MCP annotations are an honest-client signal. The SDK does not independently verify an MCP server's declarations.
-- `MCPAdapter` does not implement MCP transports, JSON-RPC framing, or asynchronous client adaptation; callers provide a connected synchronous client or a compatible discovery callable.
-
----
+_Compatibility:_ **Backward-compatible additive wire change.** Existing callers do not need to pass any new fields; absent MCP metadata and `tool_arguments=None` are omitted.
 
 ## [0.14.4] - 2026-07-27
 
@@ -130,36 +74,21 @@ ToolParameters Approval Rules wire contract (Tier 2 / Разрыв 2 follow-up).
 
 ### Added
 
-- **`BusinessImpact.tool_call(tool_name, params)`** factory — `business_impact.py:323` new factory builds a `BusinessImpact(kind='tool_call', tool_name=..., params=...)` envelope by analogy with the legacy `BusinessImpact` money constructor. Mirrors the backend `BusinessImpact::ToolCall(ToolCallParams)` variant (`backend/src/proxy/gate/business_impact.rs:62-307`). Used internally by `ToolParamsExtractor`; exposed publicly so users can hand-build impacts without importing the dataclass.
-- **`ToolCallParams` dataclass** — `business_impact.py:143` mirrors the backend struct (`tool_name` ≤ 128 bytes, `param_name` ≤ 64, JSON-roundtrippable values only). `BusinessImpact.kind` now discriminates `Money` | `ToolCall`; existing money callers continue to discriminate on the same field via the `extractor_*` metadata.
-- **`ToolParamsExtractor` + `tool_params(...)` factory** — `extractor.py:815` (class) and the matching factory. Three modes: explicit `{rule_param: arg_name}` map, `include_all=True` (default — every kwarg captured), or `include_all=False` with no map (empty). PII-masked sentinels (`"***"`) and JSON-unsafe values (`float`, custom objects) are filtered before the wire. The factory is the analogue of `MoneyImpactExtractor + money_outflow(...)`.
-- **Bare `@sensitive` now ships ToolParameters on the wire** — `decorators.py:1096` (`_do_sensitive_register`) auto-attaches a default `ToolParamsExtractor(include_all=True)` on a bare `@sensitive` decorator. The stamp goes through `_stamp_extractor_on_innermost` so the bare function (the one `@protect` captures as `fn`) carries the attribute, not just the `@protect` wrapper. An explicit `@sensitive(impact=money_outflow(...))` or `@sensitive(impact=tool_params({...}))` wins — the auto-attach only fires when no extractor is present.
-- **`@sensitive(impact=tool_params({...}))` decorator form** — `decorators.py:1065` new docstring + `decorators.py:711` dispatch branch. Operators writing ToolParameters Approval Rules on the backend can now declare the per-rule param map directly at the decorator site instead of relying on the auto-attach default.
+- **`BusinessImpact.tool_call(tool_name, params)`** factory — `business_impact.py:323` new factory builds a `BusinessImpact(kind='tool_call', tool_name=..., params=...)` envelope b [...]
+- **`ToolCallParams` dataclass** — `business_impact.py:143` mirrors the backend struct (`tool_name` ≤ 128 bytes, `param_name` ≤ 64, JSON-roundtrippable values only). [...]
+- **`ToolParamsExtractor` + `tool_params(...)` factory** — `extractor.py:815` (class) and the matching factory. [...]
+- **Bare `@sensitive` now ships ToolParameters on the wire** — `decorators.py:1096` (`_do_sensitive_register`) auto-attaches a default `ToolParamsExtractor(include_all=True)` on a  [...]
+- **`@sensitive(impact=tool_params({...}))` decorator form** — `decorators.py:1065` new docstring + `decorators.py:711` dispatch branch. [...]
 
 ### Fixed
 
-- **Auto-attach chain walk preserves an explicit `impact=tool_params({...})` map** — `decorators.py:43` new helper `_find_extractor_in_chain` walks `__wrapped__` (bounded at 32 hops) so the auto-attach check sees the explicit extractor stamped on the bare function instead of falling through to the default. **Before this fix**, `@sensitive(impact=tool_params({"delete_force": "force"})) @protect def delete_user(force, user_id): ...` silently shipped `{force: <bool>, user_id: <int>}` (the auto-attach default) instead of the explicit `{delete_force: <bool>}` map. **After this fix**, the renamed key reaches the wire. Regression tests in `TestAutoAttachChainWalk` (4 cases): bare auto-attach, explicit tool_params map preserved, explicit money_outflow preserved, circular-`__wrapped__` defensive bounded walk.
-- **`_enforce_sensitive_tool` dispatch handles both extractor types** — `decorators.py:677` (success path) and `decorators.py:711` (error path) now branch by extractor type. NR-B003 error hint text branches too — operators writing ToolParameters rules see "did you mean `impact=tool_params(...)`?" while money operators see the money remediation advice.
-- **Bare `@sensitive` regression in the existing `tests/test_sensitive_extractor.py`** — the 5 existing tests still pass because they register the tool manually via `rt.add_sensitive_tool(name)`, which bypasses the decorator auto-attach path. Documented as a deliberate carve-out: only `@sensitive` (the decorator form) auto-attaches.
+- **Auto-attach chain walk preserves an explicit `impact=tool_params({...})` map** — `decorators.py:43` new helper `_find_extractor_in_chain` walks `__wrapped__` (bounded at 32 hop [...]
+- **`_enforce_sensitive_tool` dispatch handles both extractor types** — `decorators.py:677` (success path) and `decorators.py:711` (error path) now branch by extractor type. [...]
+- **Bare `@sensitive` regression in the existing `tests/test_sensitive_extractor.py`** — the 5 existing tests still pass because they register the tool manually via `rt.add_sensiti [...]
 
-### Tests
+_Tests: 7 additions (tests/test_business_impact.py, tests/test_extractors.py, tests/test_protect.py…)._
 
-- `tests/test_tool_params_extractor.py` — **23 new tests** across 5 classes (`TestToolParamsFactory`, `TestToolParamsExtraction`, `TestAutoAttachOnBareSensitive`, `TestToolCallParamsShape`, `TestAutoAttachChainWalk`). Covers factory shape (3), three extraction modes (4), PII sentinel + float filtering (3), action digest byte-identity with the backend's canonical JSON (1), the auto-attach wiring (2), dataclass validator (7), kind dispatch (1), and the chain-walk regression (4). Verified: 23/23 pass.
-- `tests/test_business_impact.py::TestToolCallActionDigestPins` — **5 new tests** cross-language parity for the `ToolCall` impact, pinned to the same hex literal the Rust backend pins in `backend/src/proxy/gate/business_impact.rs::tests::tool_call_digest_golden_value_stripe_charge_500`. A drift on either side trips the test on the other side next time the suite runs. Fixture payload: `tool_call("stripe.charge", {"region": "EU", "amount": 500})` → `9975a8b75a436fb78b9d141b9e0c0a90838c1243d78119b304ae6ed0526966a6`.
-- `tests/test_sensitive_extractor.py` — 5/5 pass (regression check, the auto-attach wiring is additive on top of 0.14.1).
-- `tests/test_business_impact.py` — full class passes (28/28 including the 5 new parity pins).
-- `tests/test_extractors.py` — 35/35 pass.
-- `tests/test_protect.py + test_protect_branches.py + test_execute_approval_flow.py + test_approval_money_flow.py + test_gate_real_path.py + test_handle.py` — 99/99 pass.
-- `tests/test_runtime.py + test_runtime_branches.py + test_init_contract.py` — 70/70 pass (1 skipped, pre-existing).
-
-### Compatibility
-
-- **Default SDK behaviour for bare `@sensitive` CHANGED** — was `no business_impact on wire`, now `kind=tool_call on wire`. Operators who relied on the Phase 0 path (approval_id-only grant consume) must either pass `@sensitive(impact=tool_params(include_all=False))` explicitly, or accept the new ToolParameters wire shape. The change is additive on the SDK side; legacy backends ignore `kind=tool_call` and fall through to a no-op.
-- **Existing `@sensitive(impact=money_outflow(...))` callers are unaffected** — the explicit extractor wins over the auto-attach (verified by `test_explicit_money_outflow_chain_walk_preserved`).
-- **Legacy "no impact extractor" call sites (registered via `rt.add_sensitive_tool(name)` directly) are unaffected** — the auto-attach is only wired through `_do_sensitive_register`, which only the `@sensitive` decorator calls.
-- **No SDK_MIN_VERSION bump.** ToolParameters is an opt-in backend feature; SDK 0.14.4 talking to a backend that has the `BusinessImpact::ToolCall` variant (commit `1e501cd6` and later) is the supported path. SDK 0.14.4 talking to an older backend works but the `kind=tool_call` envelope is ignored — same effective behaviour as 0.14.3 minus the wire bytes.
-
----
+_Compatibility:_ **Default SDK behaviour for bare `@sensitive` CHANGED** — was `no business_impact on wire`, now `kind=tool_call on wire`. Operators who relied on the Phase 0 path (approval_id-only grant consume) must either pass `@sensitive(impact=too [...]
 
 ## [0.14.2] - 2026-07-24
 
@@ -167,25 +96,14 @@ Three hotfixes that fell out of the 0.14.1 demo run. Each one is independently s
 
 ### Fixed
 
-- **`@protect` decorator now emits a `tools/track_tool` event** — `decorators.py:470` and `decorators.py:521` (sync + async wrappers) now call `runtime.track_tool(fn.__name__, metadata={"arguments": _safe_kwargs(kwargs)})` after the wrapped body returns. Pre-0.14.2 the `protected` decorator only fired the gate check and skipped the bookkeeping emit, so the dashboard never saw a `protect` execution even though the body ran. The new emit goes through the same sink as `llm_call` events, so it picks up the dedup LRU at `runtime.track()` for free.
-- **`track_tool` event carries `tokens: 0` and a fresh `uuidv7` `execution_id`** — `runtime.py:3077` now stamps both fields onto every `tool_call` event. The backend's `SdkTrackRequest` requires `tokens: u64` (non-Optional) and a threadable `execution_id`; pre-0.14.2 the event dict only carried `type` / `tool_name` / `is_retry` and the deserializer rejected it. Span lifecycle events (`span_start` / `span_end`) get the same `tokens: 0` default via `runtime.py:2161`.
-- **Approval-resolved WS callback is now a plain sync function** — `transport.py:1757` `wrapped_approval_resolved` was previously declared `async def` to be awaitable, but the WebSocket dispatch path invokes it as a plain function (the dispatch signature is `dict[str, Any] -> None`, not awaitable). The async-decorated coroutine was silently dropped, so the sync `threading.Event` inside `runtime._wait_for_approval_resolution` never got set on the first approval round-trip — the demo's first approval hung forever. Caught 2026-07-24 with the demo's first approval resolution.
-- **WebSocket cancellation is treated as a clean shutdown** — `runtime.py:1160` now catches `asyncio.CancelledError` before the generic `except Exception` block. `WebSocketConnection.close()` cancels the receive task to unblock this waiter during normal shutdown; on Python 3.11+ `CancelledError` derives from `BaseException` (not `Exception`), so the old code re-raised it and produced a noisy `WS receive loop ended: <never logged>` debug line on every clean shutdown. The new branch is silent and the path stays contained.
+- **`@protect` decorator now emits a `tools/track_tool` event** — `decorators.py:470` and `decorators.py:521` (sync + async wrappers) now call `runtime.track_tool(fn.__name__, meta [...]
+- **`track_tool` event carries `tokens: 0` and a fresh `uuidv7` `execution_id`** — `runtime.py:3077` now stamps both fields onto every `tool_call` event. [...]
+- **Approval-resolved WS callback is now a plain sync function** — `transport.py:1757` `wrapped_approval_resolved` was previously declared `async def` to be awaitable, but the WebS [...]
+- **WebSocket cancellation is treated as a clean shutdown** — `runtime.py:1160` now catches `asyncio.CancelledError` before the generic `except Exception` block. [...]
 
-### Tests
+_Tests: 4 additions (tests/test_approval_money_flow.py, tests/test_approval_ws_sync_callback.py, tests/test_runtime_branches.py…)._
 
-- `tests/test_approval_ws_sync_callback.py` — 103 lines of new coverage for the WS approval-resolved dispatch path: the callback is invoked as a sync function, the `threading.Event` is set, the wait returns within the timeout, and the previous async-decorated shape is asserted-not-present.
-- `tests/test_runtime_branches.py` — 36 lines of new coverage for the `await conn._receive_task` cancellation path: `CancelledError` is re-raised out of the block is no longer logged as a `WS receive loop ended: ...` debug line, and the `finally` cleanup still runs.
-- The existing `tests/test_sensitive_extractor.py` (5/5) and `tests/test_approval_money_flow.py` (18/18) pass unchanged — the new fields are additive on top of the 0.14.1 wire shape.
-
-### Compatibility
-
-- **Backward-compatible bug fix.** No SDK_MIN_VERSION bump. No public API change.
-- The new `tokens: 0` / `execution_id` fields on `track_tool` events are forwarded exactly as minted; the backend's `SdkTrackRequest` already accepts them (the 0.14.0 envelope contract).
-- The approval-resolved callback is the same public contract (`def on_approval_resolved(payload: dict) -> None`); only the in-transport wrapper changed from `async def` to `def`.
-- The WS cancellation handler is silent in the same way the previous `except Exception` was silent; the only user-visible delta is a removed debug log line on clean shutdown.
-
----
+_Compatibility:_ **Backward-compatible bug fix.** No SDK_MIN_VERSION bump. No public API change.
 
 ## [0.14.1] - 2026-07-24
 
@@ -193,57 +111,33 @@ Decimal JSON serialization patch. `track_tool` event payloads that contain a `De
 
 ### Fixed
 
-- **`_signed_request_body` Decimal serialization** — `transport.py:251` now passes `default=str` to `json.dumps(payload, separators=(",", ":"), default=str)`. Decimal serialises as its lossless string representation (`"50.99"` on the wire), and the backend's pricing math runs on the same string. Pre-fix events that serialised cleanly still serialise to the same bytes because `default=` is only consulted when the default encoder fails. Other non-JSON-native types (`bytes`, `datetime`, `UUID`) get the same `str()` fallback so a single encoder pass handles them all.
-- **WAL fallback `default=str`** — `transport.py:711` `_signed_request_body` WAL fallback (`f.write(json.dumps(event) + "\n")`) also gets `default=str` for consistency. The on-disk fallback log is read by ops only when the backend is unreachable, so the wire-format guarantee does not apply here.
+- **`_signed_request_body` Decimal serialization** — `transport.py:251` now passes `default=str` to `json.dumps(payload, separators=(",", ":"), default=str)`. [...]
+- **WAL fallback `default=str`** — `transport.py:711` `_signed_request_body` WAL fallback (`f.write(json.dumps(event) + "\n")`) also gets `default=str` for consistency. [...]
 
-### Tests
+_Tests: 2 additions (tests/test_approval_money_flow.py, tests/test_sensitive_extractor.py)._
 
-- `tests/test_sensitive_extractor.py` — 5/5 pass (the wire-format bytes match for any payload without `Decimal`).
-- `tests/test_approval_money_flow.py` — 18/18 pass.
-- Full suite — `pytest -n auto --cov=src/nullrun --cov-branch --cov-report=xml --cov-fail-under=0` → 1367 passed, 7 skipped, 29 warnings in 33.24s, coverage 81.49%.
-
-### Compatibility
-
-- **Backward-compatible bug fix**. No SDK_MIN_VERSION bump. No public API change.
-- The wire shape is preserved for every pre-fix event (a non-Decimal payload serialises to the same bytes); the Decimal serialisation is a strict superset.
-
----
+_Compatibility:_ **Backward-compatible bug fix**. No SDK_MIN_VERSION bump. No public API change.
 
 ## [0.14.0] - 2026-07-23
 
 
 ### Added
 
-- **`InvalidMoneyPrecisionError`** and **`InvalidMoneyAmountError`** — dedicated `ValueError` subclasses with structured fields. The amount variant carries a `reason` discriminator (`"negative"` / `"overflow"` / `"non_finite"`); the precision variant carries `currency` / `allowed` / `received` / `received_digits`. Legacy `except ValueError:` blocks still catch them.
+- **`InvalidMoneyPrecisionError`** and **`InvalidMoneyAmountError`** — dedicated `ValueError` subclasses with structured fields. [...]
 - **`BusinessImpact`** model (`dataclass(frozen=True)`) with explicit `currency` / `units` / `amount_minor` fields. `details` dict is still accepted on the legacy path.
-- **`@sensitive(impact=BusinessImpact(...))`** — new decorator kwarg that emits a structured `business_impact` envelope on the `/track` event. Existing `@sensitive(details=...)` / `@sensitive(amount_minor=..., currency=...)` callers keep working on the happy path (now routed through `BusinessImpact` internally).
-- **`MoneyImpactExtractor`** — new helper that normalises `Decimal` / `int` / `float` / str into `BusinessImpact` minor-units, raising `InvalidMoneyAmountError` / `InvalidMoneyPrecisionError` on the audit gaps above.
+- **`@sensitive(impact=BusinessImpact(...))`** — new decorator kwarg that emits a structured `business_impact` envelope on the `/track` event. [...]
+- **`MoneyImpactExtractor`** — new helper that normalises `Decimal` / `int` / `float` / str into `BusinessImpact` minor-units, raising `InvalidMoneyAmountError` / `InvalidMoneyPrec [...]
 
 ### Changed
 
-- **Negative `amount_minor` rejected** on both unit paths. A negative value would silently fall through every `op=gt` predicate (`negative < positive` is always False) — pre-fix a $-50 refund could be wired through without the backend catching it. `0` is still accepted (legitimate $0.00 refund).
-- **Sub-precision Decimal rejected** — `Decimal("1.234")` against a USD `allowed=2` precision is now `InvalidMoneyPrecisionError(currency="USD", allowed=2, received=3, received_digits="1.234")` instead of a silent round to `1.23` that drops the high-order digit the user explicitly typed. `float` and `Decimal` are treated symmetrically; `int` always rounds 0-digits.
+- **Negative `amount_minor` rejected** on both unit paths. A negative value would silently fall through every `op=gt` predicate (`negative < positive` is always False) — pre-fix a  [...]
+- **Sub-precision Decimal rejected** — `Decimal("1.234")` against a USD `allowed=2` precision is now `InvalidMoneyPrecisionError(currency="USD", allowed=2, received=3, received_dig [...]
 - **`/execute` handles `require_approval` correctly** — re-checks with the `approval_id` returned by the backend (was dropping the approval handshake on round-trips).
-- **Server `approval_timeout` clamped to `[1, 3600]s`** on the SDK side as defence against a malformed / overshooting backend that returns `0` or `2147483647` in the Разрыв 1c field.
+- **Server `approval_timeout` clamped to `[1, 3600]s`** on the SDK side as defence against a malformed / overshooting backend that returns `0` or `2147483647` in the Разрыв 1c fiel [...]
 
-### Tests
+_Tests: 6 additions (tests/test_approval_money_flow.py, tests/test_business_impact.py, tests/test_execute_approval_flow.py…)._
 
-- `tests/test_money_hardening.py` — 5 Definition-of-Done scenarios (negative amount, sub-precision Decimal, overflow, non-finite, `0` accepted).
-- `tests/test_business_impact.py` — `BusinessImpact` model contract + integration with the wire envelope.
-- `tests/test_units_discriminator.py` — `USD` vs `USDT` collision caught at the `BusinessImpact` boundary, not on the backend at `/track` time.
-- `tests/test_sensitive_extractor.py` — `@sensitive(impact=...)` round-trip + legacy `details=` backward-compat.
-- `tests/test_approval_money_flow.py` — 5 contract tests covering the `MoneyImpactExtractor` path end-to-end.
-- `tests/test_execute_approval_flow.py` — `/execute` round-trip with stub backend exercising the `require_approval` + `approval_id` re-check path.
-
-### Compatibility
-
-- **Backward compatible** on the happy path. Every existing call site keeps working; the new errors are `ValueError` subclasses; the new `BusinessImpact` decorator kwarg is optional.
-- **No SDK_MIN_VERSION bump** — legacy backends without the Разрыв 1c field fall through to the env default (see 0.13.13 release notes).
-- **No on-wire change** — envelope shape preserved; new fields are additive on the SDK side and ignored by older backends.
-
----
-
----
+_Compatibility:_ **Backward compatible** on the happy path. Every existing call site keeps working; the new errors are `ValueError` subclasses; the new `BusinessImpact` decorator kwarg is optional.
 
 ## [0.13.13] - 2026-07-21
 
@@ -251,21 +145,13 @@ Approval-wait SDK sync with backend commit `0ad03b9` ("\u0420\u0430\u0437\u0440\
 
 ### Fixed
 
-- **Approval wait uses server-authoritative `approval_timeout_seconds` when present** \u2014 new optional kwarg `timeout_seconds: float | None = None` on `_wait_for_approval_resolution`. When the gate response carries a positive integer, that value drives the parked `event.wait`; when the field is absent, non-positive, or non-numeric, the SDK falls back to the env default (pre-0.13.13 behaviour preserved). Explicit zero/negative values are rejected because `event.wait(timeout=0)` deadlocks on the very first call.
-- **`check_workflow_budget` reads `response["approval_timeout_seconds"]`** with type and sign validation. Malformed values fall through to the env default path. `approval_expires_at` is documented as informational (UI/logs) and intentionally not parsed by the SDK.
-- **Diverging server vs env default emits a DEBUG log line** ("approval {id}: using server timeout={X}s (env default would have been {Y}s)") so an operator inspecting logs can see which value actually drove the wait \u2014 useful for diagnosing "why did this approval time out earlier than I configured" tickets.
+- **Approval wait uses server-authoritative `approval_timeout_seconds` when present** \u2014 new optional kwarg `timeout_seconds: float | None = None` on `_wait_for_approval_resolu [...]
+- **`check_workflow_budget` reads `response["approval_timeout_seconds"]`** with type and sign validation. Malformed values fall through to the env default path. [...]
+- **Diverging server vs env default emits a DEBUG log line** ("approval {id}: using server timeout={X}s (env default would have been {Y}s)") so an operator inspecting logs can see  [...]
 
-### Tests
+_Tests: 1 additions (tests/test_approval_timeout_field.py)._
 
-- `tests/test_approval_timeout_field.py` \u2014 6 new tests: server timeout used when response has valid value, env fallback when response omits the field, env fallback when server value is zero/negative, env fallback when server value is non-numeric, timeout sentinel returned when no ws push, diverging server value logs at debug.
-
-### Compatibility
-
-- The new `timeout_seconds` kwarg is optional with a `None` default, so existing callers are unaffected.
-- Legacy backends without the \u0420\u0430\u0437\u0440\u0438\u0432 1c field fall through to the env default \u2014 exactly as before.
-- The SDK is a passive consumer of the new optional fields; no wire-format change.
-
----
+_Compatibility:_ The new `timeout_seconds` kwarg is optional with a `None` default, so existing callers are unaffected.
 
 ## [0.13.12] - 2026-07-20
 
@@ -273,27 +159,22 @@ CI / coverage-testability release. No on-wire change, no SDK_MIN_VERSION bump, n
 
 ### Changed
 
-- **`pytest` suite is now CI-fast on Windows + xdist** — a new `_fast_sleep` autouse fixture in `tests/conftest.py` caps test-code `time.sleep` calls at 1ms, with two opt-out paths (`@pytest.mark.slow_sleep` and `NULLRUN_FAST_SLEEP=0` env var). The fixture also patches `nullrun.transport.time.sleep` and `nullrun.breaker.circuit_breaker.time.sleep` so the `time.sleep(...)` calls captured in those modules at import time still hit the cap. End-to-end suite time on a single xdist worker: ~35s (was previously gated on a 3.3s per-test wall-clock tax in the `TestCircuitBreaker` half-open tests).
-- **`TestCircuitBreaker` half-open tests no longer sleep the wall clock** — `test_open_transitions_to_half_open_after_timeout`, `test_half_open_success_closes`, and `test_half_open_failure_reopens` now use a new `_advance_clock(monkeypatch, seconds=...)` helper that patches `nullrun.breaker.circuit_breaker.time.monotonic` to the wall clock `+N`. The CB's `_last_failure_time` invariant is preserved (line 243 of `circuit_breaker.py`) without a real wait.
-- **`TestPingChainScheduler` opts out of the cap via marker** — the new `@pytest.mark.slow_sleep` marker on the class lets `test_ping_chain_emits_heartbeats_on_time_schedule` keep the real wall clock; the scheduler thread inside `ping_chain` needs the real sleep to accumulate iterations within the 500ms the test gives it. The marker is registered in `pyproject.toml` under `[tool.pytest.ini_options].markers`.
+- **`pytest` suite is now CI-fast on Windows + xdist** — a new `_fast_sleep` autouse fixture in `tests/conftest.py` caps test-code `time.sleep` calls at 1ms, with two opt-out paths [...]
+- **`TestCircuitBreaker` half-open tests no longer sleep the wall clock** — `test_open_transitions_to_half_open_after_timeout`, `test_half_open_success_closes`, and `test_half_open [...]
+- **`TestPingChainScheduler` opts out of the cap via marker** — the new `@pytest.mark.slow_sleep` marker on the class lets `test_ping_chain_emits_heartbeats_on_time_schedule` keep  [...]
 
-### Tests
-
-- The `_advance_clock` helper lives in `tests/test_transport.py` and is module-private to the CB tests for now. If a future test needs the same wall-clock advancement (e.g. a new CB recovery test), move it to `tests/conftest.py` — that promotion is out of scope for this release.
-- `tests/test_v3_wire_contract.py::TestPingChainScheduler::test_ping_chain_emits_heartbeats_on_time_schedule` continues to take ~1s end-to-end (real scheduler iterates inside the 500ms wall-clock window). The 0.13.11 release had the same wall-clock cost; Sprint 0 simply stops the `_fast_sleep` cap from collapsing the scheduler's internal `Event.wait` to 1ms and starving the iteration loop.
-- Sprint 0 reproducibly runs `1237 passed, 7 skipped, 29 warnings` on the full suite under `pytest -n auto --cov=src/nullrun --cov-branch --cov-report=xml:coverage.xml --cov-fail-under=0`. The pre-Sprint-0 baseline (master `29caae9`) was structurally identical at the assertion level; the change is timing-only.
+_Tests: 3 additions (tests/conftest.py, tests/test_transport.py, tests/test_v3_wire_contract.py)._
 
 ### CI
 
-- `pyproject.toml` — new `markers = ["slow_sleep: opt out of the conftest autouse time.sleep cap"]` entry under `[tool.pytest.ini_options]`. Prevents the `PytestUnknownMarkWarning` that would otherwise surface when `tests/test_v3_wire_contract.py` decorates `TestPingChainScheduler` with `@pytest.mark.slow_sleep`.
-- The Codecov badge in `README.md` will now report the real combined coverage on master. Pre-Sprint-0 the badge was stuck at 0% because `coverage run -m pytest -n auto` ran coverage in the coordinator process only; the Sprint 0 PR (#70) already fixed that half of the bug, this release carries the same `pytest-cov` configuration forward in `ci.yml` (`--cov=src/nullrun --cov-branch --cov-report=xml:coverage.xml --cov-report=term`). Codecov's per-commit 0.13.12 patch coverage should land above the `.codecov.yml` 70% patch target.
+- `pyproject.toml` — new `markers = ["slow_sleep: opt out of the conftest autouse time.sleep cap"]` entry under `[tool.pytest.ini_options]`. [...]
+- The Codecov badge in `README.md` will now report the real combined coverage on master. Pre-Sprint-0 the badge was stuck at 0% because `coverage run -m pytest -n auto` ran coverage in the coordinator process only; the Sprint 0 PR (#70) already fixed [...]
 
 ### Audit
 
-- No SDK public API change. No wire-format change. No backend migration required. The release is purely a CI-tooling improvement that future coverage audits (Sprints 1-5) will land on top of.
-- Pre-Sprint-0 instability under `pytest-cov + xdist`: `test_status.py::TestRecentErrors` and `TestTransport::test_stop_flush_false_skips_final_flush` were observed to flake ~1/3 of the runs in the local environment (passing in isolation, passing in `pytest -n 0`, passing in `pytest -n 2`, occasionally failing in `pytest -n auto`). Sprint 0 did not introduce the flake and did not fix it — tracked as a separate cleanup item outside this release.
+- No SDK public API change. No wire-format change. No backend migration required. [...]
+- Pre-Sprint-0 instability under `pytest-cov + xdist`: `test_status.py::TestRecentErrors` and `TestTransport::test_stop_flush_false_skips_final_flush` were observed to flake ~1/3 of the runs in the local environment (passing in isolation, passing in  [...]
 
----
 
 ## [0.13.0] - 2026-07-04
 
@@ -301,25 +182,22 @@ Drift-fixes release. Closes the SDK-side items on `docs/drift.md` (2026-07-04); 
 
 ### Added
 
-- **Idempotency-key propagation to `/track` v3 single-event** — new `nullrun.context._server_minted_idempotency_key_var` + `get_/set_/reset_/clear_server_minted_idempotency_key` helpers. `_capture_server_minted_execution_id` now also reads `response["operation_id"]` (which equals the `/check` `idempotency_key` per `runtime.py:1260`); `_enrich_event` stamps it onto `wire_event` for `llm_call`; `_build_v3_track_payload` propagates it onto the v3 `/track` body with a contextvar fallback for tests and direct callers. Without this, transport-level retry on the same event either 503'd with `RESERVATION_NOT_FOUND` (reservation key DEL'd after first consume per CLAUDE.md §25) or double-billed the underlying budget.
+- **Idempotency-key propagation to `/track` v3 single-event** — new `nullrun.context._server_minted_idempotency_key_var` + `get_/set_/reset_/clear_server_minted_idempotency_key` he [...]
 
 ### Changed
 
-- `runtime.py` module docstring now distinguishes **SDK-side transport failure** (network / 5xx / breaker open → fail-OPEN on the `/check` path) from **wire 4xx/5xx that names an enforcement failure** (`BUDGET_REDIS_UNAVAILABLE` → 402 fail-CLOSED, `RATE_LIMIT_REDIS_UNAVAILABLE` → 503 fail-CLOSED). The previous README claim "Fail-OPEN na infrastructure failures" was conflating the two — the SDK code is now correctly documented in the docstring; the README rewrite is tracked under `drift.md` P0-1 (deferred to a separate doc PR).
+- `runtime.py` module docstring now distinguishes **SDK-side transport failure** (network / 5xx / breaker open → fail-OPEN on the `/check` path) from **wire 4xx/5xx that names an enforcement failure** (`BUDGET_REDIS_UNAVAILABLE` → 402 fail-CLOSED, `R [...]
 
 ### Fixed
 
-- **Wire `status_code` preserved on every decision exception** — `NullRunBlockedException`, `NullRunBudgetError`, `NullRunChainError`, `NullRunWorkflowInactiveError`, `NullRunConsumeOverbudgetError` now all accept `status_code: int | None = None`. `_parse_v3_error_envelope` populates it from `response.status_code` for every branch (402 budget, 403 workflow/chain cross-org, 422 `CONSUME_OVERBUDGET`, 503 `RATE_LIMIT_REDIS_UNAVAILABLE`, ...). FastAPI exception handlers reading `exc.status_code` previously got `None` / 500 for budget blocks because the backend's 402 was lost in the constructor chain.
-- **Patch-coverage gap from 0.12.2 closed** — `tests/test_v3_wire_contract.py::TestGateCacheRuntimeFlow` (3 tests) drives `NullRunRuntime.check_workflow_budget` inside `with chain(...)` and exercises the `cache_enabled` / cache-hit / cache-miss / cache-bypass-via-env branches in `runtime.py:1287-1310` that were previously uncovered (was dragging codecov/patch below the 70% floor on PR #52).
+- **Wire `status_code` preserved on every decision exception** — `NullRunBlockedException`, `NullRunBudgetError`, `NullRunChainError`, `NullRunWorkflowInactiveError`, `NullRunConsu [...]
+- **Patch-coverage gap from 0.12.2 closed** — `tests/test_v3_wire_contract.py::TestGateCacheRuntimeFlow` (3 tests) drives `NullRunRuntime.check_workflow_budget` inside `with chain( [...]
 
-### Tests
-
-- `tests/test_drift_fixes_2026_07_04.py` — 15 new tests: 5 idempotency-key contextvar lifecycle + payload-shape, 8 status_code on every decision exception, 2 fail-CLOSED on wire 503 `RATE_LIMIT_REDIS_UNAVAILABLE`. All pass on the 0.13.0 source.
-- `tests/test_v3_wire_contract.py::TestGateCacheRuntimeFlow` — 3 runtime-level chain-mode cache tests as described above.
+_Tests: 2 additions (tests/test_drift_fixes_2026_07_04.py, tests/test_v3_wire_contract.py)._
 
 ### Audit
 
-- New `docs/drift.md` records the six P0 + P1 items that turned up during pre-publish review of 0.12.2 (idempotency-key wiring, status_code on exceptions, fail-CLOSED honesty, plus four P0/P1 README issues that are deferred to a README rewrite PR and explicitly NOT in this release).
+- New `docs/drift.md` records the six P0 + P1 items that turned up during pre-publish review of 0.12.2 (idempotency-key wiring, status_code on exceptions, fail-CLOSED honesty, plus four P0/P1 README issues that are deferred to a README rewrite PR and [...]
 
 
 ## [0.12.2] - 2026-07-04
@@ -328,8 +206,8 @@ Bug-fix release. Two related correctness fixes layered on top of 0.12.1; no wire
 
 ### Fixed
 
-- **BUG #4 — `/check` execution_id**: `check_workflow_budget()` now sends a fresh `uuidv7` as the `execution_id` field on every call, instead of reusing `workflow_id`. The backend's `gate_reserve_v3` overwrites the field with its own server-minted value on the response, but the previous behaviour could confuse the v3 reservation binding on `/track` when `track_single()` reached the backend — the same root cause as the four gaps 0.12.1 closed, from the client-side placeholder angle. (CLAUDE.md §29 §24 ownership.)
-- **BUG #5 — chain-mode gate thrash**: new `nullrun.runtime._GATE_CACHE` (5s TTL, keyed on `(workflow_id, chain_id, model)`) collapses consecutive `/gate` calls from inside `with chain(...)` to a single roundtrip, avoiding 100 /gate calls per 100-step agent loop. Single-shot (Hard mode) callers bypass the cache — the gate legitimately flips allow→block between consecutive calls there, and a stale "allow" would leak a budget-exhausted call through. Opt-out via `NULLRUN_GATE_CACHE_DISABLE=1` for callers that want the legacy always-roundtrip behaviour (e.g. live smoke tests per `docs/runbooks/budget-blue-green-smoke.sh`).
+- **BUG #4 — `/check` execution_id**: `check_workflow_budget()` now sends a fresh `uuidv7` as the `execution_id` field on every call, instead of reusing `workflow_id`. [...]
+- **BUG #5 — chain-mode gate thrash**: new `nullrun.runtime._GATE_CACHE` (5s TTL, keyed on `(workflow_id, chain_id, model)`) collapses consecutive `/gate` calls from inside `with c [...]
 
 ### Added
 
@@ -349,7 +227,7 @@ This release closes the four gaps documented in `docs/sdk-v3-migration-gaps.md`:
 - `check_workflow_budget()` now reads `response["reservation_id"]` and stores it on a contextvar (`nullrun.context._server_minted_execution_id_var`).
 - New helpers `set_server_minted_execution_id` / `get_server_minted_execution_id` / `reset_server_minted_execution_id` + a paired `_server_minted_reservation_at` timestamp for the 295s TTL guard.
 - `_enrich_event` stamps `execution_id` onto the /track payload when the captured reservation is fresh, and drops it (clearing the capture) once past the safety window — prevents forwarding a doomed id that would 503 on /track per CLAUDE.md section 33.
-- `_route_track` routes `llm_call` events to the v3 `/api/v1/track` single-event endpoint via `Transport.track_single()` so backend `gate_consume_v3` validates the consume-vs-reserve + epsilon invariant (CLAUDE.md section 25). Span / tool events keep using the legacy `/api/v1/track/batch`.
+- `_route_track` routes `llm_call` events to the v3 `/api/v1/track` single-event endpoint via `Transport.track_single()` so backend `gate_consume_v3` validates the consume-vs-reserve + epsilon invariant (CLAUDE.md section 25). [...]
 - `NULLRUN_V3_TRACK_DISABLE=1` opt-out forces everything through the legacy batch path (backends still on v1/v2).
 
 ### Added
@@ -369,6 +247,7 @@ This release closes the four gaps documented in `docs/sdk-v3-migration-gaps.md`:
 - SDK no longer treats the /check `reservation_id` field as decorative. Each LLM-call track event now carries the server-minted uuidv7 the backend minted, so v3 `gate_consume_v3` can find the matching `reservation:{execution_id}` Redis key (300s TTL).
 - LLM-call events now POST to `/api/v1/track` (v3 single-event) instead of `/api/v1/track/batch`. This exercises the consume-vs-reserve invariant that the batch path silently skipped (regression of the v1/v2 `monthly_cost` counter — see CLAUDE.md section 0 G1).
 
+
 ## [0.12.0] - 2026-07-03
 
 Server-minted execution_id default ON. Per CLAUDE.md section 24, every /check now mints a server-side uuidv7 execution_id. The SDK no longer needs to generate its own; the response carries the server-minted id which propagates to /track. This is the SDK_MIN_VERSION for the v3 rollout - older SDKs still work for v1/v2 endpoints but should upgrade.
@@ -383,6 +262,7 @@ Server-minted execution_id default ON. Per CLAUDE.md section 24, every /check no
 ### Changed
 
 - __version__ bumped from 0.11.0 to 0.12.0.
+
 
 ## [0.9.1] - 2026-06-29
 
@@ -419,36 +299,8 @@ httpx transport and the LangChain callback for the same real call.
   - httpx transport reads `model` and `id` straight out of the
     OpenAI-style response body (`payload["model"]`,
     `payload["id"]`). `_openai_extractor` now also carries `"id"` on
-    its return so the transport has it without re-parsing the body.
-  - LangChain callback reads `model` from `invocation_params` /
-    `response.llm_output["model_name"]` and `id` from
-    `response.llm_output["id"]` / `response.id` / the generation's
-    AIMessage `.id` / `response.response_metadata["id"]` — all four
-    locations are populated by langchain-openai 1.x for OpenAI chat
-    completions.
 
-  When any of the three signals is missing, the helper falls back to
-  the empty string on that slot; the resulting fingerprint is still
-  deterministic for the call, just less specific. A missing `id`
-  (custom chat-model wrappers that don't surface it) still collapses
-  the two observers via the model+provider combination.
-
-### Tests
-
-- `tests/test_unified_fingerprint.py` pins the new contract:
-  deterministic fingerprint for identical inputs, distinct
-  fingerprints for distinct inputs, the httpx transport calls the
-  helper with values extracted from the response body, the LangChain
-  callback produces the SAME fingerprint for the same LLM call when
-  reading the chat-completion id from any of the four known
-  langchain locations.
-- `tests/test_llm_call_metadata_flags.py` updated to match the new
-  extractor shape (`usage["id"]` is now present alongside
-  `usage["model"]`).
-
-No public-API break. No behavior change for callers whose
-instrumentation already populates `model` correctly.
-
+_(Trimmed; see git log 0.9.1 for full change set.)_
 ## [0.11.0] - 2026-07-02
 
 Wire-protocol v3 alignment with the backend's Sprint 6 v1 cut
@@ -459,8 +311,6 @@ fail-CLOSED pre-check — every signed POST was rejected with HTTP 400
 `PROTOCOL_HEADER_REQUIRED`. This release aligns the SDK with the v3
 wire contract and adds the missing soft-mode / chain / heartbeat /
 cancel / budget-estimate surface.
-
-### BREAKING (wire-contract)
 
 - **`X-NULLRUN-PROTOCOL: 3` is now mandatory on every signed POST.**
   The backend's `proxy/http/gate/protocol.rs` middleware rejects
@@ -486,164 +336,13 @@ cancel / budget-estimate surface.
 - **`Transport.check_v3(request)` — POST /api/v1/check.** The v3
   replacement for `/gate`. Adds three optional wire fields
   (CLAUDE.md §16):
-  - `chain_id` (UUID v4) — pairs with `chain_op` for soft-mode
-    budget enforcement (CLAUDE.md §5, §6).
-  - `chain_op` (`"start"` / `"continue"` / `"end"` / `"auto"`)
-    — state-machine transitions; absent defaults to auto-register.
-  - `idempotency_key` — replays return the original decision.
-  - `stream: bool` — hints the backend whether streaming is
-    expected (no wire-enforced behaviour change yet).
-  - The response carries a server-minted `execution_id` (§24);
-    callers MUST NOT treat the request's `execution_id` as
-    authoritative.
 
-- **`Transport.track_single(request)` — POST /api/v1/track.**
-  Single-event consume path with the CONSUME_SCRIPT invariant
-  (`actual_cost <= reserved_cents + epsilon_cents`, CLAUDE.md §25).
-  Returns 422 CONSUME_OVERBUDGET when the call's actual cost
-  exceeds the reservation by more than epsilon. The reservation is
-  NOT silently re-reserved (ADR-005).
-
-- **`Transport.cancel(execution_id, reason=None)` — POST
-  /api/v1/cancel.** Idempotent via `cancel:{execution_id}` SETNX
-  (CLAUDE.md §23). Repeated calls return 200 OK without side
-  effects. Surfaced as `NullRunRuntime.cancel_execution()` for the
-  ergonomic wrapper.
-
-- **`Transport.heartbeat(chain_id)` — POST /api/v1/heartbeat.**
-  Atomic `EXPIRE chain:{org}:{chain_id} 300` with SETNX-based
-  dedup via `heartbeat:{chain_id}:{ts_floor_30s}` (CLAUDE.md §26).
-  Cadence: wall-clock 30s (configurable 10-120s). Skew tolerance
-  ±5s.
-
-- **`Transport.chain_end(chain_id)` — POST /api/v1/chain/end.**
-  Explicit chain close (CLAUDE.md §6). Idempotent — unknown
-  chain_id is a no-op 200. Surfaced as
-  `NullRunRuntime.chain_end()`.
-
-- **`Transport.approximate_budget(organization_id=None)` — GET
-  /api/v1/budget/approximate.** UI-only budget estimation
-  (CLAUDE.md §17). Returns 503 `BUDGET_DATA_UNAVAILABLE` when
-  ALL sources fail — NEVER returns 0 (the dashboard must not
-  display "≈ $0 spent" when data is missing). Surfaced as
-  `NullRunRuntime.approximate_budget()`.
-
-- **`Transport._parse_v3_error_envelope(response, endpoint)`**
-  — ACTIVE error envelope parser. Maps the backend's
-  `error_code` field to typed SDK exception subclasses
-  (PROTOCOL_TOO_OLD → `NullRunProtocolError`, CONSUME_OVERBUDGET
-  → `NullRunConsumeOverbudgetError`, CHAIN_CROSS_ORG →
-  `NullRunChainError`, WORKFLOW_INACTIVE →
-  `NullRunWorkflowInactiveError`, etc.). Coexists with the
-  frozen `_parse_error_envelope` from 0.6.0 — the frozen
-  helper remains for the audit/contract test surface.
-
-- **Chain context (`nullrun.context`).** New contextvars
-  `_chain_id_var` + `_chain_op_var` plus the public API:
-  - `chain(chain_id, op="start")` — contextmanager (mirrors
-    `workflow()`).
-  - `get_chain_id()` / `set_chain_id()` — manual setters.
-  - `get_chain_op()` / `set_chain_op()` — chain-op enum setter.
-  - Reachable from the top-level `nullrun` namespace via
-    `_LAZY_EXPORTS` (consistent with `workflow` /
-    `set_call_context`).
-
-- **`NullRunRuntime.ping_chain(chain_id, interval=30.0)` —
-  time-based heartbeat scheduler (CLAUDE.md §26).** Returns a
-  `stop()` callable. The daemon thread emits POST /heartbeat on
-  a wall-clock schedule (`time.monotonic`), not on chunk-count.
-  Pre-fix chunk-based heuristic (every 50 chunks) had two
-  pathological cases — slow chunk rates left chains idle,
-  bursty traffic wasted heartbeat budget on a fresh chain.
-  Cadence clamped to the 10-120s policy range per §26.
-
-- **`NullRunRuntime.cancel_execution(execution_id, reason=None)`
-  + `chain_end(chain_id)` + `approximate_budget()`** — ergonomic
-  wrappers around the new `Transport` methods.
-
-### Added (exceptions)
-
-- `NullRunProtocolError` (NR-P001) — PROTOCOL_TOO_OLD /
-  PROTOCOL_TOO_NEW.
-- `NullRunChainError` (NR-CH001) — CHAIN_MAX_DURATION_EXCEEDED /
-  CHAIN_CROSS_ORG / CHAIN_ORG_MISMATCH / CHAIN_NOT_FOUND /
-  CHAIN_EXPIRED. Carries `chain_id` and `backend_code` for
-  diagnostic clarity.
-- `NullRunConsumeOverbudgetError` (NR-O001) — CONSUME_OVERBUDGET.
-  Carries `reserved_cents`, `max_allowed_cents`, `actual_cost_cents`,
-  `epsilon_cents` so callers can reconcile manually without
-  re-parsing the message string.
-- `NullRunWorkflowInactiveError` (NR-W004) — WORKFLOW_INACTIVE
-  (CLAUDE.md §4 fail-CLOSED on soft-deleted workflow + active key,
-  wired in Sprint 6 v1 12.2).
-- `NullRunRateLimitRedisError` (NR-R002) —
-  RATE_LIMIT_REDIS_UNAVAILABLE. Fail-CLOSED per §4 enforcement
-  table (aggregate rate limit = authoritative gate).
-
-All five are subclasses of either `NullRunInfrastructureError`
-(protocol / rate-limit-redis) or `NullRunDecision` (chain /
-overbudget / workflow-inactive) so existing `except
-NullRunError:` clauses keep matching.
-
-### Changed
-
-- **`check_workflow_budget()` forwards chain context.** When the
-  caller has wrapped the gate in `with chain(chain_id, op="start")`,
-  the SDK now includes `chain_id` + `chain_op` + `idempotency_key`
-  in the /gate (or /check) payload so the backend's Lua
-  RESERVE_SCRIPT can run the soft-mode branch (CLAUDE.md §5).
-  Absent chain context, behaviour is identical to 0.10.0 (single-
-  shot Hard). Wire-shape is additive — legacy callers see no
-  payload change.
-- **`Transport.check()` (legacy /gate) forwards chain_id /
-  chain_op / idempotency_key / stream when present.** Same
-  additive contract — missing keys are omitted, not nulled.
-- **`_auth_headers()` includes `X-NULLRUN-PROTOCOL`.** Affects
-  `_post_auth_with_retry`, `_fetch_remote_state`, `get_org_status`.
-- **`runtime._post_auth_with_retry` now passes headers.** Pre-fix
-  the helper did `self._client.post(url, json=json_body)` with no
-  headers — the wire had no `X-API-Key`, no Authorization, and no
-  protocol header, which the backend's protocol + CSRF middlewares
-  reject. Now it passes `self._auth_headers()`.
-
-### Backwards compatibility
-
-- All five new `Transport` methods are additive. Existing
-  `check()` / `execute()` / batch `_send_batch_with_retry_info`
-  paths keep their previous signatures.
-- The five new exception classes are subclasses of the existing
-  public hierarchy (`NullRunError` ← `NullRunDecision` /
-  `NullRunInfrastructureError`); existing `except NullRunError:`
-  clauses keep matching.
-- The wire-protocol header is mandatory ONLY when connecting to
-  a v3-or-later backend. Older pre-v3 backends ignore the header
-  — no payload-level break.
-
-### Notes
-
-- The v3 `gate_reserve_v3` Lua script (CLAUDE.md §33) is on
-  blue-green deployment per §19 — the SDK must work against
-  BOTH the legacy `cost/reservation.rs::reserve_budget_atomic`
-  (v1/v2 default) AND the v3 Lua path. The new `check_v3` /
-  `track_single` helpers are the v3 path; the legacy `check` /
-  batch `track` continue to hit the v1/v2 default. Operators
-  flip the backend flag `NULLRUN_RESERVE_V3_ENABLED=1` to
-  migrate; SDKs on 0.11.0 work in both modes.
-- Soft-mode budget enforcement requires the backend's
-  `NULLRUN_SOFT_LIMIT_ENABLED=1` flag (CLAUDE.md §0 G3). Without
-  it, chain_id is forwarded but the backend still treats soft
-  passes as hard blocks. This is the controlled migration
-  state noted in §0.
-
----
-
+_(Trimmed; see git log 0.11.0 for full change set.)_
 ## [0.10.0] - 2026-06-29
 
 (Unreleased — work-in-progress; will be backfilled once 0.11.0
 ships.)
 
-
----
 
 ## [0.9.0] - 2026-06-29
 
@@ -677,16 +376,7 @@ script exit.
   `atexit` handler eliminates the noisy log. No-op if `init()`
   was never called.
 
-### Tests
-
-- `tests/test_llm_call_metadata_flags.py` pins the new contract:
-  every `llm_call` span carries `metadata.tracked` or
-  `metadata.streaming_skipped`. Coverage is now an out-of-process
-  concern.
-- `tests/test_coverage_report.py` and `tests/test_coverage_seen_httpx.py`
-  removed — coverage is no longer an SDK-side concept.
-
----
+_Tests: 3 additions (tests/test_coverage_report.py, tests/test_coverage_seen_httpx.py, tests/test_llm_call_metadata_flags.py)._
 
 ## [0.8.3] - 2026-06-29
 
@@ -724,18 +414,7 @@ reach. Promotes the missing-model wire failure from WARN to fail-LOUD.
   wire-private and stripped before persisting. Activated only for
   `llm_call`; other event types are silent.
 
-### Tests
-
-- `tests/contract/test_llm_call_model_wire.py` pins all three
-  invariants: 7 unit tests for `_extract_model_from_response`
-  (every known langchain shape + non-OpenAI wrappers + empty-string
-  fallthrough), 3 tests for `track()`'s missing-model wire tagging
-  (ERROR + counter + `__missing_model` flag + non-llm_call silence),
-  and 2 tests for the eager-wrap sweep (pre-existing Client gets
-  wrapped, idempotent on re-patch).
-
----
-
+_(Trimmed; see git log 0.8.3 for full change set.)_
 ## [0.8.2] - 2026-06-29
 
 Additive patch on top of 0.8.0. No public-API break. Continues the
@@ -764,16 +443,7 @@ schema so a future rename can't silently break the SDK.
   `DEFAULT_RATE` ≈ \$0/call. Unit-tested in
   `tests/test_model_fallback.py`.
 
-### Tests
-
-- `tests/test_batch_response_parsing.py` pins the post-2026-06-27
-  `BatchTrackResponse` shape (`actions: Vec<ActionTaken>`,
-  `messages: Vec<String>`) and documents that the legacy
-  `actions_taken: Vec<String>` field is intentionally dropped in
-  0.8.0. Regression test so a future backend rename can't silently
-  break the SDK.
-
----
+_Tests: 1 additions (tests/test_batch_response_parsing.py)._
 
 ## [0.8.0] - 2026-06-28
 
@@ -810,68 +480,8 @@ payload hygiene.
   stopped forwarding `invocation_params` to `on_llm_end`, every
   LangChain-callback track event carried `model="unknown"` and
   the backend cost pipeline fell through to `DEFAULT_RATE`. The
-  same shape applied to llama-index mock providers and autogen
-  subclasses that don't expose a `.model` attribute. New
-  fallback chain (per path):
 
-  - `NullRunCallback.on_llm_end` (langgraph): `invocation_params.model_name`
-    → `response.response_metadata['model_name']` → AIMessage
-    `response_metadata` → `response.llm_output['model_name']` →
-    `response.model_name` / `response.model` → `'unknown'`
-    (truly last resort, not the common case).
-  - `extract_from_event` (llama_index): `event.response.model` →
-    `event.response.raw.model` → `usage['model']`. Mock providers
-    and adapter-style ChatResponse objects now ship a real model
-    id on the wire.
-  - `on_messages` (autogen): `self.model` → `result.model`. OpenAI's
-    response carries the actual model id (may differ from request
-    if the server resolved an alias) — this is the right value.
-  - `_emit_from_span` (auto, openai-agents): `span['model']` →
-    `usage['model']` → `span['response_metadata']['model_name']`.
-    Some custom tracer configs leave `span['model']` empty; the
-    other two sources usually have it.
-
-- **Two shared helpers added to `instrumentation/langgraph.py`:**
-  `_extract_model_from_response` and `_extract_provider_from_response`.
-  These mirror the same best-effort pattern `_get_finish_reason`
-  already uses, so we have a single "best-effort read from the
-  response object" idiom across the module. The autogen /
-  llama_index / agents paths duplicate the walk inline (the
-  response shapes differ too much to share a single helper), but
-  the *ordering* matches: official-attr → metadata → usage
-  → wrapper-attr.
-
-### Operator-visible change
-
-`logger.warning("track(): llm_call event missing 'model' field — backend will fall back to DEFAULT_RATE. event=...")` is now emitted from `NullRunRuntime.track()` whenever an `llm_call` event reaches the wire without a `model` field. This log is the single signal an operator needs to reproduce "which observation (httpx / langchain callback / manual track / agents tracer / requests) produced an `llm_call` without `model` set". Activated only for `llm_call`; other event types are silent. Log destination is whatever the host application configures for the `nullrun.runtime` logger.
-
-### Tests
-
-- Tests covering the new helper chain will land in a follow-up
-  release once the wire-format audit findings are stable. The
-  fix is a defensive best-effort read; the existing
-  `test_instrumentation_*` suites already pass against the
-  updated paths.
-
----
-
-Additive patch on top of 0.7.7. Converts two silent fail-OPEN footguns
-into explicit `DeprecationWarning` / `RuntimeError`. No behavior
-change for callers who don't touch the deprecated surface.
-
-### Deprecated
-
-- `NullRunRuntime.start_recording()` and `NullRunRuntime.stop_recording()` now emit `DeprecationWarning`. They have been silent no-op stubs since Sprint 2.1 (0.4.0). Decision history is available via the backend dashboard at `/control-center/decision-history`. **Both methods will be removed in 0.9.0.**
-- Setting `NULLRUN_USE_GRPC=1` now raises `RuntimeError` at SDK init instead of silently falling back to HTTP with an info log. gRPC transport remains on the roadmap but is not yet implemented. Unset the env var to use HTTP. See https://docs.nullrun.io/reference/sdk-api#transport
-
-### Migration
-
-- Replace `runtime.start_recording(workflow_id, metadata=...)` with a dashboard navigation or `nullrun.status()` introspection.
-- Remove any `NULLRUN_USE_GRPC` env var from deployment configs (Docker compose, k8s manifests, systemd units).
-- Catch `RuntimeError` at SDK init if you want to keep the env var as a feature flag — but the recommended path is to unset it.
-
----
-
+_(Trimmed; see git log 0.8.0 for full change set.)_
 ## [0.7.8] - 2026-06-28
 
 Additive patch on top of 0.7.7. Converts two silent fail-OPEN footguns
@@ -880,7 +490,7 @@ change for callers who don't touch the deprecated surface.
 
 ### Deprecated
 
-- `NullRunRuntime.start_recording()` and `NullRunRuntime.stop_recording()` now emit `DeprecationWarning`. They have been silent no-op stubs since Sprint 2.1 (0.4.0). Decision history is available via the backend dashboard at `/control-center/decision-history`. **Both methods will be removed in 0.9.0.**
+- `NullRunRuntime.start_recording()` and `NullRunRuntime.stop_recording()` now emit `DeprecationWarning`. They have been silent no-op stubs since Sprint 2.1 (0.4.0). [...]
 - Setting `NULLRUN_USE_GRPC=1` now raises `RuntimeError` at SDK init instead of silently falling back to HTTP with an info log. gRPC transport remains on the roadmap but is not yet implemented. Unset the env var to use HTTP. See https://docs.nullrun.io/reference/sdk-api#transport
 
 ### Migration
@@ -889,7 +499,6 @@ change for callers who don't touch the deprecated surface.
 - Remove any `NULLRUN_USE_GRPC` env var from deployment configs (Docker compose, k8s manifests, systemd units).
 - Catch `RuntimeError` at SDK init if you want to keep the env var as a feature flag — but the recommended path is to unset it.
 
----
 
 ## [0.7.7] - 2026-06-27
 
@@ -926,62 +535,8 @@ default to `None` / empty so existing call sites keep working.
     Backend matches each against the workflow's effective
     `blocked_tools` aggregate and returns `block` on any match.
     `None` leaves whatever was previously set; `[]` clears.
-  - `nullrun.get_call_model()` and `nullrun.get_call_tools()` are
-    the read-side helpers (also reachable via
-    `nullrun.context.get_call_model` / `get_call_tools`).
 
-### Fixed
-
-- **`/gate` pre-flight no longer sends `model="budget-precheck"`.**
-  Pre-0.7.7 every SDK `/gate` call for any workflow with a budget
-  was hard-blocked because the runtime hard-coded the literal
-  string `"budget-precheck"` as the model. The backend's
-  `PolicyEvaluationGraph.evaluate()` stub treated any synthetic
-  `cost_limit` rule with score > 0.8 as `Block` (see
-  `backend/src/policy/graph.rs:448-462`,
-  `backend/src/proxy/http/gate/internal.rs:619-628`), so the
-  pricing lookup never landed on a real model and the rule fired
-  with the wrong score. Now the runtime forwards the model from
-  `set_call_context(model=...)` (or `None` when unset), and the
-  backend's `calculate_projected_cost` falls through to the
-  default rate cleanly.
-
-- **`/gate` pre-flight now forwards the per-call `tools` list.**
-  `Transport.check` previously dropped the `tools` key from the
-  wire payload, so even when the user called
-  `set_call_context(tools=[...])` the backend's
-  `gate/internal.rs::check_tool_block` had nothing to match
-  against. The transport now propagates `tools` when the runtime
-  sets it; `[]` vs missing-`None` are distinguished on the wire
-  (per `gate/internal.rs::check_tool_block` doc-comment —
-  "no tools will be called" is different from "I did not tell you
-  what tools").
-
-### Tests
-
-- **`tests/test_gate_real_path.py`** (new, 226 lines) — regression
-  test pinning the fix. Three classes:
-  - `TestGateRealPathRegression` — default request now returns
-    `allow` (not the old blanket block on the synthetic
-    `cost_limit` rule), wire payload contains no
-    `policy-N` residue from the old graph plumbing, and a real
-    `decision="block"` still raises `WorkflowKilledInterrupt`
-    (so the fix didn't accidentally remove the real-block path).
-  - `TestSetCallContext` — `set_call_context(model=...)` flows
-    into the wire body, `set_call_context(tools=[...])` flows
-    into the wire body, no-context means no `tools` key at all
-    (not `[]`), and `set_call_context(tools=[])` clears a
-    previously-set tool list.
-  - `TestPackageExports` — the new helpers are reachable from
-    `nullrun.*`.
-
-- `tests/conftest.py` — `reset_runtime` fixture now also clears
-  `_call_model_var` and `_call_tools_var` so a test's
-  `set_call_context(...)` doesn't leak into the next test's wire
-  payload.
-
----
-
+_(Trimmed; see git log 0.7.7 for full change set.)_
 ## [0.7.6] - 2026-06-27
 
 Additive patch on top of the 0.7.0 thin-client refactor. Brings a
@@ -1017,72 +572,8 @@ small transport consistency fixes. No breaking changes.
     "category": "decision"
   }
   ```
-  HTTP status mapping:
-  - `NR-B004` (budget), `NR-L001` (loop), `NR-R001` (rate) → **429**
-    with optional `Retry-After`.
-  - `NR-T001` (tool blocked), `NR-X001` (generic block) → **403**.
-  - `NR-W003` (paused) → **503** with `Retry-After`.
-  - `NR-W002` (killed) → **503**. `WorkflowKilledInterrupt` is a
-    `BaseException` subclass so Starlette's `add_exception_handler`
-    refuses it; the integration uses an ASGI middleware instead
-    (hybrid pattern documented in the module docstring).
-  - All `NullRunInfrastructureError` subclasses → **503**
-    (failure is on our side, not the user's).
 
-- **`nullrun.messages`** — default user-facing message catalog.
-  Every `NR-*` error code has an English default message owned by
-  NULLRUN, not by customer code, so a Customer Support Bot hitting
-  a budget cap shows the same wording across every NullRun-backed
-  application.
-  - `format_user_message(exc)` — render an exception as a
-    user-facing string.
-  - `set_user_message(code, text)` — per-process override for
-    branded variants in a single deployment.
-  - `get_user_message(code)` — raw lookup.
-  - `reset_overrides()` — clear all overrides (for tests).
-
-### Changed
-
-- **`Transport._send_batch` canonical JSON serialization** —
-  route the `/track/batch` body through `_signed_request_body` for
-  consistent compact-separator serialisation (`,`/`:`). HMAC itself
-  is unaffected (it hashes the bytes either way), but consistent
-  serialisation removes a special-case from the wire-format contract
-  tests. Docstring invariant: "All three signed POST call sites
-  MUST serialise via this helper."
-
-- **`Transport._send_batch` actions response handling** —
-  backend renamed `BatchTrackResponse.actions_taken` (debug names)
-  → `BatchTrackResponse.actions` (`ActionTaken` structs with
-  human-readable strings moved to `messages`). Single `/track`
-  still uses `TrackResponse.actions_taken`. We read both for
-  forward-compat; per-element `try/except` so one malformed
-  entry doesn't abort the whole loop.
-
-- **`pyproject.toml` metadata** — long-form description with
-  keyword coverage for search, `Maintainer:` populated via
-  `maintainers = [...]`, expanded classifiers
-  (`OS Independent` / Linux / Windows / macOS,
-  Python 3.13, `CPython`, `Security`, `AI`, `WWW/HTTP` topics),
-  project URL expander (Discussions / Releases / Source /
-  Security Policy).
-
-### Tests
-
-- `tests/test_messages.py` (new, 282 lines) — catalog completeness
-  (every NR-* code in `exceptions.py` has a default message),
-  override / reset behavior, render path.
-- `tests/test_integrations_fastapi.py` (new, 289 lines) — HTTP
-  status mapping per error code, response shape, ASGI
-  middleware path for `WorkflowKilledInterrupt`, hybrid
-  (exception handlers + middleware) composition.
-- `tests/test_decision_split.py` (new, 199 lines) — pins the
-  decision / infrastructure error split.
-- Updates to `tests/test_runtime.py`, `tests/test_extractors.py`
-  reflecting transport canonical-JSON + actions-renamed changes.
-
----
-
+_(Trimmed; see git log 0.7.6 for full change set.)_
 ## [0.7.0] - 2026-06-26
 
 ### BREAKING CHANGES
@@ -1118,39 +609,8 @@ enforcement, its dataclass, and its hardcoded thresholds are removed.
   init)
 - WS `on_policy_invalidated` callback (no local policy to invalidate)
 
-**Migration:**
 
-If you need to display policy values in a UI, fetch them directly
-via `GET /api/v1/orgs/{org_id}/policies`. The SDK no longer mirrors
-them.
-
-**Audit:** Drift D-01 from 2026-06-26 SDK↔backend audit
-(`PolicyResponse` lacked fields SDK expected; local defaults silently
-widened limits).
-
-### Transport finalizer behavior change
-
-`Transport._atexit_flush_safe` is now a no-op that emits a single
-`DEBUG` log line. It does NOT persist buffered events to the WAL
-anymore — by the time `weakref.finalize` fires, `self._buffer` /
-`self._lock` / `self._client` are already gone, so any attempt to
-write them would either no-op or crash. **Crash-safety now lives
-exclusively in `stop()` and the context-manager pattern.** Callers
-who relied on the implicit on-exit WAL flush must switch to:
-
-```python
-with nullrun.Transport(api_url=..., api_key=...) as t:
-    # use t; __exit__ calls stop() which calls _persist_to_wal
-    ...
-```
-
-or call `t.stop()` explicitly before process exit. A `DEBUG` log
-line "Transport finalizer fired without explicit stop(); remaining
-events may be lost" is the user-visible signal that events were
-dropped.
-
----
-
+_(Trimmed; see git log 0.7.0 for full change set.)_
 ## [0.6.1] — 2026-06-24
 
 Additive release — Layers 1, 2, and 3 of the "give the user a chance"
@@ -1186,118 +646,8 @@ of parsing the message string.
   the existing user-facing class, so existing `except` clauses
   keep matching):
 
-  | Class | Subclass of | `error_code` | `retryable` |
-  |---|---|---|---|
-  | `NullRunConfigError` | `NullRunError` | `NR-C001` | False |
-  | `NullRunAuthError` | `NullRunAuthenticationError` | `NR-A001` | False |
-  | `NullRunBackendError` | `NullRunTransportError` | `NR-B002` | **True** |
-  | `NullRunBudgetError` | `NullRunBlockedException` | `NR-X001` | False |
-  | `NullRunToolBlockedError` | `NullRunBlockedException` | `NR-T001` | False |
 
-- **Public re-exports** — `nullrun.NullRunError`,
-  `nullrun.NullRunAuthError`, `nullrun.NullRunConfigError`,
-  `nullrun.NullRunBackendError`, `nullrun.NullRunBudgetError`,
-  `nullrun.NullRunToolBlockedError`,
-  `nullrun.WorkflowKilledInterrupt` are now in
-  `nullrun.__all__` and show up in `dir(nullrun)` for
-  discoverability. The legacy types (`NullRunBlockedException`,
-  `NullRunAuthenticationError`, `WorkflowKilledException`,
-  `WorkflowPausedException`) stay importable via the lazy-export
-  table for back-compat — adding them here would change
-  `dir(nullrun)` for existing users.
-
-### Layer 2 — `nullrun.on_error()` global hook
-
-- **`nullrun.on_error(hook)` — global error hook.** Fires for
-  every structured `NullRunError` *before* the exception
-  propagates so the call stack is still live. Returns an
-  idempotent `unregister` callable.
-  - **Skipped** for `WorkflowKilledInterrupt` (BaseException
-    subclass — kill is a signal, not an error) and for
-    non-`NullRunError` exceptions.
-  - **Multiple hooks** fire in registration order.
-  - **Hook exceptions** are caught and logged at DEBUG — a
-    misbehaving hook cannot break the SDK.
-  - **Zero-cost fast path** when no hook is registered
-    (`has_hooks()` short-circuit before any allocation).
-- **Backed by** `nullrun.observability.error_hooks` —
-  `register_hook`, `unregister_hook`, `emit_error`, `clear_hooks`,
-  `STAGES`, `ErrorContext`.
-
-### Layer 3 — `nullrun.status()` introspection
-
-- **`nullrun.status()` — synchronous runtime snapshot.** Returns
-  a frozen `NullRunStatus` dataclass (state, version, reason,
-  auth state, policy state, connectivity, workflow state,
-  bounded recent-errors ring buffer).
-  - **Four headline states** derived automatically: `ok`,
-    `degraded`, `offline`, `misconfigured`.
-  - **Raises** `NullRunConfigError` (`NR-C004`) if no runtime
-    has been `init()`'d — never lazily creates a runtime as a
-    side effect.
-  - **Thread-safe** — safe to call from the agent loop, the
-    transport flush thread, or a debug console.
-- **Backed by** `nullrun.observability.status` —
-  `NullRunStatus`, `RecentError`, `WorkflowState`,
-  `_RecentErrorRing`.
-
-### Docs
-
-- **`docs/errors/`** — 15 per-code pages (`NR-A001..A003`,
-  `NR-B001..B005`, `NR-C001/C003`, `NR-L001`, `NR-R001`,
-  `NR-T001`, `NR-W002/W003`) plus a `README.md` index. Each
-  page documents the trigger conditions, the `user_action`,
-  the `retryable` hint, and a small reproducer / fix snippet.
-- **`docs/integration-baseline-2026-06-19.md`** — pinned
-  baseline for the next integration run.
-
-### Tests
-
-- **`tests/test_exception_hierarchy.py`** — pins the
-  hierarchy shape (class roots), the structured fields on every
-  public class, and the five back-compat invariants (`except`
-  clauses keep matching across the new subclasses;
-  `WorkflowKilledInterrupt` is the only public class not
-  catchable by `except Exception`).
-- **`tests/test_error_hooks.py`** — registry basics, `emit_error`
-  semantics (fires with both args, swallows hook exceptions,
-  one-bad-hook-isolated, unregister-mid-dispatch is safe),
-  `ErrorContext` validation, the `WorkflowKilledInterrupt` and
-  `WorkflowKilledException` bypass rules, and that the global
-  `nullrun.on_error` shim is wired through.
-- **`tests/test_status.py`** — no-runtime raises `NR-C004`,
-  with-runtime snapshot is frozen / equality-stable, key prefix
-  is truncated to 10 chars, state derivation (ok / degraded /
-  misconfigured), recent-errors ring buffer (capacity 10, fed
-  by `_emit_sdk_error`).
-- **`tests/test_integration_contract.py`** — `track_event`
-  `setdefault` race pinned against the locked helper.
-- **`tests/test_dead_code_removed.py::test_dir_size_unchanged`** —
-  rewritten to key off `nullrun.__all__` (source of truth for
-  the curated surface) instead of a hardcoded symbol count, so
-  the curated-surface contract is still pinned without
-  blocking legitimate additions.
-
-### Release plumbing
-
-- The previous `0.6.0` on TestPyPI is **yanked** (visible but
-  not installable via `pip install nullrun`) — it predates
-  the Layer-1 / Layer-2 / Layer-3 work merged in this release,
-  so users who pinned `0.6.0` on TestPyPI should upgrade to
-  `0.6.1` to pick up the new structured exceptions and
-  observability APIs.
-
-### Back-compat
-
-- Every existing `except` clause keeps matching — the new
-  exception classes are subclasses of the existing ones.
-- `from nullrun.breaker.exceptions import X` keeps working
-  unchanged.
-- `pip install nullrun==0.6.1` is a drop-in replacement for
-  `0.6.0`.
-
----
-
+_(Trimmed; see git log 0.6.1 for full change set.)_
 ## [0.6.0] — 2026-06-23
 
 Hardening pass driven by the 2026-06-22 SDK↔backend integration audit.
@@ -1306,8 +656,6 @@ release shipped: SDK POSTs being rejected by the backend's CSRF
 middleware, WS HMAC identity field drift, and policy-fetch silently
 falling through to a permissive default on any backend blip. Coverage
 jumped from ~76% to **84.59%** (branch = true).
-
-### Security (P0 — must-fix)
 
 - **FIX-F3 — every signed POST now carries `Authorization: Bearer <api_key>`.**
   The backend's CSRF middleware (`backend/src/auth/csrf.rs::has_bearer_auth`)
@@ -1333,106 +681,16 @@ jumped from ~76% to **84.59%** (branch = true).
   HMAC signature. Pre-fix a future server-side rename would silently
   break WS signature verification with no compile-time signal.
 
-### Security (P0 — fail-CLOSED contract)
-
 - **Policy fetch is now fail-CLOSED (F-R2-02).** Pre-fix, any HTTP
   exception, non-200 status, or empty `{"data": []}` response silently
-  fell through to `Policy.default_local()` — which had
-  `budget_cents=1000`, `rate_limit=100`, `loop_threshold=6`, no tool
-  block, i.e. effectively unenforced. A 503 from the backend would
-  keep the customer's SDK running with zero enforcement for the rest
-  of the session. Post-fix the SDK resolves the policy on this gate in
-  priority order: (1) the last known-good cached policy
-  (`self._last_good_policy` — written by every successful
-  `_fetch_policy`), (2) `Policy.strict_local()` (zero budget cap
-  forces the backend reservation service, which is itself
-  fail-CLOSED), (3) opt-out via `NULLRUN_POLICY_FAIL_OPEN=1` to
-  restore the legacy permissive fallback for tests/staging.
-  Mirrors the shape of `NULLRUN_SKIP_BUDGET_CHECK=1` and
-  `NULLRUN_SENSITIVE_FAIL_OPEN=1`.
 
-- **`Policy.strict_local()` new classmethod.** Tight fail-CLOSED
-  fallback: `budget_cents=0`, `rate_limit=1`, `loop_threshold=1`,
-  `retry_threshold=1`. The zero budget cap forces every cost-bearing
-  operation through the backend's reservation service. The 1-call
-  rate limit caps sustained throughput. The threshold-of-1 loop and
-  retry detectors fire on the first suspicious repetition.
-
-### Fixed
-
-- **`Policy.from_dict` now reads `rate_limit_per_minute`** (the
-  backend field name from `PolicyResponse` in
-  `backend/src/proxy/http/policies.rs`). Falls back to legacy
-  `rate_limit` for backwards compat. SDK keeps the local attribute
-  name `rate_limit` (cents per minute) — only the wire-mapping
-  changes.
-
-- **`_is_acknowledged_state` case-insensitive fallback for WS.**
-  New helper on `WebSocketConnection` checks PascalCase first (the
-  happy path per `handlers.rs:9258` `as_pascal_case()` normaliser),
-  then falls back to lowercase for defensive coverage against server
-  regressions to `"killed"`/`"paused"`.
-
-- **Backend policy fetch uses the correct route.** Pre-fix the SDK
-  POSTed to `/api/v1/policies` with `organization_id` in the body —
-  the backend route is `GET /api/v1/orgs/{org_id}/policies`, so the
-  call 404'd and silently fell through to `Policy.default_local()`
-  (silent fail-OPEN on every policy fetch).
-
-- **`README.md` PyPI badge switched from `dm` to `dt`.** The daily
-  mirror (`dm`) was inflating the displayed download count from
-  mirror syncs; the total (`dt`) shows the canonical PyPI total.
-
-### Tests
-
-- **`tests/test_integration_contract.py`** (new, 675 lines, 12 test
-  classes). Pins the SDK↔backend wire-format contracts surfaced by
-  the 2026-06-22 audit: `Authorization` header on every signed POST
-  (FIX-F3), `/api/v1/orgs/{org_id}/policies` and
-  `/api/v1/orgs/{org_id}/workflows/{wf}` URL shapes, ACK unit
-  discrimination, WS HMAC identity field (FIX-F4), backend
-  `PolicyResponse` → SDK `Policy` field mapping, canonical-bytes
-  guard against silent re-serialisation drift, sensitive-tool
-  routing through `/execute`, fail-CLOSED policy fetch under
-  exceptions / 5xx / empty data, outgoing WS ACK is plain JSON (not
-  signed — corrects the 0.5.2 overclaim), all five workflow states
-  (`running` / `paused` / `killed` / `completed` / `failed`)
-  accepted, atomic remote-state registration across concurrent
-  reconnects. Each test is paired with a specific backend file —
-  update both sides in lock-step, do not edit one side alone.
-
-- **`tests/test_high_reliability_fixes.py`** — re-aligned with the
-  fail-CLOSED contract after the master merge; pins the
-  last-known-good policy cache priority.
-
-- **`tests/test_hmac_byte_equality.py`** — pinned the
-  `content=` vs `json=` body-byte equality that the legacy batch
-  path silently broke.
-
-- **`tests/test_ws_signed_payload.py`** — expanded to cover the
-  `api_key` / `api_key_id` dual-field WS HMAC identity contract.
-
-- **`tests/test_preflight_fail_policy.py`** — updated to cover
-  `NULLRUN_POLICY_FAIL_OPEN=1` opt-out alongside the default
-  fail-CLOSED path.
-
-- **Coverage:** 84.59% (branch = true, `fail_under = 82`). Per-file
-  leaders: `transport.py` 85.01%, `transport_websocket.py` 65.64%,
-  `runtime.py` 83.71%, `instrumentation/auto.py` 70.17% (LLM-vendor
-  patches — most remain opt-in), `instrumentation/langgraph.py`
-  93.69%, `instrumentation/crewai.py` 90.82%,
-  `instrumentation/autogen.py` 93.41%.
-
----
-
+_(Trimmed; see git log 0.6.0 for full change set.)_
 ## [0.3.1] — 2026-06-17
 
 Production-readiness hardening. No public-API changes; the curated 6-symbol
 surface is unchanged. Aligns the SDK with the contracts in
 `NULLRUN/docs/adr/008-sdk-preflight-fail-policy.md` and
 `NULLRUN/docs/kill-contract.md`.
-
-### Fixed (P0 — must-fix)
 
 - **gRPC transport code path removed.** `create_grpc_transport` was
   referenced but never defined, so setting `NULLRUN_USE_GRPC=1` raised
@@ -1462,94 +720,8 @@ surface is unchanged. Aligns the SDK with the contracts in
 - **`Transport` is now a context manager.** `with Transport(...) as t:`
   starts the flush thread on enter and stops it on exit. Replaces
   the manual `start() / stop()` pair that was easy to forget.
-- **HMAC body byte-equality in the legacy batch path.** The
-  pre-fix code signed `body = json.dumps({"events": batch})` and
-  then sent the same payload via httpx's `json=...` parameter,
-  which re-serialises with compact separators. The signed bytes
-  and the wire bytes were not identical. Now the path uses
-  `content=body` so the signed bytes are the wire bytes.
-- **All 4 examples fixed.** `basic.py` was calling `init()` with no
-  args (raises in 0.3.0). `basic_observe.py` was passing
-  `organization_id=` (not in the signature) and calling
-  `nullrun.coverage_report()` (did not exist). `cost_dashboard.py`
-  was using `Authorization: Bearer` and the non-existent
-  `/api/v1/orgs/{org_id}/usage` endpoint. All four now use the
-  current SDK surface and the canonical `/api/v1/orgs/{org_id}/status`
-  endpoint.
 
-### Fixed (P1)
-
-- **AsyncTransport dead code deleted.** 626 lines of unused
-  async transport that had no call sites. Tests already removed.
-- **TrackResult dead class deleted.** `track()` returns `dict`,
-  not `TrackResult`. The class was unreferenced.
-- **Singleton-state lock added.** `init()` now wraps the three
-  singleton-slot writes (`NullRunRuntime._instance`,
-  `_rt_mod._runtime`, `_dec_mod._runtime`) in a module-level
-  `threading.Lock` so concurrent `init()` calls cannot leave
-  the slots pointing at two different runtimes.
-- **Legacy API key warning.** Pre-Phase-139 API keys (no
-  `workflow_id` from `/auth/verify`) now emit a one-time
-  WARNING explaining that remote kill/pause will not be
-  honoured. Without the warning, the dashboard KILL button
-  silently no-ops for users on legacy keys.
-- **Distributed circuit-breaker race fix.** The pre-fix code
-  defined `_publish_half_open_state` but never called it. The
-  `state` property now calls it on the `OPEN → HALF_OPEN`
-  transition so other workers see the new state in Redis
-  instead of falling back to PERMISSIVE.
-
-### Removed (dead code)
-
-- `AsyncTransport` (626 lines)
-- `TrackResult` (12 lines)
-- `BoundedDict` cost / loop / retry counters
-- `_check_local_limits` (the local budget check that read
-  `cost_cents` which the SDK never sets — was dead for the
-  public API)
-- `StructuredLogger`, `get_logger`, `TenantFilter`,
-  `configure_logging_with_tenant_context`, `timed` from
-  `observability.py` (zero call sites)
-- `tenant_context`, `set_tenant_context`, `get_org_id` from
-  `context.py` (zero call sites; `get_org_id` was already
-  documented as gone in 0.3.0 CHANGELOG)
-- `instrumentation/openai.py` (the v0.x patcher that no
-  longer applied to `openai>=1.0`)
-
-### Added
-
-- `NullRunRuntime.coverage_report()` — public method that
-  returns `{"seen": ..., "tracked": ...,
-  "streaming_skipped": ...}`. The auto-instrumentation layer
-  already populates the counters; this method just exposes
-  them. Called by `examples/basic_observe.py`.
-- `Transport.__enter__` / `__exit__` (see above)
-- `tests/test_init_contract.py` — pins the 0.3.0 init
-  contract (api_key required, singleton state, no
-  organization_id kwarg)
-- `tests/test_insecure_transport.py` — homograph / IPv6 /
-  case-insensitive coverage for the new URL check
-- `tests/test_grpc_removed.py` — pins the post-deletion
-  gRPC contract
-- `tests/test_legacy_key_warning.py` — pins the legacy
-  API key warning
-- `tests/test_cb_halfopen_publish.py` — pins the
-  HALF_OPEN Redis publish
-- `tests/test_kill_deprecation.py` — pins the
-  `WorkflowKilledInterrupt` deprecation-bypass contract
-
-### Documentation
-
-- `WorkflowKilledInterrupt` docstring now includes a
-  "Catching in production" section with the recommended
-  Sentry / OpenTelemetry pattern (`except BaseException`,
-  not `except Exception`).
-- `NULLRUN/docs/sdk/README.md` rewritten to match the
-  actual 6-symbol SDK surface and current `track_*`
-  signatures. The previous 7-symbol reference was a
-  description of an older design that did not match the
-  shipped SDK.
-
+_(Trimmed; see git log 0.3.1 for full change set.)_
 ## [0.5.2] — 2026-06-19
 
 This release bundles the Sprint 2.5 production-readiness hardening
@@ -1558,8 +730,6 @@ shipped as separate `[Unreleased]` sections during development; they
 are merged here into a single canonical entry so release tooling that
 scans for the `[Unreleased]` anchor picks up the complete change set
 exactly once.
-
-### Added (production-readiness hardening)
 
 - **HMAC signing expanded (with documented exceptions, audit 2026-06-22
   round 2 — F-R2-05 / F-R2-14).** The SDK now signs every
@@ -1587,232 +757,8 @@ exactly once.
 
   **Outgoing WebSocket ACK is plain JSON, not signed.** Earlier
   documentation overstated this — `transport_websocket._send_ack`
-  sends `{"type": "ack", "message_id", "received_at"}` as plain
-  JSON without an HMAC signature. The backend does not currently
-  verify ACK authenticity (`ws_control.rs:842-848` is a TODO).
-  If that ever changes, the SDK will sign the ACK using the
-  same `WS_HMAC_IDENTITY_FIELD` + `secret_key` path as incoming
-  messages — until then, treat CHANGELOG claims of "signed ACKs"
-  as inaccurate.
 
-- **WebSocket protocol compliance (Phase 2 of the plan).** The SDK now
-  honours `resync_required` (closes the connection, clears local state,
-  reconnects — no merge per ADR-007), enforces per-workflow `version`
-  monotonic dedup (drops events with `version <= last` to survive
-  at-least-once delivery), and signs outgoing ACKs. The URL uses
-  `X-API-Key` header (never the query string — per SEC-7, the server
-  rejects `?api_key=…`).
-
-- **`track_event` fingerprint + coverage counters (Phase 3).** `track_event`
-  now emits a stable `_fingerprint` so the dedup LRU at the `track()`
-  sink collapses repeat emissions of the same event (the user's manual
-  `track_event` plus the httpx transport hook firing on the same LLM
-  call). The fingerprint is stripped before the wire send. The
-  `_coverage_seen` / `_coverage_tracked` / `_coverage_streaming_skipped`
-  counters are now initialised in `__init__` so the
-  `_safe_bump_coverage` helper in `nullrun.instrumentation.auto`
-  actually increments the dashboard's coverage tab.
-
-- **`SENSITIVE_ARG_KEYS` expanded from 7 to 29 tokens.** Now masks
-  `password`, `passwd`, `pwd`, `token`, `secret`, `api_key`, `apikey`,
-  `key`, `auth`, `authorization`, `bearer`, `session`, `session_id`,
-  `cookie`, `access_token`, `refresh_token`, `id_token`, `private_key`,
-  `secret_key`, `email`, `phone`, `ssn`, `credit_card`,
-  `credit_card_number`, `cvv`, `cvc`, `pin`, `otp`, `mfa`. Matching
-  is case-insensitive.
-
-- **Recursive `_safe_error_str` (Phase 3).** The previous one-level
-  regex was replaced with a balanced-brace walker that handles
-  arbitrary nesting depth and dict values that contain `{` / `}` in
-  string content. Bare `details=foo` (no opening brace) is preserved
-  so we don't lose free-form text.
-
-- **`RateLimitError` exception class (Phase 4).** A new
-  `RateLimitError(NullRunTransportError)` carries the parsed
-  `Retry-After` (seconds) and `upgrade_url` from the 429 envelope
-  per `contracts/errors.ts`. The transport layer's
-  `_parse_error_envelope` helper maps 4xx / 5xx / 429 to typed
-  exceptions (`NullRunAuthenticationError` /
-  `NullRunTransportError(GATEWAY_ERROR)` / `RateLimitError`) so
-  callers can branch on the type instead of string-matching
-  `str(exc)`.
-
-- **`Transport.post_signed_with_401_retry` helper (Phase 4).** The
-  runtime can opt into transparent one-shot re-authentication on
-  HTTP 401 by passing a `reauth_callback` (typically
-  `lambda: self._authenticate()`). The first 401 re-calls
-  `auth/verify` to pick up the freshly-rotated `secret_key` and
-  retries the original request. A second 401 propagates as
-  `NullRunAuthenticationError`.
-
-- **`PolicyCache.clear()` (Phase 2).** New method on the transport's
-  policy cache so the `PolicyInvalidated` WebSocket callback can
-  flush every cached decision atomically. The
-  `Transport.clear_policy_cache` public method now delegates to it
-  instead of poking the internal `_cache` dict.
-
-- **`_fingerprint_for_event_dict` helper (Phase 3).** New in
-  `nullrun.instrumentation.auto` for the generic event-dict
-  fingerprint used by `track_event` (the existing
-  `_fingerprint_for` is for HTTP responses keyed on host+body+status).
-
-- **Async Policy Cache**: `AsyncTransport` now uses `PolicyCache` for CACHED fallback mode. Previously the async transport always fell back to PERMISSIVE when gateway was unreachable. Now it caches successful execute decisions and uses them when gateway is unavailable.
-
-- **Custom Sensitive Tools API**: Added `add_sensitive_tool()`, `remove_sensitive_tool()`, `register_sensitive_tools()`, and `get_sensitive_tools()` methods to `NullRunRuntime`. Users can now register custom tools as sensitive requiring strict mode enforcement.
-
-- **`NullRunBlockedException.tool_name` attribute** (FIX-5): The `tool_name`
-  kwarg is now a first-class attribute on `NullRunBlockedException`
-  (and its subclasses `LoopDetectedException`, etc.) instead of being
-  absorbed into `**details`. Cookbook examples that read `exc.tool_name`
-  no longer raise `AttributeError`. Backwards-compatible: `tool_name`
-  defaults to `None` and does not appear in `exc.details` when unset.
-  The stringified exception now includes `tool={name}` when set.
-
-- **`check_control_plane` is case-insensitive on the state value.**
-  SDK now normalises the state with `.lower()` before comparing to
-  `"paused"` / `"killed"`. Pre-fix a backend regression to UPPERCASE
-  (e.g. `"KILLED"` in `state_change`) would have silently failed the
-  match and let a killed workflow keep running. Backend already emits
-  PascalCase per the `as_pascal_case()` normaliser in
-  `handlers.rs:9258`; this is defensive per `analyze.md` §11.6.
-
-### Removed (Phase 5)
-
-- **Empty placeholder modules deleted.** `src/nullrun/flow/`,
-  `src/nullrun/gate/`, `src/nullrun/common/` were placeholders for
-  promised-but-unimplemented products. Removed.
-- **Orphan `protos/` directory deleted.** `grpc_transport.py` was
-  removed in 0.4.0; the proto schema is no longer needed in the SDK.
-- **`instrumentation/openai.py` (v0.x patcher) deleted.** It patched
-  `openai.ChatCompletion.create` which `openai>=1.0` does not
-  expose. All OpenAI v1.0+ traffic is now tracked via the httpx
-  transport hook in `nullrun.instrumentation.auto`.
-- **`DecisionHistoryRecorder.replay_locally` / `replay_event` /
-  `replay_from_file` deleted.** They called `runtime.track` (which
-  hits the backend) despite the docstring claiming "local-only".
-  The honest-scope local recorder surface (`start_recording`,
-  `stop_recording`, `record_event`, `estimate_cost`,
-  `RecordingSession.to_dict` / `from_dict`) is preserved.
-- **`observability.TenantFilter` no longer writes the deprecated
-  `org_id` field** — only the canonical `organization_id` and
-  `api_key_id` remain. The legacy `get_org_id()` helper is gone
-  alongside the workspace_id → organization_id migration.
-
-### Fixed
-
-- **`examples/cost_dashboard.py`** switched from
-  `Authorization: Bearer` (which the SDK never uses on the user's
-  behalf) to `X-API-Key`, and from the non-existent `/usage`
-  endpoint to the canonical `/quota` per `contracts/openapi.yaml`.
-
-- **P0-1 (PCI-DSS / GDPR): positional PII masking.** Sensitive tools
-  called positionally (e.g. ``charge("4111-1111-1111-1111", 50)``) now
-  mask positional args the same way kwargs already do, by introspecting
-  the function signature with ``inspect.signature(fn)`` and applying
-  ``SENSITIVE_ARG_KEYS`` to the matching parameter name. Pre-fix the
-  PAN at position 0 was forwarded as-is into ``/execute`` and landed
-  in the audit log.
-
-- **P0-3 (OOM): streaming response memory cap.** Sync and async
-  httpx transports now use bounded chunked reads capped at
-  ``MAX_RESPONSE_BYTES`` (16 MiB by default; ``NULLRUN_MAX_RESPONSE_BYTES``
-  env var to override). When the cap is exceeded, tracking is skipped
-  and ``_coverage_streaming_skipped`` is incremented so the dashboard
-  sees which hosts are producing oversized responses. Pre-fix
-  ``response.read()`` / ``await response.aread()`` buffered the entire
-  response body in memory — a 16+ MB allocation per streaming LLM
-  call under load.
-
-- **P0-4 (cost-audit): drop-newest on buffer overflow.** The CB-OPEN
-  re-queue path in ``Transport._do_flush_locked`` now drops the
-  NEWEST non-critical events instead of the oldest. The oldest
-  events (start-of-incident, start-of-billing-period) are exactly
-  what a billing investigator needs to reconstruct — losing them
-  silently broke monthly rollups. Control-plane events
-  (``state_change`` / ``kill_received`` / ``policy_invalidated`` /
-  ``key_rotated``) are preserved regardless of position so the
-  dashboard's KILL switch continues to land even under sustained
-  backend outage.
-
-- **P0-6 + P3-3 (security): redact-before-truncate.** ``_safe_repr``
-  now runs ``_strip_details_balanced`` on the FULL repr before
-  truncating to ``max_len=50``. Pre-fix the truncate ran first, and
-  if ``details={...}`` lived past position 50 in the original repr
-  (common for httpx.HTTPError with a long URL), the redact pass
-  saw nothing on the truncated slice and the raw payload leaked
-  into ``span_end`` audit events.
-
-- **S-8 / P2-4: ``agent_id`` is now a real UUID with dashes.**
-  ``agent()`` context manager emits ``str(uuid.uuid4())`` (e.g.
-  ``95ca7c0b-8334-478a-af23-2788803ef3b8``) for auto-generated ids.
-  Pre-fix the format was ``f"agent-{uuid.uuid4().hex}"`` — 32 hex
-  chars with no dashes; backend UUID-typed columns silently
-  dropped these to NULL on insert. User-supplied names are still
-  preserved verbatim.
-
-- **S-9: LRU cap on ``NullRunCallback._active_runs``** (4096 entries,
-  FIFO eviction with WARN log). Pre-fix this dict grew unbounded
-  when ``on_chain_end`` did not fire (errors in the chain body
-  short-circuited the end hook for some LangChain versions),
-  leaking memory in long-running services.
-
-- **S-10: WebSocket reconnect max-attempts cap** (10 consecutive
-  failures). Pre-fix the loop was unbounded (``while not
-  self._closed:``) and leaked the WS thread forever when the backend
-  was permanently down. After the cap the SDK falls back to
-  HTTP-poll for control-plane state delivery.
-
-- **P2-1: ``_coverage_seen`` now bumps in the httpx path.**
-  Pre-fix the counter was only incremented in the ``requests``
-  path (``auto_requests.py:185``), so the dashboard's coverage
-  view was empty for the dominant httpx traffic (every OpenAI /
-  Anthropic / Gemini / Mistral / Cohere call). Now both sync and
-  async httpx ``_emit`` bump the counter.
-
-- **P3-2: webhook delivery uses exponential backoff** (cap 30s).
-  Pre-fix the schedule was linear (``0.5 * (attempt + 1)``); under
-  sustained outage this produced a tight retry storm on the dead
-  endpoint — each KILL/PAUSE spawned its own delivery thread.
-  Post-fix the schedule is ``0.5 * 2**attempt`` capped at 30s:
-  0.5s, 1.0s, 2.0s, 4.0s, 8.0s, 16.0s, 30.0s.
-
-### Tests
-
-Added regression tests for every item above (57 new tests across 9
-new test files: ``test_agent_id_uuid.py``, ``test_args_pii_masked.py``,
-``test_streaming_oom_cap.py``, ``test_lru_active_runs.py``,
-``test_reconnect_cap.py``, ``test_coverage_seen_httpx.py``,
-``test_webhook_backoff.py``, ``test_redact.py``; existing
-``test_buffer_invariants.py`` extended with drop-newest + critical-event
-preservation cases).
-
-### Legacy
-
-- **SDK silent runtime fallback removed** (FIX-4): `_get_or_create_runtime`
-  in `nullrun.decorators` no longer wraps `NullRunRuntime.get_instance()`
-  in a `try/except Exception` that rebuilds a no-arg `NullRunRuntime()`.
-  In 0.3.0 (T3-S2) the no-arg constructor requires `api_key` and raises
-  `NullRunAuthenticationError` — so the fallback swallowed the auth
-  error from `get_instance()` only to crash with the same error from
-  the fallback path itself. After this fix, the auth error propagates
-  cleanly to the first `@protect` invocation, mirroring the fail-loud
-  contract of `nullrun.init()`. Aligns with the T3-S2 invariant that
-  the SDK has no local mode: a missing API key is a hard error, not a
-  silent allow-all.
-
-### Notes
-
-- Public surface unchanged. `init`, `protect`, `track_llm`,
-  `track_tool`, `track_event` retain the same call signatures
-  documented in the existing examples. The platform's
-  `docs/sdk/README.md` describes an alternative 7-symbol surface
-  (with `wrap` alias and a different `init(organization_id, ...)`
-  signature) — that doc is out of sync with the SDK; an update
-  to the platform docs is tracked separately. Per the production
-  plan's user decisions, the SDK's surface is the source of truth.
-
----
-
+_(Trimmed; see git log 0.5.2 for full change set.)_
 ## [0.4.0] — 2026-06-17
 
 Production-readiness release. Resolves all BLOCKER + HIGH + MEDIUM + LOW
@@ -1822,8 +768,6 @@ audit findings from the 0.3.x audit. The curated 6-symbol public surface
 entry is the summary. Phase-7 (framework patches) and Phase-8
 (release-prep polish) ship as follow-up releases under the same 0.4.x
 line.
-
-### Removed (dead code)
 
 - `BoundedDict` class (`runtime.py`) — dead since 0.3.1.
 - `wrap_tool`, `wrap`, `check_before_tool`, `enforce_check_before_llm`,
@@ -1841,8 +785,6 @@ line.
   pre-weakref.finalize migration.
 - `EventRecorder` (`decision_history.py`) — never used.
 
-### Fixed (BLOCKER)
-
 - **First-`track()` `AttributeError` (Phase 2).** `runtime.track()` no
   longer reads `self._workflow_costs` (a BoundedDict removed in 0.3.1
   whose two callers survived). Returns `local_cost_cents = 0` from
@@ -1852,80 +794,8 @@ line.
   now defined in `auto.py`. The whole module imports cleanly and the
   coverage dashboard counter is reachable.
 - **`auto_instrument()` now calls `patch_requests`.** The `requests`
-  library path is no longer dead; ~30-50% of real codebases that use
-  `requests` directly are now tracked.
 
-### Fixed (HIGH reliability — Phase 5)
-
-- `_remote_states` now protected by `threading.RLock`. New helpers
-  `_remote_state_for` / `_set_remote_state` are the only public mutation
-  path. `test_remote_states_race.py` is now meaningful.
-- `PolicyCache` no longer writes `policy_version` into the `ttl_seconds`
-  field (silent cache-lifetime corruption). Added dedicated
-  `policy_version` field on `CachedDecision`.
-- `get_instance()` re-auth path is now inside the singleton lock; no
-  more TOCTOU window where a concurrent caller can observe a
-  half-shutdown runtime.
-- `_fetch_remote_state` uses `self._transport._client` (shared pool
-  + circuit breaker) instead of a raw `httpx.get`.
-- `workflow()` emits a real UUID4 instead of `wf-{hex32}`.
-- `@sensitive` propagates `NullRunAuthenticationError` instead of
-  silently swallowing it.
-- Custom-host LLM endpoints now honour the dashboard KILL switch
-  (the kill check is no longer gated on the extractor table).
-- `Transport.execute` accepts an `on_transport_error` callback
-  (per ADR-008) so sensitive-tool pre-checks can fail-CLOSED on
-  classified transport errors.
-
-### Changed (MEDIUM hygiene — Phase 6)
-
-- `NULLRUN_FALLBACK_MODE` env var (or `fallback_mode` constructor arg)
-  selects PERMISSIVE / STRICT / CACHED.
-- `_rebuild` strips `Transfer-Encoding` alongside `Content-Encoding`.
-- `shutdown()` caps join waits at 0.5s (was 2.0s) — safe from
-  signal handlers.
-- WS URL constructed via `urllib.parse` (rejects unknown schemes).
-- `DEDUP_LRU_MAX` raised 512 -> 4096.
-
-### Added (Phase 7 — framework patches)
-
-- `nullrun.instrumentation.llama_index` — `patch_llama_index`
-  subscribes to `LLMChatEndEvent` and `FunctionCallEvent` on the
-  llama-index core Dispatcher. Optional extra `pip install
-  nullrun[llama-index]`.
-- `nullrun.instrumentation.crewai` — `patch_crewai` wraps
-  `Crew.kickoff` and `Crew.kickoff_async` to install
-  `step_callback` / `task_callback`. Post-run reads
-  `crew.usage_metrics` and emits one `llm_call` event per model.
-  Optional extra `pip install nullrun[crewai]`.
-- `nullrun.instrumentation.autogen` — `patch_autogen` wraps
-  `BaseChatAgent.on_messages` for span tracking and
-  `OpenAIChatCompletionClient.create` for streaming-safe usage
-  capture. Optional extra `pip install nullrun[autogen]`.
-
-### Added (Phase 8 — release polish)
-
-- `NullRunRuntime.get_org_status(org_id)` — public helper for
-  reading `/api/v1/orgs/{org_id}/status`. Routes through the shared
-  transport client. Used by `examples/cost_dashboard.py`.
-- `NULLRUN_BATCH_SIZE` and `NULLRUN_FLUSH_INTERVAL_MS` env vars
-  override `FlushConfig` without subclassing.
-- README "mTLS / client certificate authentication" section
-  documenting `NULLRUN_TLS_CLIENT_CERT`, `NULLRUN_TLS_CLIENT_KEY`,
-  `NULLRUN_TLS_CA_CERT`.
-- Circuit-breaker `OPEN -> HALF_OPEN` jitter sleep capped at 5s
-  (was 30s).
-- `RecordingSession` no longer persists the dedup `_fingerprint`
-  field — it leaks to disk via `save()` otherwise.
-
-### Notes
-
-- The platform's `docs/sdk/README.md` describes a 7-symbol surface that
-  does not match the shipped SDK. The SDK's curated surface is the
-  source of truth; platform docs re-alignment is tracked separately.
-
----
-
+_(Trimmed; see git log 0.4.0 for full change set.)_
 ## [0.3.0] — 2026-06-15
 
 ### Breaking
@@ -1962,45 +832,20 @@ line.
   `from nullrun.transport import FallbackMode, PoolConfig`) remain
   available. Audited for 0 external callers.
 
-### Migration
-
-- **0.2.x → 0.3.0**:
-  - `nullrun.init()` calls without `api_key` will raise. Pass
-    `api_key="nr_live_..."` explicitly or set `NULLRUN_API_KEY`.
-  - `NullRunRuntime(...)` constructions without `api_key` will raise
-    (same fix).
-  - Tests using `NullRunNoop` / `local_mode=True` mocking must switch
-    to `NullRunRuntime(api_key="test-key", _test_mode=True)` —
-    `_test_mode` skips the network calls without silently bypassing
-    policy.
-  - `from nullrun import BreakerError` (and the 6 other legacy names)
-    must use the canonical paths above.
-
-### Added
-
-- **Async Policy Cache**: `AsyncTransport` now uses `PolicyCache` for CACHED fallback mode. Previously the async transport always fell back to PERMISSIVE when gateway was unreachable. Now it caches successful execute decisions and uses them when gateway is unavailable.
-- **Custom Sensitive Tools API**: Added `add_sensitive_tool()`, `remove_sensitive_tool()`, `register_sensitive_tools()`, and `get_sensitive_tools()` methods to `NullRunRuntime`. Users can now register custom tools as sensitive requiring strict mode enforcement.
-
-### Deprecated
-
-- **No-api-key init / local mode** (T3-S1): Calling `nullrun.init()` or constructing `NullRunRuntime(...)` without an `api_key` (and with `NULLRUN_API_KEY` unset) now emits a `DeprecationWarning`. The runtime still falls back to local mode and silently bypasses every backend gate (budget, policy, control plane). The fallback will be **removed in 0.3.0** — passing `api_key='nr_live_...'` explicitly or setting `NULLRUN_API_KEY` is the only supported path going forward. Pin the warning to a hard error with `python -W error::DeprecationWarning` to catch callers in CI.
-
----
-
+_(Trimmed; see git log 0.3.0 for full change set.)_
 ## [0.1.1] — 2026-05-20
 
 ### Fixed
 
-- **CR-2**: Fixed buffer overflow when circuit breaker is OPEN. Previously, re-queued events were prepended to buffer, causing newest events to be dropped first. Now appends to buffer end and checks max_buffer_size before re-queue.
+- **CR-2**: Fixed buffer overflow when circuit breaker is OPEN. Previously, re-queued events were prepended to buffer, causing newest events to be dropped first. [...]
 - **CR-5**: Async circuit breaker now uses `asyncio.Lock` instead of `threading.Lock` for proper async context handling.
-- **CR-1+CR-4**: `runtime.py` now creates Transport before `_authenticate()` and `_fetch_policy()`, reusing the HTTP client for connection pooling and consistent timeout/retry policies.
+- **CR-1+CR-4**: `runtime.py` now creates Transport before `_authenticate()` and `_fetch_policy()`, reusing the HTTP client for connection pooling and consistent timeout/retry poli [...]
 - **AsyncAwait**: Fixed `_call_async()` not awaiting `_on_success_async()` and `_on_failure_async()` coroutines, causing "coroutine was never awaited" warnings in async transport.
 
 ### Changed
 
 - Transport buffer now enforces max_buffer_size **before** re-queuing events on circuit breaker OPEN
 
----
 
 ## [0.1.0] — 2026-05-18
 
@@ -2015,21 +860,6 @@ line.
 - Main runtime entrypoint (`runtime.py`)
 - `X-API-Version` header on all outgoing requests
 
-### Notes
-
 - Requires Python ≥ 3.10
 - Compatible with NullRun API version `2024-01-15`
 
----
-
-## How to upgrade
-
-### 0.x → next
-
-_No breaking changes yet. Watch this file._
-
----
-
-[0.5.2]: https://github.com/maltsev-dev/nullrun-sdk/compare/v0.4.0...v0.5.2
-[0.1.1]: https://github.com/maltsev-dev/nullrun-sdk/releases/tag/v0.1.1
-[0.1.0]: https://github.com/maltsev-dev/nullrun-sdk/releases/tag/v0.1.0
