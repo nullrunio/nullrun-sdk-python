@@ -62,7 +62,6 @@ import os
 import threading
 import time
 import uuid
-import warnings
 from collections.abc import Callable
 from typing import Any, Optional
 
@@ -104,43 +103,13 @@ from nullrun.uuid7 import uuid7_str  # 2026-07-04 BUG #4
 logger = logging.getLogger(__name__)
 
 # Sentinel used when a gate fires outside a ``with workflow(...)``
-# context. The double-underscore prefix namespacing avoids
-# collision with a user workflow that happens to be named
-# ``<unknown>`` (the previous literal was a collision hazard).
-# Wire compat: still a string.
 UNKNOWN_WORKFLOW_ID: str = "__nullrun_unknown__"
 
 # 2026-07-04 (BUG #5): in-process gate cache for chain-mode
-# invocations. Without this, every @protect inside `with chain(...)`
-# issues a /gate HTTP roundtrip + Redis reserve. For a 100-step
-# agent loop that's 100 roundtrips. The gate decision is
-# deterministic for a given (workflow_id, chain_id, model) over a
-# short window (chain status only changes on `chain_end`), so
-# caching the LAST decision for 5s is safe.
-#
-# Scope: ONLY when chain_id is set. Single-shot (Hard) callers
-# must NOT cache — the gate legitimately returns "allow" once and
-# "block" on the next call (Hard mode binary), and a stale "allow"
-# could let through a budget-exhausted call. Chain-mode callers
-# share a budget envelope, so caching "allow" is consistent with
-# the chain's semantics.
-#
-# Opt-out: NULLRUN_GATE_CACHE_DISABLE=1
 _GATE_CACHE: dict[tuple[str, str | None, str | None], tuple[float, dict[str, Any]]] = {}
 _GATE_CACHE_TTL_SECONDS: float = 5.0
 
 # 2026-07-24 (Root-cause fix for the ``@sensitive`` reinit gap):
-# a process-level set of tool names that the ``@sensitive``
-# decorator has stamped as needing strict mode. The runtime
-# singleton also tracks this via ``_sensitive_tools``, but
-# that set is populated at decoration time and can be lost
-# across ``init_or_die()`` calls if the user re-initializes
-# the runtime (the registration landed on the OLD instance
-# and the new instance starts with an empty set). The
-# module-level set is decorator-driven and survives any
-# runtime singleton churn, so ``is_strict_mode_forced`` is
-# the second source of truth that ``runtime.execute`` consults
-# before falling through to inline mode.
 _STRICT_MODE_FORCED: set[str] = set()
 
 
@@ -169,15 +138,6 @@ def is_strict_mode_forced(tool_name: str) -> bool:
 
 
 # 2026-07-04 (v0.12.0 wiring fix — ):
-# the maximum age (seconds) for a captured ``reservation_id``
-# to be eligible for forwarding onto a /track payload. Past
-# this age the underlying ``reservation:{execution_id}`` Redis
-# key has expired (300s TTL per) — forwarding would
-# guarantee a 503 ``RESERVATION_NOT_FOUND`` on /track. The
-# 5s margin below the 300s TTL absorbs clock-skew between
-# the SDK's ``time.monotonic `` and the Redis cluster's own
-# TTL decay (sub-second typically, but the safety budget is
-# worth the simplicity of a hard-coded threshold).
 SERVER_MINTED_RESERVATION_MAX_AGE_SECONDS: float = 295.0
 
 # Hard cap on server-supplied approval_timeout_seconds. The
@@ -244,30 +204,6 @@ def _validate_approval_timeout(value: object, log_prefix: str) -> float | None:
 
 
 # Privacy boundary: fields that MUST NOT leave the SDK on the
-# wire. The transport layer (POST /api/v1/track/batch) reads
-# whatever is in the event dict, so anything not allowlisted ends
-# up in the user's audit log on the backend side. We strip:
-#
-# * ``cost_cents`` -- the SDK does not estimate cost; the backend
-# recomputes it from tokens + the org's pricing policy. Sending
-# a wrong number risks double-billing when the backend also
-# persists its own computed cost.
-# * ``_fingerprint`` -- the dedup key (sha256[:16] over the raw
-# response body). Process-local; leaking it to audit logs
-# would let an operator with audit-log read access fingerprint
-# which prompts went through dedup, defeating the purpose.
-# * ``raw_usage`` -- the vendor's full usage dict (OpenAI
-# ``prompt_tokens_details``, Anthropic ``cache_*_input_tokens``
-# etc.) -- every field we care about has been lifted out of
-# raw_usage onto the event itself, so the original dict is now
-# just an opaque blob of provider-specific data. Carrying it on
-# the wire is a privacy regression: provider response payloads
-# can include user-supplied metadata, organization names, or
-# other PII the backend has no business logging.
-#
-# Anything new added here MUST also be added to the in-process
-# callers that consume these fields (the dedup LRU at
-# ``_seen_track_fingerprints``, any local loggers).
 _WIRE_STRIP_FIELDS: frozenset[str] = frozenset({"cost_cents", "_fingerprint", "raw_usage"})
 
 
@@ -378,12 +314,6 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         self.api_url = api_url or os.getenv("NULLRUN_API_URL", "https://api.nullrun.io")
 
         # T3-S2 (0.3.0): api_key is now required. The previous `local_mode`
-        # flag silently bypassed every backend gate (budget, policy
-        # control plane), which was a real safety hole in production.
-        # We raise NullRunAuthenticationError here instead so the
-        # misconfiguration is caught at startup. The public `init `
-        # surface raises first with a clearer message; this is the
-        # direct construction path used by tests and advanced callers.
         if not self.api_key:
             raise NullRunAuthenticationError(
                 "NullRunRuntime() requires an api_key. Pass api_key='nr_live_...' "
@@ -450,25 +380,9 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         self._seen_track_fingerprints = make_dedup_state()
 
         # Per ADR-008 the SDK does not track local cost. The two response
-        # fields below are kept in the return shape for backwards
-        # compatibility with 0.3.x callers but always read 0. The previous
-        # implementation read from `self._workflow_costs` (a BoundedDict
-        # removed in 0.3.1) which left `track ` raising AttributeError on
-        # first call.
         self._local_cost_cents_estimate: int = 0
 
         # 0.9.0: coverage counters removed. Coverage is now derived
-        # server-side from the llm_call span metadata (`tracked` and
-        # `streaming_skipped` flags set by the instrumentation layer).
-        # The previous per-host dicts and 60s daemon thread are gone.
-
-        # Remote control plane state (per-workflow, pushed from server via WS).
-        # Unified model: effective_state = max(local_state, remote_state).
-        # All writes and reads go through the `_remote_state_for` /
-        # `_set_remote_state` helpers so the WS callback, the HTTP
-        # poll, and the gate check can run concurrently without a
-        # TOCTOU race. RLock because the same thread can re-enter
-        # via the gate's get-then-set sequence.
         self._remote_states: dict[str, dict[str, Any]] = {}
         self._states_lock = threading.RLock()
 
@@ -502,11 +416,6 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         self._approval_timeout_seconds: float = _t
 
         # Control plane transport. The SDK connects to the server's
-        # WS endpoint and receives state push events (killed/paused)
-        # within ~100ms of the operator action -- vs the previous 1s
-        # HTTP poll. The HTTP poll path is preserved as a fallback
-        # when `NULLRUN_TRANSPORT=http` is set (env var defaults to
-        # `ws`).
         self._transport_mode: str = os.getenv("NULLRUN_TRANSPORT", "ws").lower()
         self._ws_thread: threading.Thread | None = None
         self._ws_stop_event = threading.Event()
@@ -532,14 +441,6 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         )
 
         # Note: a gRPC transport was prototyped in earlier SDK versions but the
-        # gRPC server at the platform is intentionally frozen until the
-        # activation checklist (TLS, auth, proto extensions, cost pipeline
-        # parity, tests) is complete. The SDK no longer attempts to construct
-        # a gRPC client.
-        # FIX 2026-06-28: was a silent no-op (logger.info) — customers who
-        # set NULLRUN_USE_GRPC expecting gRPC silently fell back to HTTP with
-        # no signal. Now we raise loudly so the misconfiguration is visible
-        # at startup instead of being diagnosed from a missing proto trace.
         if os.getenv("NULLRUN_USE_GRPC"):
             raise RuntimeError(
                 "NULLRUN_USE_GRPC is set but the gRPC transport is not "
@@ -914,13 +815,6 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         logger.debug(f"Authenticating with API at {self.api_url}/auth/verify")
         try:
             # 2026-06-28 audit P2.3: retry transient 503/504 + network blips
-            # during init. Backend emits 503 + Retry-After: 5 on transient
-            # DB error (backend/src/proxy/handlers.rs:11346-11351). Pre-fix
-            # the first 503 surfaced as NR-A001 to the user as if their API
-            # key were bad. Three attempts, exponential backoff (0.5s → 1s
-            # → 2s), honor Retry-After when present. Auth-key failures (401)
-            # are NOT retried — the key is wrong on attempt 1 means it's
-            # wrong on attempt 3.
             response = self._post_auth_with_retry(
                 f"{self.api_url}/api/v1/auth/verify",
                 json_body={"api_key": self.api_key},
@@ -1313,10 +1207,6 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
 
         if entry is None:
             # The WS push arrived for an approval we never
-            # registered (a duplicate, a stale message from a
-            # previous SDK instance, or a backend-version mismatch).
-            # Log at debug because this is normal during a
-            # restart cycle; do NOT raise.
             logger.debug(
                 "WS approval push for unknown approval_id=%s -- ignoring",
                 approval_id,
@@ -1597,25 +1487,12 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         call_tools = get_call_tools()
 
         # 2026-07-02 (v0.11.0): forward chain context for soft-mode
-        # budget enforcement. When the user
-        # has wrapped the call in `with chain(chain_id, op="start")`
-        # the backend's Lua RESERVE_SCRIPT uses the chain to decide
-        # whether to allow soft-mode overdrafts. Absent chain_id, the
-        # gate falls back to single-shot Hard mode (binary budget
-        # or no) — the previous behaviour.
         chain_id = get_chain_id()
         chain_op = get_chain_op()
 
         check_req = {
             "organization_id": self.organization_id or "local",
             # 2026-07-04 (BUG #4): requires server-minted
-            # execution_id. Sending `workflow_id` here would re-use the
-            # same execution_id for every /check in the workflow, breaking
-            # the v3 reservation binding. We send a fresh uuidv7 per call
-            # as a placeholder; the server's `gate_reserve_v3` overwrites
-            # the field on the response, and `_capture_server_minted_execution_id`
-            # (called below) picks up the server-minted `reservation_id`
-            # for the downstream /track path.
             "execution_id": uuid7_str(),
             "operation_id": str(uuid.uuid4()),
             "check_type": "llm",
@@ -1657,11 +1534,6 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             check_req["chain_op"] = chain_op if chain_op != "auto" else None
 
         # 2026-07-02 (v0.11.0): idempotency key.
-        # Replays of the same idempotency_key return the original
-        # decision instead of re-running the gate. We use the
-        # operation_id as the idempotency anchor — operation_id is
-        # already a UUID v4 generated per call, so it doubles as
-        # an idempotency_key without an extra round-trip.
         check_req["idempotency_key"] = check_req["operation_id"]
 
         # In-process gate cache for chain-mode invocations. See
@@ -1677,19 +1549,6 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             cached = _GATE_CACHE.get(cache_key)
             if cached is not None and (time.monotonic() - cached[0]) < _GATE_CACHE_TTL_SECONDS:
                 # Cache hit within TTL — reuse the response without a
-                # network roundtrip. The server's cumulative-spend
-                # tracking is the source of truth; this is a debounce.
-                #
-                # 2026-07-13 (P0 SDK fix): we MUST still capture the
-                # server-minted ``reservation_id`` / ``operation_id``
-                # from the cached response — otherwise the cached
-                # response's ids stay pinned to the *first* call in
-                # the chain, and every subsequent /track inside the
-                # 5s TTL window ships the same idempotency_key with
-                # different request bodies → backend returns 409
-                # ``idempotency_key hash mismatch`` and the SDK drops
-                # the event (runtime.py:2649). Re-running the
-                # capture here is the missing piece.
                 response = cached[1]
                 _capture_server_minted_execution_id(response)
             else:
@@ -1712,30 +1571,6 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 return
 
         # 2026-07-04 (v0.12.0 wiring fix — ):
-        # capture the server-minted ``reservation_id`` returned by
-        # the backend's v3 ``gate_reserve_v3`` Lua path. Per
-        # the server is the source-of-truth for execution_id
-        # ownership; the value in ``GateResponse.reservation_id``
-        # is a freshly-minted uuidv7 that maps to the
-        # ``reservation:{execution_id}`` Redis key (TTL 300s).
-        #
-        # The /track handler v3 ``consume_budget_v3`` rejects with
-        # 503 ``RESERVATION_NOT_FOUND`` when ``execution_id`` in
-        # the request body does NOT match a live reservation key
-        # — fail-CLOSED. Storing the id on a contextvar
-        # means downstream ``track_llm`` / ``track_tool`` /
-        # ``track_event`` calls can fill in the field without
-        # threading it through the user-facing call sites.
-        #
-        # On legacy backends (``server_minted_execution_id=False``
-        # capability) the field is omitted — ``get_...`` returns
-        # ``None`` and the SDK falls back to the previous
-        # (un-minted) wire flow. Capture happens regardless of
-        # ``decision``: a "throttle" pass still produces a
-        # reservation_id; only "block" + transport-failed clear it.
-        # We capture BEFORE the decision checks so a future
-        # bugfix that reorders them can't desync capture from
-        # response.
         _capture_server_minted_execution_id(response)
 
         decision = response.get("decision", "allow")
@@ -1758,15 +1593,6 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             return
         if decision == "block":
             # FIX-2026-06-27: backend /gate sets both `explanation` (a
-            # human-readable string, always populated on GateResponse::block)
-            # and `explanations` (an optional Vec<String> that the gate
-            # engine never populates today — `Some(vec![])` on the success
-            # path, `None` on the explicit-block path). Pre-fix the SDK only
-            # read `explanations`, so the user saw the useless fallback
-            # "block" with `details={}` even when the backend knew exactly
-            # why it blocked ("Budget exhausted: need 2 cents, 0 available").
-            # Fall back to `explanation` (singular String) when the list is
-            # empty so the real reason surfaces in the kill/pause reason.
             reasons = response.get("explanations") or (
                 [response["explanation"]] if response.get("explanation") else ["block"]
             )
@@ -2181,11 +2007,6 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 }
 
         # 0.7.0 thin-client: NO local check here. All enforcement
-        # decisions arrive from the backend via /gate and /execute.
-        # The SDK forwards the event to the transport and lets the
-        # backend decide.
-
-        # Enrich event with context
         enriched = self._enrich_event(event)
         # Backend's SdkTrackRequest requires tokens for every event type,
         # including span lifecycle and protected-tool telemetry.
@@ -2197,21 +2018,6 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         )
 
         # Register workflow for remote state polling. workflow_id
-        # may be None on legacy keys -- that's fine, the no-op
-        # branch in check_control_plane will skip polling.
-        #
-        # Audit F-R2-12 (2026-06-22): route through ``_remote_state_for``
-        # which takes ``_states_lock`` for the entire setdefault. The
-        # pre-fix code did `with self._states_lock: setdefault(...)`
-        # in a single lock entry but never held the lock across the
-        # subsequent state read — so a concurrent ``_set_remote_state``
-        # from a WS push could win the race and leave the entry as a
-        # freshly-empty dict again on the next track_event call (a
-        # remote PAUSE / KILL would silently lose its state between
-        # the WS push and the next event). Using the locked helper
-        # here keeps setdefault atomic against WS pushes, and we
-        # don't read the returned dict anywhere — we only need the
-        # side-effect of registering the workflow_id.
         workflow_id = enriched.get("workflow_id")
         if workflow_id:
             self._remote_state_for(workflow_id)
@@ -2250,29 +2056,6 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         }
 
         # Audit 2026-06-29 (SDK↔backend wire: silent zero-billing):
-        # backend cost pipeline emits ``WARN model_id=default``
-        # whenever an llm_call event reaches the wire without a
-        # ``model`` field (pipeline.rs:176 ``unwrap_or("default")``).
-        # Pre-fix the SDK warned and continued — the backend then
-        # silently fell through to ``DEFAULT_RATE`` and every call
-        # was recorded as ≈$0, breaking budget enforcement.
-        #
-        # Post-fix the SDK is fail-LOUD (not fail-closed yet — the
-        # event is still sent so the backend can audit/reject):
-        #
-        # 1. ERROR log instead of WARN — operator sees the breakage
-        # immediately, not buried in routine log noise.
-        # 2. Bump the ``dropped_llm_call_no_model`` runtime counter
-        # so dashboards can surface the regression rate.
-        # 3. Tag the wire event with ``__missing_model: True`` so
-        # the backend's into_track_request gate (fail-CLOSED
-        # layer) can reject with HTTP 422 and a clear error
-        # envelope instead of silently recording a zero-cost
-        # call. The flag is treated as a wire-private signal —
-        # the backend strips it before persisting.
-        #
-        # Activated only for llm_call so span_start/span_end/
-        # tool_call traffic doesn't pollute logs or the wire.
         if wire_event.get("type") == "llm_call" and not wire_event.get("model"):
             logger.error(
                 "track(): llm_call event missing 'model' field — "
@@ -2731,54 +2514,6 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         metrics.inc_runtime("execute_allowed")
         return result
 
-    def start_recording(self, workflow_id: str, metadata: dict[str, Any] = None) -> str:
-        """
-                Start recording events for local decision history.
-
-        .. deprecated:: 0.8.0
-                    Decision history moved to the backend dashboard. This method
-                    is a no-op stub and will be removed in 0.9.0. Use
-                    ``nullrun.status `` for a per-runtime snapshot or visit
-                    https:/docs.nullrun.io/concepts/decision-history for the
-                    dashboard workflow.
-
-                Args:
-                    workflow_id: ID of the workflow to record
-                    metadata: Optional metadata about the session
-
-                Returns:
-                    session_id for this recording (always ``""`` since 0.4.0)
-        """
-        # FIX 2026-06-28: was a silent no-op with logger.debug. Now emits
-        # DeprecationWarning so customer code that still imports this
-        # surfaces a visible migration signal before deletion in 0.9.0.
-        warnings.warn(
-            "NullRunRuntime.start_recording() is deprecated and will be "
-            "removed in nullrun 0.9.0. Decision history is available via "
-            "the backend dashboard at /control-center/decision-history.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return ""
-
-    def stop_recording(self):
-        """
-                Stop recording and return the session.
-
-        .. deprecated:: 0.8.0
-                    See:meth:`start_recording`. Will be removed in 0.9.0.
-
-                Returns:
-                    The recorded session, or None if not recording
-        """
-        # FIX 2026-06-28: paired deprecation warning for start_recording.
-        warnings.warn(
-            "NullRunRuntime.stop_recording() is deprecated and will be removed in nullrun 0.9.0.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return None
-
     def _enrich_event(self, event: dict[str, Any]) -> dict[str, Any]:
         """Add context fields to event."""
         enriched = dict(event)  # Don't modify original
@@ -2813,26 +2548,6 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 enriched["attempt_index"] = attempt_index
 
         # 2026-07-04 (v0.12.0 wiring fix — ):
-        # include the server-minted execution_id on the /track
-        # payload when one is in scope (captured by
-        # ``check_workflow_budget`` via
-        # ``_capture_server_minted_execution_id``).
-        #
-        # Wire field: ``execution_id`` — matches the backend's
-        # ``consume_budget_v3`` consume-request body schema
-        # (``backend/src/cost/reservation.rs::consume_budget_v3``).
-        #
-        # Skip when:
-        # * the user / caller already supplied ``execution_id``
-        # (explicit takes precedence)
-        # * no reservation was captured yet (legacy path or this
-        # is the very first event before the first /check)
-        # * the captured reservation has aged past
-        # ``SERVER_MINTED_RESERVATION_MAX_AGE_SECONDS`` (295s
-        # by default — 5s safety margin below the 300s Redis
-        # reservation TTL per). Forwards of a stale id
-        # would 503 ``RESERVATION_NOT_FOUND`` on /track and
-        # we'd rather drop the field than trip the gate.
         if "execution_id" not in enriched:
             import time as _time
 
@@ -2863,56 +2578,12 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                     enriched["execution_id"] = smid
 
         # 2026-07-04: propagate the in-scope
-        # /check idempotency_key onto the wire_event so the v3
-        # /track single-event payload carries the same anchor and
-        # the backend's replay branch returns 200 +
-        # ``idempotent_replay: true`` on retry (handlers.rs:
-        # 4654-4725). Without this, a transport-level retry on the
-        # SAME event either re-runs CONSUME_SCRIPT (→ 503
-        # RESERVATION_NOT_FOUND, since the reservation key was
-        # DEL'ed after the first successful consume per) or
-        # double-bills. Read via the same contextvar written at
-        # ``_capture_server_minted_execution_id`` time — symmetric
-        # lifetime with ``execution_id`` (cleared together on
-        # /track emit and on workflow/chain block exit).
         if "idempotency_key" not in enriched:
             from nullrun.context import get_server_minted_idempotency_key
 
             idem_key = get_server_minted_idempotency_key()
             if idem_key:
                 # 2026-08-06 (DEF-SDKWRAP-CHAIN-SOFT-EXECUTION-ID-REUSE-01,
-                # Session 6 TC-SDKWRAP-05/07/16): the captured /check
-                # operation_id is reused across every llm_call event
-                # within the same chain-context cache window
-                # (``_GATE_CACHE_TTL_SECONDS=5s``). The backend's v3
-                # /track idempotency layer
-                # (``backend/src/proxy/handlers.rs::finalize_track_idempotency``)
-                # hashes the request body against the stored body for
-                # the same key — every event after the FIRST one in
-                # the cache window shares the same idempotency_key but
-                # has a DIFFERENT body (tokens, model, latency, etc.)
-                # → 409 ``IDEMPOTENCY_KEY_MISMATCH`` and the event is
-                # silently dropped. Per CLAUDE.md §22 (Trust model):
-                # "losing actual token counts means downstream billing
-                # sees tokens=0 instead of the real cost" — billing-
-                # integrity regression.
-                #
-                # Fix: derive a per-event idempotency_key by combining
-                # the captured /check operation_id (so retries of the
-                # same event still hit the same server-side cache slot
-                # and the backend returns 200 + ``idempotent_replay:
-                # true``) with a per-event discriminator (span_id is
-                # minted once per @protect invocation, see
-                # ``decorators.py::_next_span`` — unique per event,
-                # stable across retries of the same event). Format:
-                # ``<op_id>:<span_short>`` where ``span_short`` is the
-                # first 16 hex chars of span_id — collision-free for
-                # distinct span_ids (122 bits of entropy in the source
-                # UUID v4) and short enough to keep the key under 80
-                # chars for backend storage. The discriminator only
-                # applies when a captured /check key is in scope —
-                # caller-supplied keys (above) and legacy batch-path
-                # keys (no /check involved) are unaffected.
                 span_id = enriched.get("span_id")
                 if span_id and ":" not in idem_key:
                     enriched["idempotency_key"] = (
@@ -2922,42 +2593,6 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                     enriched["idempotency_key"] = idem_key
 
         # 2026-07-12 (multi-agent span attachment — SDK counterpart at
-        # nullrun-sdk-python release/0.13.5 commit efff530):
-        # ``langgraph.py::on_llm_end`` may have already stamped
-        # ``parent_trace_id`` when an LLM call sits inside a
-        # chain / agent (we set it from the child SpanContext there).
-        #
-        # 2026-07-12 hotfix #2: ALWAYS override from the chain
-        # contextvar when one is in scope. The pre-hotfix code only
-        # filled the field when it was absent from the event dict,
-        # which broke when ``on_llm_end``'s ``_active_runs[run_id]``
-        # lookup missed (run_id drift between the auto-injected
-        # chat_model callback and an explicit user-supplied one,
-        # or no matching on_llm_start because the user wrapped the
-        # LLM call in a non-langgraph stack). In that case
-        # ``on_llm_end`` leaves the field absent, our ``trace_id``
-        # fallback (line 2422) overwrites the event with the chain
-        # contextvar, but ``parent_trace_id`` stays NULL because the
-        # previous condition was skipped. The drift was
-        # investigated via a synthetic diagnostic script
-        # (``sdk_diag.py``) running on SDK 0.13.7 — cost_events
-        # received the chain trace_id but not parent_trace_id.
-        #
-        # Override semantics: the chain contextvar is the single
-        # source of truth for "what chain does this event belong
-        # to". Both ``langgraph.py::on_llm_end``'s caller-set value
-        # AND a non-langgraph caller's absence resolve to the same
-        # contextvar. So preferring the contextvar when present is
-        # idempotent for the happy path AND closes the drift in the
-        # unhappy path.
-        #
-        # The backend's ``cost_events.parent_trace_id`` column +
-        # unified SELECT third JOIN arm
-        # (``cs.join_kind = 'parent_trace_id'``) both depend on
-        # this being present whenever a chain is in scope; without
-        # it the dashboard falls back to the weaker ``trace_id``
-        # arm and LLM rows show empty Model / Tokens / Cost on the
-        # orchestration row that owns the call.
         from nullrun.context import get_trace_id as _get_trace_id
 
         chain_trace_id = _get_trace_id()
@@ -3300,32 +2935,6 @@ def __getattr__(name):
 
 
 # The module-level slot is a proxy over the registry. The
-# PEP 562 __getattr__ above handles reads; writes go through the
-# proxy class installed by install_runtime_proxy. See the
-# long-form comment in nullrun._singleton for why a plain
-# assignment does not work on module instances.
-
-
-# 2026-07-04 (v0.12.0 wiring fix — ):
-# helper used by ``check_workflow_budget`` to capture the server-minted
-# execution_id from the /check response into a contextvar. Lives at
-# module scope so any /check path (``check_workflow_budget``
-# ``check_v3``, future ``preflight_v3``) can call it without taking
-# a dependency on the runtime singleton.
-#
-# Behaviour:
-# * On a real ``reservation_id`` field: store it on the
-# ``_server_minted_execution_id_var`` contextvar + record
-# ``time.monotonic `` on ``_server_minted_reservation_at_var``
-# so ``_enrich_event`` can refuse to forward a stale capture
-# past the 300s reservation TTL.
-# * On missing/None/empty value: clear both contextvars so
-# downstream /track ships without ``execution_id`` (the legacy
-# / v1-v2 wire shape — backend is tolerant per the
-# ``server_minted_execution_id=False`` capability gating).
-# * On an invalid UUID string (defence-in-depth — backend is the
-# source-of-truth and only mints uuidv7, but a buggy proxy
-# could echo a malformed field): drop it with a warning log.
 def _capture_server_minted_execution_id(response: dict[str, Any]) -> str | None:
     """Capture ``response["reservation_id"]`` into the server-minted
     execution_id contextvar.
@@ -3352,8 +2961,6 @@ def _capture_server_minted_execution_id(response: dict[str, Any]) -> str | None:
     raw = response.get("reservation_id") if isinstance(response, dict) else None
     if not raw:
         # Legacy / v1-v2 backend, or a block response with no
-        # reservation. Clear any prior capture so the next /track
-        # doesn't ship a stale id from a previous /check.
         clear_server_minted_execution_id()
         return None
 
@@ -3386,14 +2993,6 @@ def _capture_server_minted_execution_id(response: dict[str, Any]) -> str | None:
     set_server_minted_execution_id(raw)
     set_server_minted_reservation_at(_time.monotonic())
     # 2026-07-04: capture the /check
-    # idempotency_key so the matching /track event can carry the
-    # same anchor (handlers.rs:4654-4725 — replay returns 200 +
-    # idempotent_replay: true on key hit). We look at the
-    # request body via the response's ``operation_id`` field
-    # when the server echoes it (the /check request sets
-    # ``idempotency_key = operation_id`` at runtime.py:1260)
-    # when absent, fall back to None and let the /track wire
-    # payload drop the field.
     op_id = response.get("operation_id") if isinstance(response, dict) else None
     if isinstance(op_id, str) and op_id:
         set_server_minted_idempotency_key(op_id)
@@ -3405,30 +3004,6 @@ def _capture_server_minted_execution_id(response: dict[str, Any]) -> str | None:
 
 
 # 2026-07-04 (v0.12.0 wiring fix — ): build the
-# v3 /track single-event payload from an enriched llm_call event.
-# Lives at module scope so ``_route_track`` (a method) can call it
-# without taking a runtime dependency beyond the contextvar getters.
-#
-# Wire shape (``/api/v1/track`` schema
-# ``backend/src/proxy/handlers.rs::TrackRequest``):
-#
-# {
-# "reservation_id": "<server-minted uuidv7 from /check>"
-# "workflow_id": "<bound workflow uuid>"
-# "tokens": <int>, # input + output
-# "input_tokens": <int>
-# "output_tokens": <int>
-# "cost_cents": <int>, # 0 — backend computes from tokens
-# "model": "<model name>", # used for rate lookup
-# "metadata": {...}, # optional, free-form
-# "cost_source": "provisional", # per trust model
-# }
-#
-# The backend's ``gate_consume_v3`` reads ``reservation_id`` and
-# runs CONSUME_SCRIPT v3 (server-minted execution_id owner check +
-# consume ≤ reserve + epsilon invariant). If a required field is
-# missing OR the runtime cannot construct the payload, returns
-# ``None`` and the caller falls back to ``/track/batch``.
 def _build_v3_track_payload(
     wire_event: dict[str, Any],
     reservation_id: str,
@@ -3481,15 +3056,6 @@ def _build_v3_track_payload(
     if "span_id" in wire_event and wire_event["span_id"]:
         payload["span_id"] = wire_event["span_id"]
     # 2026-07-12 (multi-agent span attachment): the orchestration
-    # trace that owns this LLM call. Stamped by ``_enrich_event``
-    # from the active span contextvar (or earlier by
-    # ``langgraph.py::on_llm_end`` when the call sits inside a chain
-    # / agent). Backend persists it on ``cost_events.parent_trace_id``
-    # and the unified SELECT joins ``traces.trace_id`` directly via
-    # this column so the workflow detail "Recent executions" panel
-    # surfaces Model / Tokens / Cost on the orchestration row that
-    # owns the LLM call. Without this, the dashboard's 4/5-row
-    # empty-cells problem returns for every multi-agent workflow.
     if "parent_trace_id" in wire_event and wire_event["parent_trace_id"]:
         payload["parent_trace_id"] = wire_event["parent_trace_id"]
 
@@ -3508,22 +3074,6 @@ def _build_v3_track_payload(
             payload[k] = wire_event[k]
 
     # 2026-07-13 (vendor-extractor edge cases, SDK counterpart at
-    # nullrun-sdk-python release/0.13.9): the 5 wire fields
-    # surfaced by the vendor-specific extractors (Cohere v2
-    # tool_calls, Mistral num_cached_tokens, Gemini
-    # thoughtsTokenCount, Anthropic 4.5+ extended-thinking,
-    # Bedrock Mistral/Llama finish_reason) must ride through the
-    # v3 /track payload so the backend's `TrackRequestRaw` /
-    # `TrackRequest` / `QueuedEvent` constructors persist them on
-    # the migration-220 columns. The legacy `/track/batch` path
-    # already preserves them (it serializes `wire_event` as-is),
-    # but the v3 mapper builds an explicit payload dict, so we
-    # have to opt each field in by name.
-    #
-    # The backend defaults all five to `None` on missing keys, so
-    # a legacy event that lands on the v3 path without these
-    # fields still parses cleanly (matches the legacy v1/v2
-    # behaviour). We forward only non-None values here.
     for k in (
         "cache_read_tokens",
         "cache_write_tokens",

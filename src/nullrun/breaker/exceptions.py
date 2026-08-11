@@ -361,15 +361,6 @@ class RateLimitError(NullRunTransportError):
 
 
 # ---------------------------------------------------------------------------
-# v3 wire-protocol error codes
-# ---------------------------------------------------------------------------
-# 2026-07-02 (v0.11.0): five new error subclasses covering the v3
-# envelope codes. Each one carries a stable ``error_code`` so callers
-# can branch on the catalog value rather than parsing the
-# ``error_message`` string. All are retryable = False — these are
-# client-actionable problems (upgrade SDK, fix api_key, stop sending
-# the request) that retrying without changing something will just hit
-# the same wall.
 
 
 class NullRunProtocolError(NullRunInfrastructureError):
@@ -440,17 +431,10 @@ class NullRunChainError(NullRunDecision):
     ) -> None:
         self.chain_id = chain_id
         # Execution Graph v0 (2026-08-06): when the backend rejects
-        # a sub-agent call with PARENT_EXECUTION_*, the offending
-        # parent_execution_id is preserved on the exception so
-        # cookbook code can log / surface it without re-parsing the
-        # message string. ``None`` for non-lineage chain errors.
         self.parent_execution_id = parent_execution_id
         self.backend_code = backend_code or self.error_code
         self.details = details or {}
         # 2026-07-04: preserve the wire HTTP
-        # status. Chain errors map to 402/403/404 depending on
-        # the specific code — FastAPI handlers reading
-        # ``exc.status_code`` should see the right one.
         self.status_code = status_code
         super().__init__(message, **kwargs)
 
@@ -506,8 +490,6 @@ class NullRunConsumeOverbudgetError(NullRunDecision):
         self.actual_cost_cents = actual_cost_cents
         self.epsilon_cents = epsilon_cents
         # 2026-07-04: CONSUME_OVERBUDGET maps to
-        # 422 on the wire — surface it so FastAPI
-        # handlers don't fall back to 500.
         self.status_code = status_code
         super().__init__(message, **kwargs)
 
@@ -544,8 +526,6 @@ class NullRunWorkflowInactiveError(NullRunDecision):
     ) -> None:
         self.workflow_id = workflow_id
         # 2026-07-04: WORKFLOW_INACTIVE maps to
-        # 403 on the wire — surface it so FastAPI
-        # handlers don't fall back to 500.
         self.status_code = status_code
         super().__init__(message, **kwargs)
 
@@ -772,10 +752,6 @@ class NullRunBlockedException(NullRunDecision):
         self.action = action
         self.tool_name = tool_name
         # 2026-07-04: wire HTTP status preserved
-        # so FastAPI exception handlers can return the correct
-        # status without re-deriving from the error class. ``None``
-        # when the block fired client-side (loop detection, retry
-        # storm, sensitive-tool pre-check).
         self.status_code = status_code
         self.details = details
         tool_suffix = f", tool={tool_name}" if tool_name else ""

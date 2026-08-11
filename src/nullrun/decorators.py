@@ -51,8 +51,6 @@ from nullrun.context import get_workflow_id
 from nullrun.runtime import NullRunRuntime, get_runtime
 
 # Sentinel used when a gate fires outside a workflow context.
-# Matches the constant in nullrun.runtime so we don't introduce
-# a new magic string in audit logs.
 UNKNOWN_WORKFLOW_ID = "__nullrun_unknown__"
 
 from nullrun.tracing import (
@@ -69,10 +67,6 @@ logger = logging.getLogger(__name__)
 F = TypeVar("F", bound=Callable[..., Any])
 
 # Expanded sensitive-arg keys. The original 7-key set missed
-# obvious PII tokens and credential names; ``@sensitive`` and
-# ``_safe_kwargs`` would have shipped them in the audit log.
-# Matching is case-insensitive (see ``_safe_kwargs`` which calls
-# ``.lower `` on the key).
 SENSITIVE_ARG_KEYS = frozenset(
     {
         # Credentials / secrets
@@ -200,9 +194,6 @@ def _safe_args(fn: Callable[..., Any], args: tuple[Any, ...]) -> list[Any]:
 
 
 # Strip the `details={...}` payload from an exception's string form
-# before it lands in the span_end audit event. The current walker
-# handles nested dicts and dict values that contain `{` / `}` in
-# their string content.
 _DETAILS_REDACTED = "<redacted>"  # the payload only — caller prepends "details="
 
 
@@ -317,11 +308,6 @@ def _get_or_create_runtime() -> NullRunRuntime:
     # `_runtime` afterward sees the same instance.
     return NullRunRuntime.get_instance()
     # The previous OpenAI v0.x auto-patch hook was removed in 0.4.0:
-    # openai>=1.0 does not expose ChatCompletion.create as an
-    # attribute. All OpenAI v1.0+ traffic is now tracked
-    # vendor-independently by the httpx transport hook in
-    # nullrun.instrumentation.auto, which is wired by
-    # nullrun.init — not at the lazy-resolve path here.
     logger.info("NullRun runtime initialized: mode=cloud")
     #  writes through the registry descriptor, so
     # the next caller that reads  (or )
@@ -442,8 +428,6 @@ def protect(fn: F | None = None) -> F | Callable[[F], F]:
             token = set_span(span)
 
             # ADR-008 Rule 4: gate order is
-            # control_plane → budget → span_start → sensitive
-            # Wrapped in try/except so span_end still emits on KILL/PAUSE.
             error: BaseException | None = None
             try:
                 # 1. KILL/PAUSE from the dashboard short-circuits
@@ -493,8 +477,6 @@ def protect(fn: F | None = None) -> F | Callable[[F], F]:
         token = set_span(span)
 
         # ADR-008 Rule 4: gate order is
-        # control_plane → budget → span_start → sensitive
-        # Wrapped in try/except so span_end still emits on KILL/PAUSE.
         error: BaseException | None = None
         try:
             # 1. KILL/PAUSE from the dashboard short-circuits
@@ -615,52 +597,14 @@ def _enforce_sensitive_tool(
     and still raises `NullRunBlockedException`.
     """
     # 2026-07-24 (Root-cause fix): the previous code used
-    # ``is_sensitive_tool(fn.__name__)`` as the single source of
-    # truth. That looked up the name in ``runtime._sensitive_tools``,
-    # which is populated by the ``@sensitive`` decorator at
-    # *decoration time*. If the user calls ``init_or_die()`` (or any
-    # other runtime singleton reinit path) AFTER the module-level
-    # decorators run — which is the common pattern in the
-    # examples — the registration lands on the OLD runtime, the
-    # new runtime has an empty ``_sensitive_tools`` set, and this
-    # gate returns early before reading ``_nullrun_extractor``.
-    # The function carries the typed impact extractor as an
-    # attribute on the callable itself, so use the presence of
-    # the extractor as a second source of truth: if either the
-    # runtime registry knows the name OR the function carries
-    # ``_nullrun_extractor``, this is a sensitive tool and the
-    # gate must run. This avoids the four-cell state space
-    # (extractor × registered) collapsing to the silent-skip
-    # "your bug" cell.
-    #
-    # The ``@sensitive`` decorator now stamps the attribute on the
-    # innermost callable (via ``_stamp_extractor_on_innermost``),
-    # so the bare ``fn`` parameter here carries it directly and a
-    # single ``getattr`` is enough.
     extractor = getattr(fn, "_nullrun_extractor", None)
     if not runtime.is_sensitive_tool(fn.__name__) and extractor is None:
         return
     masked = _safe_kwargs(kwargs)
     # P0-1: positional args are masked the same way as kwargs. Without
-    # this, a sensitive tool called positionally (e.g.
-    # ``charge("4111-1111-1111-1111", 50)``) would leak the PAN into
-    # the /execute payload that lands in the audit log.
     masked_args = _safe_args(fn, args)
 
     # If the wrapped function carries an ``_nullrun_extractor``
-    # attribute (set by the @sensitive decorator's
-    # ``impact=money_outflow(...)`` argument), extract the typed
-    # action impact from the live args before sending /execute.
-    # The extractor returns a fully-validated BusinessImpact; we
-    # then compute its action_digest and pass both onto the wire
-    # so the backend can stamp the approval row AND verify the
-    # digest on the post-approval re-check.
-    #
-    # If the extractor raises (bad arg name, wrong type, negative
-    # amount, etc.), we fail-CLOSED per ADR-008: a sensitive tool
-    # whose impact cannot be extracted MUST NOT run. The exception
-    # is converted to NullRunTransportError so the outer
-    # try/except below wraps it as NullRunBlockedException.
     business_impact_dict: dict[str, Any] | None = None
     action_digest_hex: str | None = None
     # ``extractor`` was already resolved at the top of this
@@ -750,8 +694,6 @@ def _enforce_sensitive_tool(
             ) from exc
 
     # ADR-008: prefer `on_transport_error` (raise classified
-    # NullRunTransportError); fall back to legacy `fallback_mode` for
-    # older runtimes that pre-date the rename.
     from nullrun.breaker.exceptions import (
         NullRunBlockedException,
         NullRunTransportError,
@@ -785,9 +727,6 @@ def _enforce_sensitive_tool(
         raise
     except NullRunTransportError as exc:
         # ADR-008: classified transport failure. Re-raise as
-        # NullRunBlockedException so the caller's existing
-        # `except NullRunBlockedException` catches the same way as a
-        # real policy block. The body never runs.
         if fail_open:
             logger.warning(
                 f"sensitive tool pre-check unavailable for {fn.__name__!r}: "
@@ -866,10 +805,6 @@ def _enforce_sensitive_tool(
         raise err from exc
 
     # Defense in depth (ADR-008 Rule 1 + Rule 2): if `runtime.execute`
-    # ever returns a dict with `decision_source` indicating a transport
-    # failure (legacy `FALLBACK_*` strings OR the typed
-    # `TransportErrorSource` enum values), honor the gate's fail-CLOSED
-    # policy here. The body still must not run.
     if isinstance(result, dict):
         decision_source = result.get("decision_source", "")
         if isinstance(decision_source, str) and (
@@ -981,31 +916,6 @@ def sensitive(
     ``_enforce_sensitive_tool`` pre-check fires.
     """
     # Factory form: @sensitive(impact=...) returns a decorator that
-    # closes over the impact extractor. We stamp the extractor onto
-    # the function later (when the decorator is invoked) so users
-    # can mix @sensitive(impact=...) with @protect in any order.
-    #
-    # 2026-07-24 (Root-cause fix): the user-typical spelling is
-    #
-    #     @sensitive(impact=money_outflow(...))
-    #     @protect
-    #     def refund_customer(...):
-    #         ...
-    #
-    # Python applies decorators bottom-up, so @protect runs first
-    # and ``_attach_decorator`` receives the @protect-wrapped
-    # function. The pre-fix code stamped ``_nullrun_extractor`` on
-    # the wrapper (``_fn``) directly, so the gate later saw the
-    # extractor on the @protect wrapper but not on the bare
-    # user function that ``@protect`` captured as ``fn``. The
-    # gate's ``_enforce_sensitive_tool`` therefore found no
-    # extractor on ``fn``, returned early, and never built the
-    # typed ``business_impact`` for the /execute payload. To fix
-    # the root cause, walk ``__wrapped__`` (set on the @protect
-    # wrapper by ``functools.wraps``) to find the innermost
-    # user function and stamp the attribute there. This way the
-    # gate can find the extractor via a single ``getattr`` on
-    # the bare function — no chain walk needed at gate time.
     if fn is None:
 
         def _attach_decorator(_fn: F) -> F:
@@ -1085,25 +995,6 @@ def _find_extractor_in_chain(fn: Any) -> Any:
 
 def _do_sensitive_register(fn: F) -> F:
     # If @sensitive was applied bare (no impact=...), auto-attach a
-    # default ``ToolParamsExtractor(include_all=True)`` so the tool
-    # is immediately eligible for ToolParameters Approval Rules
-    # without requiring every user to write
-    # ``@sensitive(impact=tool_params())`` explicitly.
-    #
-    # The existing money extractor (set via
-    # ``@sensitive(impact=money_outflow(...))``) wins because the
-    # ``@sensitive`` decorator stamps the explicit extractor
-    # BEFORE calling this function; we only auto-attach when no
-    # extractor is present. See ``sensitive()`` factory form
-    # (lines ~979) where ``_attach_decorator`` runs first and may
-    # have already set ``_nullrun_extractor``.
-    #
-    # The auto-attach uses ``_stamp_extractor_on_innermost`` so the
-    # attribute lands on the bare user function -- the @protect
-    # wrapper captures the bare function as ``fn`` and the
-    # ``_enforce_sensitive_tool`` guard finds the extractor via a
-    # single ``getattr`` lookup. See the 2026-07-24 root-cause
-    # fix (line 1024 onward) for the rationale.
     try:
         from nullrun.extractor import ToolParamsExtractor, tool_params
 
@@ -1135,31 +1026,11 @@ def _do_sensitive_register(fn: F) -> F:
         rt = _get_or_create_runtime()
         rt.add_sensitive_tool(fn.__name__)
         # 2026-07-24 (Root-cause fix): the runtime singleton
-        # above is the one that was active at *decoration time*.
-        # If the user calls ``init_or_die()`` (or any other
-        # runtime reinit path) after the module-level
-        # decorators run — which is the common pattern in the
-        # examples — the new runtime starts with an empty
-        # ``_sensitive_tools`` set and the previous
-        # registration is lost. Stamping the tool name in
-        # the module-level ``_STRICT_MODE_FORCED`` set as well
-        # gives ``runtime.execute`` a second source of truth
-        # that survives the singleton churn. Importing here
-        # rather than at module top so this module stays
-        # import-cycle-free against ``nullrun.decorators`` (the
-        # only legitimate consumer is itself).
         from nullrun.runtime import register_strict_mode_forced
 
         register_strict_mode_forced(fn.__name__)
     except Exception as exc:
         # Sensitive tool registration is part of the fail-CLOSED contract
-        # (ADR-008 / sensitive-tool-fail-closed memory). If we
-        # cannot reach the runtime to register the tool, the body MUST NOT
-        # execute later — but since `@sensitive` only registers the name
-        # and the wrapper enforces it on each call, raising here is the
-        # correct signal. The earlier `except Exception` quietly turned a
-        # registration failure into a body that ran without pre-execution
-        # check — a security regression under partial initialization.
         raise RuntimeError(
             f"@sensitive registration failed for {fn.__name__!r}: {exc}. "
             "Cannot proceed without runtime; tool will be blocked until "

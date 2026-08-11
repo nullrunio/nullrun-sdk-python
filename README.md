@@ -1,17 +1,14 @@
 <div align="center">
 
-<!-- HERO -->
-<img src="https://raw.githubusercontent.com/nullrunio/nullrun-sdk-python/master/docs/assets/banner.svg" alt="NullRun — Runtime decision layer for AI agents" width="100%"/>
-
 # NullRun
 
 **Ship AI agents with real-time budget, policy, and human-approval gates.**
 
 Zero-refactor cost control, tool policy enforcement, and audit trail for any
-LLM-powered agent — works with OpenAI, Anthropic, LangGraph, CrewAI, AutoGen,
+LLM-powered agent - works with OpenAI, Anthropic, LangGraph, CrewAI, AutoGen,
 LlamaIndex, and your own stack.
 
-[Quickstart](#-quickstart) · [Docs](https://docs.nullrun.io) · [Examples](https://github.com/nullrunio/nullrun-examples)
+[Quickstart](https://docs.nullrun.io/getting-started/onboarding/) · [Docs](https://docs.nullrun.io) · [Examples](https://github.com/nullrunio/nullrun-examples)
 
 <!-- BADGES: project health -->
 <div align="center">
@@ -40,7 +37,8 @@ LlamaIndex, and your own stack.
 
 ---
 
-> ⚠️ **Status: alpha (v0.14.7, protocol v3.31.6).** The public API may shift between minor versions. Pin your dependency and read the [CHANGELOG](https://github.com/nullrunio/nullrun-sdk-python/blob/master/CHANGELOG.md) before upgrading.
+> ⚠️ **Status: alpha (v0.14.9).** The public API may shift between minor versions. 
+> Pin your dependency and read the [CHANGELOG](https://github.com/nullrunio/nullrun-sdk-python/blob/master/CHANGELOG.md) before upgrading.
 
 ---
 
@@ -63,11 +61,11 @@ Existing observability tools tell you **after** the fact. NullRun enforces **bef
 
 | | |
 |---|---|
-|  **Hard & soft budget gates** — atomic Redis-enforced, no client-trust model |  **Tool policy enforcement** — block dangerous tools before execution |
+|  **Hard & soft budget gates** — atomic Redis-enforced |  **Tool policy enforcement** — block dangerous tools before execution |
 |  **Human-in-the-loop approvals** — pause agent and await `approval_resolved` via WS push |  **Immutable audit trail** — every decision, every tool call, every cent |
 |  **Zero-code instrumentation** — `nullrun.init()` patches `httpx` once for any vendor |  **LangGraph, CrewAI, AutoGen, LlamaIndex** — first-class integrations |
-|  **Memory-safe streaming** — 16 MiB response body cap (anti-OOM); full body for usage extraction |  **Lightweight** — no LLM-key storage, no proxy required |
-|  **Server-authoritative cost** — wire protocol v3.31, server-minted execution IDs |  **MCP support** — expose tools to agents via Model Context Protocol |
+|  **Memory-safe streaming** — 16 MiB response body; full body for usage extraction |  **Lightweight** — no LLM-key storage, no proxy required |
+|  **Server-authoritative cost** — server-minted execution IDs |  **MCP support** — expose tools to agents via Model Context Protocol |
 
 ---
 
@@ -218,7 +216,7 @@ def my_agent(prompt: str) -> str:
 
 | | **NullRun** | LangChain callbacks | Helicone | Portkey | OpenLLMetry |
 |---|---|---|---|---|---|
-| **Enforce before execution** | ✅ | ❌ observe-only | ⚠️ async | ⚠️ async | ❌ |
+| **Enforce before execution** | ✅ | ❌ | ⚠️ async | ⚠️ async | ❌ |
 | **Server-authoritative budget** | ✅  | ❌ | ❌ | ❌ | ❌ |
 | **Tool-call policy** | ✅ | ❌ | ❌ | ⚠️ limited | ❌ |
 | **Human-in-the-loop approvals** | ✅ | ❌ | ❌ | ❌ | ❌ |
@@ -236,12 +234,12 @@ def my_agent(prompt: str) -> str:
 
 Runnable, copy-pastable examples live in a separate repo so you can adapt without cloning the SDK source:
 
--  **LangGraph** — multi-node agent with budget + approval [→](https://github.com/nullrunio/nullrun-examples/tree/main/langgraph)
--  **CrewAI** — multi-agent crew with shared budget [→](https://github.com/nullrunio/nullrun-examples/tree/main/crewai)
--  **AutoGen** — group-chat agent with policy gating [→](https://github.com/nullrunio/nullrun-examples/tree/main/autogen)
--  **LlamaIndex** — RAG pipeline with cost-per-query enforcement [→](https://github.com/nullrunio/nullrun-examples/tree/main/llama-index)
--  **Custom tools** — register your own tools for policy [→](https://github.com/nullrunio/nullrun-examples/tree/main/custom-tools)
--  **Multi-agent** — shared budget across sub-agents [→](https://github.com/nullrunio/nullrun-examples/tree/main/multi-agent)
+-  **[LangGraph](https://docs.nullrun.io/how-to/langgraph/)** — multi-node agent with budget + approval
+-  **[CrewAI](https://docs.nullrun.io/how-to/crewai/)** — multi-agent crew with shared budget
+-  **[AutoGen](https://docs.nullrun.io/how-to/autogen/)** — group-chat agent with policy gating
+-  **[LlamaIndex](https://docs.nullrun.io/how-to/llama-index/)** — RAG pipeline with cost-per-query enforcement
+-  **[Custom tools](https://docs.nullrun.io/how-to/fastapi/)** — register your own tools for policy
+-  **[Multi-agent](https://docs.nullrun.io/how-to/multi-agent/)** — shared budget across sub-agents
 
 ---
 
@@ -254,7 +252,7 @@ Runnable, copy-pastable examples live in a separate repo so you can adapt withou
 | **v0.16** | 📋 planned | Cost prediction from prompt, semantic tool policy (regex → AST) |
 | **v1.0** | 🎯 beta target | Stable wire contract, full async support, type-safe decisions |
 
-[Full roadmap & RFCs →](https://docs.nullrun.io/roadmap)
+[Full roadmap & RFCs →](https://nullrun.io/roadmap)
 
 ---
 
@@ -277,21 +275,17 @@ require tests for new public API, and run `ruff` + `mypy` in CI.
 
 NullRun does **not** store or proxy your LLM provider keys — it sits beside your existing clients and observes the calls. The gate is **server-authoritative** for cost: even a malicious SDK cannot inflate spend by sending a fake `cost_cents` to `/track`.
 
-See the security policy at <https://github.com/nullrunio/nullrun-sdk-python/security/policy> for the threat model and disclosure policy.
-
-To report a vulnerability: **support@nullrun.io**.
+See the security [policy](https://github.com/nullrunio/nullrun-sdk-python/security/policy) for the threat model and disclosure policy.
 
 ---
 
 ## Community & support
 
--  **GitHub Issues**: <https://github.com/nullrunio/nullrun-sdk-python/issues>
--  **GitHub Discussions**: <https://github.com/nullrunio/nullrun-sdk-python/discussions>
--  **Enterprise support**: support@nullrun.io
+-  [GitHub Issues](https://github.com/nullrunio/nullrun-sdk-python/issues)
+-  [Support](support@nullrun.io)
 
 ---
 
----
 
 <div align="center">
 
