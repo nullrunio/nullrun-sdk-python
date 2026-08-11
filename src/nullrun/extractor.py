@@ -41,11 +41,10 @@ that:
 
 from __future__ import annotations
 
-import functools
 import inspect
 from collections.abc import Callable
 from decimal import Decimal, InvalidOperation
-from typing import Any, Optional, Union
+from typing import Any
 
 from nullrun.business_impact import (
     INFLOW,
@@ -598,17 +597,6 @@ class MoneyImpactExtractor:
         return BusinessImpact(impact=impact)
 
 
-@functools.lru_cache(maxsize=128)
-def _cached_signature(fn_id: int) -> inspect.Signature | None:
-    for obj in gc_get_objects():
-        if id(obj) == fn_id:
-            try:
-                return inspect.signature(obj)
-            except (TypeError, ValueError):
-                return None
-    return None
-
-
 def money_outflow(
     argument: str,
     currency: str = "USD",
@@ -910,14 +898,3 @@ def tool_params(
         param_extractors=param_extractors,
         include_all=include_all,
     )
-
-
-def compute_impact_digest(impact: BusinessImpact) -> str:
-    """Thin alias re-exported for call-site readability."""
-    return compute_action_digest(impact)
-
-
-def gc_get_objects() -> list[Any]:
-    import gc
-
-    return gc.get_objects()

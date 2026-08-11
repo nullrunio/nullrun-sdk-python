@@ -34,6 +34,7 @@ Usage:
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import inspect
 import logging
@@ -419,64 +420,26 @@ def protect(fn: F | None = None) -> F | Callable[[F], F]:
         # bound to itself so the next call wraps the target function.
         return protect
 
-    if inspect.iscoroutinefunction(fn):
+    @contextlib.contextmanager
+    def _protect_body(args: tuple[Any, ...], kwargs: dict[str, Any], unify_block: bool):
+        """Shared ADR-008 Rule-4 scaffolding for sync + async wrappers.
 
-        @functools.wraps(fn)
-        async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
-            runtime = _get_or_create_runtime()
-            span = _next_span()
-            token = set_span(span)
+        Runs the four pre-execution gates (KILL/PAUSE → budget → span
+        start → sensitive-tool policy), yields the runtime so the
+        caller can invoke ``fn`` and ``track_tool`` within the gated
+        region, then emits ``span_end`` with the captured error.
 
-            # ADR-008 Rule 4: gate order is
-            error: BaseException | None = None
-            try:
-                # 1. KILL/PAUSE from the dashboard short-circuits
-                # everything else. The resolution order is the
-                # user-set contextvar first, then the API-key-bound
-                # workflow — same precedence as check_workflow_budget.
-                runtime.check_control_plane(get_workflow_id() or None)
-
-                # 2. Budget pre-flight via /gate. Raises
-                # WorkflowKilledInterrupt on real block; fails open
-                # on transport error (see runtime.check_workflow_budget).
-                runtime.check_workflow_budget()
-
-                # 3. Span start — best-effort, never blocks.
-                _emit_span_start(runtime, span, fn.__name__)
-
-                # 4. Per-tool policy for @sensitive tools. Fails CLOSED
-                # on transport error (see _enforce_sensitive_tool).
-                _enforce_sensitive_tool(runtime, fn, args, kwargs)
-
-                result = await fn(*args, **kwargs)
-                runtime.track_tool(
-                    fn.__name__,
-                    metadata={"arguments": _safe_kwargs(kwargs)},
-                )
-                return result
-            except BaseException as exc:  # noqa: BLE001
-                # Capture the error so we can include it in span_end
-                # *after* the contextvar is reset. Re-raise so the
-                # caller's try/except still sees the original exception.
-                error = exc
-                raise
-            finally:
-                reset_span(token)
-                _emit_span_end(
-                    runtime,
-                    span,
-                    error=_safe_error_str(error),
-                )
-
-        return async_wrapper  # type: ignore[return-value]
-
-    @functools.wraps(fn)
-    def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+        ``unify_block`` controls the kill/pause signal translation.
+        Sync wrappers pass ``True`` so the user sees a single
+        ``NullRunBlockedException`` regardless of which gate raised;
+        async wrappers pass ``False`` so the underlying
+        ``WorkflowKilledInterrupt`` propagates — async frameworks
+        (asyncio task cancellation, signal handlers) rely on the
+        original ``BaseException`` subtype to interrupt cleanly.
+        """
         runtime = _get_or_create_runtime()
         span = _next_span()
         token = set_span(span)
-
-        # ADR-008 Rule 4: gate order is
         error: BaseException | None = None
         try:
             # 1. KILL/PAUSE from the dashboard short-circuits
@@ -497,21 +460,10 @@ def protect(fn: F | None = None) -> F | Callable[[F], F]:
             # on transport error (see _enforce_sensitive_tool).
             _enforce_sensitive_tool(runtime, fn, args, kwargs)
 
-            result = fn(*args, **kwargs)
-            runtime.track_tool(
-                fn.__name__,
-                metadata={"arguments": _safe_kwargs(kwargs)},
-            )
-            return result
+            yield runtime
         except BaseException as exc:  # noqa: BLE001
             error = exc
-            # Unify the "blocked" signal at the @protect boundary so
-            # callers can catch a single NullRunBlockedException for
-            # both policy blocks and sensitive-tool blocks. Direct
-            # calls to check_workflow_budget still raise the original
-            # exception type so callers that distinguish hard vs
-            # soft blocks keep that signal.
-            if isinstance(exc, (WorkflowKilledInterrupt, WorkflowPausedException)):
+            if unify_block and isinstance(exc, (WorkflowKilledInterrupt, WorkflowPausedException)):
                 # Layer 1: pass through the kill/pause error_code so
                 # the user can tell WHY the body did not run —
                 # ``NR-W002`` (killed) vs ``NR-W003`` (paused). The
@@ -539,6 +491,30 @@ def protect(fn: F | None = None) -> F | Callable[[F], F]:
                 span,
                 error=_safe_error_str(error),
             )
+
+    if inspect.iscoroutinefunction(fn):
+
+        @functools.wraps(fn)
+        async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+            with _protect_body(args, kwargs, unify_block=False) as runtime:
+                result = await fn(*args, **kwargs)
+                runtime.track_tool(
+                    fn.__name__,
+                    metadata={"arguments": _safe_kwargs(kwargs)},
+                )
+                return result
+
+        return async_wrapper  # type: ignore[return-value]
+
+    @functools.wraps(fn)
+    def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+        with _protect_body(args, kwargs, unify_block=True) as runtime:
+            result = fn(*args, **kwargs)
+            runtime.track_tool(
+                fn.__name__,
+                metadata={"arguments": _safe_kwargs(kwargs)},
+            )
+            return result
 
     return sync_wrapper  # type: ignore[return-value]
 
@@ -931,32 +907,44 @@ def sensitive(
     return _do_sensitive_register(fn)
 
 
-def _stamp_extractor_on_innermost(fn: F, impact: Any) -> None:
-    """Stamp ``_nullrun_extractor`` on the innermost callable.
+# Maximum depth for ``__wrapped__`` chain walks. The real chain is
+# at most 3 deep (@sensitive factory + @protect + functools.wraps
+# from @protect); the cap defends against pathological cycles.
+_WRAPPED_CHAIN_MAX_HOPS = 32
 
-    Walks the ``__wrapped__`` chain (set by ``functools.wraps``)
-    to find the deepest user function. Falls back to ``fn``
-    itself if no chain is present. Setting the attribute on the
-    innermost callable means the gate's ``_enforce_sensitive_tool``
-    can read it from the bare user function via a single
-    ``getattr`` call — no chain walk needed.
+
+def _walk_wrapped_chain(fn: Any) -> Any:
+    """Yield each callable in ``fn``'s ``__wrapped__`` chain.
+
+    Stops on ``None``, on a cycle (id already seen), or at
+    ``_WRAPPED_CHAIN_MAX_HOPS`` hops. The original ``fn`` is
+    always yielded first.
     """
+    seen: set[int] = set()
+    current: Any = fn
+    for _ in range(_WRAPPED_CHAIN_MAX_HOPS):
+        if current is None or id(current) in seen:
+            return
+        seen.add(id(current))
+        yield current
+        current = getattr(current, "__wrapped__", None)
+
+
+def _stamp_extractor_on_innermost(fn: F, impact: Any) -> None:
+    """Stamp ``_nullrun_extractor`` on the innermost callable in the chain.
+
+    Setting the attribute on the innermost callable means the gate's
+    ``_enforce_sensitive_tool`` can read it from the bare user function
+    via a single ``getattr`` call — no chain walk needed.
+    """
+    last: Any = None
+    for current in _walk_wrapped_chain(fn):
+        last = current
+    target = last if last is not None else fn
     # `setattr` keeps mypy happy without a TYPE_CHECKING
     # forward-reference declaration; ruff B010 is a stylistic
     # preference (no functional risk here).
-    seen: set[int] = set()
-    current: Any = fn
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
-        next_current = getattr(current, "__wrapped__", None)
-        if next_current is None:
-            setattr(current, "_nullrun_extractor", impact)  # noqa: B010
-            return
-        current = next_current
-    # Fallback: chain exhausted without finding a leaf. Stamp
-    # on the input itself so the attribute is at least present
-    # on the outermost wrapper @protect captured.
-    setattr(fn, "_nullrun_extractor", impact)  # noqa: B010
+    setattr(target, "_nullrun_extractor", impact)  # noqa: B010
 
 
 def _find_extractor_in_chain(fn: Any) -> Any:
@@ -969,27 +957,11 @@ def _find_extractor_in_chain(fn: Any) -> Any:
     auto-attach path would see ``None`` on the @protect wrapper
     and silently stamp its default ToolParamsExtractor on top,
     breaking the user's explicit map.
-
-    Returns the extractor object (the actual ``_nullrun_extractor``
-    value) or ``None`` if no extractor is found on the chain.
-    The chain walk is bounded to ``len(repr(callable))`` hops to
-    defend against pathological ``__wrapped__`` cycles; in practice
-    the chain is at most 3 deep (@sensitive factory + @protect +
-    functools.wraps chain from @protect).
     """
-    seen: set[int] = set()
-    current: Any = fn
-    # Bound the walk: a decorator chain longer than this is almost
-    # certainly a cycle. The cap is generous (the real chain is
-    # typically 2-3 deep).
-    for _ in range(32):
-        if current is None or id(current) in seen:
-            return None
-        seen.add(id(current))
+    for current in _walk_wrapped_chain(fn):
         ext = getattr(current, "_nullrun_extractor", None)
         if ext is not None:
             return ext
-        current = getattr(current, "__wrapped__", None)
     return None
 
 

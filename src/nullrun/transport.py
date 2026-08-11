@@ -132,7 +132,7 @@ def verify_hmac_signature(
     api_key: str,
     secret_key: str,
     timestamp: int,
-    body: str,
+    body: str | bytes,
     signature: str,
     max_age_seconds: int = 300,
 ) -> bool:
@@ -143,7 +143,7 @@ def verify_hmac_signature(
         api_key: Client's API key
         secret_key: Client's secret key
         timestamp: Unix timestamp from request
-        body: Request body as JSON string
+        body: Request body as JSON string or UTF-8 bytes
         signature: HMAC signature to verify
         max_age_seconds: Maximum allowed age of request (default 5 min)
 

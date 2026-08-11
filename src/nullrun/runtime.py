@@ -325,7 +325,6 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # Local enforcement is the backend's job as of 0.7.0; the SDK
         # is a thin client. The BoundedDict / LoopTracker / RateTracker
         # machinery has been removed alongside ``_check_local_limits``.
-        self._workflow_start_time: float = time.time()
 
         # Layer 3: ring buffer for the ``nullrun.status `` recent
         # errors list. Capacity 10 — bounded so a long-lived process
@@ -870,15 +869,6 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             )
             self._emit_sdk_error(err, stage="auth")
             raise err from e
-
-    def _start_transport(self) -> None:
-        """Start the transport layer with background flush.
-
-        Note: Transport is already created in __init__ before auth/policy.
-        This method only starts it.
-        """
-        if self._transport:
-            self._transport.start()
 
     def _start_remote_polling(self) -> None:
         """Start the control-plane background listener.
@@ -1999,24 +1989,6 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             "local_cost_cents": self._local_cost_cents_estimate,
         }
 
-    def _trigger_action(
-        self,
-        action: ActionType,
-        workflow_id: str,
-        reason: str,
-    ) -> None:
-        """
-        Trigger a protective action.
-
-        This executes the action through the action handler.
-        """
-        if self._action_handler:
-            try:
-                self._action_handler.handle(action.value, workflow_id, reason)
-            except Exception as e:
-                logger.debug(f"Action handler raised: {e}")
-                # Let the exception propagate
-
     # =============================================================================
     # Pre-Execution Enforcement (SDK Boundary)
     # =============================================================================
@@ -2057,45 +2029,6 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         needle = tool_name.lower()
         with self._tools_lock:
             return needle in self._sensitive_tools_lower or needle in self._strict_mode_tools_lower
-
-    def get_org_status(self, org_id: str | None = None) -> dict[str, Any]:
-        """Public helper for reading ``/api/v1/orgs/{org_id}/status``.
-
-        Routes through ``self._transport._client`` so the shared
-        connection pool, retry policy, and circuit breaker apply.
-
-        Args:
-            org_id: Optional organisation ID. Defaults to the runtime's
-                ``self.organization_id`` (set during ``_authenticate``).
-
-        Returns:
-            Parsed JSON dict of the org-status payload.
-
-        Raises:
-            NullRunAuthenticationError: if neither ``org_id`` nor
-                ``self.organization_id`` is available.
-            httpx.HTTPError: on transport failure.
-        """
-        resolved = org_id or self.organization_id
-        if not resolved:
-            err = NullRunAuthenticationError(
-                "get_org_status requires org_id (or a runtime bound to one)",
-                error_code="NR-C003",
-                user_action=(
-                    "Call nullrun.init() first, or pass org_id=<uuid> "
-                    "explicitly. The runtime is not bound to an organization "
-                    "yet — auth() must complete before this method can be used."
-                ),
-            )
-            self._emit_sdk_error(err, stage="org_status")
-            raise err
-        response = self._transport._client.get(
-            f"{self.api_url}/api/v1/orgs/{resolved}/status",
-            headers=self._auth_headers(),
-            timeout=10.0,
-        )
-        response.raise_for_status()
-        return response.json()  # type: ignore[no-any-return]
 
     def add_sensitive_tool(self, tool_name: str) -> None:
         """

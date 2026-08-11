@@ -64,46 +64,6 @@ class _NullRunRuntimeMeta(type):
 
 __all__ = ["_InstanceProxy", "_NullRunRuntimeMeta"]
 
-def install_module_proxy(module, attribute_name: str = "_runtime") -> None:
-    """Install a descriptor on module that proxies the attribute
-    to the registry.
-
-    Backwards-compat for code that imports
-    nullrun.runtime._runtime or
-    nullrun.decorators._runtime directly — historically these
-    were plain module attributes holding the active runtime. The
-    registry is the source of truth now, so the module attribute
-    is a property-style proxy.
-
-    Args:
-        module: The module object to patch.
-        attribute_name: Name of the attribute to replace. Defaults
-            to "_runtime" which is what both runtime.py and
-            decorators.py historically named their module-level
-            slot.
-
-    Implementation note: we use a per-module property so the
-    descriptor holds no state — every read goes straight through
-    to :func:`get_active_runtime` and every write goes to
-    :func:`get_registry`.set / :func:`get_registry`.clear.
-    """
-    from nullrun._registry import get_active_runtime, get_registry
-
-    def _fget(_mod):
-        return get_active_runtime()
-
-    def _fset(_mod, value):
-        if value is None:
-            get_registry().clear()
-        else:
-            get_registry().set(value)
-
-    setattr(module, attribute_name, property(_fget, _fset, doc="Registry proxy."))
-
-
-__all__.append("install_module_proxy")
-
-
 
 class _RuntimeProxyModule(type(sys.modules[__name__])):  # type: ignore[misc]
     """Subclass the module's metaclass to install a real descriptor

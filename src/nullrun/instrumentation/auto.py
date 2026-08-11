@@ -856,42 +856,7 @@ class NullRunSyncTransport(httpx.BaseTransport):
         body: bytes,
         request: httpx.Request,
     ) -> httpx.Response:
-        # `response.read ` above consumed the streamed body — and httpx
-        # transparently decompresses gzip/br/zstd during that read. We
-        # MUST strip the encoding header on the rebuilt response, otherwise
-        # the downstream caller (e.g. openai/httpx) sees `content-encoding:
-        # gzip` and tries to decompress an already-decompressed body
-        # raising `zlib.error: Error -3 while decompressing data:
-        # incorrect header check`. content-length also has to be recomputed
-        # against the post-decompression byte count.
-        req = getattr(response, "_request", None) or request
-        headers = response.headers.copy()
-        # Also strip Transfer-Encoding so downstream HTTP clients
-        # (and httpx itself) don't try to chunk-decode an
-        # already-buffered body.
-        for enc in (
-            "content-encoding", "Content-Encoding",
-            "transfer-encoding", "Transfer-Encoding",
-        ):
-            if enc in headers:
-                del headers[enc]
-        if "content-length" in headers:
-            try:
-                headers["content-length"] = str(len(body))
-            except Exception:  # pragma: no cover
-                pass
-        elif "Content-Length" in headers:
-            try:
-                headers["Content-Length"] = str(len(body))
-            except Exception:  # pragma: no cover
-                pass
-        return httpx.Response(
-            status_code=response.status_code,
-            headers=headers,
-            content=body,
-            request=req,
-            extensions=response.extensions,
-        )
+        return _rebuild_response(response, body, request)
 
     def _emit(
         self,
@@ -914,68 +879,13 @@ class NullRunSyncTransport(httpx.BaseTransport):
         # zero-billed. Request body is the next authoritative source:
         # SDK users pass ``model="gpt-4.1-mini"`` in the ChatOpenAI
         # constructor.
-        model_from_response = usage.get("model")
         model_for_event = (
-            model_from_response
+            usage.get("model")
             or _extract_model_from_request_body(request)
         )
-
-        # 0.9.0: every successful llm_call span carries
-        # `metadata.tracked: True`. The backend's coverage query
-        # (backend/src/coverage/mod.rs) computes tracked_pct from
-        # this flag — it replaces the old `_coverage_seen` /
-        # `_coverage_tracked` per-host dicts. Usage was extracted
-        # successfully, so the SDK's `_match_extractor` identified
-        # a known provider. See plan at
-        # `~/.claude/plans/async-swinging-hanrahan.md`.
         try:
-            # Lift cache / reasoning / finish / tool names out of
-            # raw_usage onto the event itself. The backend's
-            # gate/budget/loop detection needs them as first-class
-            # columns; raw_usage is no longer on the wire (stripped
-            # at the track boundary — see _WIRE_STRIP_FIELDS in
-            # runtime.py).
-            #
-            # Audit 2026-06-29 (unified fingerprint): we use the
-            # ``_fingerprint_for_llm_call`` helper so this emission
-            # shares the same dedup key as the LangChain callback's
-            # emission for the same call. The previous per-transport
-            # ``_fingerprint_for(host, body, status)`` produced a key
-            # the callback could never collide with, doubling every
-            # real LLM call on the wire.
-            response_id = usage.get("id")
             self._runtime.track(
-                {
-                    "type": "llm_call",
-                    "provider": _provider_label(host),
-                    "host": host,
-                    "model": model_for_event,
-                    "tokens": usage.get("total_tokens", 0),
-                    "input_tokens": usage.get("prompt_tokens", 0),
-                    "output_tokens": usage.get("completion_tokens", 0),
-                    "cache_read_tokens": int(usage.get("cache_read_tokens", 0) or 0),
-                    "cache_write_tokens": int(usage.get("cache_write_tokens", 0) or 0),
-                    "reasoning_tokens": int(usage.get("reasoning_tokens", 0) or 0),
-                    "finish_reason": usage.get("finish_reason"),
-                    "tool_names": usage.get("tool_names") or [],
-                    "has_usage": True,
-                    "metadata": {
-                        "tracked": True,
-                    },
-                    # Stripped at the wire boundary by _WIRE_STRIP_FIELDS
-                    # in runtime.py — kept here only so the in-process
-                    # dedup layer can see the full vendor payload.
-                    "raw_usage": usage,
-                    # Audit 2026-06-29 (unified fingerprint): see
-                    # ``_fingerprint_for_llm_call`` — same key the
-                    # LangChain callback computes, so the dedup LRU
-                    # collapses the two emissions for the same call.
-                    "_fingerprint": _fingerprint_for_llm_call(
-                        model_for_event,
-                        _provider_label(host),
-                        response_id,
-                    ),
-                }
+                _build_llm_call_event(host, usage, model_for_event)
             )
         except Exception as e:
             logger.debug("NullRun transport: track failed: %s", e)
@@ -1044,38 +954,7 @@ class NullRunAsyncTransport(httpx.AsyncBaseTransport):
         body: bytes,
         request: httpx.Request,
     ) -> httpx.Response:
-        # See `NullRunSyncTransport._rebuild` for the gzip-strip rationale.
-        # Without stripping content-encoding, the async openai/anthropic
-        # clients re-decompress the already-decompressed body and raise
-        # zlib.error.
-        req = getattr(response, "_request", None) or request
-        headers = response.headers.copy()
-        # Also strip Transfer-Encoding so downstream HTTP clients
-        # (and httpx itself) don't try to chunk-decode an
-        # already-buffered body.
-        for enc in (
-            "content-encoding", "Content-Encoding",
-            "transfer-encoding", "Transfer-Encoding",
-        ):
-            if enc in headers:
-                del headers[enc]
-        if "content-length" in headers:
-            try:
-                headers["content-length"] = str(len(body))
-            except Exception:  # pragma: no cover
-                pass
-        elif "Content-Length" in headers:
-            try:
-                headers["Content-Length"] = str(len(body))
-            except Exception:  # pragma: no cover
-                pass
-        return httpx.Response(
-            status_code=response.status_code,
-            headers=headers,
-            content=body,
-            request=req,
-            extensions=response.extensions,
-        )
+        return _rebuild_response(response, body, request)
 
     def _emit(
         self,
@@ -1091,40 +970,8 @@ class NullRunAsyncTransport(httpx.AsyncBaseTransport):
         # `_extract_model_from_request_body` is sync-only); leave
         # model as the response-body value or None.
         try:
-            # See sync _emit for rationale. Async path uses
-            # identical event shape so the dedup key space stays
-            # unified across sync + async transports.
-            #
-            # Audit 2026-06-29 (unified fingerprint): see sync
-            # _emit for the rationale — async transport must use the
-            # same key the LangChain callback computes so the dedup
-            # LRU collapses duplicates.
-            response_id = usage.get("id")
             self._runtime.track(
-                {
-                    "type": "llm_call",
-                    "provider": _provider_label(host),
-                    "host": host,
-                    "model": usage.get("model"),
-                    "tokens": usage.get("total_tokens", 0),
-                    "input_tokens": usage.get("prompt_tokens", 0),
-                    "output_tokens": usage.get("completion_tokens", 0),
-                    "cache_read_tokens": int(usage.get("cache_read_tokens", 0) or 0),
-                    "cache_write_tokens": int(usage.get("cache_write_tokens", 0) or 0),
-                    "reasoning_tokens": int(usage.get("reasoning_tokens", 0) or 0),
-                    "finish_reason": usage.get("finish_reason"),
-                    "tool_names": usage.get("tool_names") or [],
-                    "has_usage": True,
-                    "metadata": {
-                        "tracked": True,
-                    },
-                    "raw_usage": usage,
-                    "_fingerprint": _fingerprint_for_llm_call(
-                        usage.get("model"),
-                        _provider_label(host),
-                        response_id,
-                    ),
-                }
+                _build_llm_call_event(host, usage, usage.get("model"))
             )
         except Exception as e:
             logger.debug("NullRun transport: async track failed: %s", e)
@@ -1134,6 +981,97 @@ class NullRunAsyncTransport(httpx.AsyncBaseTransport):
             await self._inner.aclose()
         except Exception as e:  # pragma: no cover — defensive
             logger.debug("NullRun transport: inner aclose failed: %s", e)
+
+
+def _rebuild_response(
+    response: httpx.Response,
+    body: bytes,
+    request: httpx.Request,
+) -> httpx.Response:
+    """Rebuild ``response`` with a fresh body, stripping transport encodings.
+
+    ``response.read`` above consumed the streamed body — and httpx
+    transparently decompresses gzip/br/zstd during that read. We MUST
+    strip the encoding header on the rebuilt response, otherwise the
+    downstream caller (e.g. openai/httpx) sees ``content-encoding:
+    gzip`` and tries to decompress an already-decompressed body
+    raising ``zlib.error: Error -3 while decompressing data:
+    incorrect header check``. ``content-length`` also has to be
+    recomputed against the post-decompression byte count.
+
+    Shared by ``NullRunSyncTransport`` and ``NullRunAsyncTransport``
+    (the rebuild path is byte-identical for the two — only the body
+    source differs).
+    """
+    req = getattr(response, "_request", None) or request
+    headers = response.headers.copy()
+    # Also strip Transfer-Encoding so downstream HTTP clients
+    # (and httpx itself) don't try to chunk-decode an
+    # already-buffered body.
+    for enc in (
+        "content-encoding", "Content-Encoding",
+        "transfer-encoding", "Transfer-Encoding",
+    ):
+        if enc in headers:
+            del headers[enc]
+    if "content-length" in headers:
+        try:
+            headers["content-length"] = str(len(body))
+        except Exception:  # pragma: no cover
+            pass
+    elif "Content-Length" in headers:
+        try:
+            headers["Content-Length"] = str(len(body))
+        except Exception:  # pragma: no cover
+            pass
+    return httpx.Response(
+        status_code=response.status_code,
+        headers=headers,
+        content=body,
+        request=req,
+        extensions=response.extensions,
+    )
+
+
+def _build_llm_call_event(
+    host: str,
+    usage: ExtractedUsage,
+    model_for_event: Any,
+) -> dict[str, Any]:
+    """Build the ``llm_call`` event dict emitted by sync + async transports.
+
+    Shared so the dedup key (``_fingerprint``) stays identical across
+    both paths — a sync httpx call and the same logical call arriving
+    via async httpx would otherwise compute different fingerprints
+    and double-count. ``raw_usage`` is preserved here for the in-process
+    dedup LRU; the wire boundary in ``runtime.py`` strips it via
+    ``_WIRE_STRIP_FIELDS``.
+    """
+    response_id = usage.get("id")
+    return {
+        "type": "llm_call",
+        "provider": _provider_label(host),
+        "host": host,
+        "model": model_for_event,
+        "tokens": usage.get("total_tokens", 0),
+        "input_tokens": usage.get("prompt_tokens", 0),
+        "output_tokens": usage.get("completion_tokens", 0),
+        "cache_read_tokens": int(usage.get("cache_read_tokens", 0) or 0),
+        "cache_write_tokens": int(usage.get("cache_write_tokens", 0) or 0),
+        "reasoning_tokens": int(usage.get("reasoning_tokens", 0) or 0),
+        "finish_reason": usage.get("finish_reason"),
+        "tool_names": usage.get("tool_names") or [],
+        "has_usage": True,
+        "metadata": {
+            "tracked": True,
+        },
+        "raw_usage": usage,
+        "_fingerprint": _fingerprint_for_llm_call(
+            model_for_event,
+            _provider_label(host),
+            response_id,
+        ),
+    }
 
 
 def _provider_label(host: str) -> str:

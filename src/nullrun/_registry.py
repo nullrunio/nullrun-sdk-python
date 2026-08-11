@@ -52,11 +52,9 @@ class RuntimeRegistry:
     """Thread-safe single-slot registry for the active runtime.
 
     The registry is a process-wide singleton (``_registry`` below).
-    Tests that need isolation should use the
-    :func:`replace_for_test` context manager rather than creating a
-    second registry; multiple runtimes per process are not supported
-    by design (the SDK's enforce-the-active-runtime contract assumes
-    exactly one writer at a time).
+    Multiple runtimes per process are not supported by design (the
+    SDK's enforce-the-active-runtime contract assumes exactly one
+    writer at a time).
 
     Lifetime
     --------
@@ -109,18 +107,6 @@ class RuntimeRegistry:
         with self._lock:
             previous = self._instance
             self._instance = None
-            return previous
-
-    def replace_for_test(self, runtime: NullRunRuntime | None) -> NullRunRuntime | None:
-        """Context-manager-friendly variant for test isolation.
-
-        Returns a callable that the test fixture can invoke in its
-        teardown to restore the prior state without explicitly
-        holding the lock across the body of the test.
-        """
-        with self._lock:
-            previous = self._instance
-            self._instance = runtime
             return previous
 
 
