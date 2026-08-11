@@ -1264,8 +1264,9 @@ class TestServerMintedExecutionIdContextvar:
     """
 
     def test_default_value_is_none(self):
-        # New ContextVar with no prior set → None. Verifies the SDK
-        # doesn't ship with a stale id baked into the context.
+        # New ContextVar with no prior set → None (audit: "нет var
+        # на старте"). Verifies the SDK doesn't ship with a stale
+        # id baked into the context.
         assert get_server_minted_execution_id() is None
 
     def test_set_returns_token_get_returns_value(self):

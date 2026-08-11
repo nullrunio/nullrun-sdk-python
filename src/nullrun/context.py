@@ -198,28 +198,65 @@ def set_chain_op(op: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Server-minted execution_id
+# Server-minted execution_id (2026-07-04 — )
 # ---------------------------------------------------------------------------
 #
-# The /check response carries a server-minted ``reservation_id`` (and an
-# ``idempotency_key``) that the /track payload must reuse. The runtime
-# captures both into contextvars on every successful /check; ``_enrich_event``
-# reads them and tags the /track payload with ``execution_id``.
+# Pre-0.12.0 the SDK sent a client-supplied ``execution_id`` (usually
+# ``workflow_id``) in /check requests and IGNORED the server's response.
+# This left two problems:
 #
-# Lifetime: reset on ``with workflow(...)`` / ``with chain(...)`` exit so a
-# /check in one block never leaks into a /track in a sibling block. Tests
-# drive it with the Token-based ``set_server_minted_*`` / ``reset_*`` helpers
-# (``clear_`` is a no-token convenience for the runtime).
+# 1. ownership — the backend's `gate_reserve_v3`
+# generates a uuidv7 internally, persists
+# ``execution:{execution_id}`` (24h TTL) and creates
+# ``reservation:{execution_id}`` (300s TTL). The client-minted
+# id never matched, so on the v3 path the gate rejected /track
+# with 503 RESERVATION_NOT_FOUND — fail-CLOSED.
 #
-# The reservation TTL is 300s. The runtime ignores the captured value when
-# the age exceeds 295s so an exceptionally long LLM call never ships a
-# doomed ``execution_id``.
+# 2. idempotency — /track's ``idempotency_key``
+# contract depends on the server-minted UUID being reused
+# on retry. Without picking it up at /check the SDK has no
+# way to compute a stable key.
+#
+# Fix: capture the ``reservation_id`` field from the /check
+# response into this contextvar. The runtime sets it on every
+# successful /check; the runtime's ``_enrich_event`` reads it on
+# the way out and tags the /track payload with ``execution_id``.
+#
+# Lifetime: scoped automatically by ``with workflow(...)`` /
+# ``with chain(...)`` — the runtime resets the contextvar on
+# block exit so a /check in one block never leaks into a /track
+# in a sibling block. Tests can drive it manually with
+# ``set_/reset_server_minted_execution_id`` (Token-based API
+# mirrors the user-facing audit spec; ``clear_`` is a
+# no-token convenience for the runtime's ``_enrich_event``
+# after a /track has been issued).
+#
+# The reservation TTL (300s) is shorter than the chain id's 24h
+# binding TTL, so we also record the capture timestamp —
+# ``get_server_minted_reservation_at`` returns ``time.monotonic ``
+# at the moment /check returned 200. The runtime ignores the
+# contextvar when the age exceeds 295s (5s margin below the
+# 300s backend reservation TTL) so an exceptionally long LLM
+# call never ships a doomed ``execution_id``.
 _server_minted_execution_id_var: ContextVar[str | None] = ContextVar(
     "server_minted_execution_id", default=None
 )
 _server_minted_reservation_at_var: ContextVar[float] = ContextVar(
     "server_minted_reservation_at", default=0.0
 )
+# 2026-07-04: /track idempotency anchor.
+# The /check request carries ``idempotency_key = operation_id`` (UUID v4)
+# the backend's /track handler (handlers.rs:4654-4725) accepts the same
+# key and replays the original response on hit (200 + ``idempotent_replay:
+# true``). Without forwarding the key from /check onto the /track payload
+# a transport-level retry on the SAME event either re-runs CONSUME_SCRIPT
+# (→ 503 RESERVATION_NOT_FOUND, since the reservation key was DEL'ed by
+# the first successful consume per) or double-bills.
+#
+# Captured into a contextvar at the same instant as
+# ``server_minted_execution_id`` so the two values always refer to the
+# same /check. ``None`` when the /check didn't supply one (legacy or
+# capability-disabled backend) — the /track payload then omits the field.
 _server_minted_idempotency_key_var: ContextVar[str | None] = ContextVar(
     "server_minted_idempotency_key", default=None
 )

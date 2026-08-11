@@ -314,6 +314,47 @@ def test_protect_respects_externally_set_span(recording_runtime):
 # ──────────────────────────────────────────────────────────────
 
 
+def test_init_replaces_stale_decorator_runtime_cache(mock_api):
+    """`nullrun.init` must update the @protect decorator's own module-level cache.
+
+    Pre-seed `decorators._runtime` with a sentinel that raises on
+    `track_event`, then call `init`. If the fix is in place, init
+    overwrites the slot and the sentinel is never reachable.
+    """
+    import nullrun.decorators as _dec
+
+    class _DeadSentinel:
+        """A pre-seeded cache slot that raises if @protect ever uses it."""
+
+        def track_event(self, *args, **kwargs):  # noqa: ARG002
+            raise AssertionError(
+                "decorators._runtime was not refreshed by init(); "
+                "the @protect cache is still pointing at a stale runtime."
+            )
+
+    _dec._runtime = _DeadSentinel()
+
+    rt = nullrun.init(
+        api_key="test-key-12345678",
+        api_url="https://api.test.nullrun.io",
+    )
+    try:
+        # The fix: init must overwrite the decorator's cache slot.
+        # Without the fix, this assertion fails because the slot
+        # still points at _DeadSentinel.
+        assert _dec._runtime is rt, (
+            "init() did not update decorators._runtime; "
+            "the @protect cache is still pointing at a stale runtime."
+        )
+        assert not isinstance(_dec._runtime, _DeadSentinel)
+    finally:
+        _dec._runtime = None
+        try:
+            rt.shutdown()
+        except Exception:
+            pass
+
+
 def test_protect_uses_new_runtime_after_reinit(mock_api):
     """After init → shutdown → init, @protect emits span events to the NEW runtime, not the dead one."""
     import nullrun.decorators as _dec

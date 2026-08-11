@@ -17,26 +17,141 @@ that:
 5. Computes the byte-identical ``action_digest`` the backend
    expects (see ``nullrun.business_impact.compute_action_digest``).
 
-## Validation contract
+## Why this is its own helper, not part of ``@sensitive``
 
-- Float / bool are rejected at the input level. ``bool`` is a
-  subclass of ``int`` and would otherwise sneak through as a
-  ``1``-cent call.
-- ``units`` is explicit (``"major"`` / ``"minor"``); never
-  inferred from the type annotation, because a refactor that
-  changes ``amount: int`` to ``amount: Decimal`` would silently
-  flip the operator-facing rule from "$0.50" to "$50.00".
-- Major-unit precision is validated against the ISO-4217
-  exponent; the SDK never rounds silently. Callers must
-  ``quantize`` explicitly if they want rounding.
-- Negative amounts are rejected (``InvalidMoneyAmountError``),
-  so ``op=gt`` predicates cannot silently fall through.
-- ``i64`` overflow and the per-currency business cap are
-  checked post-conversion and raise ``InvalidMoneyAmountError``.
-- Currency is a strict 3-letter uppercase ISO-4217 code; the
-  whitelist is consulted at construction time so a misconfigured
-  decorator fails fast at ``@sensitive`` application, not on
-  the first call.
+The ``@sensitive`` decorator chain is the integration point, but
+the per-call impact extraction is data-driven and tested
+independently. Keeping ``extractor.py`` as a pure helper avoids
+the ``inspect.signature()`` cost on every sensitive call (the
+binding result is cached after first extraction via Python's
+``lru_cache``-friendly design) and makes the unit-discriminator
+test matrix cheap to write without instantiating the full
+``NullRunRuntime``.
+
+For the production flow, ``runtime.execute(...)`` reads the
+extractor from the function's ``_nullrun_extractor`` attribute
+(which ``@sensitive(impact=money_outflow(...))`` sets) and calls
+``impact_for(...)`` automatically.
+
+## Why ``units`` is explicit, not a type discriminator
+
+The previous review explicitly rejected the
+``int = minor, Decimal = major`` shortcut because the unit
+semantics of a function argument should not flip silently when
+the function signature is refactored. Concretely:
+
+    @nullrun.sensitive(impact=nullrun.money_outflow(argument="amount"))
+    def refund(amount: int) -> ...   # 50 = 50 cents (minor units)
+    def refund(amount: Decimal) -> ... # 50 = $50.00 (5000 cents)
+
+If ``units`` were implicit-from-type, renaming ``amount``'s
+annotation from ``int`` to ``Decimal`` would silently change the
+operator-facing rule from "$0.50" to "$50.00". The explicit
+``units="major" | units="minor"`` argument in the decorator
+fixes the unit semantics at the call site so a future
+signature refactor does not flip the meaning.
+
+## Float is rejected outright
+
+``Decimal`` exists precisely so that money code does not have
+to deal with binary-floating-point surprises (``0.1 + 0.2 !=
+0.3`` in IEEE-754). The extractor therefore refuses ``float``
+values at the input level. The error includes a pointer to
+the right alternative (``Decimal`` for major, ``int`` for minor)
+so the operator can fix the call site without guessing.
+
+## Major-unit precision is validated, never rounded
+
+The first version of this module used banker's rounding
+(``ROUND_HALF_EVEN``) to convert ``Decimal("50.99")`` to
+``5099`` minor units. That decision was rejected in review:
+banker's rounding silently drops sub-cent precision
+(``Decimal("50.005")`` becomes ``5000`` minor units), which
+is the exact bug class the explicit ``units`` discriminator
+is designed to prevent. The current contract validates the
+precision of the ``Decimal`` against the ISO-4217 minor-unit
+exponent for the currency and raises ``InvalidMoneyPrecisionError``
+if the caller supplied more precision than the currency
+supports. The caller can explicitly truncate with
+``value.quantize(Decimal('1E-N'))`` to opt in to rounding; the
+SDK never rounds silently.
+
+## Sign is validated
+
+A negative amount for either ``money_outflow`` (debit) or
+``money_inflow`` (credit) is semantically incoherent. The
+review pointed out that ``{"direction":"outflow",
+"amount_minor":-5000}`` would silently fall through every
+``op=gt`` predicate because ``-5000 > 5000`` is always False,
+and the operator would never see a block. The current contract
+rejects negative amounts with ``InvalidMoneyAmountError`` so the
+``@protect`` wrapper can fail-CLOSED on the call site. If a
+future variant needs negative amounts (e.g. refunds as negative
+outflows) it can opt in via a future ``units="signed"``
+discriminator.
+
+## Overflow is bounded
+
+``i64`` can hold up to ``2**63 - 1 = 9_223_372_036_854_775_807``
+minor units (about $9.2 \u00d7 10\u00b9\u2076 for USD). The extractor checks
+the converted value against this limit and raises
+``InvalidMoneyAmountError`` if it would overflow. The check
+uses ``int`` post-conversion so the operator sees the
+offending amount, not just "too large".
+
+## Business cap is bounded
+
+The wire-format ``i64`` limit is a few hundred quadrillion
+dollars, which is well above any sensible per-call debit. The
+business cap (``_BUSINESS_CAP_MINOR`` table) is a much smaller
+per-currency limit chosen so that any amount above the cap
+goes through a separate risk path rather than being treated
+as a normal call. The cap is policy, not correctness: a $1M
+USD debit is technically valid on the wire, but for an agent
+running a refund tool it almost certainly warrants a human
+review. The cap is enforced as ``InvalidMoneyAmountError(reason="excessive")``
+with a clear "above the per-call business cap" message; the
+``@protect`` wrapper upgrades the error to fail-CLOSED.
+
+## Float and ``bool`` are rejected
+
+``float`` is rejected because IEEE-754 surprises are the entire
+reason ``Decimal`` exists. ``bool`` is rejected because ``bool``
+is a subclass of ``int`` in Python; without the explicit check,
+``refund(amount=True)`` would silently treat ``True`` as
+``1`` cent.
+
+## Currency is validated (whitelist + case)
+
+ISO-4217 minor-unit exponent lookup covers a small set of
+codes by design. The ``normalize_currency`` helper rejects any
+input that is not a 3-letter uppercase ISO-4217 code (e.g.
+``"usd"``, ``"Usd"``, ``"USDX"``, ``""`` raise
+``InvalidCurrencyError``). The SDK does NOT silently
+upper-case the input because:
+
+- it would hide typos (``"usd"`` vs ``"USD"`` vs ``"Usd"``
+  would all normalize to ``"USD"``, masking a typo in the
+  call site);
+- ISO-4217 is a closed set of 3-letter uppercase codes,
+  anything else is wrong by definition;
+- the error message names the offending input so the operator
+  can fix the call site.
+
+The whitelist is consulted by ``currency_minor_digits`` and
+``business_cap_minor``; unknown codes are rejected with
+``InvalidCurrencyError`` instead of falling back to a default.
+This closes the conservative-fallback gap from the previous
+hardening pass (``UNKNOWN`` was allowed but the operator
+might never notice the typo).
+
+## Currency case rejection is enforced at construction time
+
+The ``MoneyImpactExtractor.__init__`` validates the currency
+via ``normalize_currency``. Passing ``"usd"`` raises
+``InvalidCurrencyError`` at decorator-application time, before
+the tool is ever called. This is fail-CLOSED: a misconfigured
+decorator never reaches runtime.
 """
 
 from __future__ import annotations

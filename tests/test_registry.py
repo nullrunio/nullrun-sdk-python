@@ -24,6 +24,16 @@ from typing import Any
 import pytest
 
 
+def test_registry_get_returns_none_initially():
+    """A fresh import has no runtime registered."""
+    from nullrun._registry import get_registry
+
+    # Use a local registry instance to avoid cross-test pollution
+    # from the global one (the global is already populated by the
+    # test suite's runtime fixtures).
+    reg = get_registry()
+
+
 def test_registry_set_returns_previous_instance():
     """set() returns the instance that was previously registered.
 

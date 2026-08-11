@@ -100,7 +100,7 @@ _Compatibility:_ **Backward-compatible additive wire change.** Existing callers 
 
 ## [0.14.4] - 2026-07-27
 
-ToolParameters Approval Rules wire contract (Tier 2 / Breakpoint-2 follow-up). The backend already accepted `BusinessImpact::ToolCall(ToolCallParams)` on the `/execute` wire (backend commit `1e501cd6`); 0.14.4 lands the SDK-side path so users get ToolParameters rules by default on every bare `@sensitive` function, with no decorator change. Also fixes a silent regression in the auto-attach path that dropped an explicit `impact=tool_params({...})` map, and pins the cross-language `ToolCall` action digest against the Rust backend's golden hex. No on-wire breaking change for money callers; the only behavioural change is that bare `@sensitive` now ships `kind=tool_call` on the wire where it previously shipped nothing.
+ToolParameters Approval Rules wire contract (Tier 2 / Разрыв 2 follow-up). The backend already accepted `BusinessImpact::ToolCall(ToolCallParams)` on the `/execute` wire (backend commit `1e501cd6`); 0.14.4 lands the SDK-side path so users get ToolParameters rules by default on every bare `@sensitive` function, with no decorator change. Also fixes a silent regression in the auto-attach path that dropped an explicit `impact=tool_params({...})` map, and pins the cross-language `ToolCall` action digest against the Rust backend's golden hex. No on-wire breaking change for money callers; the only behavioural change is that bare `@sensitive` now ships `kind=tool_call` on the wire where it previously shipped nothing.
 
 ### Added
 
@@ -163,7 +163,7 @@ _Compatibility:_ **Backward-compatible bug fix**. No SDK_MIN_VERSION bump. No pu
 - **Negative `amount_minor` rejected** on both unit paths. A negative value would silently fall through every `op=gt` predicate (`negative < positive` is always False) — pre-fix a  [...]
 - **Sub-precision Decimal rejected** — `Decimal("1.234")` against a USD `allowed=2` precision is now `InvalidMoneyPrecisionError(currency="USD", allowed=2, received=3, received_dig [...]
 - **`/execute` handles `require_approval` correctly** — re-checks with the `approval_id` returned by the backend (was dropping the approval handshake on round-trips).
-- **Server `approval_timeout` clamped to `[1, 3600]s`** on the SDK side as defence against a malformed / overshooting backend that returns `0` or `2147483647` in the approval field [...]
+- **Server `approval_timeout` clamped to `[1, 3600]s`** on the SDK side as defence against a malformed / overshooting backend that returns `0` or `2147483647` in the Разрыв 1c fiel [...]
 
 _Tests: 6 additions (tests/test_approval_money_flow.py, tests/test_business_impact.py, tests/test_execute_approval_flow.py…)._
 
