@@ -516,6 +516,19 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "handle": ("nullrun._handle", "handle"),
     "guarded": ("nullrun._handle", "guarded"),
     "init_or_die": ("nullrun._handle", "init_or_die"),
+    # ADR-009 P1 — governance audit surface (typed wire classes).
+    # Users reach these as `from nullrun import AuditQuery` /
+    # `from nullrun.audit import ...`. The runtime exposes
+    # `runtime.audit.list(...)` / `.verify(...)` / etc. — those
+    # methods do not appear in this table because they are bound
+    # on the runtime instance, not on the package.
+    "AuditEntry": ("nullrun.audit", "AuditEntry"),
+    "AuditLogMeta": ("nullrun.audit", "AuditLogMeta"),
+    "AuditLogPage": ("nullrun.audit", "AuditLogPage"),
+    "AuditQuery": ("nullrun.audit", "AuditQuery"),
+    "AuditVerifyResult": ("nullrun.audit", "AuditVerifyResult"),
+    "AuditExportJob": ("nullrun.audit", "AuditExportJob"),
+    "AuditExportStatus": ("nullrun.audit", "AuditExportStatus"),
 }
 
 

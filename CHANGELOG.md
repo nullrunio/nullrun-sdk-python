@@ -1,3 +1,25 @@
+## [0.15.0] - 2026-08-12
+
+ADR-009 governance audit surface (P1) — typed read API for the org's hash-chained `audit_events` table. Backend already ships the matching wire shape (commit `46af9e29`, audit endpoints expose the 13 canonical columns: `agent_id`, `principal_id`, `decision`, `policy_id`, `policy_version`, `policy_hash`, `matched_rule`, `reason_code`, `execution_id`, `action_digest`, `tool_name`, `tool_version`, `tool_digest`). This release lands the SDK consumer side: a `nullrun.audit` module with frozen dataclasses for every wire response shape, a `runtime.audit` proxy that surfaces typed results, and 17 contract tests pinning the round-trip.
+
+No SDK_MIN_VERSION bump. No breaking API change. The five `Transport.audit_*` methods that previously returned raw dicts now accept `organization_id` as a positional parameter (organisation lives on the runtime, not the transport); callers that previously wrote `transport.audit_log(org)` continue to work — the new proxy at `runtime.audit.list()` is the recommended path going forward.
+
+### Added
+
+- **`nullrun.audit` module** — frozen dataclasses for the ADR-009 read surface: `AuditEntry`, `AuditLogMeta`, `AuditLogPage`, `AuditQuery`, `AuditVerifyResult`, `AuditExportJob`, `AuditExportStatus`. Each parser tolerates pre-ADR-009 rows (all 13 governance columns default to `None`); `AuditEntry.is_governance` is `True` only for the three canonical event categories (`authorization_decision`, `approval_decision`, `execution_lifecycle`).
+- **`AuditQuery.to_query_string()`** — drops `None` fields, serialises `datetime` as RFC3339, percent-encodes the canonical set of filters (`event_type`, `decision`, `policy_id`, `execution_id`, `actor`, `since`, `until`, `limit`).
+- **`AuditProxy` on `NullRunRuntime`** — `runtime.audit.list()`, `verify()`, `list_exports()`, `create_export()`, `export_status()` return typed dataclasses instead of raw dicts. `AuditProxy._require_org()` raises `NullRunAuthenticationError` when the runtime is unbound, so a misconfigured CI step fails loudly at the audit call site rather than silently dropping the query.
+- **`Transport.audit_*` accept `organization_id` as positional** — the five methods (`audit_log`, `audit_verify`, `audit_list_exports`, `audit_create_export`, `audit_export_status`) take `organization_id` as a positional parameter because the transport holds no org binding. The `AuditProxy` threads `self.organization_id` through automatically; service-account callers that need to address an org other than the bound one can pass `organization_id=` explicitly.
+- **Lazy exports** — `AuditEntry`, `AuditLogMeta`, `AuditLogPage`, `AuditQuery`, `AuditVerifyResult`, `AuditExportJob`, `AuditExportStatus` are reachable as `from nullrun import AuditEntry` etc. via the existing PEP 562 lazy-export map.
+
+### Fixed
+
+- **`Transport.audit_*` referenced `self.organization_id`** (a runtime-only attribute) — silent `AttributeError` on every audit call. Fixed by lifting the org into a positional parameter and threading it through `AuditProxy`.
+
+_Tests: 17 additions (`tests/test_audit.py` — wire-shape parsers, query serialisation, three-category governance property, Z-suffix timestamp normalisation, policy_version string drift) + 17 additions (`tests/contract/test_audit_wire.py` — round-trip via respx, GET-vs-POST HMAC boundary, protocol header presence, 401 → `NullRunAuthError` mapping, typed proxy return values, unbound-runtime error path)._
+
+_Compatibility:_ **No SDK_MIN_VERSION bump.** The `Transport.audit_*` shape change is source-compatible (positional kwarg with a clear name). Pre-0.15 callers that wrote `transport.audit_log("org-uuid")` continue to work; pre-0.15 callers that wrote `transport.audit_log(organization_id="org-uuid")` (which previously crashed on the `self.organization_id` lookup) now work for the first time.
+
 ## [0.14.11] - 2026-08-11
 
 Patch release — partial revert of sprint-5 cleanup commits whose scope exceeded what the codebase actually supported. Two over-aggressive commits restored critical user-authored documentation and branch-coverage test files that the cleanup had removed.

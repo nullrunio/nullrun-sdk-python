@@ -69,6 +69,15 @@ import httpx
 
 from nullrun._registry import get_active_runtime
 from nullrun.actions import ActionHandler, ActionType
+from nullrun.audit import (  # ADR-009 P1 — governance audit surface
+    AuditEntry,
+    AuditExportJob,
+    AuditExportStatus,
+    AuditLogMeta,
+    AuditLogPage,
+    AuditQuery,
+    AuditVerifyResult,
+)
 from nullrun.breaker.exceptions import (
     BreakerError,
     NullRunAuthenticationError,
@@ -205,6 +214,183 @@ def _validate_approval_timeout(value: object, log_prefix: str) -> float | None:
 
 # Privacy boundary: fields that MUST NOT leave the SDK on the
 _WIRE_STRIP_FIELDS: frozenset[str] = frozenset({"cost_cents", "_fingerprint", "raw_usage"})
+
+
+# ADR-009 P1 — typed proxy for the governance audit surface.
+# Wraps Transport's five raw methods with typed dataclasses so
+# callers don't write JSON parsing glue. Bound on every
+# NullRunRuntime instance as ``self.audit`` so the runtime's
+# organisation_id propagates automatically.
+class AuditProxy:
+    """Typed governance-audit client (ADR-009 v3.49).
+
+    Bound to a :class:`NullRunRuntime` instance as
+    ``runtime.audit``. Routes every method through the runtime's
+    bound ``organization_id`` so callers don't need to thread
+    it explicitly.
+
+    Wire surface (one-to-one with ``Transport`` audit methods):
+    ``list()``            -> :class:`AuditLogPage`
+    ``verify()``          -> :class:`AuditVerifyResult`
+    ``list_exports()``    -> list[:class:`AuditExportJob`]
+    ``create_export()``   -> dict (raw ``{job_id, status}``)
+    ``export_status()``   -> :class:`AuditExportStatus`
+
+    Auth errors propagate as the standard
+    ``NullRunAuthenticationError`` / ``NullRunBackendError``
+    classes. Audit reads are GET so no HMAC signing applies —
+    this is purely a typed convenience over an existing
+    transport.
+
+    Example:
+        from nullrun.audit import AuditQuery
+        page = runtime.audit.list(
+            AuditQuery(event_type="authorization_decision", limit=50)
+        )
+        for entry in page.entries:
+            if entry.decision == "deny":
+                notify_security_team(entry)
+    """
+
+    def __init__(self, runtime: "NullRunRuntime") -> None:
+        self._runtime = runtime
+
+    def _require_org(self) -> str:
+        """Return the runtime's bound org or raise a typed error.
+
+        Audit endpoints are org-scoped; without a bound org the
+        URL would be malformed. ``_authenticate`` sets this on
+        the runtime; if a caller constructs a runtime in a way
+        that skips auth (e.g. some test fixtures) the error is
+        surfaced here instead of silently hitting a 404.
+        """
+        org = self._runtime.organization_id
+        if not org:
+            raise NullRunAuthenticationError(
+                "AuditProxy requires an authenticated runtime "
+                "(runtime.organization_id is None). Call nullrun.init() "
+                "or NullRunRuntime(...)._authenticate() first."
+            )
+        return org
+
+    def list(
+        self,
+        query: AuditQuery | None = None,
+        *,
+        organization_id: str | None = None,
+    ) -> AuditLogPage:
+        """Read one page of governance audit events.
+
+        Args:
+            query: Optional :class:`nullrun.audit.AuditQuery` filter.
+                ``None`` returns "all rows" — rarely what you want.
+            organization_id: Override the runtime's bound org. Useful
+                for service-account patterns where one runtime reads
+                audit data across multiple orgs.
+
+        Returns:
+            :class:`AuditLogPage` with ``entries`` (parsed list of
+            :class:`AuditEntry`) and ``meta`` (pagination summary).
+        """
+        org = organization_id or self._require_org()
+        wire = self._runtime._transport.audit_log(  # type: ignore[union-attr]
+            organization_id=org, query=query
+        )
+        return AuditLogPage.from_wire(wire)
+
+    def verify(
+        self,
+        *,
+        since: str | None = None,
+        organization_id: str | None = None,
+    ) -> AuditVerifyResult:
+        """Walk the chain forward and re-verify hash continuity.
+
+        Args:
+            since: Optional RFC3339 lower bound. With ``since`` only
+                rows since that timestamp are walked (plus a prior
+                anchor row for hash continuity). Without ``since``
+                the full chain from row 1 is re-verified.
+            organization_id: Optional org override.
+
+        Returns:
+            :class:`AuditVerifyResult` — ``verified``, ``chain_valid``,
+            ``record_count``, ``first_hash``, ``last_hash``,
+            ``first_failure_reason``, ``timestamp``, ``hmac_checked``.
+        """
+        org = organization_id or self._require_org()
+        wire = self._runtime._transport.audit_verify(  # type: ignore[union-attr]
+            organization_id=org, since=since
+        )
+        return AuditVerifyResult.from_wire(wire)
+
+    def list_exports(
+        self,
+        *,
+        organization_id: str | None = None,
+    ) -> list[AuditExportJob]:
+        """List recent export jobs (last 10).
+
+        Args:
+            organization_id: Optional org override.
+
+        Returns:
+            List of :class:`AuditExportJob` ordered by creation time
+            (newest first, per backend ordering).
+        """
+        org = organization_id or self._require_org()
+        wire = self._runtime._transport.audit_list_exports(  # type: ignore[union-attr]
+            organization_id=org
+        )
+        return [AuditExportJob.from_wire(d) for d in wire]
+
+    def create_export(
+        self,
+        *,
+        organization_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Enqueue a 30-day audit log export.
+
+        The backend covers a hard-coded trailing-30-day window
+        (audit.rs:692-700). Per-job window override will arrive
+        alongside the typed-impact work; for now this enqueues
+        the default.
+
+        Args:
+            organization_id: Optional org override.
+
+        Returns:
+            Raw ``{"job_id": str, "status": "pending"}`` dict —
+            callers typically pair this with :meth:`export_status`
+            in a poll loop.
+        """
+        org = organization_id or self._require_org()
+        return self._runtime._transport.audit_create_export(  # type: ignore[union-attr]
+            organization_id=org
+        )
+
+    def export_status(
+        self,
+        job_id: str,
+        *,
+        organization_id: str | None = None,
+    ) -> AuditExportStatus:
+        """Poll a previously-enqueued export job.
+
+        Args:
+            job_id: UUID returned by :meth:`create_export`.
+            organization_id: Optional org override.
+
+        Returns:
+            :class:`AuditExportStatus` with ``status``,
+            ``file_url`` (when ``completed``), ``record_count``
+            ``created_at``, ``completed_at``, ``error_message``.
+        """
+        org = organization_id or self._require_org()
+        wire = self._runtime._transport.audit_export_status(  # type: ignore[union-attr]
+            organization_id=org, job_id=job_id
+        )
+        return AuditExportStatus.from_wire(wire)
 
 
 # The metaclass routes the legacy NullRunRuntime._instance
@@ -439,6 +625,14 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 flush_interval=5.0,
             ),
         )
+
+        # ADR-009 P1 — typed proxy for the governance audit surface.
+        # ``audit`` is bound to ``self`` so every call routes through
+        # ``self.organization_id`` (set in _authenticate), even before
+        # that attribute exists — ``AuditProxy.list`` etc. read it at
+        # call time. The proxy is created here so callers can use
+        # ``runtime.audit.list(...)`` immediately after ``init``.
+        self.audit = AuditProxy(self)
 
         # Note: a gRPC transport was prototyped in earlier SDK versions but the
         if os.getenv("NULLRUN_USE_GRPC"):

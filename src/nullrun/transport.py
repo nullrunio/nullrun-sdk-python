@@ -1780,6 +1780,227 @@ class Transport:
 
         raise _parse_v3_error_envelope(response, "approximate_budget")
 
+    # ====================================================================
+    # ADR-009 P1 — Audit log governance surface (v0.15.0)
+    # ====================================================================
+    # Five methods exposing the /api/v1/orgs/:org_id/audit-log/* family
+    # of endpoints to SDK consumers. Pre-v0.15.0 SDKs had no audit
+    # client — operators had to curl the wire directly. Now they can
+    # call ``runtime.audit.list(...)`` etc. and get typed dataclasses
+    # back without writing JSON parsing glue.
+    #
+    # All five methods route through the same auth + protocol +
+    # trace-context machinery as the other Transport methods — see
+    # ``_auth_headers_for_get`` below. Audit reads are GET, so no
+    # HMAC body signing is required.
+
+    def audit_log(
+        self,
+        organization_id: str,
+        query: Any | None = None,
+    ) -> dict[str, Any]:
+        """GET /api/v1/orgs/:org_id/audit-log — read governance audit log.
+
+        Args:
+            organization_id: Org UUID — required because the
+                /audit-log endpoint is org-scoped. The runtime
+                proxy passes ``self.organization_id`` automatically
+                so direct callers rarely need to set this.
+            query: Optional :class:`nullrun.audit.AuditQuery`
+                instance describing the filter set (event_type,
+                decision, policy_id, execution_id, action, actor,
+                since, until, limit). Pass ``None`` for "all rows"
+                (rarely what you want — chains grow unbounded).
+
+        Returns:
+            Parsed JSON dict with ``data`` (list of
+            AuditEntryResponse shapes) and ``meta`` (AuditLogMeta
+            pagination summary). Use
+            :func:`nullrun.audit.AuditLogPage.from_wire` to parse
+            into typed dataclasses.
+
+        Raises:
+            NullRunBackendError: 401/403/5xx.
+            NullRunAuthenticationError: 401.
+        """
+        from nullrun.audit import AuditQuery
+
+        q: AuditQuery = query if isinstance(query, AuditQuery) else (query or AuditQuery())
+        qs = q.to_query_string()
+        url = f"{self.api_url}/api/v1/orgs/{organization_id}/audit-log"
+        if qs:
+            url = f"{url}?{qs}"
+        headers = self._auth_headers_for_get()
+        try:
+            response = self._client.get(url, headers=headers, timeout=10.0)
+        except httpx.RequestError as e:
+            raise NullRunTransportError(
+                f"Network error on /audit-log: {e}",
+                source=TransportErrorSource.NETWORK_ERROR,
+                endpoint="audit_log",
+            ) from e
+        if response.status_code == 200:
+            return response.json()  # type: ignore[no-any-return]
+        raise _parse_v3_error_envelope(response, "audit_log")
+
+    def audit_verify(
+        self,
+        organization_id: str,
+        *,
+        since: str | None = None,
+    ) -> dict[str, Any]:
+        """GET /api/v1/orgs/:org_id/audit-log/verify — chain integrity.
+
+        Walks the chain forward from `since` (or from row 1 if
+        omitted) and re-computes content_hash + previous_hash
+        continuity. Returns the same payload the audit page's
+        "Integrity" banner reads — use
+        :func:`nullrun.audit.AuditVerifyResult.from_wire` to parse.
+
+        Args:
+            organization_id: Org UUID — required.
+            since: Optional RFC3339 lower bound. With `since`,
+                only rows since that timestamp are walked (plus a
+                prior anchor row for hash continuity). Without
+                `since`, the full chain from row 1 is re-verified.
+
+        Returns:
+            Parsed JSON dict with `verified`, `chain_valid`,
+            `record_count`, `first_hash`, `last_hash`,
+            `first_failure_reason`, `timestamp`, `hmac_checked`.
+
+        Raises:
+            NullRunBackendError / NullRunAuthenticationError.
+        """
+        params: list[tuple[str, str]] = []
+        if since:
+            params.append(("since", since))
+        qs = "&".join(f"{k}={v}" for k, v in params)
+        url = f"{self.api_url}/api/v1/orgs/{organization_id}/audit-log/verify"
+        if qs:
+            url = f"{url}?{qs}"
+        headers = self._auth_headers_for_get()
+        try:
+            response = self._client.get(url, headers=headers, timeout=30.0)
+        except httpx.RequestError as e:
+            raise NullRunTransportError(
+                f"Network error on /audit-log/verify: {e}",
+                source=TransportErrorSource.NETWORK_ERROR,
+                endpoint="audit_verify",
+            ) from e
+        if response.status_code == 200:
+            return response.json()  # type: ignore[no-any-return]
+        raise _parse_v3_error_envelope(response, "audit_verify")
+
+    def audit_list_exports(
+        self,
+        organization_id: str,
+    ) -> list[dict[str, Any]]:
+        """GET /api/v1/orgs/:org_id/audit-log/export — list recent export jobs.
+
+        Returns the raw JSON list of recent export job summaries
+        (last 10). Use :func:`nullrun.audit.AuditExportJob.from_wire`
+        to parse each entry.
+
+        Raises:
+            NullRunBackendError / NullRunAuthenticationError.
+        """
+        url = f"{self.api_url}/api/v1/orgs/{organization_id}/audit-log/export"
+        headers = self._auth_headers_for_get()
+        try:
+            response = self._client.get(url, headers=headers, timeout=10.0)
+        except httpx.RequestError as e:
+            raise NullRunTransportError(
+                f"Network error on /audit-log/export (list): {e}",
+                source=TransportErrorSource.NETWORK_ERROR,
+                endpoint="audit_list_exports",
+            ) from e
+        if response.status_code == 200:
+            body = response.json()
+            # Wire shape is `{"exports": [...]}` per the audit export
+            # list handler in backend/src/proxy/http/audit.rs.
+            if isinstance(body, dict):
+                return body.get("exports", []) or []
+            return body if isinstance(body, list) else []
+        raise _parse_v3_error_envelope(response, "audit_list_exports")
+
+    def audit_create_export(
+        self,
+        organization_id: str,
+    ) -> dict[str, Any]:
+        """POST /api/v1/orgs/:org_id/audit-log/export — enqueue 30-day export.
+
+        The backend creates a job, returns ``{"job_id", "status":
+        "pending"}`` immediately, and processes in the background.
+        Poll :meth:`audit_export_status` for completion.
+
+        The export covers the trailing 30 days; the backend hard-codes
+        that window today (audit.rs:692-700 — ``chrono::Utc::now() -
+        Duration::days(30)``). When the per-job window becomes
+        configurable this method will accept a `since`/`until`
+        override.
+
+        Returns:
+            Parsed JSON dict with ``job_id`` (UUID) and ``status``.
+
+        Raises:
+            NullRunBackendError / NullRunAuthenticationError.
+        """
+        url = f"{self.api_url}/api/v1/orgs/{organization_id}/audit-log/export"
+        headers = self._build_signed_headers(body=b"{}")
+        try:
+            response = self._client.post(url, content=b"{}", headers=headers, timeout=10.0)
+        except httpx.RequestError as e:
+            raise NullRunTransportError(
+                f"Network error on /audit-log/export (create): {e}",
+                source=TransportErrorSource.NETWORK_ERROR,
+                endpoint="audit_create_export",
+            ) from e
+        if response.status_code == 200:
+            return response.json()  # type: ignore[no-any-return]
+        raise _parse_v3_error_envelope(response, "audit_create_export")
+
+    def audit_export_status(
+        self,
+        organization_id: str,
+        job_id: str,
+    ) -> dict[str, Any]:
+        """GET /api/v1/orgs/:org_id/audit-log/export/:job_id/status.
+
+        Polls a previously-enqueued export job. When ``status`` flips
+        to ``completed`` the ``file_url`` field carries an S3
+        presigned URL (or `/tmp/...` path on dev), and an
+        ``error_message`` is set on the ``failed`` transition.
+
+        Args:
+            organization_id: Org UUID — required.
+            job_id: UUID returned by :meth:`audit_create_export`.
+
+        Returns:
+            Parsed JSON dict with ``job_id``, ``status``,
+            ``file_url``, ``record_count``, ``created_at``,
+            ``completed_at``, ``error_message``.
+
+        Raises:
+            NullRunBackendError / NullRunAuthenticationError.
+        """
+        url = (
+            f"{self.api_url}/api/v1/orgs/{organization_id}"
+            f"/audit-log/export/{job_id}/status"
+        )
+        headers = self._auth_headers_for_get()
+        try:
+            response = self._client.get(url, headers=headers, timeout=10.0)
+        except httpx.RequestError as e:
+            raise NullRunTransportError(
+                f"Network error on /audit-log/export/{job_id}/status: {e}",
+                source=TransportErrorSource.NETWORK_ERROR,
+                endpoint="audit_export_status",
+            ) from e
+        if response.status_code == 200:
+            return response.json()  # type: ignore[no-any-return]
+        raise _parse_v3_error_envelope(response, "audit_export_status")
+
     def _auth_headers_for_get(self) -> dict[str, str]:
         """Headers for an unsigned GET (no HMAC body).
 

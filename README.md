@@ -37,7 +37,7 @@ LlamaIndex, and your own stack.
 
 ---
 
-> ⚠️ **Status: alpha (v0.14.9).** The public API may shift between minor versions. 
+> ⚠️ **Status: alpha (v0.15.0).** The public API may shift between minor versions.
 > Pin your dependency and read the [CHANGELOG](https://github.com/nullrunio/nullrun-sdk-python/blob/master/CHANGELOG.md) before upgrading.
 
 ---
@@ -230,6 +230,51 @@ def my_agent(prompt: str) -> str:
 
 ---
 
+##  Querying the audit log
+
+Every gate decision, approval resolution, and execution lifecycle event
+is written to the org's hash-chained `audit_events` table on the backend.
+The SDK surfaces a typed read API at `runtime.audit.*` so backends on
+ADR-009 (`schema_version = 3`) return typed dataclasses — not raw dicts.
+
+```python
+from nullrun import NullRunRuntime, AuditQuery
+from datetime import datetime, timezone, timedelta
+
+runtime = NullRunRuntime(api_key="nr_...")
+
+# 1) Last 50 governance decisions in the last 24h.
+since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+page = runtime.audit.list(
+    AuditQuery(event_type="authorization_decision", since=since, limit=50)
+)
+for entry in page.entries:
+    print(entry.timestamp, entry.decision, entry.tool_name, entry.reason_code)
+```
+
+Available surfaces:
+
+| Method | Returns | Endpoint |
+|---|---|---|
+| `runtime.audit.list(query=...)` | `AuditLogPage` (entries + meta) | `GET /api/v1/orgs/{org}/audit-log` |
+| `runtime.audit.verify(since=...)` | `AuditVerifyResult` (chain head/tail/reason) | `GET /api/v1/orgs/{org}/audit-log/verify` |
+| `runtime.audit.list_exports()` | `list[AuditExportJob]` | `GET /api/v1/orgs/{org}/audit-log/export` |
+| `runtime.audit.create_export()` | `dict` (`job_id`, `status`) | `POST /api/v1/orgs/{org}/audit-log/export` |
+| `runtime.audit.export_status(job_id)` | `AuditExportStatus` | `GET /api/v1/orgs/{org}/audit-log/export/{job_id}/status` |
+
+`AuditQuery` filters on the canonical ADR-009 columns: `event_type`
+(`authorization_decision` / `approval_decision` / `execution_lifecycle`),
+`decision`, `policy_id`, `execution_id`, `actor`, `since`, `until`, `limit`.
+Pre-ADR-009 backends return legacy fields only — `AuditEntry.is_governance`
+is `False` for those rows, and the 13 governance columns default to `None`.
+
+If you call `runtime.audit.*` before `nullrun.init()` (no org binding),
+the proxy raises `NullRunAuthenticationError` — not a silent 404 — so a
+misconfigured CI step fails loudly at the audit call site rather than
+silently dropping the query.
+
+---
+
 ##  Examples
 
 Runnable, copy-pastable examples live in a separate repo so you can adapt without cloning the SDK source:
@@ -247,9 +292,9 @@ Runnable, copy-pastable examples live in a separate repo so you can adapt withou
 
 | Version | Status | Highlights |
 |---|---|---|
-| **v0.14.x** (current) | ✅ alpha | Wire protocol v3.31, server-minted execution IDs, MCP, anti-OOM streaming cap |
-| **v0.15** | 🚧 in progress | OpenTelemetry exporter, Redis-backed offline queue, hardened init contract |
-| **v0.16** | 📋 planned | Cost prediction from prompt, semantic tool policy (regex → AST) |
+| **v0.14.x** | ✅ alpha | Wire protocol v3.31, server-minted execution IDs, MCP, anti-OOM streaming cap |
+| **v0.15** (current) | ✅ alpha | ADR-009 governance audit surface, typed `runtime.audit.*`, capability probes for `/audit-log/verify` |
+| **v0.16** | 📋 planned | OpenTelemetry exporter, Redis-backed offline queue, hardened init contract |
 | **v1.0** | 🎯 beta target | Stable wire contract, full async support, type-safe decisions |
 
 [Full roadmap & RFCs →](https://nullrun.io/roadmap)
