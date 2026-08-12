@@ -56,6 +56,8 @@ for the full rules, including transport error classification
 (`FALLBACK_NETWORK_ERROR` / `FALLBACK_GATEWAY_ERROR` / `FALLBACK_BREAKER_OPEN`).
 """
 
+from __future__ import annotations
+
 import asyncio
 import logging
 import os
