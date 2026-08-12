@@ -58,6 +58,46 @@ _ACTIVE_RUNS_MAX = 4096
 # branch's empty raw_usage. These helpers walk every source independently.
 
 
+def _read_token_attrs(obj: Any) -> tuple[int, int, int, dict[str, Any]] | None:
+    """Normalize ``input_tokens`` / ``output_tokens`` / ``total_tokens`` from a
+    dict or an attribute-bearing object.
+
+    Accepts both ``input_tokens`` / ``output_tokens`` (Anthropic, LangChain v1)
+    and ``prompt_tokens`` / ``completion_tokens`` (OpenAI v0 legacy) keys
+    on dicts. Returns ``None`` if ``obj`` has no token info.
+    """
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        in_t = obj.get("input_tokens") or obj.get("prompt_tokens") or 0
+        out_t = obj.get("output_tokens") or obj.get("completion_tokens") or 0
+        total_t = obj.get("total_tokens") or 0
+        if not (in_t or out_t or total_t):
+            return None
+        return int(in_t), int(out_t), int(total_t), dict(obj)
+    if hasattr(obj, "input_tokens") or hasattr(obj, "total_tokens"):
+        in_t = getattr(obj, "input_tokens", 0) or 0
+        out_t = getattr(obj, "output_tokens", 0) or 0
+        total_t = getattr(obj, "total_tokens", 0) or 0
+        if not (in_t or out_t or total_t):
+            return None
+        return int(in_t), int(out_t), int(total_t), {
+            "input_tokens": in_t,
+            "output_tokens": out_t,
+            "total_tokens": total_t,
+        }
+    return None
+
+
+def _apply_usage(usage: dict[str, Any], extracted: tuple[int, int, int, dict[str, Any]]) -> None:
+    in_t, out_t, total_t, raw = extracted
+    usage["input_tokens"] = in_t
+    usage["output_tokens"] = out_t
+    usage["total_tokens"] = total_t
+    usage["raw_usage"] = raw
+    usage["has_usage"] = True
+
+
 def _safe_get_gen_message(response: Any) -> Any:
     """Return ``response.generations[0][0].message`` for LLMResult callback
     responses, or ``None`` if any layer is missing / malformed.
@@ -189,111 +229,31 @@ def extract_usage_from_response(response: Any, provider: str, model: str) -> dic
         "tool_names": [],
     }
 
-    # Try LangChain's usage_metadata first (most common for OpenAI via LangChain)
-    # NOTE: For callback-based invocation, response is LLMResult, not AIMessage
-    # LLMResult stores usage in generations[0][0].message.usage_metadata
-    if hasattr(response, 'usage_metadata'):
-        usage_meta = response.usage_metadata
-        if isinstance(usage_meta, dict):
-            usage["input_tokens"] = usage_meta.get('input_tokens', 0) or 0
-            usage["output_tokens"] = usage_meta.get('output_tokens', 0) or 0
-            usage["total_tokens"] = usage_meta.get('total_tokens', 0) or 0
-            usage["raw_usage"] = dict(usage_meta)
-        elif hasattr(usage_meta, 'input_tokens'):
-            # Object with attributes
-            usage["input_tokens"] = getattr(usage_meta, 'input_tokens', 0) or 0
-            usage["output_tokens"] = getattr(usage_meta, 'output_tokens', 0) or 0
-            usage["total_tokens"] = getattr(usage_meta, 'total_tokens', 0) or 0
-            usage["raw_usage"] = {
-                'input_tokens': usage["input_tokens"],
-                'output_tokens': usage["output_tokens"],
-                'total_tokens': usage["total_tokens"],
-            }
-
-    # For callback-based LLMResult, check generations[0][0].message.usage_metadata
-    if hasattr(response, 'generations') and response.generations:
-        first_gen = response.generations[0][0] if response.generations else None
-        if first_gen and hasattr(first_gen, 'message'):
-            msg = first_gen.message
-            if hasattr(msg, 'usage_metadata'):
-                usage_meta = msg.usage_metadata
-                if isinstance(usage_meta, dict):
-                    usage["input_tokens"] = usage_meta.get('input_tokens', 0) or 0
-                    usage["output_tokens"] = usage_meta.get('output_tokens', 0) or 0
-                    usage["total_tokens"] = usage_meta.get('total_tokens', 0) or 0
-                    usage["raw_usage"] = dict(usage_meta)
-                elif hasattr(usage_meta, 'input_tokens'):
-                    usage["input_tokens"] = getattr(usage_meta, 'input_tokens', 0) or 0
-                    usage["output_tokens"] = getattr(usage_meta, 'output_tokens', 0) or 0
-                    usage["total_tokens"] = getattr(usage_meta, 'total_tokens', 0) or 0
-                    usage["raw_usage"] = {
-                        'input_tokens': usage["input_tokens"],
-                        'output_tokens': usage["output_tokens"],
-                        'total_tokens': usage["total_tokens"],
-                    }
-
-    # Try response.usage (Anthropic, standard OpenAI format)
-    if hasattr(response, 'usage') and response.usage:
-        usage_raw = response.usage
-        if isinstance(usage_raw, dict):
-            usage["input_tokens"] = usage_raw.get('input_tokens', 0) or 0
-            usage["output_tokens"] = usage_raw.get('output_tokens', 0) or 0
-            usage["total_tokens"] = usage_raw.get('total_tokens', 0) or 0
-            usage["raw_usage"] = dict(usage_raw)
-        elif hasattr(usage_raw, 'input_tokens') or hasattr(usage_raw, 'total_tokens'):
-            # Object with attributes
-            usage["input_tokens"] = getattr(usage_raw, 'input_tokens', 0) or 0
-            usage["output_tokens"] = getattr(usage_raw, 'output_tokens', 0) or 0
-            usage["total_tokens"] = getattr(usage_raw, 'total_tokens', 0) or 0
-            usage["raw_usage"] = {
-                'input_tokens': usage["input_tokens"],
-                'output_tokens': usage["output_tokens"],
-                'total_tokens': usage["total_tokens"],
-            }
-
-    # All 4 sources above are `if` (not `elif`) because the same
+    # NOTE: All sources below are checked (not elif) because the same
     # response can carry token info on multiple attributes (e.g.
     # `usage_metadata = {}` plus `response_metadata.token_usage =
     # {real tokens}`). `elif` would silently drop the
     # `response_metadata` branch whenever the previous branch's
-    # hasattr() returned True with an empty value. The first
+    # `hasattr()` returned True with an empty value. The first
     # non-empty source wins; later branches may overwrite (LangChain
     # providers in practice never put conflicting numbers on two
     # attributes of the same response, so a "last-wins" is safe
-    # in practice; see the `_extract_usage` docstring for the
-    # priority order rationale).
-    #
-    # Try response_metadata (some providers) - also check llm_output for LLMResult
-    if hasattr(response, 'response_metadata'):
-        resp_meta = response.response_metadata
-        if isinstance(resp_meta, dict):
-            # Some providers put token info here
-            token_usage = resp_meta.get('token_usage', {})
-            if isinstance(token_usage, dict):
-                usage["input_tokens"] = (
-                    token_usage.get('prompt_tokens', 0) or
-                    token_usage.get('input_tokens', 0) or 0
-                )
-                usage["output_tokens"] = (
-                    token_usage.get('completion_tokens', 0) or
-                    token_usage.get('output_tokens', 0) or 0
-                )
-                usage["total_tokens"] = token_usage.get('total_tokens', 0) or 0
-                usage["raw_usage"] = dict(token_usage)
-    # Check llm_output for LLMResult (callback case)
-    if hasattr(response, 'llm_output') and response.llm_output:
-        token_usage = response.llm_output.get('token_usage', {})
-        if isinstance(token_usage, dict):
-            usage["input_tokens"] = (
-                token_usage.get('prompt_tokens', 0) or
-                token_usage.get('input_tokens', 0) or 0
-            )
-            usage["output_tokens"] = (
-                token_usage.get('completion_tokens', 0) or
-                token_usage.get('output_tokens', 0) or 0
-            )
-            usage["total_tokens"] = token_usage.get('total_tokens', 0) or 0
-            usage["raw_usage"] = dict(token_usage)
+    # in practice).
+    gen_msg = _safe_get_gen_message(response)
+    resp_meta = getattr(response, "response_metadata", None) or {}
+    llm_output = getattr(response, "llm_output", None) or {}
+    sources: tuple[Any, ...] = (
+        getattr(response, "usage_metadata", None),
+        getattr(gen_msg, "usage_metadata", None) if gen_msg is not None else None,
+        getattr(response, "usage", None),
+        resp_meta.get("token_usage") if isinstance(resp_meta, dict) else None,
+        llm_output.get("token_usage") if isinstance(llm_output, dict) else None,
+    )
+    for source in sources:
+        extracted = _read_token_attrs(source)
+        if extracted is None:
+            continue
+        _apply_usage(usage, extracted)
 
     # Check for streaming chunks that accumulated usage
     # (streaming responses may not have usage until final chunk)

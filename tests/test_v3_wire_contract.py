@@ -1,20 +1,10 @@
 """
 Contract tests pinning the v3 wire format.
 
-Background: 0.11.0 added six new endpoints (/check, /track
-/cancel, /heartbeat, /chain/end, /budget/approximate) and a
-mandatory ``X-NULLRUN-PROTOCOL: 3`` header. Each test in this file
-guards a specific class of wire-drift so a future SDK refactor
-trips CI rather than silently breaking the v3 backend.
-
-If you change any of these and the tests fail, update the matching
-file in ``backend/src/proxy/http/gate/protocol.rs`` and
-``backend/src/proxy/handlers.rs`` in lock-step — do not edit one
-side alone.
-
-Pattern follows ``tests/test_integration_contract.py`` (FIX-F3 /
-FIX-F4 / REMOTE_STATE pinning) — same respx-based pattern, same
-strict-URL assertions, same headers-included checks.
+Each test guards a specific class of wire-drift so a future SDK refactor
+trips CI rather than silently breaking the v3 backend. If you change
+any of these and the tests fail, update the matching backend file in
+lock-step — do not edit one side alone.
 """
 
 from __future__ import annotations
@@ -833,16 +823,11 @@ class TestChainEndEndpoint:
 
 
 class TestGateExecutionId:
-    """: /gate execution_id must be a fresh uuidv7
-    per call, NOT the workflow_id. Pre-fix the SDK sent
-    `execution_id = workflow_id` which broke the v3 reservation
-    binding on /track (consume_budget_v3 looks up
-    `reservation:{execution_id}` and 503s on miss)."""
+    """/gate execution_id is a fresh uuid7 per call, NOT the workflow_id."""
 
     @respx.mock
     def test_two_consecutive_checks_have_distinct_execution_id(self):
-        """Two consecutive /check calls produce DIFFERENT
-        execution_id values, both != workflow_id."""
+        """Two consecutive /check calls produce DIFFERENT execution_id values, both != workflow_id."""
         import json as _json
 
         from nullrun.uuid7 import uuid7_str
@@ -1174,3 +1159,955 @@ class TestGateCacheRuntimeFlow:
                     pass
         finally:
             os.environ.pop("NULLRUN_GATE_CACHE_DISABLE", None)
+
+
+# ─── server-minted execution_id ──────────────────────────────────
+"""
+Contract tests for the v3 server-minted execution_id wiring
+.
+
+Background
+----------
+Pre-0.12.0 the SDK read ``decision`` + ``decision_source`` from
+the /check response and IGNORED ``reservation_id``, the
+server-minted uuidv7 the backend's ``gate_reserve_v3`` writes
+to ``reservation:{execution_id}`` (TTL 300s) and surfaces on
+``GateResponse.reservation_id``. Without the round-trip:
+
+  - /track had no way to find the matching reservation key →
+    v3 ``consume_budget_v3`` rejected with 503
+    ``RESERVATION_NOT_FOUND``.
+  - /track kept using the legacy ``/api/v1/track/batch``
+    path that writes to ``monthly_cost`` (drift with the
+    dashboard's period counter, see G1).
+
+0.12.0 fixes this by:
+
+  1. Capturing ``response["reservation_id"]`` into a
+     contextvar (``get_server_minted_execution_id``).
+  2. Stamping the captured id onto every llm_call /track
+     payload so v3 ``consume_budget_v3`` can find the
+     reservation.
+  3. Routing llm_call events to ``/api/v1/track`` (v3
+     single-event) instead of ``/api/v1/track/batch``.
+
+This file pins each step so a future refactor that breaks
+propagation trips CI rather than silently re-introducing
+the drift. Pattern follows
+``tests/test_v3_wire_contract.py`` — same respx-based pattern
+strict-URL assertions, no live backend required.
+"""
+
+import time
+from unittest.mock import patch
+
+import pytest
+import respx
+from httpx import Response
+
+from nullrun.context import (
+    _server_minted_execution_id_var,
+    _server_minted_reservation_at_var,
+    clear_server_minted_execution_id,
+    get_server_minted_execution_id,
+    get_server_minted_reservation_at,
+    reset_server_minted_execution_id,
+    reset_server_minted_reservation_at,
+    set_server_minted_execution_id,
+    set_server_minted_reservation_at,
+)
+from nullrun.runtime import (
+    SERVER_MINTED_RESERVATION_MAX_AGE_SECONDS,
+    NullRunRuntime,
+    _build_v3_track_payload,
+    _capture_server_minted_execution_id,
+)
+
+BASE_URL = "https://api.test.nullrun.io"
+
+# A valid server-minted uuidv7 for tests. Layout matches the
+# backend's mint_execution_id (RFC 9562 — version nibble
+# in position 13 is `7`).
+SERVER_MINTED_V1 = "0190c5b5-7c9a-7def-8a1b-0123456789ab"
+SERVER_MINTED_V2 = "0190c5b5-7c9a-7def-8a1b-fedcba987654"
+
+
+# ─────────────────────────────────────────────────────────────────
+# Conftest-isolated state: every test gets a clean contextvar
+# ─────────────────────────────────────────────────────────────────
+
+@pytest.fixture(autouse=True)
+def _reset_server_minted_contextvar():
+    """Forget any captured execution_id before AND after the test.
+
+    Pairs with the ``reset_runtime`` autouse in conftest.py so
+    contextvar state never leaks across test cases (test
+    isolation — see memory ``test-isolation-monkeypatch-setattr``
+    for the monkeypatched-setattr rationale).
+    """
+    clear_server_minted_execution_id()
+    yield
+    clear_server_minted_execution_id()
+
+
+# ─────────────────────────────────────────────────────────────────
+# 1. ContextVar: set/get/reset + timestamp pair (audit gap #2)
+# ─────────────────────────────────────────────────────────────────
+
+class TestServerMintedExecutionIdContextvar:
+    """Token-based API for the server-minted execution_id contextvar.
+
+    Mirrors the user-facing audit spec:
+    ``set_server_minted_execution_id(value) -> Token``
+    ``get_server_minted_execution_id -> str | None``
+    ``reset_server_minted_execution_id(token) -> None``.
+    """
+
+    def test_default_value_is_none(self):
+        # New ContextVar with no prior set → None (audit: "нет var
+        # на старте"). Verifies the SDK doesn't ship with a stale
+        # id baked into the context.
+        assert get_server_minted_execution_id() is None
+
+    def test_set_returns_token_get_returns_value(self):
+        token = set_server_minted_execution_id(SERVER_MINTED_V1)
+        try:
+            assert get_server_minted_execution_id() == SERVER_MINTED_V1
+        finally:
+            reset_server_minted_execution_id(token)
+
+    def test_reset_restores_previous_value(self):
+        # Layer one scope.
+        outer_token = set_server_minted_execution_id(SERVER_MINTED_V1)
+        try:
+            assert get_server_minted_execution_id() == SERVER_MINTED_V1
+
+            # Layer two scope — set a new value.
+            inner_token = set_server_minted_execution_id(SERVER_MINTED_V2)
+            try:
+                assert get_server_minted_execution_id() == SERVER_MINTED_V2
+
+                # Reset inner — restores outer (not None).
+                reset_server_minted_execution_id(inner_token)
+                assert get_server_minted_execution_id() == SERVER_MINTED_V1
+            finally:
+                # Already reset above; guard against re-running.
+                if get_server_minted_execution_id() == SERVER_MINTED_V2:
+                    reset_server_minted_execution_id(inner_token)
+        finally:
+            reset_server_minted_execution_id(outer_token)
+
+        # Final: after outermost reset, back to None.
+        assert get_server_minted_execution_id() is None
+
+    def test_clear_drops_both_contextvars(self):
+        token_e = set_server_minted_execution_id(SERVER_MINTED_V1)
+        token_t = set_server_minted_reservation_at(123.456)
+        try:
+            assert get_server_minted_execution_id() == SERVER_MINTED_V1
+            assert get_server_minted_reservation_at() == 123.456
+
+            clear_server_minted_execution_id()
+
+            # Both dropped to their defaults. No token-based
+            # restore — this is the "block exited" cleanup path.
+            assert get_server_minted_execution_id() is None
+            assert get_server_minted_reservation_at() == 0.0
+        finally:
+            reset_server_minted_execution_id(token_e)
+            reset_server_minted_reservation_at(token_t)
+
+    def test_reservation_at_pairs_with_execution_id(self):
+        # Captured at the same instant in real code so the two
+        # values age in lockstep. Here we drive them separately
+        # to verify the two contextvars are independent.
+        t_e = set_server_minted_execution_id(SERVER_MINTED_V1)
+        t_t = set_server_minted_reservation_at(time.monotonic())
+        try:
+            # Independent: setting one does NOT touch the other.
+            new_e = set_server_minted_execution_id(SERVER_MINTED_V2)
+            try:
+                assert get_server_minted_execution_id() == SERVER_MINTED_V2
+                # Timestamp from earlier set is still visible.
+                assert get_server_minted_reservation_at() > 0
+            finally:
+                reset_server_minted_execution_id(new_e)
+        finally:
+            reset_server_minted_execution_id(t_e)
+            reset_server_minted_reservation_at(t_t)
+
+
+# ─────────────────────────────────────────────────────────────────
+# 2. Capture helper (audit gap #1)
+# ─────────────────────────────────────────────────────────────────
+
+class TestCaptureServerMintedExecutionId:
+    """``_capture_server_minted_execution_id(response)`` is the
+    runtime-side shim that moves ``response["reservation_id"]``
+    onto the contextvar. """
+
+    def test_captures_valid_uuid_v7(self):
+        out = _capture_server_minted_execution_id(
+            {"reservation_id": SERVER_MINTED_V1}
+        )
+        assert out == SERVER_MINTED_V1
+        assert get_server_minted_execution_id() == SERVER_MINTED_V1
+        # Timestamp set to a positive monotonic — tests don't pin
+        # exact value but verify it's >0 (means "captured").
+        assert get_server_minted_reservation_at() > 0
+
+    def test_clears_on_missing_field(self):
+        # Pre-populate to verify clear actually clears.
+        set_server_minted_execution_id(SERVER_MINTED_V1)
+
+        result = _capture_server_minted_execution_id({"decision": "allow"})
+        assert result is None
+        assert get_server_minted_execution_id() is None
+
+    def test_clears_on_none_field(self):
+        # Backend sometimes returns `reservation_id: null` instead
+        # of omitting the field — same outcome expected.
+        set_server_minted_execution_id(SERVER_MINTED_V1)
+        result = _capture_server_minted_execution_id(
+            {"reservation_id": None}
+        )
+        assert result is None
+        assert get_server_minted_execution_id() is None
+
+    def test_drops_malformed_uuid_with_warning(self, caplog):
+        import logging
+
+        # Pre-seed so we can verify clear happens even on
+        # malformed input.
+        set_server_minted_execution_id(SERVER_MINTED_V1)
+
+        with caplog.at_level(logging.WARNING, logger="nullrun.runtime"):
+            result = _capture_server_minted_execution_id(
+                {"reservation_id": "not-a-uuid"}
+            )
+        assert result is None
+        assert get_server_minted_execution_id() is None
+        assert any(
+            "is not a valid UUID" in record.message
+            for record in caplog.records
+        )
+
+    def test_tolerates_non_dict_response(self):
+        # Defensive: a malformed transport could surface a
+        # non-dict. Don't crash, just clear.
+        result = _capture_server_minted_execution_id("not a dict")  # type: ignore[arg-type]
+        assert result is None
+        assert get_server_minted_execution_id() is None
+
+    def test_drops_non_string_field(self):
+        # Backend is the source of truth and only emits strings
+        # but a buggy proxy could echo an int. Defensive parse.
+        result = _capture_server_minted_execution_id(
+            {"reservation_id": 123456}  # type: ignore[dict-item]
+        )
+        assert result is None
+        assert get_server_minted_execution_id() is None
+
+
+# ─────────────────────────────────────────────────────────────────
+# 3. _enrich_event: include execution_id when fresh, drop when stale
+# ─────────────────────────────────────────────────────────────────
+
+class TestEnrichEventServerMinted:
+    """``NullRunRuntime._enrich_event`` must stamp ``execution_id``
+    onto the /track payload from the contextvar (audit gap #3)
+    AND drop the field when the captured reservation has aged
+    past the 300s TTL.
+    """
+
+    def test_includes_execution_id_when_fresh(self, make_runtime):
+        rt = make_runtime()
+
+        # Capture a fresh id (timestamp = now).
+        _capture_server_minted_execution_id(
+            {"reservation_id": SERVER_MINTED_V1}
+        )
+
+        enriched = rt._enrich_event(
+            {"type": "llm_call", "workflow_id": "wf-1", "tokens": 10}
+        )
+        assert enriched["execution_id"] == SERVER_MINTED_V1
+
+    def test_explicit_execution_id_wins_over_contextvar(
+        self, make_runtime
+    ):
+        rt = make_runtime()
+
+        _capture_server_minted_execution_id(
+            {"reservation_id": SERVER_MINTED_V1}
+        )
+
+        enriched = rt._enrich_event(
+            {
+                "type": "tool_call",
+                "workflow_id": "wf-1",
+                "execution_id": "user-supplied-id",
+            }
+        )
+        # Caller's value wins — contextvar is fallback only.
+        assert enriched["execution_id"] == "user-supplied-id"
+
+    def test_drops_execution_id_when_age_exceeds_threshold(
+        self, make_runtime
+    ):
+        rt = make_runtime()
+
+        # Force the timestamp to ancient history.
+        token = set_server_minted_execution_id(SERVER_MINTED_V1)
+        stale_at = time.monotonic() - (
+            SERVER_MINTED_RESERVATION_MAX_AGE_SECONDS + 10.0
+        )
+        t_at = set_server_minted_reservation_at(stale_at)
+        try:
+            enriched = rt._enrich_event(
+                {"type": "llm_call", "workflow_id": "wf-1", "tokens": 10}
+            )
+            # Stale → field dropped, contextvar cleared.
+            assert "execution_id" not in enriched
+            assert get_server_minted_execution_id() is None
+        finally:
+            reset_server_minted_execution_id(token)
+            reset_server_minted_reservation_at(t_at)
+
+    def test_keeps_execution_id_when_age_just_under_threshold(
+        self, make_runtime
+    ):
+        # Boundary: 1 second before the safety cutoff — still
+        # considered fresh.
+        rt = make_runtime()
+        token = set_server_minted_execution_id(SERVER_MINTED_V1)
+        t_at = set_server_minted_reservation_at(
+            time.monotonic()
+            - (SERVER_MINTED_RESERVATION_MAX_AGE_SECONDS - 1.0)
+        )
+        try:
+            enriched = rt._enrich_event(
+                {"type": "llm_call", "workflow_id": "wf-1", "tokens": 10}
+            )
+            assert enriched["execution_id"] == SERVER_MINTED_V1
+        finally:
+            reset_server_minted_execution_id(token)
+            reset_server_minted_reservation_at(t_at)
+
+    def test_no_execution_id_when_capture_empty(self, make_runtime):
+        # No capture in scope → no execution_id field.
+        rt = make_runtime()
+        enriched = rt._enrich_event(
+            {"type": "llm_call", "workflow_id": "wf-1", "tokens": 10}
+        )
+        assert "execution_id" not in enriched
+
+
+# ─────────────────────────────────────────────────────────────────
+# 4. _build_v3_track_payload: shape the v3 single-event body
+# ─────────────────────────────────────────────────────────────────
+
+class TestBuildV3TrackPayload:
+    """Map an enriched event onto the ``/api/v1/track`` schema."""
+
+    def test_full_event_builds_full_payload(self):
+        out = _build_v3_track_payload(
+            {
+                "type": "llm_call",
+                "workflow_id": "wf-1",
+                "tokens": 100,
+                "input_tokens": 60,
+                "output_tokens": 40,
+                "model": "claude-sonnet-4-6",
+                "latency_ms": 250,
+                "metadata": {"x": "y"},
+                "trace_id": "trace-1",
+                "span_id": "span-1",
+                "agent_id": "agent-1",
+            },
+            SERVER_MINTED_V1,
+        )
+        assert out == {
+            "reservation_id": SERVER_MINTED_V1,
+            "workflow_id": "wf-1",
+            "tokens": 100,
+            "input_tokens": 60,
+            "output_tokens": 40,
+            "model": "claude-sonnet-4-6",
+            "latency_ms": 250,
+            "metadata": {"x": "y"},
+            "trace_id": "trace-1",
+            "span_id": "span-1",
+            "agent_id": "agent-1",
+            "cost_cents": 0,
+            "cost_source": "provisional",
+        }
+
+    def test_minimal_event_only_required_fields(self):
+        # workflow_id + tokens + reservation_id are the floor.
+        out = _build_v3_track_payload(
+            {"type": "llm_call", "workflow_id": "wf-1", "tokens": 1},
+            SERVER_MINTED_V1,
+        )
+        assert out == {
+            "reservation_id": SERVER_MINTED_V1,
+            "workflow_id": "wf-1",
+            "tokens": 1,
+            "cost_cents": 0,
+            "cost_source": "provisional",
+        }
+
+    def test_missing_workflow_id_returns_none(self):
+        # Caller falls back to /track/batch.
+        out = _build_v3_track_payload(
+            {"type": "llm_call", "tokens": 1},
+            SERVER_MINTED_V1,
+        )
+        assert out is None
+
+    def test_missing_tokens_returns_none(self):
+        out = _build_v3_track_payload(
+            {"type": "llm_call", "workflow_id": "wf-1"},
+            SERVER_MINTED_V1,
+        )
+        assert out is None
+
+    def test_tokens_coerced_to_int(self):
+        # Defensive: SDK usually emits int but a user-supplied
+        # token via the dict could be a numpy.int64 in a
+        # cookbook scenario. Force int so wire is int.
+        out = _build_v3_track_payload(
+            {"type": "llm_call", "workflow_id": "wf-1", "tokens": "100"},
+            SERVER_MINTED_V1,
+        )
+        assert out is not None
+        assert out["tokens"] == 100
+        assert isinstance(out["tokens"], int)
+
+
+# ─────────────────────────────────────────────────────────────────
+# 5. _route_track: routes llm_call → /track, others → /track/batch
+# ─────────────────────────────────────────────────────────────────
+
+class TestRouteTrack:
+    """``NullRunRuntime._route_track(wire_event)`` decides between
+    the v3 single-event endpoint (``/api/v1/track``) and the
+    legacy batch endpoint (``/api/v1/track/batch``).
+    """
+
+    @respx.mock
+    def test_llm_call_with_smid_routes_to_single(self, make_runtime):
+        rt = make_runtime()
+
+        # Set up both endpoints with respx — only one should fire.
+        single_route = respx.post(f"{BASE_URL}/api/v1/track").mock(
+            return_value=Response(200, json={"status": "ok"})
+        )
+        batch_route = respx.post(f"{BASE_URL}/api/v1/track/batch").mock(
+            return_value=Response(200, json={"ok": True, "accepted": 1})
+        )
+
+        # Capture a server-minted id.
+        _capture_server_minted_execution_id(
+            {"reservation_id": SERVER_MINTED_V1}
+        )
+
+        # Drive through track_llm so the enrich path runs.
+        rt.track_llm(
+            input_tokens=60,
+            output_tokens=40,
+            model="claude-sonnet-4-6",
+        )
+
+        assert single_route.call_count == 1
+        assert batch_route.call_count == 0
+
+        # Wire shape — body contains the captured reservation_id.
+        sent = single_route.calls.last.request
+        import json as _json
+        body = _json.loads(sent.content)
+        assert body["reservation_id"] == SERVER_MINTED_V1
+        assert body["tokens"] == 100
+        assert body["cost_source"] == "provisional"
+
+    @respx.mock
+    def test_tool_call_routes_to_batch(self, make_runtime):
+        rt = make_runtime()
+
+        single_route = respx.post(f"{BASE_URL}/api/v1/track").mock(
+            return_value=Response(200, json={"status": "ok"})
+        )
+        batch_route = respx.post(f"{BASE_URL}/api/v1/track/batch").mock(
+            return_value=Response(200, json={"ok": True, "accepted": 1})
+        )
+
+        # Capture anyway — even WITH smid in scope, non-llm_call
+        # events still go to the batch endpoint (no reservation
+        # to release).
+        _capture_server_minted_execution_id(
+            {"reservation_id": SERVER_MINTED_V1}
+        )
+
+        rt.track_tool(
+            tool_name="bash",
+            duration_ms=50,
+        )
+
+        # track buffers; tool_call events don't trip the v3
+        # path because they have no reservation to release. Force
+        # the batch flush so respx sees the call.
+        rt._transport.flush_now()
+
+        assert single_route.call_count == 0
+        assert batch_route.call_count == 1
+
+    @respx.mock
+    def test_llm_call_without_smid_falls_back_to_batch(self, make_runtime):
+        # No /check in scope → no smid → legacy path.
+        rt = make_runtime()
+
+        single_route = respx.post(f"{BASE_URL}/api/v1/track").mock(
+            return_value=Response(200, json={"status": "ok"})
+        )
+        batch_route = respx.post(f"{BASE_URL}/api/v1/track/batch").mock(
+            return_value=Response(200, json={"ok": True, "accepted": 1})
+        )
+
+        # No capture call here — contextvar stays empty.
+
+        rt.track_llm(
+            input_tokens=10,
+            output_tokens=5,
+            model="claude-sonnet-4-6",
+        )
+        # Buffer + flush.
+        rt._transport.flush_now()
+
+        assert single_route.call_count == 0
+        assert batch_route.call_count == 1
+
+    @respx.mock
+    def test_v3_track_disable_env_forces_legacy(self, make_runtime, monkeypatch):
+        # Env flag opt-out — even WITH smid, force batch.
+        monkeypatch.setenv("NULLRUN_V3_TRACK_DISABLE", "1")
+
+        rt = make_runtime()
+
+        single_route = respx.post(f"{BASE_URL}/api/v1/track").mock(
+            return_value=Response(200, json={"status": "ok"})
+        )
+        batch_route = respx.post(f"{BASE_URL}/api/v1/track/batch").mock(
+            return_value=Response(200, json={"ok": True, "accepted": 1})
+        )
+
+        _capture_server_minted_execution_id(
+            {"reservation_id": SERVER_MINTED_V1}
+        )
+
+        rt.track_llm(input_tokens=1, output_tokens=1, model="x")
+        rt._transport.flush_now()
+
+        assert single_route.call_count == 0
+        assert batch_route.call_count == 1
+
+
+# ─────────────────────────────────────────────────────────────────
+# 6. End-to-end: capture from /gate response flows to /track
+# ─────────────────────────────────────────────────────────────────
+
+class TestEndToEndCaptureFlow:
+    """The two halves of the v3 wire-up must cooperate.
+
+    ``check_workflow_budget`` captures the ``reservation_id``
+    from the /gate response. ``track_llm`` (via
+    ``_route_track``) reads the captured id and ships it on
+    /track. These tests pin the round trip so any refactor
+    that breaks the connection is caught at CI time.
+    """
+
+    @respx.mock
+    def test_reservation_id_from_gate_lands_on_track(self, make_runtime):
+        rt = make_runtime()
+
+        # /gate returns reservation_id (server-minted uuidv7).
+        respx.post(f"{BASE_URL}/api/v1/gate").mock(
+            return_value=Response(
+                200,
+                json={
+                    "decision": "allow",
+                    "decision_source": "gateway",
+                    "reservation_id": SERVER_MINTED_V1,
+                },
+            )
+        )
+
+        # /track (single) — what the v3 routing should hit.
+        single_route = respx.post(f"{BASE_URL}/api/v1/track").mock(
+            return_value=Response(200, json={"status": "ok"})
+        )
+
+        # Drive /gate (which captures)...
+        from nullrun.context import workflow
+        with workflow("wf-1"):
+            rt.check_workflow_budget()
+
+            #... then drive /track within the same scope.
+            rt.track_llm(
+                input_tokens=10,
+                output_tokens=5,
+                model="claude-sonnet-4-6",
+            )
+
+        assert single_route.call_count == 1
+        import json as _json
+        body = _json.loads(single_route.calls.last.request.content)
+        assert body["reservation_id"] == SERVER_MINTED_V1
+
+    @respx.mock
+    def test_block_response_does_not_infect_subsequent_track(
+        self, make_runtime
+    ):
+        # /gate returns "block" with NO reservation_id. The
+        # capture helper should clear any prior capture so the
+        # next /track is a legacy batch event (no reservation).
+        rt = make_runtime()
+
+        respx.post(f"{BASE_URL}/api/v1/gate").mock(
+            return_value=Response(
+                200,
+                json={
+                    "decision": "block",
+                    "decision_source": "gateway",
+                    "explanation": "budget exhausted",
+                    # NO reservation_id — backend does NOT mint
+                    # on a hard block (the request didn't
+                    # proceed past the gate).
+                },
+            )
+        )
+
+        single_route = respx.post(f"{BASE_URL}/api/v1/track").mock(
+            return_value=Response(200, json={"status": "ok"})
+        )
+        batch_route = respx.post(f"{BASE_URL}/api/v1/track/batch").mock(
+            return_value=Response(200, json={"ok": True, "accepted": 1})
+        )
+
+        from nullrun.breaker.exceptions import WorkflowKilledInterrupt
+        from nullrun.context import workflow
+        with workflow("wf-1"):
+            # Block path raises — WorkflowKilledInterrupt is a
+            # BaseException (carries the kill signal
+            # must propagate honestly). Catch it explicitly for
+            # this test which only wants to verify contextvar hygiene.
+            try:
+                rt.check_workflow_budget()
+            except WorkflowKilledInterrupt:
+                pass
+
+            rt.track_llm(
+                input_tokens=1,
+                output_tokens=1,
+                model="x",
+            )
+            rt._transport.flush_now()
+
+        # No reservation_id was minted → falls back to batch.
+        assert single_route.call_count == 0
+        assert batch_route.call_count == 1
+
+
+# ─── v3.38 wire-drift fixes ─────────────────────────────────
+"""Regression tests for the v3.38 wire-drift fixes (2026-08-07).
+
+These pin three contract-level fixes that were verified against
+backend source code, not against comments or documentation:
+
+* **capabilities probe route** — the SDK was probing
+  ``/health`` (a generic liveness payload) instead of the
+  canonical ``/api/v1/capabilities`` route. Pre-fix, every
+  ``is_v3_ready()`` returned False because the probe never saw
+  a v3 capability payload, leaving every flag a runtime no-op.
+
+* **API_KEY_* error code granularity (v3.38)** — the backend
+  split the v3.36 ``API_KEY_REVOKED`` bucket into five distinct
+  wire codes (``API_KEY_EXPIRED`` / ``API_KEY_DISABLED`` /
+  ``API_KEY_INVALID`` / ``API_KEY_MISSING`` /
+  ``API_KEY_MALFORMED``) so SDKs can branch on each lifecycle
+  state. Pre-fix, only ``API_KEY_REVOKED`` was mapped in
+  ``_V3_ERROR_CODE_MAP`` — the other five silently fell through
+  to the generic HTTP-status fallback (``NullRunAuthentication
+  Error``) without ever becoming ``NullRunAuthError``, losing
+  the diagnostic class. Wire codes are now surfaced on
+  ``NullRunAuthError.wire_code``.
+
+* **decision == "soft_pass" handling** — the backend returns
+  ``soft_pass`` for soft-mode calls that proceed via the chain's
+  overdraft cap (CLAUDE.md §5). Pre-fix, the runtime's
+  ``check_workflow_budget`` had no branch for ``soft_pass`` —
+  the ``decision == "allow"`` default fall-through meant the
+  body proceeded (correct) but the operator saw no log line
+  and no overdraft counter incremented (silent budget drift).
+
+The tests pin the fixed behaviour so a future refactor that
+breaks any of these three contracts gets caught in CI rather
+than at first production /check.
+"""
+
+from pathlib import Path
+
+import httpx
+import pytest
+import respx
+
+from nullrun.breaker import exceptions as exc
+from nullrun.capabilities import (
+    CAPABILITIES_PATH,
+    probe_capabilities,
+)
+from nullrun.transport import _V3_ERROR_CODE_MAP, _parse_v3_error_envelope
+
+BASE_URL = "https://api.test.nullrun.io"
+
+_RUNTIME_SRC_PATH = (
+    Path(__file__).parent.parent / "src" / "nullrun" / "runtime.py"
+)
+
+
+# ---------------------------------------------------------------------------
+# Fix #1 — capabilities probe route (/api/v1/capabilities, not /health)
+# ---------------------------------------------------------------------------
+
+
+def test_capabilities_path_constant_is_canonical_route():
+    """``CAPABILITIES_PATH`` must point at ``/api/v1/capabilities``.
+
+    The constant is the single source of truth — every
+    ``probe_capabilities`` call builds ``{api_url}{CAPABILITIES_PATH}``
+    (capabilities.py:290). Pinning the constant here catches a
+    refactor that re-introduces the legacy ``/health`` route.
+    """
+    assert CAPABILITIES_PATH == "/api/v1/capabilities"
+
+
+def test_probe_capabilities_against_canonical_route_with_v3_payload():
+    """A v3 backend responding at /api/v1/capabilities with the
+    nested ``capabilities:`` payload yields ``is_v3_ready() == True``.
+
+    Pins the entire probe → parse → flag chain against the canonical
+    route. Pre-fix the SDK probed /health and never saw this payload,
+    so ``is_v3_ready()`` was always False.
+    """
+    payload = {
+        "min_protocol_version": 3,
+        "max_protocol_version": 3,
+        "protocol_version": 3,
+        "capabilities": {
+            "server_minted_execution_id": True,
+            "per_execution_reservations": True,
+            "enforcement_modes_soft": True,
+            "heartbeat_time_based": True,
+        },
+    }
+    with respx.mock:
+        respx.get(f"{BASE_URL}/api/v1/capabilities").mock(
+            return_value=httpx.Response(200, json=payload)
+        )
+        # Negative pin — a stale /health mock returning 200 must
+        # NOT satisfy the probe. This catches regressions where
+        # someone re-adds /health as a fallback.
+        respx.get(f"{BASE_URL}/health").mock(
+            return_value=httpx.Response(200, json={"status": "ok"})
+        )
+        parsed = probe_capabilities(BASE_URL)
+    assert parsed is not None
+    assert parsed.is_v3_ready()
+    assert parsed.server_minted_execution_id is True
+    assert parsed.per_execution_reservations is True
+    assert parsed.heartbeat_time_based is True
+
+
+# ---------------------------------------------------------------------------
+# Fix #2 — v3.38 API_KEY_* codes in _V3_ERROR_CODE_MAP + wire_code attr
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "wire_code",
+    [
+        "API_KEY_REVOKED",
+        "API_KEY_EXPIRED",
+        "API_KEY_DISABLED",
+        "API_KEY_INVALID",
+        "API_KEY_MISSING",
+        "API_KEY_MALFORMED",
+    ],
+)
+def test_v3_error_code_map_covers_all_api_key_states(wire_code):
+    """All six v3.38 API_KEY_* wire codes must map to NullRunAuthError.
+
+    Pre-fix the map only covered ``API_KEY_REVOKED`` — the other
+    five silently fell through to the generic HTTP-status fallback
+    (line ~2616 in transport.py), losing the diagnostic class.
+    Pinning the map catches a refactor that drops any of the five
+    new entries.
+    """
+    assert wire_code in _V3_ERROR_CODE_MAP
+    assert _V3_ERROR_CODE_MAP[wire_code] is exc.NullRunAuthError
+
+
+def test_parse_v3_error_envelope_surfaces_wire_code_on_auth_error():
+    """A 401 with error_code=API_KEY_EXPIRED yields NullRunAuthError
+    whose ``wire_code`` attribute exposes the granular backend code.
+
+    Without ``wire_code``, callers have only the SDK-side NR-A003
+    taxonomy and lose the granular lifecycle signal. Mirrors
+    NullRunChainError.backend_code pattern (exceptions.py:448).
+    """
+    response = httpx.Response(
+        401,
+        json={
+            "error_code": "API_KEY_EXPIRED",
+            "error_message": "key TTL elapsed",
+            "details": {"expires_at": "2026-08-01T00:00:00Z"},
+        },
+    )
+    err = _parse_v3_error_envelope(response, "gate")
+    assert isinstance(err, exc.NullRunAuthError)
+    # SDK-side taxonomy preserved (NR-A003) — the fix adds wire_code
+    # instead of clobbering error_code.
+    assert err.error_code == "NR-A003"
+    # Granular wire code surfaced for handler dispatch.
+    assert err.wire_code == "API_KEY_EXPIRED"
+
+
+def test_parse_v3_error_envelope_preserves_default_wire_code_for_revoked():
+    """API_KEY_REVOKED continues to work — wire_code defaults to it
+    when the constructor is called without an explicit value (e.g.
+    a future refactor that bypasses the catalog dispatch).
+    """
+    err = exc.NullRunAuthError("revoked")
+    assert err.wire_code == "API_KEY_REVOKED"
+    assert err.error_code == "NR-A003"
+
+
+def test_parse_v3_error_envelope_auth_error_does_not_clobber_unrelated_details():
+    """The fix to filter ``details`` to known kwargs must not lose
+    extras silently — unknown keys (e.g. ``expires_at``) must land
+    on ``self.details`` for caller introspection. Pre-fix the
+    envelope parser forwarded every detail as a kwarg, which threw
+    TypeError on the first unknown key (e.g. when the backend
+    started emitting ``expires_at`` for v3.38 EXPIRED responses).
+    """
+    response = httpx.Response(
+        401,
+        json={
+            "error_code": "API_KEY_DISABLED",
+            "error_message": "admin disabled this key",
+            "details": {
+                "disabled_at": "2026-08-01T00:00:00Z",
+                "disabled_by": "admin@nullrun.io",
+            },
+        },
+    )
+    err = _parse_v3_error_envelope(response, "gate")
+    assert isinstance(err, exc.NullRunAuthError)
+    assert err.wire_code == "API_KEY_DISABLED"
+    # The disabled_at / disabled_by fields land on self.details
+    # (not lost, not raised).
+    details = getattr(err, "details", {}) or {}
+    assert details.get("disabled_at") == "2026-08-01T00:00:00Z"
+    assert details.get("disabled_by") == "admin@nullrun.io"
+
+
+# ---------------------------------------------------------------------------
+# Fix #3 — decision == "soft_pass" handling in check_workflow_budget
+# ---------------------------------------------------------------------------
+#
+# ``check_workflow_budget(self) -> None`` builds its own ``check_req``
+# dict and fetches via ``self._transport.check()`` — the signature
+# has no way to inject a response fixture without a full transport
+# mock. The soft_pass branch is a pure decision switch (runtime.py
+# ~1799-1830) so a source-level scan is the most reliable pin,
+# matching the migration_drift_tests pattern used elsewhere in the
+# SDK and backend.
+
+
+def test_check_workflow_budget_handles_soft_pass_decision():
+    """``check_workflow_budget`` must contain a ``decision ==
+    "soft_pass"`` branch.
+
+    Pre-fix, ``soft_pass`` fell through the ``decision == "allow"``
+    default — body executed (correct) but no log line, no counter.
+    Operators had zero visibility into "budget soft cap is biting".
+
+    Static scan pins the runtime.py structure so a future refactor
+    that drops the branch gets caught in CI rather than at first
+    production /check.
+    """
+    runtime_src = _RUNTIME_SRC_PATH.read_text(encoding="utf-8")
+
+    assert 'decision == "soft_pass"' in runtime_src, (
+        "check_workflow_budget must branch on `decision == \"soft_pass\"`. "
+        "Pre-fix the branch was missing — soft_pass fell through the "
+        "default allow path and operators got no overdraft telemetry."
+    )
+
+
+def test_check_workflow_budget_soft_pass_branch_increments_overdraft_counter():
+    """The soft_pass branch must increment ``soft_overdraft_used``
+    so operators can graph soft-cap pressure in the dashboard —
+    silent budget drift is the regression we are preventing.
+    """
+    runtime_src = _RUNTIME_SRC_PATH.read_text(encoding="utf-8")
+
+    # Slice the soft_pass branch out of the file by anchoring on
+    # the literal and the next known decision branch. The slice
+    # must contain the counter increment.
+    soft_pass_idx = runtime_src.find('decision == "soft_pass"')
+    assert soft_pass_idx >= 0, "soft_pass branch not found"
+    require_approval_idx = runtime_src.find(
+        'decision == "require_approval"', soft_pass_idx
+    )
+    assert require_approval_idx >= 0, (
+        "decision == require_approval marker not found after soft_pass — "
+        "the runtime source structure has drifted from this pin's anchor."
+    )
+    branch_slice = runtime_src[soft_pass_idx:require_approval_idx]
+
+    assert "soft_overdraft_used" in branch_slice, (
+        "soft_pass branch must increment `soft_overdraft_used` so the "
+        "dashboard can graph soft-cap pressure."
+    )
+    assert "metrics.inc_runtime" in branch_slice, (
+        "soft_pass branch must call `metrics.inc_runtime(...)` to record "
+        "the counter."
+    )
+
+
+def test_check_workflow_budget_soft_pass_branch_logs_overdraft_telemetry():
+    """The soft_pass branch must log at WARNING level with the
+    backend's ``overdraft_used_cents`` value — that's the operator's
+    primary signal that the chain's overdraft cap is burning.
+    """
+    runtime_src = _RUNTIME_SRC_PATH.read_text(encoding="utf-8")
+
+    soft_pass_idx = runtime_src.find('decision == "soft_pass"')
+    require_approval_idx = runtime_src.find(
+        'decision == "require_approval"', soft_pass_idx
+    )
+    branch_slice = runtime_src[soft_pass_idx:require_approval_idx]
+
+    assert "overdraft_used_cents" in branch_slice, (
+        "soft_pass branch must surface `overdraft_used_cents` from the "
+        "backend response — silent loss of this value means operators "
+        "have no visibility into which chains are burning overdraft."
+    )
+    assert "logger.warning" in branch_slice, (
+        "soft_pass branch must log at WARNING level — overdraft pressure "
+        "is operator-actionable, not informational."
+    )
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

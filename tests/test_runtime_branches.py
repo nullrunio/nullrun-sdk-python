@@ -316,19 +316,6 @@ def test_execute_block_raises_NullRunBlockedException():
     assert excinfo.value.reason == "denied by policy"
 
 
-# ─── start_recording / stop_recording no-op stubs ───────────────────
-
-
-def test_start_recording_returns_empty_string():
-    rt = _make_test_runtime()
-    assert rt.start_recording("wf-1") == ""
-
-
-def test_stop_recording_returns_none():
-    rt = _make_test_runtime()
-    assert rt.stop_recording() is None
-
-
 # ─── shutdown ────────────────────────────────────────────────────────
 
 

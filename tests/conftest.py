@@ -15,47 +15,30 @@ BASE_URL = "https://api.test.nullrun.io"
 @pytest.fixture(autouse=True)
 def reset_runtime():
     """Reset all singletons before each test (not after - avoids double-flush issues)."""
-    # Import here to avoid circular issues
     import nullrun.actions as _act
     import nullrun.decorators as _dec
     import nullrun.runtime as _rt_mod
     from nullrun.context import _call_model_var, _call_tools_var
     from nullrun.runtime import NullRunRuntime
 
-    # Disable polling for all tests via the runtime's internal `polling` flag
-    # (see make_runtime below — passes polling=False by default). The legacy
-    # NULLRUN_DISABLE_POLLING env var is no longer consulted.
-
-    # Reset before test only - don't call shutdown in teardown
-    # because mock_api fixture already cleaned up its respx context
     NullRunRuntime.reset_instance()
     _dec._runtime = None
     _act._action_handler = None
     # Module-level cache used by `nullrun.track_llm` / `nullrun.track_tool` →
-    # `get_runtime `. Without this, a stale singleton from a previous test
-    # leaks across the suite (e.g. a test that did `nullrun.init(...)` with
-    # the prod URL leaves that URL pinned for the next test).
+    # `get_runtime`. Without this, a stale singleton from a previous test
+    # leaks across the suite.
     _rt_mod._runtime = None
-    # T4 (2026-06-27): reset the per-call context (model + tools) so a
-    # previous test's `set_call_context(...)` doesn't leak into the next
-    # test's wire payload.
     _call_model_var.set(None)
     _call_tools_var.set(())
 
     yield
 
-    # Stop any running transport flush thread BEFORE we drop the
-    # reference. Without this the thread keeps running across tests,
-    # the buffer drains through httpx with no respx context active,
-    # and the worker logs a ``ConnectError`` retry storm for the rest
-    # of the xdist session — observed 9m 47s of "Request failed
-    # (attempt N/11), retrying in 10s" on PR #60, which dwarfed the
-    # actual test time. ``flush=False`` skips the final ``_do_flush``
-    # / ``_persist_to_wal`` so the teardown is a true no-op even when
-    # the buffer still has events; the test that wrote them is
-    # responsible for asserting on what it cared about. Best-effort:
-    # the runtime may be in any state at teardown, and we don't want
-    # a flaky shutdown to mask the real test failure that just ran.
+    # Stop any running transport flush thread BEFORE dropping the reference.
+    # Without this the thread keeps running across tests, the buffer drains
+    # through httpx with no respx context active, and the worker logs a
+    # ConnectError retry storm for the rest of the xdist session.
+    # flush=False skips the final _do_flush / _persist_to_wal so the teardown
+    # is a true no-op even when the buffer still has events.
     inst = NullRunRuntime._instance
     if inst is not None:
         try:
@@ -100,12 +83,7 @@ def mock_api():
                 },
             )
         )
-        # Execute endpoint. 2026-07-05 retry-budget bump surfaced
-        # the test suite previously relied on respx allow-all for
-        # unmocked URLs, which only worked because the old
-        #  × 5s httpx timeout still completed in
-        # <2s. Adding the explicit mock makes the execute path
-        # deterministic regardless of the retry count.
+        # Execute endpoint
         respx.post(f"{BASE_URL}/api/v1/execute").mock(
             return_value=Response(
                 200,
@@ -132,12 +110,9 @@ def mock_api():
         respx.post(f"{BASE_URL}/api/v1/track/batch").mock(
             return_value=Response(200, json={"ok": True, "accepted": 1})
         )
-        # 0.7.0: SDK no longer fetches /policies on init (backend
-        # owns all policy state; SDK is a thin client).
-        # Capabilities endpoint (canonical /api/v1/capabilities,
-        # mirrors backend/src/proxy/http/protocol.rs:189).
-        # Empty capabilities object — SDK treats this as a non-v3
-        # backend and continues in compatibility mode.
+        # Capabilities endpoint (canonical /api/v1/capabilities).
+        # Empty capabilities object — SDK treats this as a non-v3 backend
+        # and continues in compatibility mode.
         respx.get(f"{BASE_URL}/api/v1/capabilities").mock(
             return_value=Response(
                 200,
@@ -162,9 +137,8 @@ def make_runtime(mock_api):
     """Factory for creating isolated NullRunRuntime in tests.
 
     Pins the created runtime into the @protect decorator's module-level
-    slot so `@protect` (which resolves a runtime lazily via
-    `decorators._get_or_create_runtime`) finds the test runtime, not a
-    fallback that would try to construct one with no api_key.
+    slot so `@protect` resolves the test runtime rather than trying to
+    construct one with no api_key.
     """
     import nullrun.decorators as _dec
     from nullrun.runtime import NullRunRuntime
@@ -173,18 +147,11 @@ def make_runtime(mock_api):
         defaults = dict(
             api_key="test-key-12345678",
             api_url=BASE_URL,
-            # Internal flag — tests don't want a background WS/HTTP poller
-            # opening real sockets. The mocked respx context only covers
-            # auth/policy/track endpoints, not the long-lived control plane.
-            polling=False,
+            polling=False,  # Internal flag: no background WS/HTTP poller opening real sockets.
         )
         defaults.update(kwargs)
         rt = NullRunRuntime(**defaults)
-        # Pin for @protect decorator's lazy resolution. Without this
-        # @protect would call NullRunRuntime.get_instance which reads
-        # env vars, finds no NULLRUN_API_KEY in the test environment
-        # and raise NullRunAuthenticationError.
-        _dec._runtime = rt
+        _dec._runtime = rt  # Pin for @protect decorator's lazy resolution.
         return rt
 
     return _make
@@ -192,36 +159,22 @@ def make_runtime(mock_api):
 
 @pytest.fixture
 def make_test_runtime(monkeypatch, tmp_path):
-    """Factory for tests that build a real ``NullRunRuntime`` inline
-    (no ``mock_api`` indirection).
+    """Factory for tests that build a real ``NullRunRuntime`` inline (no ``mock_api`` indirection).
 
-    Pins ``NULLRUN_WAL_PATH`` to a tmp_path-scoped file so the
-    constructor's ``Transport._replay_from_wal`` never reads the
-    default ``tempfile.gettempdir()/nullrun.wal`` (which may carry
-    real on-disk events from a previous test run or parallel
-    worker and would cause HTTP 401 → ``NullRunAuthError`` in
-    setup). Mirrors the ``test_runtime`` fixture in
-    ``test_protect_branches.py`` so all tests that build a runtime
-    directly get the same isolation.
-
-    Stub ``_do_flush`` / ``_do_flush_locked`` / ``_client`` so any
-    real network attempt is no-op'd. Reset singleton around the
-    factory so test ordering is independent.
+    Pins ``NULLRUN_WAL_PATH`` to a tmp_path-scoped file so the constructor's
+    ``Transport._replay_from_wal`` never reads the default WAL (which may carry
+    real on-disk events from a previous run).
     """
     from unittest.mock import MagicMock
 
     from nullrun.runtime import NullRunRuntime
 
     NullRunRuntime.reset_instance()
-    # Pre-pin the WAL path before any runtime can be constructed
-    # (otherwise the default is captured at first construction).
     monkeypatch.setenv("NULLRUN_WAL_PATH", str(tmp_path / "sdk.wal"))
 
     def _factory(**overrides):
         api_key = overrides.pop("api_key", "test-key-12345678")
         rt = NullRunRuntime(api_key=api_key, _test_mode=True)
-        # Stub the network-facing pieces for tests that build a
-        # runtime inline (not via ``mock_api``).
         rt._transport._do_flush = lambda: None
         rt._transport._do_flush_locked = lambda: None
         rt._transport._client = MagicMock()
@@ -235,24 +188,12 @@ def make_test_runtime(monkeypatch, tmp_path):
 
 @pytest.fixture(autouse=True)
 def _fast_sleep(monkeypatch, request):
-    # (coverage): neutralise time.sleep in test code so the suite
-    # is no longer gated on the retry loop's real wall-clock wait. The
-    # three TestCircuitBreaker tests in tests/test_transport.py
-    # (test_open_transitions_to_half_open_after_timeout and its two
-    # siblings at lines 358, 369, 381) used a bare time.sleep(1.1) to
-    # wait out recovery_timeout=1.0 — a 3.3-second tax per worker that
-    # produced a slow single-worker on xdist and was the only thing
-    # between the user and a clean coverage.xml. The CB state machine
-    # inspects time.monotonic() (circuit_breaker.py:243), so we don't
-    # have to move a clock — we just have to remove the actual wall
-    # wait the test is paying.
-    #
-    # A test that genuinely needs the real wall clock can decorate
-    # itself with ``@pytest.mark.slow_sleep`` — the marker check below
-    # is per-test (via ``request.node``) and the decision lives next
-    # to the test. The legacy env-var override
-    # ``NULLRUN_FAST_SLEEP=0`` is also honoured for tooling that
-    # drives pytest from the shell.
+    # Neutralise time.sleep in test code so the suite is no longer gated on
+    # the retry loop's real wall-clock wait. The CB state machine inspects
+    # time.monotonic() so we don't need to move a clock.
+    # A test that needs the real wall clock can decorate itself with
+    # ``@pytest.mark.slow_sleep``. Legacy env-var override
+    # ``NULLRUN_FAST_SLEEP=0`` is also honoured.
     if os.environ.get("NULLRUN_FAST_SLEEP") == "0":
         yield
         return
@@ -265,21 +206,13 @@ def _fast_sleep(monkeypatch, request):
     _real_sleep = _time.sleep
 
     def _fast_sleep(seconds):
-        # Cap any test sleep at 1ms — well above the cancellable-wait
-        # regression threshold (0.05s in the wild, but 1ms is enough
-        # to let the flush thread reach its wait) and zero impact on
-        # retries because the retry loop checks time.monotonic() and
-        # the existing per-test monkeypatch covers that case
-        # (test_circuit_breaker_branches.py).
+        # Cap any test sleep at 1ms.
         if seconds > 0.001:
             return _real_sleep(0.001)
         return _real_sleep(seconds)
 
     monkeypatch.setattr(_time, "sleep", _fast_sleep)
-    # Stub the modules that captured a module-level reference at
-    # import time. nullrun.transport imports time and uses
-    # time.sleep(...) in its retry loop, so we have to patch the
-    # reference the retry helper actually resolves at call time.
+    # Stub the modules that captured a module-level reference at import time.
     try:
         import nullrun.transport as _transport_mod
 
@@ -298,29 +231,11 @@ def _fast_sleep(monkeypatch, request):
 
 @pytest.fixture(autouse=True)
 def _isolated_wal(monkeypatch, tmp_path):
-    # CI flakefix: every test gets a private
-    # ``NULLRUN_WAL_PATH`` so ``Transport._replay_from_wal`` cannot
-    # replay events from a previous run / parallel xdist worker /
-    # failed teardown against the real backend.
-    #
-    # Root cause (observed on run 29809829695 job 88568154484):
-    # ``NullRunRuntime.__init__`` calls ``self._transport.start()``
-    # which calls ``_replay_from_wal()``. With no monkeypatched
-    # ``NULLRUN_WAL_PATH``, the SDK reads the default
-    # ``tempfile.gettempdir()/nullrun.wal`` and tries to drain any
-    # events found there against the real ``api_url``. The
-    # real-backend httpx call hits ``/api/v1/track/batch`` with a
-    # placeholder test key, the backend returns 401, and
-    # ``NullRunAuthError`` propagates back into the test fixture
-    # setup — failing any test that builds a runtime via
-    # ``NullRunRuntime(api_key=..., _test_mode=True)`` without the
-    # ``make_test_runtime`` fixture. CI 3.12 hits this race more
-    # often than 3.10/3.11 due to thread-scheduling differences
-    # in ``Transport.start()``.
-    #
-    # ``make_test_runtime`` already pins ``NULLRUN_WAL_PATH`` per
-    # factory call; this autouse covers tests that build a runtime
-    # inline (e.g. ``test_state_compare_case_insensitive.py:28``
-    # and ``test_v3_wire_contract.py::TestPingChainScheduler``).
+    # CI flakefix: every test gets a private NULLRUN_WAL_PATH so
+    # Transport._replay_from_wal cannot replay events from a previous run
+    # against the real backend. Without this, NullRunRuntime.__init__ reads
+    # the default tempfile.gettempdir()/nullrun.wal and tries to drain any
+    # events found there against the real api_url — the backend returns 401
+    # and NullRunAuthError propagates back into the test fixture setup.
     monkeypatch.setenv("NULLRUN_WAL_PATH", str(tmp_path / "sdk.wal"))
     yield

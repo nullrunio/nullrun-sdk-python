@@ -68,12 +68,6 @@ class TransportMetrics:
     circuit_closed_count: int = 0
     fallback_mode_activations: int = 0
     # HMAC verification failures on the control plane WebSocket
-    # (B13). Pre-fix, a signature mismatch on a signed
-    # ``state_change`` / ``key_rotated`` / ``policy_invalidated``
-    # message was logged at WARNING and the message was silently
-    # dropped — meaning a forged or mis-rotated kill command could
-    # be lost without a counter to alert on. The metric here is
-    # what a SRE alerts on for "control plane signature integrity".
     hmac_verify_failures_total: int = 0
     # separate counter for the timestamp-expired branch
     # of verify_hmac_signature. A spike here is almost always

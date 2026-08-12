@@ -33,11 +33,11 @@ import time
 
 import pytest
 
-from nullrun.transport_websocket import (
-    WebSocketConnection,
-    compute_hmac_signature,
+from nullrun.transport import (
+    generate_hmac_signature,
     verify_hmac_signature,
 )
+from nullrun.transport_websocket import WebSocketConnection
 
 # --- helpers ---------------------------------------------------------------
 
@@ -52,7 +52,7 @@ def _build_signed_envelope(message: dict, api_key: str, secret_key: str) -> dict
     """
     timestamp = int(time.time())
     payload_json = json.dumps(message, separators=(",", ":"))
-    signature = compute_hmac_signature(api_key, secret_key, timestamp, payload_json.encode("utf-8"))
+    signature = generate_hmac_signature(api_key, secret_key, timestamp, payload_json.encode("utf-8"))
     envelope = dict(message)
     envelope["signature"] = signature
     envelope["timestamp"] = timestamp
@@ -78,7 +78,7 @@ def _build_real_server_envelope(
     """
     timestamp = int(time.time())
     payload_json = json.dumps(message, separators=(",", ":"))
-    signature = compute_hmac_signature(
+    signature = generate_hmac_signature(
         api_key_id, secret_key, timestamp, payload_json.encode("utf-8")
     )
     envelope = dict(message)
@@ -123,7 +123,7 @@ def _build_legacy_envelope(message: dict, api_key: str, secret_key: str) -> dict
 def test_compute_and_verify_hmac_round_trip():
     payload = b'{"type":"state_change","workflow_id":"wf-1","state":"Killed","version":2}'
     ts = int(time.time())
-    sig = compute_hmac_signature("api_key_123", "secret_xyz", ts, payload)
+    sig = generate_hmac_signature("api_key_123", "secret_xyz", ts, payload)
     assert verify_hmac_signature("api_key_123", "secret_xyz", ts, payload, sig)
     # Different secret -> reject
     assert not verify_hmac_signature("api_key_123", "wrong_secret", ts, payload, sig)
@@ -136,7 +136,7 @@ def test_verify_hmac_signature_rejects_expired_timestamp():
     # Use a timestamp older than max_age_seconds=300 to guarantee the
     # "expired" branch fires regardless of test wall-clock drift.
     stale_ts = int(time.time()) - 1000
-    sig = compute_hmac_signature("k", "s", stale_ts, payload)
+    sig = generate_hmac_signature("k", "s", stale_ts, payload)
     assert not verify_hmac_signature("k", "s", stale_ts, payload, sig)
 
 

@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any
 # ``X-Signature`` headers. Importing here keeps the signing logic
 # in one place — ``transport.py`` owns the helper, the WS layer
 # only consumes it.
-from nullrun.transport import generate_hmac_signature
+from nullrun.transport import generate_hmac_signature, verify_hmac_signature
 
 try:
     import websockets
@@ -57,81 +57,6 @@ _MAX_RECONNECT_ATTEMPTS = 10
 # ``auth_context.key_id ``. Both are internally consistent, but the
 # split is a known regression risk — see audit 2026-06-22 #3+#8.
 WS_HMAC_IDENTITY_FIELD = "api_key"
-
-
-def compute_hmac_signature(api_key: str, secret_key: str, timestamp: int, payload: bytes) -> str:
-    """
-    Compute HMAC-SHA256 signature for WebSocket message verification.
-
-    Signature = HMAC-SHA256(secret_key, timestamp:api_key:payload_hash)
-    where payload_hash = SHA256(message_json)
-
-    Args:
-        api_key: Client's API key (identifier)
-        secret_key: Client's secret key (used for HMAC)
-        timestamp: Unix timestamp in seconds
-        payload: Raw message payload bytes
-
-    Returns:
-        Hex-encoded HMAC-SHA256 signature
-    """
-    payload_hash = hashlib.sha256(payload).hexdigest()
-
-    # Construct message: timestamp:api_key:payload_hash
-    message = f"{timestamp}:{api_key}:{payload_hash}"
-
-    signature = hmac.new(
-        secret_key.encode("utf-8"), message.encode("utf-8"), hashlib.sha256
-    ).hexdigest()
-
-    return signature
-
-
-def verify_hmac_signature(
-    api_key: str,
-    secret_key: str,
-    timestamp: int,
-    payload: bytes,
-    signature: str,
-    max_age_seconds: int = 300,
-) -> bool:
-    """
-    Verify HMAC signature for a WebSocket message.
-
-    Args:
-        api_key: Client's API key (identifier)
-        secret_key: Client's secret key (used for HMAC)
-        timestamp: Unix timestamp from message (seconds)
-        payload: Raw message payload bytes
-        signature: HMAC signature to verify (hex-encoded)
-        max_age_seconds: Maximum allowed age of message (default 5 min)
-
-    Returns:
-        True if signature is valid and timestamp is fresh, False otherwise
-    """
-    # Check timestamp freshness
-    current_time = int(time.time())
-    age = abs(current_time - timestamp)
-
-    if age > max_age_seconds:
-        # Mirror the same counter used by the SDK-side transport-error
-        # path so SRE can distinguish transient drops from this branch.
-        # HTTP verify path so SRE gets one alert ladder for
-        # clock-skew issues, not two.
-        try:
-            from nullrun.observability import metrics
-
-            metrics.inc_transport("hmac_verify_expired_total")
-        except Exception:  # noqa: BLE001 — best-effort counter
-            pass
-        logger.warning(f"WS signature timestamp expired: age={age}s, max={max_age_seconds}s")
-        return False
-
-    # Compute expected signature
-    expected = compute_hmac_signature(api_key, secret_key, timestamp, payload)
-
-    # Constant-time comparison to prevent timing attacks
-    return hmac.compare_digest(expected, signature)
 
 
 class WebSocketConnection:

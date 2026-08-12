@@ -1,4 +1,4 @@
-.PHONY: install test lint type-check coverage clean build publish-test publish
+.PHONY: install test lint type-check coverage clean build publish-test publish smoke-test
 
 # ── Setup ─────────────────────────────────────────────────────
 install:
@@ -12,6 +12,12 @@ install:
 # with ``No such file or directory``. Re-introduce it ONLY
 # when gRPC is unblocked (see README §"gRPC transport").
 
+# Sprint 5: the ``run-example`` target was removed. The
+# ``examples/`` directory was deleted along with the gRPC
+# transport in 0.3.1, and the target referenced the now-missing
+# ``examples/basic.py``. Local smoke-testing uses ``smoke-test``
+# below instead.
+
 # ── Tests ─────────────────────────────────────────────────────
 test:
 	pytest tests/ -v
@@ -19,11 +25,13 @@ test:
 test-watch:
 	pytest tests/ -v --tb=short -f
 
+# Sprint 5: align with CI (.github/workflows/ci.yml:82).
+# ``coverage run -m pytest`` only traced the xdist coordinator,
+# so every parallel run uploaded 0 hits. pytest-cov starts coverage
+# in every worker and combines the data before producing the XML.
 coverage:
-	coverage run -m pytest tests/
-	coverage report
-	coverage html
-	@echo "HTML report: htmlcov/index.html"
+	pytest tests/ --cov=src/nullrun --cov-branch --cov-report=xml:coverage.xml --cov-report=term
+	@echo "XML report: coverage.xml"
 
 # ── Code quality ──────────────────────────────────────────────
 lint:
@@ -41,7 +49,7 @@ check: lint type-check test
 
 # ── Build & Publish ───────────────────────────────────────────
 clean:
-	rm -rf dist/ build/ *.egg-info htmlcov/ .coverage
+	rm -rf dist/ build/ *.egg-info htmlcov/ .coverage coverage.xml
 
 build: clean
 	pip install build
@@ -56,9 +64,6 @@ publish: build
 	twine upload dist/*
 
 # ── Dev helpers ───────────────────────────────────────────────
-run-example:
-	python examples/basic.py
-
 smoke-test: build
 	pip install dist/*.whl --force-reinstall
 	python -c "from nullrun import protect; print('OK')"

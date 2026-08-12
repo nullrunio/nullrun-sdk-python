@@ -1,5 +1,5 @@
 # Build stage for Python SDK
-FROM python:3.11-slim as builder
+FROM python:3.11-slim AS builder
 
 WORKDIR /app
 
@@ -31,10 +31,7 @@ RUN pip install /app/dist/*.whl --force-reinstall
 RUN useradd -m -u 1000 nullrun
 USER nullrun
 
-# Install optional dependencies
-# Sprint 1.3 (B9): the previous `nullrun-breaker[langgraph]` package
-# does not exist in `pyproject.toml` (only `nullrun[langgraph]`).
-# Installing the non-existent package would make `docker build` fail.
+# Install optional dependencies.
+# `nullrun[langgraph]` is the canonical extras name — the previous
+# `nullrun-breaker[langgraph]` package does not exist in pyproject.toml.
 RUN pip install "nullrun[langgraph]"
-
-ENTRYPOINT ["python", "-m", "nullrun.breaker"]

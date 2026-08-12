@@ -23,12 +23,12 @@ import httpx
 import pytest
 import respx
 
-from nullrun.transport import Transport
-from nullrun.transport_websocket import (
-    WebSocketConnection,
-    compute_hmac_signature,
+from nullrun.transport import (
+    Transport,
+    generate_hmac_signature,
     verify_hmac_signature,
 )
+from nullrun.transport_websocket import WebSocketConnection
 
 # ─────────────────────────────────────────────────────────────────────
 # FIX-F3: every POST must carry Authorization: Bearer <api_key> so the
@@ -189,7 +189,7 @@ class TestWsHmacIdentityContract:
         msg = {"type": "state_change", "workflow_id": "wf-1", "state": "Normal", "version": 1}
         payload_bytes = json.dumps(msg, separators=(",", ":")).encode("utf-8")
         ts = int(time.time())
-        sig = compute_hmac_signature(USER_KEY, SECRET, ts, payload_bytes)
+        sig = generate_hmac_signature(USER_KEY, SECRET, ts, payload_bytes)
         envelope = dict(msg)
         envelope.update(
             {
@@ -214,7 +214,7 @@ class TestWsHmacIdentityContract:
         msg = {"type": "state_change", "workflow_id": "wf-1", "state": "Normal", "version": 1}
         payload_bytes = json.dumps(msg, separators=(",", ":")).encode("utf-8")
         ts = int(time.time())
-        sig = compute_hmac_signature(USER_KEY, SECRET, ts, payload_bytes)
+        sig = generate_hmac_signature(USER_KEY, SECRET, ts, payload_bytes)
 
         # Sanity: pure verify with the user-facing key passes.
         assert verify_hmac_signature(USER_KEY, SECRET, ts, payload_bytes, sig)
@@ -232,7 +232,7 @@ class TestWsHmacIdentityContract:
         ts = int(time.time())
 
         # Server (FIX-F4) signs with the user-facing key.
-        prod_sig = compute_hmac_signature(USER_KEY, SECRET, ts, payload_bytes)
+        prod_sig = generate_hmac_signature(USER_KEY, SECRET, ts, payload_bytes)
 
         # Verify with user-facing key (matches production) → passes.
         assert verify_hmac_signature(USER_KEY, SECRET, ts, payload_bytes, prod_sig), (
