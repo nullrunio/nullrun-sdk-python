@@ -41,7 +41,6 @@ from unittest.mock import MagicMock
 
 import pytest
 
-
 RUNTIME_PATH = os.path.join(
     os.path.dirname(__file__), "..", "src", "nullrun", "runtime.py"
 )
@@ -64,6 +63,23 @@ def _production_source(path: str) -> str:
     present in production, so the entire runtime.py is the corpus.
     """
     return _read(path)
+
+
+def _strip_comment_lines(src: str) -> str:
+    """Drop ``#`` comment lines so source-pin tests checking for
+    forbidden user-facing wording don't trip on rationale comments
+    that legitimately mention the same word.
+
+    The fix for DEF-ERRHDL-MALFORMED-MSG-01 added a multi-line
+    comment explaining *why* the word "compromised" was dropped
+    from user-facing messages. That comment legitimately uses the
+    word to describe the rationale; the source-pin should only
+    scan user-visible strings (which live in string literals,
+    not in ``# ...`` comments).
+    """
+    return "\n".join(
+        line for line in src.splitlines() if not line.lstrip().startswith("#")
+    )
 
 
 # ─── DEF-ERRHDL-AUTH-PATH-CODE-PIN-01 ──────────────────────────────────────
@@ -149,17 +165,23 @@ def test_auth_response_validator_does_not_say_compromised():
     for what is actually a wire-shape mismatch.
     """
     src = _production_source(RUNTIME_PATH)
+    # Strip comment lines: the fix itself added a multi-line
+    # rationale comment that legitimately uses the word to
+    # explain why it was dropped. The source-pin targets the
+    # user-visible message, which lives in string literals
+    # (not ``# ...`` comments).
+    code_only = _strip_comment_lines(src)
     # The fix replaces the "compromised" wording. The pre-fix text
     # was "server may be outdated or compromised"; the post-fix
     # text is "server returned an unexpected response shape".
     # Pin the absence of the trigger word (case-sensitive).
-    assert "compromised" not in src, (
+    assert "compromised" not in code_only, (
         "runtime.py must not contain the word 'compromised' in "
         "user-facing messages -- see DEF-ERRHDL-MALFORMED-MSG-01. "
         "The word triggers SOC alerts on a wire-shape mismatch."
     )
     # Positive pin: the replacement wording must be present
-    assert "unexpected response shape" in src, (
+    assert "unexpected response shape" in code_only, (
         "runtime.py auth response validator must use the neutral "
         "'unexpected response shape' wording (post-fix replacement "
         "for 'compromised')"
@@ -218,7 +240,12 @@ def test_authenticate_500_routes_to_null_run_backend_error():
     fake_response = MagicMock()
     fake_response.status_code = 500
     fake_response.headers = {}
-    rt._transport._client.post.return_value = fake_response
+    # _authenticate routes through _post_auth_with_retry (already
+    # mocked by _make_runtime_with_mocked_auth); point its
+    # return_value at the fake 500 response. Patching
+    # ``rt._transport._client.post`` instead is the pre-0.15.0
+    # contract and no longer reaches the auth path.
+    rt._post_auth_with_retry.return_value = fake_response
 
     with pytest.raises(NullRunBackendError) as exc_info:
         rt._authenticate()
