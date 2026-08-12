@@ -292,8 +292,13 @@ class AuditVerifyResult:
     first_hash: str | None
     last_hash: str | None
     first_failure_reason: str | None
-    timestamp: datetime
-    hmac_checked: bool
+    # The wire contract allows an empty timestamp when the server
+    # returns a row before a successful hash-chain completion; the
+    # parser tolerates it as `None` rather than crashing dataclass
+    # construction. Pre-ADR-009 rows also serialise without a
+    # timestamp (the field was added in ADR-009 itself).
+    timestamp: datetime | None = None
+    hmac_checked: bool = False
 
     @classmethod
     def from_wire(cls, raw: dict[str, Any]) -> AuditVerifyResult:

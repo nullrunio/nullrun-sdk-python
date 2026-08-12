@@ -59,6 +59,7 @@ for the full rules, including transport error classification
 from __future__ import annotations
 
 import asyncio
+import builtins
 import logging
 import os
 import threading
@@ -330,7 +331,7 @@ class AuditProxy:
         self,
         *,
         organization_id: str | None = None,
-    ) -> list[AuditExportJob]:
+    ) -> builtins.list[AuditExportJob]:
         """List recent export jobs (last 10).
 
         Args:
