@@ -37,7 +37,6 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-
 # ---------------------------------------------------------------------------
 # Wire-shape dataclasses — one-to-one with AuditEntryResponse fields.
 # ---------------------------------------------------------------------------
@@ -99,7 +98,7 @@ class AuditEntry:
         )
 
     @classmethod
-    def from_wire(cls, raw: dict[str, Any]) -> "AuditEntry":
+    def from_wire(cls, raw: dict[str, Any]) -> AuditEntry:
         """Parse a single dict out of the response `data` array.
 
         Tolerates missing keys (forward-compat) and string-vs-int
@@ -170,7 +169,7 @@ class AuditLogMeta:
     limit: int
 
     @classmethod
-    def from_wire(cls, raw: dict[str, Any]) -> "AuditLogMeta":
+    def from_wire(cls, raw: dict[str, Any]) -> AuditLogMeta:
         return cls(
             total_returned=int(raw.get("total_returned", 0)),
             total_matching=int(raw.get("total_matching", 0)),
@@ -194,7 +193,7 @@ class AuditLogPage:
     meta: AuditLogMeta
 
     @classmethod
-    def from_wire(cls, raw: dict[str, Any]) -> "AuditLogPage":
+    def from_wire(cls, raw: dict[str, Any]) -> AuditLogPage:
         data = raw.get("data", []) or []
         return cls(
             entries=[AuditEntry.from_wire(d) for d in data],
@@ -297,7 +296,7 @@ class AuditVerifyResult:
     hmac_checked: bool
 
     @classmethod
-    def from_wire(cls, raw: dict[str, Any]) -> "AuditVerifyResult":
+    def from_wire(cls, raw: dict[str, Any]) -> AuditVerifyResult:
         ts_raw = raw.get("timestamp", "")
         ts_norm = ts_raw.replace("Z", "+00:00") if ts_raw.endswith("Z") else ts_raw
         return cls(
@@ -331,7 +330,7 @@ class AuditExportJob:
     error_message: str | None = None
 
     @classmethod
-    def from_wire(cls, raw: dict[str, Any]) -> "AuditExportJob":
+    def from_wire(cls, raw: dict[str, Any]) -> AuditExportJob:
         def _parse_dt(s: str | None) -> datetime | None:
             if not s:
                 return None
@@ -370,7 +369,7 @@ class AuditExportStatus:
     error_message: str | None
 
     @classmethod
-    def from_wire(cls, raw: dict[str, Any]) -> "AuditExportStatus":
+    def from_wire(cls, raw: dict[str, Any]) -> AuditExportStatus:
         def _parse_dt(s: str | None) -> datetime | None:
             if not s:
                 return None

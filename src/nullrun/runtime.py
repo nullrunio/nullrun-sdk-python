@@ -254,7 +254,7 @@ class AuditProxy:
                 notify_security_team(entry)
     """
 
-    def __init__(self, runtime: "NullRunRuntime") -> None:
+    def __init__(self, runtime: NullRunRuntime) -> None:
         self._runtime = runtime
 
     def _require_org(self) -> str:
@@ -731,7 +731,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         logger.info("NullRun Runtime initialized: mode=cloud")
 
     @classmethod
-    def get_instance(cls) -> "NullRunRuntime":
+    def get_instance(cls) -> NullRunRuntime:
         """Get the singleton runtime instance.
 
         Thread-safe: the singleton lock is held for the full
@@ -772,7 +772,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 cls._instance.shutdown()
             cls._instance = None
 
-    def status(self) -> "Any":
+    def status(self) -> Any:
         """Build a Layer-3 ``NullRunStatus`` snapshot.
 
         Synchronous, thread-safe, side-effect-free — safe to
@@ -879,7 +879,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
 
     def _record_error(
         self,
-        err: "BaseException",
+        err: BaseException,
         stage: str,
         *,
         workflow_id: str | None = None,
@@ -917,7 +917,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
 
     def _emit_sdk_error(
         self,
-        err: "BaseException",
+        err: BaseException,
         stage: str,
         *,
         workflow_id: str | None = None,
