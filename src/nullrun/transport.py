@@ -2182,6 +2182,12 @@ def _parse_v3_error_envelope(
     # would create a cycle. The price is one extra import
     # non-2xx response — irrelevant for the failure path.
     from nullrun.breaker.exceptions import (
+        NullRunApprovalDeniedError,
+        NullRunApprovalDigestMismatchError,
+        NullRunApprovalExpiredError,
+        NullRunApprovalNotYetApprovedError,
+        NullRunApprovalReplayRejectedError,
+        NullRunApprovalToolDigestMismatchError,
         NullRunAuthError,
         NullRunBackendError,
         NullRunBudgetError,
@@ -2273,6 +2279,38 @@ def _parse_v3_error_envelope(
             current_spend_cents=details.get("current_spend_cents"),
             budget_cents=details.get("budget_cents"),
             status_code=status,  # 402 per backend mapping
+        )
+
+    if backend_code in (
+        "APPROVAL_NOT_YET_APPROVED",
+        "APPROVAL_DENIED",
+        "APPROVAL_EXPIRED",
+        "APPROVAL_DIGEST_MISMATCH",
+        "APPROVAL_TOOL_DIGEST_MISMATCH",
+        "APPROVAL_REPLAY_REJECTED",
+    ):
+        # v3.53 / 2026-08-13 audit, A-1+A-2 bundle: dedicated typed
+        # dispatch so callers can branch on the precise grant-consume
+        # outcome. Pre-v3.53 the SDK fell through to the catalog
+        # fallback path which called ``catalog(full_message, **details)``
+        # — NullRunBlockedException subclasses reject that signature
+        # (they need workflow_id as positional arg) so the catch-all
+        # path raised TypeError instead of the typed exception.
+        # Post-v3.53 each of the six codes maps to its own NR-Axxx
+        # subclass (NR-A010..NR-A015). Wire details carry the
+        # approval_id and the typed exception's NR-Axxx catalog
+        # value (via the class attribute) so cookbook recipes can
+        # ``except NullRunApprovalDeniedError:`` for terminal
+        # surface-to-user, ``except
+        # NullRunApprovalNotYetApprovedError:`` for wait/poll,
+        # ``except NullRunApprovalReplayRejectedError:`` for
+        # retry-loop detection, etc.
+        catalog = _V3_ERROR_CODE_MAP[backend_code]
+        return catalog(  # type: ignore[call-arg]
+            workflow_id=str(details.get("workflow_id") or "unknown"),
+            reason=full_message,
+            status_code=status,  # 403 per backend mapping
+            approval_id=details.get("approval_id"),
         )
 
     if backend_code == "RATE_LIMIT_REDIS_UNAVAILABLE":
@@ -2412,6 +2450,12 @@ def _build_v3_error_code_map() -> dict[str, type[BaseException]]:
     circular import if loaded eagerly at the top of transport.py.
     """
     from nullrun.breaker.exceptions import (
+        NullRunApprovalDeniedError,
+        NullRunApprovalDigestMismatchError,
+        NullRunApprovalExpiredError,
+        NullRunApprovalNotYetApprovedError,
+        NullRunApprovalReplayRejectedError,
+        NullRunApprovalToolDigestMismatchError,
         NullRunAuthError,
         NullRunBackendError,
         NullRunBlockedException,
@@ -2472,6 +2516,29 @@ def _build_v3_error_code_map() -> dict[str, type[BaseException]]:
         "APPROVAL_CONFLICT": NullRunBlockedException,
         "APPROVAL_NOT_FOUND": NullRunBlockedException,
         "APPROVAL_CREATE_FAILED": NullRunBlockedException,
+        # 403 — approval grant-consume outcomes (v3.53 / 2026-08-13
+        # audit, A-1+A-2 bundle). Distinct from the /gate
+        # create-failure family above: these are the seven
+        # distinct outcomes that the backend's
+        # `gate_internal()` returns on /execute post-approval
+        # grant-consume (see
+        # `backend/src/proxy/http/gate/internal.rs:3059-3108,
+        # 3115-3138`). Pre-v3.53 the SDK collapsed all six
+        # into NullRunBlockedException — bilateral wire gap.
+        # Post-v3.53 each maps to a typed exception
+        # (NR-A010..NR-A015) so cookbook recipes can branch
+        # on the precise outcome (e.g. ``except
+        # NullRunApprovalNotYetApprovedError:`` for wait/poll,
+        # ``except NullRunApprovalDeniedError:`` for terminal
+        # surface-to-user, ``except
+        # NullRunApprovalReplayRejectedError:`` for retry-loop
+        # detection).
+        "APPROVAL_NOT_YET_APPROVED": NullRunApprovalNotYetApprovedError,
+        "APPROVAL_DENIED": NullRunApprovalDeniedError,
+        "APPROVAL_EXPIRED": NullRunApprovalExpiredError,
+        "APPROVAL_DIGEST_MISMATCH": NullRunApprovalDigestMismatchError,
+        "APPROVAL_TOOL_DIGEST_MISMATCH": NullRunApprovalToolDigestMismatchError,
+        "APPROVAL_REPLAY_REJECTED": NullRunApprovalReplayRejectedError,
         # 402 — post-approval budget recheck (H6 / 2026-08-12 audit).
         # Distinct from BUDGET_HARD_BLOCKED: the operator explicitly
         # approved the grant at /gate, but the period-bound counter

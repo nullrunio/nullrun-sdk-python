@@ -860,6 +860,140 @@ class NullRunToolBlockedError(NullRunBlockedException):
     retryable = False
 
 
+# ---------------------------------------------------------------------------
+# Approval grant-consume outcomes (v3.53 / 2026-08-13 audit, A-1/A-2)
+# ---------------------------------------------------------------------------
+# These six typed exceptions wire-up the /execute grant-consume outcomes
+# that backend `backend/src/proxy/http/gate/internal.rs:3059-3108, 3115-3138`
+# surfaces as distinct §13 wire codes. Pre-v3.53 the SDK collapsed all six
+# into a generic ``NullRunBlockedException`` because the codes were missing
+# from ``_V3_ERROR_CODE_MAP`` (transport.py:2427-2484) — bilateral wire
+# gap. Post-v3.53 each outcome maps to its own typed class so cookbook
+# recipes can ``except NullRunApprovalDeniedError:`` / ``except
+# NullRunApprovalExpiredError:`` / ``except NullRunDigestMismatchError:``
+# instead of string-matching the ``error_message``.
+#
+# All six subclass :class:`NullRunBlockedException` so the legacy
+# ``except NullRunBlockedException:`` pattern keeps matching — back-compat
+# invariant preserved.
+class NullRunApprovalNotYetApprovedError(NullRunBlockedException):
+    """The approval row exists but the operator has not yet decided.
+
+    Wire code ``APPROVAL_NOT_YET_APPROVED`` (HTTP 403). SDK cookbook
+    pattern: poll the approval via the WS push channel or sleep +
+    retry, NOT surface as terminal error.
+
+    Distinct from :class:`NullRunApprovalDeniedError` (operator said
+    no — terminal) and from :class:`NullRunApprovalExpiredError`
+    (operator said yes but grant TTL elapsed). All three share the
+    HTTP 403 envelope; the wire code is the discriminator.
+    """
+
+    error_code = "NR-A010"
+    user_action = (
+        "Approval is pending — the operator has not yet decided. Wait "
+        "for the approval_resolved WebSocket frame or poll the "
+        "approval row; do NOT raise this to the user as terminal."
+    )
+    retryable = True
+
+
+class NullRunApprovalDeniedError(NullRunBlockedException):
+    """Operator explicitly denied the approval.
+
+    Wire code ``APPROVAL_DENIED`` (HTTP 403). Terminal — re-running
+    with the same approval_id will keep failing. Cookbook pattern:
+    surface denial to the user and request a fresh approval row
+    (different parameters / intent).
+    """
+
+    error_code = "NR-A011"
+    user_action = (
+        "Operator denied the approval. Surface the denial to the "
+        "user, request a fresh approval row with revised parameters. "
+        "Re-running with the same approval_id will fail again."
+    )
+    retryable = False
+
+
+class NullRunApprovalExpiredError(NullRunBlockedException):
+    """Approval grant aged out — operator said yes but ``expires_at`` is past.
+
+    Wire code ``APPROVAL_EXPIRED`` (HTTP 403). The original grant was
+    approved but the operator's approval window elapsed before
+    ``/execute`` consumed it. Cookbook pattern: request a fresh
+    approval row (do not retry the same one).
+    """
+
+    error_code = "NR-A012"
+    user_action = (
+        "Approval grant has expired — the operator approved, but "
+        "the grant's expires_at is past. Request a fresh approval "
+        "row and retry /execute with the new approval_id."
+    )
+    retryable = False
+
+
+class NullRunApprovalDigestMismatchError(NullRunBlockedException):
+    """Business-impact digest drifted since operator approval (ADR-006).
+
+    Wire code ``APPROVAL_DIGEST_MISMATCH` (HTTP 403). The operator
+    approved action A; SDK /execute requests action B (different
+    business impact). Defense against prompt-injection-driven silent
+    capability drift. Cookbook pattern: request fresh approval with
+    the actual impact the SDK intends to execute.
+    """
+
+    error_code = "NR-A013"
+    user_action = (
+        "Business-impact digest mismatch — the operator approved a "
+        "different action than the one currently bound to this "
+        "execution. Request fresh approval with the intended impact "
+        "and retry /execute."
+    )
+    retryable = False
+
+
+class NullRunApprovalToolDigestMismatchError(NullRunBlockedException):
+    """Tool capability digest drifted since operator approval (T8 / ADR-008).
+
+    Wire code ``APPROVAL_TOOL_DIGEST_MISMATCH`` (HTTP 403). The
+    operator approved the tool at /gate-create; the MCP server's
+    current capability surface differs at /execute (added destructive
+    flag, expanded schema, etc.). Cookbook pattern: re-pull the
+    current MCP ``tools/list`` and re-run /gate-create with the new
+    capability digest, OR roll back the server.
+    """
+
+    error_code = "NR-A014"
+    user_action = (
+        "Tool capability digest mismatch — the operator approved a "
+        "different tool capability than the one currently bound. "
+        "Re-pull MCP tools/list and re-run /gate-create with the "
+        "current capability surface, or roll back the server."
+    )
+    retryable = False
+
+
+class NullRunApprovalReplayRejectedError(NullRunBlockedException):
+    """Approval grant was already consumed by a prior /execute call.
+
+    Wire code ``APPROVAL_REPLAY_REJECTED`` (HTTP 403). Each grant
+    is single-use per ``consume_approved`` atomic check-and-set.
+    Cookbook pattern: do NOT retry the same approval_id; treat as
+    idempotency violation (likely a client retry loop).
+    """
+
+    error_code = "NR-A015"
+    user_action = (
+        "Approval grant was already consumed by a prior /execute "
+        "call — this is a replay/retry-loop signal, NOT a transient "
+        "failure. Inspect your retry logic; the same approval_id "
+        "will never succeed twice."
+    )
+    retryable = False
+
+
 # NOTE: the following six exception classes were removed in 0.4.0
 # because they had no callers in the SDK or in any test. They were
 # zombie public surface — defined but never raised. If a real use

@@ -2109,5 +2109,298 @@ def test_check_workflow_budget_soft_pass_branch_logs_overdraft_telemetry():
     )
 
 
+# ─── v3.53 wire-bilateral gap fix ─────────────────────────────
+"""v3.53 (2026-08-13) closes the wire-contract bilateral gap between
+backend ``backend/src/proxy/http/gate/internal.rs:3059-3108,
+3115-3138`` (which emits distinct §13 wire codes for each of the
+seven post-approval grant-consume outcomes) and the SDK
+``_V3_ERROR_CODE_MAP`` (which collapsed every distinct outcome into
+``NullRunBlockedException``).
+
+These tests pin the SDK-side fix so a future refactor that drops any
+of the six new entries or weakens the typed dispatcher gets caught
+in CI rather than at first production /execute.
+
+Pre-fix failure mode: SDK cookbook code could only catch the generic
+``NullRunBlockedException`` and string-match the ``error_message`` to
+distinguish "operator denied", "approval pending", "grant already
+consumed", etc. — fragile, locale-sensitive, and brittle against
+backend copy changes.
+"""
+
+
+@pytest.mark.parametrize(
+    "wire_code,expected_exc_class",
+    [
+        ("APPROVAL_NOT_YET_APPROVED", exc.NullRunApprovalNotYetApprovedError),
+        ("APPROVAL_DENIED", exc.NullRunApprovalDeniedError),
+        ("APPROVAL_EXPIRED", exc.NullRunApprovalExpiredError),
+        ("APPROVAL_DIGEST_MISMATCH", exc.NullRunApprovalDigestMismatchError),
+        ("APPROVAL_TOOL_DIGEST_MISMATCH", exc.NullRunApprovalToolDigestMismatchError),
+        ("APPROVAL_REPLAY_REJECTED", exc.NullRunApprovalReplayRejectedError),
+    ],
+)
+def test_v3_error_code_map_covers_all_post_approval_outcomes(
+    wire_code, expected_exc_class
+):
+    """All six post-approval grant-consume outcomes must map to a
+    distinct typed exception.
+
+    Pre-v3.53 the SDK's ``_V3_ERROR_CODE_MAP`` only covered the
+    /gate create-failure family (``APPROVAL_DB_UNAVAILABLE``,
+    ``APPROVAL_PERSISTENCE_FAILED``, etc.) — all six /execute
+    post-approval outcomes silently fell through to the generic
+    HTTP-status fallback (NullRunBlockedException with no typed
+    discrimination). Bilateral wire gap. Pins the catalog entry so
+    a refactor that drops any of the six fails loudly here.
+    """
+    assert wire_code in _V3_ERROR_CODE_MAP, (
+        f"v3.53 audit: backend emits {wire_code} on /execute grant-"
+        "consume but SDK has no map entry. Cookbook recipes cannot "
+        "branch on this outcome."
+    )
+    assert _V3_ERROR_CODE_MAP[wire_code] is expected_exc_class, (
+        f"v3.53 audit: {wire_code} maps to "
+        f"{_V3_ERROR_CODE_MAP[wire_code].__name__} in the SDK but "
+        f"the typed exception is {expected_exc_class.__name__}. "
+        "Cookbook code uses `except NullRunApprovalDeniedError:` "
+        "(etc.) so the map must point at the typed class."
+    )
+
+
+@pytest.mark.parametrize(
+    "wire_code,expected_nr_code",
+    [
+        ("APPROVAL_NOT_YET_APPROVED", "NR-A010"),
+        ("APPROVAL_DENIED", "NR-A011"),
+        ("APPROVAL_EXPIRED", "NR-A012"),
+        ("APPROVAL_DIGEST_MISMATCH", "NR-A013"),
+        ("APPROVAL_TOOL_DIGEST_MISMATCH", "NR-A014"),
+        ("APPROVAL_REPLAY_REJECTED", "NR-A015"),
+    ],
+)
+def test_post_approval_exceptions_carry_stable_nr_codes(wire_code, expected_nr_code):
+    """Each typed exception carries a stable ``error_code`` (NR-Axxx)
+    so cookbook / Sentry rules can branch on it without parsing the
+    message.
+
+    Pins the catalog triple ``(wire_code, exception, NR-code)`` so
+    a future renumbering shows up in code review / changelog
+    (NR-codes are wire-stable — see audit P0 close for v3.52).
+    """
+    cls = _V3_ERROR_CODE_MAP[wire_code]
+    assert cls.error_code == expected_nr_code, (
+        f"{cls.__name__}.error_code is {cls.error_code!r}, expected "
+        f"{expected_nr_code!r} (v3.53 catalog). NR-codes are wire-"
+        "stable — renumbering is a breaking change."
+    )
+    # NR-Axxx family is the approval-block taxonomy.
+    assert cls.error_code.startswith("NR-A"), (
+        f"{cls.__name__}.error_code must start with NR-A (approval "
+        f"taxonomy), got {cls.error_code!r}."
+    )
+
+
+def test_parse_v3_error_envelope_dispatches_approval_denied_to_typed_exception():
+    """``APPROVAL_DENIED`` from /execute → ``NullRunApprovalDeniedError``
+    with status_code=403 and wire details preserved.
+
+    Pins the dispatcher arm in ``_parse_v3_error_envelope``. Pre-v3.53
+    the catalog fallback path called ``catalog(full_message, **details)``
+    which raised TypeError on NullRunBlockedException (needs
+    workflow_id positional arg) — silent internal error instead of
+    a typed exception.
+    """
+    response = httpx.Response(
+        403,
+        json={
+            "error_code": "APPROVAL_DENIED",
+            "error_message": "Operator denied the approval",
+            "details": {
+                "approval_id": "apr-uuid-1234",
+                "workflow_id": "wf-uuid-5678",
+                "denied_by": "operator@nullrun.io",
+            },
+        },
+    )
+    err = _parse_v3_error_envelope(response, "execute")
+    assert isinstance(err, exc.NullRunApprovalDeniedError)
+    assert err.status_code == 403
+    assert err.error_code == "NR-A011"
+    # Back-compat: existing ``except NullRunBlockedException:`` still
+    # catches — every approval exception inherits from it.
+    assert isinstance(err, exc.NullRunBlockedException)
+
+
+def test_parse_v3_error_envelope_dispatches_approval_not_yet_approved():
+    """``APPROVAL_NOT_YET_APPROVED`` → ``NullRunApprovalNotYetApprovedError``
+    with ``retryable=True`` so SDK cookbook recipes can poll/await
+    the operator decision without classifying it as terminal.
+    """
+    response = httpx.Response(
+        403,
+        json={
+            "error_code": "APPROVAL_NOT_YET_APPROVED",
+            "error_message": "Approval pending",
+            "details": {"approval_id": "apr-uuid-9999"},
+        },
+    )
+    err = _parse_v3_error_envelope(response, "execute")
+    assert isinstance(err, exc.NullRunApprovalNotYetApprovedError)
+    assert err.status_code == 403
+    assert err.retryable is True
+    assert err.error_code == "NR-A010"
+
+
+def test_parse_v3_error_envelope_dispatches_approval_replay_rejected():
+    """``APPROVAL_REPLAY_REJECTED`` → ``NullRunApprovalReplayRejectedError``
+    with ``retryable=False`` — single-use grant, retrying with the
+    same approval_id will keep failing.
+    """
+    response = httpx.Response(
+        403,
+        json={
+            "error_code": "APPROVAL_REPLAY_REJECTED",
+            "error_message": "Grant already consumed",
+            "details": {"approval_id": "apr-uuid-1111"},
+        },
+    )
+    err = _parse_v3_error_envelope(response, "execute")
+    assert isinstance(err, exc.NullRunApprovalReplayRejectedError)
+    assert err.status_code == 403
+    assert err.retryable is False
+    assert err.error_code == "NR-A015"
+
+
+def test_parse_v3_error_envelope_dispatches_approval_expired():
+    """``APPROVAL_EXPIRED`` → ``NullRunApprovalExpiredError`` — terminal,
+    caller must request a fresh approval row with revised params.
+    """
+    response = httpx.Response(
+        403,
+        json={
+            "error_code": "APPROVAL_EXPIRED",
+            "error_message": "Grant TTL elapsed",
+            "details": {
+                "approval_id": "apr-uuid-2222",
+                "expires_at": "2026-08-13T00:00:00Z",
+            },
+        },
+    )
+    err = _parse_v3_error_envelope(response, "execute")
+    assert isinstance(err, exc.NullRunApprovalExpiredError)
+    assert err.status_code == 403
+    assert err.error_code == "NR-A012"
+    # Operator-facing hint points at the per-code docs page.
+    assert err.docs_url.startswith("https://")
+
+
+def test_parse_v3_error_envelope_dispatches_approval_digest_mismatch():
+    """``APPROVAL_DIGEST_MISMATCH`` → ``NullRunApprovalDigestMismatchError`` —
+    action/business-impact digest drift, terminal (re-approval needed).
+    """
+    response = httpx.Response(
+        403,
+        json={
+            "error_code": "APPROVAL_DIGEST_MISMATCH",
+            "error_message": "Action digest drifted since approval",
+            "details": {"approval_id": "apr-uuid-3333"},
+        },
+    )
+    err = _parse_v3_error_envelope(response, "execute")
+    assert isinstance(err, exc.NullRunApprovalDigestMismatchError)
+    assert err.status_code == 403
+    assert err.error_code == "NR-A013"
+
+
+def test_parse_v3_error_envelope_dispatches_approval_tool_digest_mismatch():
+    """``APPROVAL_TOOL_DIGEST_MISMATCH`` → ``NullRunApprovalToolDigestMismatchError`` —
+    tool capability digest drift (T8 / ADR-008), terminal.
+    """
+    response = httpx.Response(
+        403,
+        json={
+            "error_code": "APPROVAL_TOOL_DIGEST_MISMATCH",
+            "error_message": "Tool capability digest drifted",
+            "details": {"approval_id": "apr-uuid-4444"},
+        },
+    )
+    err = _parse_v3_error_envelope(response, "execute")
+    assert isinstance(err, exc.NullRunApprovalToolDigestMismatchError)
+    assert err.status_code == 403
+    assert err.error_code == "NR-A014"
+
+
+def test_approval_exceptions_inherit_from_nullrun_blocked_exception():
+    """All six typed exceptions inherit from ``NullRunBlockedException``
+    so legacy ``except NullRunBlockedException:`` clauses keep
+    matching (back-compat invariant).
+
+    Pins the base class so a future refactor that drops the
+    inheritance breaks cookbook code that catches the broader class.
+    """
+    for cls in (
+        exc.NullRunApprovalNotYetApprovedError,
+        exc.NullRunApprovalDeniedError,
+        exc.NullRunApprovalExpiredError,
+        exc.NullRunApprovalDigestMismatchError,
+        exc.NullRunApprovalToolDigestMismatchError,
+        exc.NullRunApprovalReplayRejectedError,
+    ):
+        assert issubclass(cls, exc.NullRunBlockedException), (
+            f"{cls.__name__} must inherit from NullRunBlockedException "
+            "so legacy `except NullRunBlockedException:` keeps matching."
+        )
+
+
+def test_approval_exceptions_inherit_from_nullrun_error():
+    """All six typed exceptions inherit from ``NullRunError`` so the
+    ``except NullRunError:`` catch-all keeps working.
+    """
+    for cls in (
+        exc.NullRunApprovalNotYetApprovedError,
+        exc.NullRunApprovalDeniedError,
+        exc.NullRunApprovalExpiredError,
+        exc.NullRunApprovalDigestMismatchError,
+        exc.NullRunApprovalToolDigestMismatchError,
+        exc.NullRunApprovalReplayRejectedError,
+    ):
+        assert issubclass(cls, exc.NullRunError), (
+            f"{cls.__name__} must inherit from NullRunError so "
+            "`except NullRunError:` catches it."
+        )
+
+
+def test_post_approval_outcomes_use_403_status_code():
+    """All six grant-consume outcomes are HTTP 403 on the wire per
+    CLAUDE.md §13. The dispatcher preserves ``status_code=403`` on
+    the typed exception so FastAPI / Starlette exception handlers
+    can map to the right HTTP status without re-deriving from
+    ``type(exc).__name__``.
+    """
+    wire_codes = [
+        "APPROVAL_NOT_YET_APPROVED",
+        "APPROVAL_DENIED",
+        "APPROVAL_EXPIRED",
+        "APPROVAL_DIGEST_MISMATCH",
+        "APPROVAL_TOOL_DIGEST_MISMATCH",
+        "APPROVAL_REPLAY_REJECTED",
+    ]
+    for wire_code in wire_codes:
+        response = httpx.Response(
+            403,
+            json={
+                "error_code": wire_code,
+                "error_message": f"test for {wire_code}",
+                "details": {"approval_id": "apr-test"},
+            },
+        )
+        err = _parse_v3_error_envelope(response, "execute")
+        assert err.status_code == 403, (
+            f"{wire_code} must dispatch with status_code=403 per "
+            f"CLAUDE.md §13 — got {err.status_code}."
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
