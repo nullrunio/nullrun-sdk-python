@@ -22,6 +22,7 @@ from httpx import Response
 from nullrun.breaker.exceptions import (
     NullRunBackendError,
     NullRunBudgetError,
+    NullRunBudgetRecheckFailedError,
     NullRunChainError,
     NullRunConsumeOverbudgetError,
     NullRunError,
@@ -484,6 +485,39 @@ class TestV3ErrorEnvelopeMapping:
         assert exc.max_allowed_cents == 101
         assert exc.actual_cost_cents == 150
         assert exc.epsilon_cents == 1
+
+    def test_budget_recheck_failed_maps_to_typed_error(self):
+        #: AR-H6 (2026-08-12) — post-approval re-check failure must
+        #: dispatch to a typed exception (NR-B006), not the generic
+        #: NullRunBudgetError (NR-B004). The two differ in retry
+        #: semantics: recheck failures are retryable after re-/gate,
+        #: fresh /gate blocks are not. Pre-v3.53 SDK collapsed the
+        #: recheck into the generic fallback with no introspection
+        #: on current_spend_cents / budget_cents.
+        resp = self._make_response(
+            402,
+            {
+                "error_code": "BUDGET_RECHECK_FAILED",
+                "error_message": "Post-approval budget authorization failed",
+                "details": {
+                    "current_spend_cents": 1050,
+                    "budget_cents": 1000,
+                    "execution_id": "exec-abc",
+                },
+            },
+        )
+        exc = _parse_v3_error_envelope(resp, "execute")
+        # Typed subclass, distinct from NR-B004 NullRunBudgetError
+        assert isinstance(exc, NullRunBudgetRecheckFailedError)
+        # Subclass of NullRunBudgetError so existing `except NullRunBudgetError:`
+        # pattern keeps matching (back-compat invariant).
+        assert isinstance(exc, NullRunBudgetError)
+        # First-class attributes surface from the wire envelope.
+        assert exc.current_spend_cents == 1050
+        assert exc.budget_cents == 1000
+        # Recheck is retryable after re-/gate (vs fresh /gate block which is not).
+        assert exc.recheck_retryable is True
+        assert exc.error_code == "NR-B006"
 
     def test_rate_limit_exceeded_maps_to_rate_limit_error(self):
         resp = self._make_response(
