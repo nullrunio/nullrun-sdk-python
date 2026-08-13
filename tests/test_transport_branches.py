@@ -301,7 +301,35 @@ def test_execute_fallback_cached_degrades_to_permissive():
 
 
 def test_execute_fallback_permissive_default():
-    """fallback_mode=PERMISSIVE → synthetic allow on transport failure."""
+    """fallback_mode=PERMISSIVE (opt-in) → synthetic allow on transport failure.
+
+    v3.53 audit #4 — PERMISSIVE is no longer the default. Caller
+    must opt in explicitly via ``fallback_mode=FallbackMode.
+    PERMISSIVE`` to keep the legacy fail-OPEN on transport failure.
+    """
+    from nullrun.breaker.exceptions import BreakerTransportError
+    from nullrun.transport import FallbackMode
+
+    t = _build_transport()
+    t._client.post = MagicMock(side_effect=BreakerTransportError("down"))
+    result = t.execute(
+        organization_id="org-1",
+        execution_id="wf-1",
+        trace_id="t-1",
+        tool="x",
+        input_data={},
+        fallback_mode=FallbackMode.PERMISSIVE,
+    )
+    assert result["decision"] == "allow"
+    assert "PERMISSIVE" in result["explanation"]
+
+
+def test_execute_fallback_strict_default():
+    """v3.53 audit #4 — STRICT is the new default on transport failure.
+
+    Confirms the flip from PERMISSIVE → STRICT. Without an explicit
+    kwarg the caller lands on fail-CLOSED per CLAUDE.md §4.
+    """
     from nullrun.breaker.exceptions import BreakerTransportError
 
     t = _build_transport()
@@ -313,8 +341,8 @@ def test_execute_fallback_permissive_default():
         tool="x",
         input_data={},
     )
-    assert result["decision"] == "allow"
-    assert "PERMISSIVE" in result["explanation"]
+    assert result["decision"] == "block"
+    assert "STRICT" in result["explanation"]
 
 
 def test_execute_httpx_network_error_with_raise():

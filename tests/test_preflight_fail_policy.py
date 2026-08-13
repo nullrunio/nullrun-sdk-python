@@ -554,3 +554,254 @@ class TestTransportClassification:
         )
         assert result["decision"] == "block"
         assert result["decision_source"] == TransportErrorSource.NETWORK_ERROR
+
+
+# ──────────────────────────────────────────────────────────────
+# Bug #6 — NULLRUN_SKIP_BUDGET_CHECK=1 production guard
+# ──────────────────────────────────────────────────────────────
+#
+# Pre-v3.53 the SDK silently honored ``NULLRUN_SKIP_BUDGET_CHECK=1``
+# regardless of environment. CLAUDE.md §20 marks that env var as a
+# DEV/TEST bypass and explicitly forbids it in production. The fix
+# in v3.53 raises NullRunInfrastructureError (NR-S001) when the
+# var is set AND the SDK detects a production environment (either
+# the default api.nullrun.io host OR NULLRUN_ENV=production on a
+# non-dev host). The bypass is still reachable via an explicit
+# ack (``NULLRUN_ALLOW_SKIP_BUDGET_CHECK=1``) for incident-response
+# scenarios so the opt-out is visible in audit / telemetry.
+
+
+class TestSkipBudgetCheckProductionGuard:
+    """Source-pin + runtime tests for v3.53 audit #6."""
+
+    # ------------------------------------------------------------------
+    # _is_production_environment() helper
+    # ------------------------------------------------------------------
+
+    def test_is_production_environment_default_api_url(self):
+        """Default api_url (api.nullrun.io) → production."""
+        from nullrun.runtime import _is_production_environment
+
+        # Default is api.nullrun.io per constructor docstring.
+        assert _is_production_environment() is True
+
+    def test_is_production_environment_with_explicit_prod_url(self):
+        """Explicit prod api_url → production."""
+        from nullrun.runtime import _is_production_environment
+
+        assert _is_production_environment("https://api.nullrun.io") is True
+
+    def test_is_production_environment_localhost_is_not_prod(self, monkeypatch):
+        """Localhost api_url is NOT production."""
+        from nullrun.runtime import _is_production_environment
+
+        assert _is_production_environment("http://localhost:8080") is False
+        assert _is_production_environment("http://127.0.0.1:8080") is False
+
+    def test_is_production_environment_staging_subdomain_is_not_prod(self, monkeypatch):
+        """Staging subdomain is NOT production."""
+        from nullrun.runtime import _is_production_environment
+
+        assert _is_production_environment("https://staging.nullrun.io") is False
+        assert _is_production_environment("https://api.staging.internal") is False
+
+    def test_is_production_environment_explicit_env_override(self, monkeypatch):
+        """NULLRUN_ENV=production on a non-dev host → production."""
+        from nullrun.runtime import _is_production_environment
+
+        monkeypatch.setenv("NULLRUN_ENV", "production")
+        assert (
+            _is_production_environment("https://custom-deployment.example.com")
+            is True
+        )
+
+    def test_is_production_environment_explicit_env_with_localhost(self, monkeypatch):
+        """NULLRUN_ENV=production BUT api_url is localhost → NOT prod
+        (so a dev who accidentally exports NULLRUN_ENV=production can
+        still use the bypass)."""
+        from nullrun.runtime import _is_production_environment
+
+        monkeypatch.setenv("NULLRUN_ENV", "production")
+        assert _is_production_environment("http://localhost:9000") is False
+
+    def test_is_production_environment_prod_alias(self, monkeypatch):
+        """NULLRUN_ENV=prod (short alias) is also detected."""
+        from nullrun.runtime import _is_production_environment
+
+        monkeypatch.setenv("NULLRUN_ENV", "prod")
+        assert (
+            _is_production_environment("https://api.nullrun.io") is True
+        )
+
+    # ------------------------------------------------------------------
+    # check_workflow_budget skip-path enforcement
+    # ------------------------------------------------------------------
+
+    def test_skip_set_in_production_raises_infrastructure_error(
+        self, make_runtime, monkeypatch
+    ):
+        """NULLRUN_SKIP_BUDGET_CHECK=1 in production + no ack → raise
+        NullRunInfrastructureError(NR-S001)."""
+        from nullrun.breaker.exceptions import NullRunInfrastructureError
+
+        # Build a runtime pointing at the prod host via a custom
+        # respx block — ``make_runtime`` is BASE_URL-bound and we
+        # need to exercise the api_url=prod branch.
+        with respx.mock(assert_all_called=False) as mock:
+            mock.post("https://api.nullrun.io/api/v1/auth/verify").mock(
+                return_value=httpx.Response(
+                    200,
+                    json={
+                        "organization_id": "ws-test",
+                        "workflow_id": "00000000-0000-0000-0000-000000000001",
+                        "plan": "pro",
+                        "user_id": "u-test",
+                        "session_token": "s-test",
+                        "expires_at": "2030-01-01T00:00:00Z",
+                    },
+                )
+            )
+            from nullrun.runtime import NullRunRuntime
+
+            rt = NullRunRuntime(
+                api_key="test-key-12345678",
+                api_url="https://api.nullrun.io",
+                polling=False,
+            )
+            assert rt.api_url == "https://api.nullrun.io"
+
+        monkeypatch.setenv("NULLRUN_SKIP_BUDGET_CHECK", "1")
+        # Ensure no ack is set (might leak from another test).
+        monkeypatch.delenv("NULLRUN_ALLOW_SKIP_BUDGET_CHECK", raising=False)
+
+        with pytest.raises(NullRunInfrastructureError) as exc_info:
+            rt.check_workflow_budget()
+
+        # Must carry the NR-S001 error_code so operators can pin
+        # this in alerting.
+        assert exc_info.value.error_code == "NR-S001"
+        assert "CLAUDE.md §20" in str(exc_info.value)
+        assert exc_info.value.retryable is False
+
+    def test_skip_set_in_production_with_ack_skips_with_warning(
+        self, make_runtime, monkeypatch, caplog
+    ):
+        """NULLRUN_SKIP_BUDGET_CHECK=1 + NULLRUN_ALLOW_SKIP_BUDGET_CHECK=1
+        in prod → skip succeeds with a WARNING log so the audit trail
+        captures the explicit ack."""
+        import logging
+
+        with respx.mock(assert_all_called=False) as mock:
+            mock.post("https://api.nullrun.io/api/v1/auth/verify").mock(
+                return_value=httpx.Response(
+                    200,
+                    json={
+                        "organization_id": "ws-test",
+                        "workflow_id": "00000000-0000-0000-0000-000000000001",
+                        "plan": "pro",
+                        "user_id": "u-test",
+                        "session_token": "s-test",
+                        "expires_at": "2030-01-01T00:00:00Z",
+                    },
+                )
+            )
+            from nullrun.runtime import NullRunRuntime
+
+            rt = NullRunRuntime(
+                api_key="test-key-12345678",
+                api_url="https://api.nullrun.io",
+                polling=False,
+            )
+
+        monkeypatch.setenv("NULLRUN_SKIP_BUDGET_CHECK", "1")
+        monkeypatch.setenv("NULLRUN_ALLOW_SKIP_BUDGET_CHECK", "1")
+
+        with caplog.at_level(logging.WARNING, logger="nullrun.runtime"):
+            # Must NOT raise — explicit ack honors the bypass.
+            rt.check_workflow_budget()
+
+        # The ack path must surface a WARNING so observability picks
+        # it up. The exact text is allowed to evolve; we assert on
+        # the key substring so the test survives minor copy edits.
+        joined = "\n".join(rec.message for rec in caplog.records)
+        assert "NULLRUN_ALLOW_SKIP_BUDGET_CHECK" in joined, (
+            "ack path did not emit a WARNING log; the explicit bypass "
+            "would be invisible in audit / telemetry"
+        )
+
+    def test_skip_set_in_dev_skips_silently(self, make_runtime, monkeypatch):
+        """NULLRUN_SKIP_BUDGET_CHECK=1 in a dev/test environment
+        (non-prod api_url) → skip succeeds silently (no raise, no
+        require_ack). Preserves the legacy dev/test behavior."""
+        # Base URL is test.nullrun.io → not prod.
+        rt = make_runtime()
+        assert rt.api_url == BASE_URL
+
+        monkeypatch.setenv("NULLRUN_SKIP_BUDGET_CHECK", "1")
+        monkeypatch.delenv("NULLRUN_ALLOW_SKIP_BUDGET_CHECK", raising=False)
+
+        # Must NOT raise — the dev path stays dev-friendly.
+        rt.check_workflow_budget()
+
+    def test_skip_not_set_no_prod_guard(self, monkeypatch):
+        """NULLRUN_SKIP_BUDGET_CHECK not set → no production guard
+        even on a prod api_url. The gate makes its normal HTTP call."""
+        with respx.mock(assert_all_called=False) as mock:
+            mock.post("https://api.nullrun.io/api/v1/auth/verify").mock(
+                return_value=httpx.Response(
+                    200,
+                    json={
+                        "organization_id": "ws-test",
+                        "workflow_id": "00000000-0000-0000-0000-000000000001",
+                        "plan": "pro",
+                        "user_id": "u-test",
+                        "session_token": "s-test",
+                        "expires_at": "2030-01-01T00:00:00Z",
+                    },
+                )
+            )
+            mock.post("https://api.nullrun.io/api/v1/gate").mock(
+                return_value=httpx.Response(
+                    200, json={"decision": "allow", "explanations": []}
+                )
+            )
+            from nullrun.runtime import NullRunRuntime
+
+            rt = NullRunRuntime(
+                api_key="test-key-12345678",
+                api_url="https://api.nullrun.io",
+                polling=False,
+            )
+
+        monkeypatch.delenv("NULLRUN_SKIP_BUDGET_CHECK", raising=False)
+
+        # Must NOT raise — the gate makes its normal HTTP call,
+        # which returns 200 OK in the mock above.
+        rt.check_workflow_budget()
+
+    def test_skip_prod_helper_rejects_nonsensical_env(self, monkeypatch):
+        """NULLRUN_ENV=staging (or other non-prod values) on a non-prod
+        host → NOT prod. (Cannot override a real prod api_url via
+        NULLRUN_ENV — the host check fires first.)
+        """
+        from nullrun.runtime import _is_production_environment
+
+        monkeypatch.setenv("NULLRUN_ENV", "staging")
+        # Non-prod host + non-prod env → not prod.
+        assert _is_production_environment("https://custom.example.com") is False
+        assert _is_production_environment("http://localhost:9000") is False
+
+    def test_skip_prod_helper_handles_unparseable_url(self, monkeypatch):
+        """An unparseable api_url does NOT crash the helper."""
+        from nullrun.runtime import _is_production_environment
+
+        # Falls through to NULLRUN_ENV check; no prod env either.
+        result = _is_production_environment("not a real url")
+        assert result is False
+
+    def test_skip_prod_helper_lowercases_hostname(self):
+        """API_URL with uppercase hostname is still matched as prod."""
+        from nullrun.runtime import _is_production_environment
+
+        # Mixed-case hostname should still match api.nullrun.io.
+        assert _is_production_environment("https://API.NULLRUN.IO") is True

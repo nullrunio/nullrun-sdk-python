@@ -307,9 +307,17 @@ class FallbackMode:
     block agent execution, but behavior must be defined and logged.
     """
 
-    # Block if Gateway unavailable (for critical tools)
+    # Block if Gateway unavailable. v3.53 audit #4 — DEFAULT for
+    # ``Transport.execute()`` and ``ExecuteConfig.fallback_mode``.
+    # Per CLAUDE.md §4 "DEFAULT: fail-CLOSED для всех enforcement
+    # путей", the /execute enforcement path must not silently allow
+    # local execution when the policy engine is unreachable.
     STRICT = "strict"
-    # Allow if Gateway unavailable, log locally (DEFAULT)
+    # Allow if Gateway unavailable, log locally. **Opt-in only** —
+    # pass ``fallback_mode=FallbackMode.PERMISSIVE`` explicitly when
+    # the caller accepts silent fail-OPEN on the enforcement path.
+    # Required for any test / dev harness that intentionally runs
+    # without a live policy engine.
     PERMISSIVE = "permissive"
 
 
@@ -341,8 +349,12 @@ class FlushConfig:
 class ExecuteConfig:
     """Configuration for execute (strict mode) behavior."""
 
-    # Fallback mode when Gateway is unavailable
-    fallback_mode: str = FallbackMode.PERMISSIVE
+    # Fallback mode when Gateway is unavailable. v3.53 audit #4 —
+    # default is STRICT (fail-CLOSED on enforcement) per CLAUDE.md §4.
+    # Pre-v3.53 the default was PERMISSIVE which silently allowed
+    # local execution on transport failure; that was fail-OPEN on the
+    # primary enforcement path (Transport.execute → /api/v1/execute).
+    fallback_mode: str = FallbackMode.STRICT
     # Gateway timeout in seconds
     timeout: float = 5.0
     # Max retries for execute calls
@@ -1007,7 +1019,15 @@ class Transport:
         tool: str,
         input_data: dict[str, Any],
         mode: str = "auto",
-        fallback_mode: str = FallbackMode.PERMISSIVE,
+        # v3.53 audit #4 — default flipped from PERMISSIVE to STRICT
+        # to match CLAUDE.md §4 ("DEFAULT: fail-CLOSED для всех
+        # enforcement путей"). /execute is the primary enforcement
+        # point (see docstring) — when the gateway is unreachable the
+        # body MUST NOT run on a silent local pass. Callers that
+        # intentionally want fail-OPEN on this path (dev / test
+        # harnesses without a live engine) must opt in by passing
+        # ``fallback_mode=FallbackMode.PERMISSIVE`` explicitly.
+        fallback_mode: str = FallbackMode.STRICT,
         operation_id: str | None = None,
         approval_id: str | None = None,
         # Typed-impact + digest-bound approval. Forwarded when @sensitive(impact=...)
@@ -1150,7 +1170,12 @@ class Transport:
                 "explanation": "Gateway unavailable, fallback=STRICT",
                 "policy_version": 0,
             }
-        else:  # PERMISSIVE (default)
+        else:  # PERMISSIVE (opt-in)
+            # v3.53 audit #4 — PERMISSIVE no longer the default; it
+            # requires the caller to pass fallback_mode=FallbackMode.
+            # PERMISSIVE explicitly. Synthesizes an allow + decision_
+            # source=FALLBACK so the caller / @sensitive decorator can
+            # still observe that the engine was unreachable.
             return {
                 "decision": "allow",
                 "decision_source": DecisionSource.FALLBACK,
@@ -2125,6 +2150,41 @@ def _extract_error_envelope(
     return ("", raw_text or str(body), dict(body) if isinstance(body, dict) else {})
 
 
+def _safe_json(response: httpx.Response, endpoint: str) -> Any:
+    """Parse a response body as JSON, wrapping parse failures.
+
+    DEF-ERRHDL-INVALID-JSON-01 (2026-08-11, RUN_ID 20260811-1): the SDK
+    previously propagated ``json.JSONDecodeError`` unchanged to user
+    code, which leaks internal file paths and the raw broken payload
+    fragment in tracebacks. This helper wraps the parse failure in
+    NullRunTransportError with a stable ``error_code`` so callers can
+    ``except`` cleanly and the user sees a short NullRun-family
+    message instead of a Python traceback.
+
+    ``body_preview`` is intentionally truncated to 200 chars and the
+    raw ``JSONDecodeError.lineno/colno`` are NOT included in the
+    surfaced message -- both are info-leak surface (line numbers
+    hint at response shape; partial body may carry PII like
+    organization_id fragments).
+    """
+    try:
+        return response.json()
+    except (json.JSONDecodeError, ValueError) as exc:
+        # Body preview capped at 200 chars; truncated to avoid
+        # flooding logs / exception chain.
+        try:
+            body_preview = (response.text or "")[:200]
+        except Exception:
+            body_preview = "<unreadable>"
+        raise NullRunTransportError(
+            f"Received malformed JSON from {endpoint} "
+            f"(status={response.status_code}): {type(exc).__name__}",
+            source=TransportErrorSource.GATEWAY_ERROR,
+            endpoint=endpoint,
+            error_code="NR-T001",
+        ) from exc
+
+
 def _parse_v3_error_envelope(
     response: httpx.Response,
     endpoint: str,
@@ -2147,9 +2207,16 @@ def _parse_v3_error_envelope(
     # would create a cycle. The price is one extra import
     # non-2xx response — irrelevant for the failure path.
     from nullrun.breaker.exceptions import (
+        NullRunApprovalDeniedError,
+        NullRunApprovalDigestMismatchError,
+        NullRunApprovalExpiredError,
+        NullRunApprovalNotYetApprovedError,
+        NullRunApprovalReplayRejectedError,
+        NullRunApprovalToolDigestMismatchError,
         NullRunAuthError,
         NullRunBackendError,
         NullRunBudgetError,
+        NullRunBudgetRecheckFailedError,
         NullRunChainError,
         NullRunConsumeOverbudgetError,
         NullRunProtocolError,
@@ -2223,6 +2290,52 @@ def _parse_v3_error_envelope(
             full_message,
             workflow_id=details.get("workflow_id"),
             status_code=status,  # 403 per backend mapping
+        )
+
+    if backend_code == "BUDGET_RECHECK_FAILED":
+        # H6 / 2026-08-12 audit: dedicated typed dispatch so callers
+        # can branch on the post-approval recheck failure (NR-B006)
+        # vs a fresh /gate block (NR-B004). The dispatcher surfaces
+        # ``current_spend_cents`` / ``budget_cents`` from the wire
+        # envelope so callers can compute the remaining cap and
+        # decide whether to retry after re-/gate.
+        return NullRunBudgetRecheckFailedError(
+            full_message,
+            current_spend_cents=details.get("current_spend_cents"),
+            budget_cents=details.get("budget_cents"),
+            status_code=status,  # 402 per backend mapping
+        )
+
+    if backend_code in (
+        "APPROVAL_NOT_YET_APPROVED",
+        "APPROVAL_DENIED",
+        "APPROVAL_EXPIRED",
+        "APPROVAL_DIGEST_MISMATCH",
+        "APPROVAL_TOOL_DIGEST_MISMATCH",
+        "APPROVAL_REPLAY_REJECTED",
+    ):
+        # v3.53 / 2026-08-13 audit, A-1+A-2 bundle: dedicated typed
+        # dispatch so callers can branch on the precise grant-consume
+        # outcome. Pre-v3.53 the SDK fell through to the catalog
+        # fallback path which called ``catalog(full_message, **details)``
+        # — NullRunBlockedException subclasses reject that signature
+        # (they need workflow_id as positional arg) so the catch-all
+        # path raised TypeError instead of the typed exception.
+        # Post-v3.53 each of the six codes maps to its own NR-Axxx
+        # subclass (NR-A010..NR-A015). Wire details carry the
+        # approval_id and the typed exception's NR-Axxx catalog
+        # value (via the class attribute) so cookbook recipes can
+        # ``except NullRunApprovalDeniedError:`` for terminal
+        # surface-to-user, ``except
+        # NullRunApprovalNotYetApprovedError:`` for wait/poll,
+        # ``except NullRunApprovalReplayRejectedError:`` for
+        # retry-loop detection, etc.
+        catalog = _V3_ERROR_CODE_MAP[backend_code]
+        return catalog(  # type: ignore[call-arg]
+            workflow_id=str(details.get("workflow_id") or "unknown"),
+            reason=full_message,
+            status_code=status,  # 403 per backend mapping
+            approval_id=details.get("approval_id"),
         )
 
     if backend_code == "RATE_LIMIT_REDIS_UNAVAILABLE":
@@ -2354,7 +2467,7 @@ def _parse_v3_error_envelope(
 # (rather than at the top of transport.py) keeps the legacy import
 # graph identical and avoids breaking the frozen
 # ``_parse_error_envelope`` test contract.
-def _build_v3_error_code_map() -> dict[str, type[BaseException]]:
+def _build_v3_error_code_map() -> dict[str, type[Exception]]:
     """Construct the v3 error_code → exception class mapping.
 
     Imported lazily because the exception classes import the
@@ -2362,6 +2475,12 @@ def _build_v3_error_code_map() -> dict[str, type[BaseException]]:
     circular import if loaded eagerly at the top of transport.py.
     """
     from nullrun.breaker.exceptions import (
+        NullRunApprovalDeniedError,
+        NullRunApprovalDigestMismatchError,
+        NullRunApprovalExpiredError,
+        NullRunApprovalNotYetApprovedError,
+        NullRunApprovalReplayRejectedError,
+        NullRunApprovalToolDigestMismatchError,
         NullRunAuthError,
         NullRunBackendError,
         NullRunBlockedException,
@@ -2422,10 +2541,42 @@ def _build_v3_error_code_map() -> dict[str, type[BaseException]]:
         "APPROVAL_CONFLICT": NullRunBlockedException,
         "APPROVAL_NOT_FOUND": NullRunBlockedException,
         "APPROVAL_CREATE_FAILED": NullRunBlockedException,
+        # 403 — approval grant-consume outcomes (v3.53 / 2026-08-13
+        # audit, A-1+A-2 bundle). Distinct from the /gate
+        # create-failure family above: these are the seven
+        # distinct outcomes that the backend's
+        # `gate_internal()` returns on /execute post-approval
+        # grant-consume (see
+        # `backend/src/proxy/http/gate/internal.rs:3059-3108,
+        # 3115-3138`). Pre-v3.53 the SDK collapsed all six
+        # into NullRunBlockedException — bilateral wire gap.
+        # Post-v3.53 each maps to a typed exception
+        # (NR-A010..NR-A015) so cookbook recipes can branch
+        # on the precise outcome (e.g. ``except
+        # NullRunApprovalNotYetApprovedError:`` for wait/poll,
+        # ``except NullRunApprovalDeniedError:`` for terminal
+        # surface-to-user, ``except
+        # NullRunApprovalReplayRejectedError:`` for retry-loop
+        # detection).
+        "APPROVAL_NOT_YET_APPROVED": NullRunApprovalNotYetApprovedError,
+        "APPROVAL_DENIED": NullRunApprovalDeniedError,
+        "APPROVAL_EXPIRED": NullRunApprovalExpiredError,
+        "APPROVAL_DIGEST_MISMATCH": NullRunApprovalDigestMismatchError,
+        "APPROVAL_TOOL_DIGEST_MISMATCH": NullRunApprovalToolDigestMismatchError,
+        "APPROVAL_REPLAY_REJECTED": NullRunApprovalReplayRejectedError,
+        # 402 — post-approval budget recheck (H6 / 2026-08-12 audit).
+        # Distinct from BUDGET_HARD_BLOCKED: the operator explicitly
+        # approved the grant at /gate, but the period-bound counter
+        # moved between /gate and /execute (another concurrent
+        # execution spent the budget). Caller should re-/gate to
+        # refresh the reservation envelope and retry /execute.
+        # Backed by GateErrorCode::BudgetRecheckFailed in the
+        # backend (error_codes.rs).
+        "BUDGET_RECHECK_FAILED": NullRunBudgetError,
     }
 
 
-_V3_ERROR_CODE_MAP: dict[str, type[BaseException]] = _build_v3_error_code_map()
+_V3_ERROR_CODE_MAP: dict[str, type[Exception]] = _build_v3_error_code_map()
 
 
 # ADR (2026-06-28, audit P2.2 close): ``_parse_error_envelope`` below

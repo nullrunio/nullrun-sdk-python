@@ -19,8 +19,8 @@ the authoritative table; deviations require an ADR amendment (Rule 5).
 |---|---|---|---|
 | `check_workflow_budget` | OPEN (skip check, log warning) | silent post-hoc correction in `/track` events via `cost_correction_applied=true` | `NULLRUN_SKIP_BUDGET_CHECK=1` -- **full billing bypass**, not just check bypass (see docstring WARNING) |
 | `check_control_plane` | OPEN (treat state as `Normal`) | deferred enforcement -- next WS-push or `/status` poll sees the true state | none |
-| `_enforce_sensitive_tool` (default `_fallback_mode=permissive`) | CLOSED -- body MUST NOT run when `decision_source` is any `FALLBACK_*` | n/a (body did not run) | `NULLRUN_SENSITIVE_FAIL_OPEN=1` -- explicitly documented as "OPEN-when-engine-unavailable" |
-| `_enforce_sensitive_tool` (`_fallback_mode=strict`) | CLOSED -- transport returns `decision=block, decision_source=FALLBACK_*` | n/a | none |
+| `_enforce_sensitive_tool` (default `_fallback_mode=strict` since v3.53) | CLOSED -- transport returns `decision=block, decision_source=FALLBACK_*` | n/a | none for the strict path; `NULLRUN_SENSITIVE_FAIL_OPEN=1` opts into the legacy permissive override |
+| `_enforce_sensitive_tool` (`_fallback_mode=permissive`, opt-in) | CLOSED -- body MUST NOT run when `decision_source` is any `FALLBACK_*` | n/a (body did not run) | `NULLRUN_SENSITIVE_FAIL_OPEN=1` -- explicitly documented as "OPEN-when-engine-unavailable" |
 | `_emit_span_start` / `_emit_span_end` | n/a -- never blocks | n/a | n/a |
 | `/track` batch path (legacy) | OPEN-on-network-error (event dropped, no retry) | n/a -- circuit breaker backoff applies | none |
 
@@ -84,8 +84,11 @@ from nullrun.audit import (  # ADR-009 P1 — governance audit surface
 from nullrun.breaker.exceptions import (
     BreakerError,
     NullRunAuthenticationError,
+    NullRunBackendError,
     NullRunBlockedException,
     NullRunError,
+    NullRunInfrastructureError,
+    NullRunTransportError,
     WorkflowKilledInterrupt,
     WorkflowPausedException,
 )
@@ -109,6 +112,7 @@ from nullrun.transport import (
     TransportErrorSource,
     _emit_for_transport_error,
     _protocol_header_value,
+    _safe_json,
 )
 from nullrun.uuid7 import uuid7_str  # 2026-07-04 BUG #4
 
@@ -123,6 +127,85 @@ _GATE_CACHE_TTL_SECONDS: float = 5.0
 
 # 2026-07-24 (Root-cause fix for the ``@sensitive`` reinit gap):
 _STRICT_MODE_FORCED: set[str] = set()
+
+
+# v3.53 audit #6 — production-environment detection for security
+# opt-out enforcement. ``NULLRUN_SKIP_BUDGET_CHECK=1`` is documented
+# as a DEV / TEST bypass (CLAUDE.md §20 "Никогда не выставлять
+# NULLRUN_SKIP_BUDGET_CHECK в production env"); pre-v3.53 the SDK
+# silently honored the opt-out regardless of environment, which
+# meant an operator who accidentally exported the var in prod got
+# a silent fail-OPEN on the budget gate.
+#
+# Two signals combine to flag a production environment:
+# 1. The configured ``api_url`` hostname matches the prod host
+#    (``api.nullrun.io``) — the SDK's hard-coded default per the
+#    constructor docstring.
+# 2. The operator set ``NULLRUN_ENV`` to ``production`` / ``prod``
+#    (explicit override for non-standard deployments that point at
+#    a custom URL but still serve prod traffic).
+#
+# Test / dev harnesses that override ``api_url`` to a local /
+# staging host are NOT flagged as production regardless of
+# ``NULLRUN_ENV`` — operators who DO want the bypass in prod can
+# set ``NULLRUN_ALLOW_SKIP_BUDGET_CHECK=1`` to acknowledge the
+# risk explicitly (analogous to ``NULLRUN_SENSITIVE_FAIL_OPEN``).
+_PROD_API_HOST: str = "api.nullrun.io"
+
+
+def _is_production_environment(api_url: str | None = None) -> bool:
+    """Return True when the SDK is running against the production
+    NullRun backend.
+
+    v3.53 audit #6 — used by ``check_workflow_budget`` to refuse
+    ``NULLRUN_SKIP_BUDGET_CHECK=1`` outside dev / test environments.
+    Detection rules (in order):
+
+    1. ``api_url`` is None or matches the prod host
+       (``api.nullrun.io``) — the default constructor value.
+    2. ``NULLRUN_ENV`` is set to ``production`` / ``prod`` (case
+       insensitive) AND the api_url is not explicitly pointed at a
+       known non-prod host (``localhost``, ``127.0.0.1``,
+       ``staging``, ``test``).
+
+    Local / staging / test deployments are NOT flagged so the dev
+    bypass keeps working. Operators who insist on the bypass in
+    prod can set ``NULLRUN_ALLOW_SKIP_BUDGET_CHECK=1`` — but the
+    env var is then surfaced in audit / telemetry so it's not a
+    silent fail-OPEN.
+    """
+    from urllib.parse import urlparse
+
+    effective_url = api_url or os.getenv(
+        "NULLRUN_API_URL", "https://api.nullrun.io"
+    )
+    # Strip any trailing slash before parsing for consistent
+    # ``hostname`` extraction.
+    effective_url = effective_url.rstrip("/")
+    try:
+        parsed = urlparse(effective_url)
+    except (TypeError, ValueError):
+        parsed = None
+    host = parsed.hostname if parsed is not None else None
+    host_lc = (host or "").lower()
+
+    # Signal 1: explicit prod host. ``api.nullrun.io`` is the
+    # canonical production endpoint; the constructor's default
+    # value is exactly this URL so any caller that did not
+    # override ``api_url`` lands here.
+    if host_lc == _PROD_API_HOST:
+        return True
+
+    # Signal 2: explicit NULLRUN_ENV=production (or "prod") AND
+    # the api_url does not point at a known dev/staging host.
+    explicit_env = os.getenv("NULLRUN_ENV", "").strip().lower()
+    non_prod_hosts = ("localhost", "127.0.0.1", "0.0.0.0", "staging", "test")  # noqa: S104  -- string marker, not a bind address
+    if explicit_env in {"production", "prod"} and not any(
+        marker in host_lc for marker in non_prod_hosts
+    ):
+        return True
+
+    return False
 
 
 def register_strict_mode_forced(tool_name: str) -> None:
@@ -459,6 +542,13 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         debug: bool = False,
         _test_mode: bool = False,
         polling: bool = True,
+        # DEF-ERRHDL-NO-TIMEOUT-01 (2026-08-11, RUN_ID 20260811-1):
+        # expose request_timeout so operators can tune the httpx read
+        # timeout for slow-network scenarios. Pre-fix the SDK hardcoded
+        # 30s read timeout in transport.py with no config surface.
+        # Precedence: kwarg > NULLRUN_REQUEST_TIMEOUT env var > 30.0
+        # (the pre-fix default).
+        request_timeout: float | None = None,
     ):
         """
         Initialize NullRun Runtime.
@@ -481,7 +571,13 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             - `api_key` is required as of 0.3.0 (T3-S2). The previous
               `local_mode` flag was removed because it silently bypassed
               every backend gate.
-            - `fallback_mode` is fixed at PERMISSIVE (no public override).
+            - `fallback_mode` is fixed at STRICT (no public override).
+              v3.53 audit #4 — was PERMISSIVE pre-v3.53; flipped to
+              STRICT to honor CLAUDE.md §4 ("DEFAULT: fail-CLOSED для
+              всех enforcement путей"). Existing callers passing
+              ``fallback_mode="permissive"`` continue to opt into the
+              legacy fail-OPEN path; the default-only change is the
+              break.
             - `timeout`/`max_retries` are fixed at 30s / 3 (no public override).
 
         Raises:
@@ -525,13 +621,28 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # The string ``fallback_mode`` parameter is deprecated and
         # accepted only for backward compat — the CACHED variant
         # was removed in 0.7.0 because the SDK no longer maintains
-        # a local policy cache (see CHANGELOG D-01).
-        fb_upper = str(fallback_mode).upper() if fallback_mode is not None else "PERMISSIVE"
-        if fb_upper == "STRICT":
-            self._fallback_mode = FallbackMode.STRICT
-        else:
+        # a local policy cache (see CHANGELOG D-01). v3.53 audit #4
+        # flipped the default from PERMISSIVE to STRICT so a future
+        # caller who omits the kwarg lands on fail-CLOSED per
+        # CLAUDE.md §4 instead of silently allowing local execution
+        # on transport failure.
+        fb_upper = str(fallback_mode).upper() if fallback_mode is not None else "STRICT"
+        if fb_upper == "PERMISSIVE":
             self._fallback_mode = FallbackMode.PERMISSIVE
-        self._timeout = 30
+        else:
+            self._fallback_mode = FallbackMode.STRICT
+        # DEF-ERRHDL-NO-TIMEOUT-01: precedence kwarg > env > default(30)
+        env_timeout = os.getenv("NULLRUN_REQUEST_TIMEOUT")
+        try:
+            self._timeout = float(
+                request_timeout
+                if request_timeout is not None
+                else (env_timeout if env_timeout else 30)
+            )
+        except (TypeError, ValueError):
+            # Malformed env var -- fall back to default rather than
+            # crash init() with a confusing config error.
+            self._timeout = 30.0
         self._max_retries = 3
         self._debug = debug
         self._transport: Transport | None = None
@@ -1019,12 +1130,24 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             )
 
             if response.status_code == 200:
-                data = response.json()
+                # DEF-ERRHDL-INVALID-JSON-01 (2026-08-11, RUN_ID 20260811-1):
+                # route 200-OK JSON parse through _safe_json so a malformed
+                # body raises NullRunTransportError (NR-T001) instead of
+                # leaking json.JSONDecodeError to user code. The
+                # /check/track/... paths already use _safe_json (transport.py).
+                data = _safe_json(response, "auth")
                 # STRICT MODE: organization_id is REQUIRED, no fallback
                 org_id = data.get("organization_id")
                 if not org_id:
+                    # DEF-ERRHDL-MALFORMED-MSG-01 (2026-08-11, RUN_ID 20260811-1):
+                    # drop "compromised" wording. "compromised" is a
+                    # security-incident term that triggers SOC alerts in
+                    # observability stacks; using it for a routine schema
+                    # mismatch is misleading. Wording now attributes the
+                    # failure to a wire-shape mismatch without making a
+                    # security claim.
                     err = NullRunAuthenticationError(
-                        "Auth response missing organization_id - server may be outdated or compromised. "
+                        "Auth response missing organization_id -- server returned an unexpected response shape. "
                         "Refusing to operate with legacy identity.",
                         error_code="NR-A002",
                         user_action=(
@@ -1085,17 +1208,42 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
 
                 logger.info(f"Authenticated: organization_id={self.organization_id}")
             else:
-                # Auth failed - raise exception instead of silent fallback
-                err = NullRunAuthenticationError(
-                    f"Auth failed with status {response.status_code}. "
-                    f"API key may be invalid or expired. Not operating in unsafe mode.",
-                    error_code=("NR-A003" if response.status_code == 401 else "NR-A001"),
-                )
+                # DEF-ERRHDL-AUTH-PATH-CODE-PIN-01 (2026-08-11, RUN_ID 20260811-1):
+                # route 5xx to NullRunBackendError so the auth path uses the same
+                # error envelope classification as /check/track. Per CLAUDE.md
+                # §13 5xx is a backend-class error, not auth-class. Without this
+                # split, operators are nudged to rotate valid keys during backend
+                # outages ("API key may be invalid or expired" for status=500 is
+                # misleading).
+                #
+                # - 401 -> NullRunAuthenticationError + NR-A003 (key was actually
+                #   rejected; this stays a true auth failure).
+                # - All other 4xx -> NullRunAuthenticationError + NR-A001 (the
+                #   prior code; covers 403 etc.).
+                # - 5xx -> NullRunBackendError + NR-B002 (the existing transport
+                #   envelope's error_code, so 5xx is classified the same as 5xx
+                #   from /check/track).
+                status = response.status_code
+                correlation_id = response.headers.get("x-correlation-id")
+                if 500 <= status < 600:
+                    err = NullRunBackendError(
+                        f"Auth backend returned status {status}. "
+                        f"The API key may still be valid -- this is a "
+                        f"backend-side failure, not an auth failure.",
+                        endpoint="auth",
+                        status_code=status,
+                    )
+                else:
+                    err = NullRunAuthenticationError(
+                        f"Auth failed with status {status}. "
+                        f"API key may be invalid or expired. Not operating in unsafe mode.",
+                        error_code=("NR-A003" if status == 401 else "NR-A001"),
+                    )
                 self._emit_sdk_error(
                     err,
                     stage="auth",
-                    correlation_id=response.headers.get("x-correlation-id"),
-                    extra={"status_code": response.status_code},
+                    correlation_id=correlation_id,
+                    extra={"status_code": status},
                 )
                 raise err
         except httpx.RequestError as e:
@@ -1629,9 +1777,70 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         pre-flight. Useful in tests where the org's API key has
         exhausted its budget from previous runs and the test only
         wants to exercise a non-budget code path.
+
+        Production guard (v3.53 audit #6): the opt-out is
+        REFUSED in production environments (api_url matches
+        ``api.nullrun.io`` or ``NULLRUN_ENV=production``). This
+        closes the silent fail-OPEN class where an operator
+        accidentally exported the var in a prod deployment and
+        silently lost the budget gate. To explicitly acknowledge
+        the risk in prod (e.g. an incident-response runbook
+        scenario), set ``NULLRUN_ALLOW_SKIP_BUDGET_CHECK=1`` as
+        well — the SDK logs the explicit ack at WARNING level
+        and emits a metric so the opt-in is visible in
+        observability.
         """
         if os.environ.get("NULLRUN_SKIP_BUDGET_CHECK", "").strip() == "1":
-            logger.debug("check_workflow_budget: skipped via NULLRUN_SKIP_BUDGET_CHECK=1")
+            # Production guard: refuse the opt-out unless the
+            # operator explicitly acked via
+            # ``NULLRUN_ALLOW_SKIP_BUDGET_CHECK=1``. CLAUDE.md §20
+            # marks NULLRUN_SKIP_BUDGET_CHECK as DEV/TEST only;
+            # pre-v3.53 the SDK silently honored it in any env
+            # which made accidental prod misuse a silent fail-OPEN.
+            if _is_production_environment(self.api_url):
+                allow_ack = (
+                    os.environ.get(
+                        "NULLRUN_ALLOW_SKIP_BUDGET_CHECK", ""
+                    ).strip()
+                    == "1"
+                )
+                if not allow_ack:
+                    logger.error(
+                        "check_workflow_budget: NULLRUN_SKIP_BUDGET_CHECK=1 "
+                        "is set but the SDK is configured for production "
+                        "(api_url=%r). Refusing to bypass the budget gate. "
+                        "Unset the var, or — only for incident-response "
+                        "scenarios — also set NULLRUN_ALLOW_SKIP_BUDGET_CHECK=1 "
+                        "to acknowledge the risk. See CLAUDE.md §20.",
+                        self.api_url,
+                    )
+                    try:
+                        metrics.inc_runtime("skip_budget_blocked_in_prod")
+                    except Exception:  # noqa: BLE001
+                        pass
+                    raise NullRunInfrastructureError(
+                        f"NULLRUN_SKIP_BUDGET_CHECK=1 is not allowed in "
+                        f"production (api_url={self.api_url!r}). Unset "
+                        "the env var or set NULLRUN_ALLOW_SKIP_BUDGET_CHECK=1 "
+                        "to acknowledge the risk. CLAUDE.md §20.",
+                        error_code="NR-S001",
+                        retryable=False,
+                    )
+                logger.warning(
+                    "check_workflow_budget: skipping via "
+                    "NULLRUN_SKIP_BUDGET_CHECK=1 in production "
+                    "(NULLRUN_ALLOW_SKIP_BUDGET_CHECK=1 also set). "
+                    "This is an explicit operator ack of the risk; "
+                    "ensure the incident-response runbook drove this."
+                )
+                try:
+                    metrics.inc_runtime("skip_budget_allowed_in_prod")
+                except Exception:  # noqa: BLE001
+                    pass
+                return
+            logger.debug(
+                "check_workflow_budget: skipped via NULLRUN_SKIP_BUDGET_CHECK=1"
+            )
             return
 
         # Bump the ``check_calls`` counter so the dashboard can show
@@ -1655,6 +1864,19 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # None only on legacy keys that have never been
         # workflow-bound -- in that case the check is silently
         # skipped.
+        #
+        # L6 audit 2026-08-12: workflow_id is intentionally NOT
+        # forwarded to the /gate wire body. The server derives it
+        # server-side from the API key's 1:1 binding (CLAUDE.md §12
+        # "1 API key = 1 workflow" invariant). Adding it to the wire
+        # would be additive telemetry only — the per-workflow budget
+        # aggregator (`wf:{id}:monthly_cost` + `wf:{id}:bp:{ts}`)
+        # operates on the server's binding, not on a client-claimed
+        # value. The `mode='hard'` corner the audit flagged is a
+        # non-issue: the field is omitted unconditionally, regardless
+        # of enforcement_mode. Workflow_id flows into /track + /events
+        # via `_enrich_event` (line ~2697) for cost attribution; /gate
+        # intentionally keeps the wire minimal.
         workflow_id = self._resolve_workflow_id(get_workflow_id())
         if not workflow_id:
             return

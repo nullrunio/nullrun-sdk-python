@@ -1073,7 +1073,6 @@ Additional transport branch tests covering gaps in
   - ``_parse_error_envelope`` for 401 / 403 / 429 / 500 / 502 / 400
 """
 
-import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -1086,7 +1085,6 @@ from nullrun.breaker.exceptions import (
 )
 from nullrun.transport import (
     FlushConfig,
-    Transport,
     _parse_error_envelope,
     verify_hmac_signature,
 )
@@ -1359,7 +1357,39 @@ def test_execute_fallback_cached_degrades_to_permissive():
 
 
 def test_execute_fallback_permissive_default():
-    """fallback_mode=PERMISSIVE → synthetic allow on transport failure."""
+    """fallback_mode=PERMISSIVE (opt-in) → synthetic allow on transport failure.
+
+    v3.53 audit #4 — PERMISSIVE is no longer the default; this test
+    now passes ``fallback_mode=FallbackMode.PERMISSIVE`` explicitly
+    to verify the opt-in path still produces ``decision="allow"``.
+    Without the explicit kwarg the default is STRICT and the body
+    would NOT be allowed.
+    """
+    from nullrun.breaker.exceptions import BreakerTransportError
+    from nullrun.transport import FallbackMode
+
+    t = _build_transport()
+    t._client.post = MagicMock(side_effect=BreakerTransportError("down"))
+    result = t.execute(
+        organization_id="org-1",
+        execution_id="wf-1",
+        trace_id="t-1",
+        tool="x",
+        input_data={},
+        fallback_mode=FallbackMode.PERMISSIVE,
+    )
+    assert result["decision"] == "allow"
+    assert "PERMISSIVE" in result["explanation"]
+
+
+def test_execute_fallback_strict_default():
+    """v3.53 audit #4 — STRICT is the new default on transport failure.
+
+    Without an explicit ``fallback_mode=`` kwarg the caller lands on
+    STRICT and gets ``decision="block"`` (fail-CLOSED on the /execute
+    enforcement path per CLAUDE.md §4). Confirms the flip from
+    PERMISSIVE → STRICT.
+    """
     from nullrun.breaker.exceptions import BreakerTransportError
 
     t = _build_transport()
@@ -1371,8 +1401,8 @@ def test_execute_fallback_permissive_default():
         tool="x",
         input_data={},
     )
-    assert result["decision"] == "allow"
-    assert "PERMISSIVE" in result["explanation"]
+    assert result["decision"] == "block"
+    assert "STRICT" in result["explanation"]
 
 
 def test_execute_httpx_network_error_with_raise():

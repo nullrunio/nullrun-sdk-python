@@ -216,7 +216,6 @@ class TestThreadSafety:
 
     def test_concurrent_handle_calls(self):
         """Concurrent handle() calls don't break state."""
-        import threading
 
         handler = ActionHandler()
         errors = []
@@ -356,23 +355,15 @@ test file exercises.
 """
 
 import threading
-import time
 import warnings
-from unittest.mock import MagicMock
 
 import pytest
 
 import nullrun
 from nullrun.actions import (
     ActionEvent,
-    ActionHandler,
-    ActionType,
-    WebhookConfig,
-    handle_action,
-    register_action_handler,
 )
 from nullrun.breaker.exceptions import (
-    NullRunBlockedException,
     WorkflowKilledException,
     WorkflowKilledInterrupt,
 )

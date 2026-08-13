@@ -515,9 +515,35 @@ class WebSocketConnection:
                 outcome = data.get("outcome", "")
                 execution_id = data.get("execution_id", "")
                 workflow_id = data.get("workflow_id", "")
+                message_id = data.get("message_id")
                 logger.info(
                     f"Approval {outcome}: id={approval_id} exec={execution_id} wf={workflow_id}"
                 )
+                # L5 / audit 2026-08-12: HMAC-signed ACK for
+                # ``approval_resolved``. Mirrors the Killed/Paused
+                # ACK path at _send_ack. Pre-fix the SDK silently
+                # consumed the frame and never acknowledged — the
+                # backend's pending-ack queue grew unbounded for
+                # orgs with high approval throughput (operators
+                # had no visibility into "did the SDK see my
+                # approval?"). Post-fix the SDK sends an ACK with
+                # HMAC over ``timestamp:api_key:sha256(body)`` so
+                # the backend can verify the consumer actually
+                # saw the resolution, not a forged retransmission.
+                # The backend's ACK handler remains best-effort
+                # informational today (per comment at
+                # ``backend/src/proxy/http/ws_control.rs:842-848``)
+                # but this wire-up closes the missing-ACK gap.
+                if (
+                    message_id
+                    and outcome in ("approved", "denied")
+                    and self._conn is not None
+                ):
+                    await self._send_ack(message_id)
+                    logger.debug(
+                        f"Sent ACK for approval_resolved message_id={message_id} "
+                        f"outcome={outcome}"
+                    )
                 if self.on_approval_resolved:
                     try:
                         self.on_approval_resolved(data)

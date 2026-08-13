@@ -337,7 +337,6 @@ class TestAuditExportStatusWire:
 class TestAuditProxy:
     @respx.mock
     def test_list_returns_typed_auditlogpage(self):
-        from nullrun.audit import AuditLogPage
 
         runtime = NullRunRuntime(
             api_key="test-key-12345678", _test_mode=True

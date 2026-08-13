@@ -512,3 +512,224 @@ def test_call_tool_idempotent_under_repeated_invocations():
     # (Exact list_tools call count is _maybe_refresh's
     # private concern; this test pins the user-visible
     # outcome.)
+
+
+# ─── v3.53 audit #5: MCPAdapter gate enforcement ──────────────────────
+"""v3.53 (2026-08-13) closes the audit-finding #5 wire-bypass class:
+``MCPAdapter.call_tool`` previously invoked
+``self._mcp_client.call_tool(...)`` directly with only a
+metadata-only contextvar stamp. Any agentic loop that called
+``adapter.call_tool`` outside a ``@protect``-decorated wrapper
+ran the underlying MCP call with NO gate enforcement — the
+tool-block / budget / approval policies did NOT apply to MCP
+invocations, only to local functions.
+
+These tests pin the post-v3.53 behavior: when an MCPAdapter is
+constructed with ``runtime=`` set, ``call_tool`` invokes
+``runtime.execute(...)`` synchronously BEFORE the MCP client.
+``decision="block"`` raises ``NullRunBlockedException`` and the
+MCP client is NOT called. ``decision="require_approval"`` raises
+``NullRunBlockedException`` with the approval_id attached. The
+legacy contextvar-only path stays reachable for back-compat
+when ``runtime`` is not provided.
+"""
+
+
+class _StubRuntime:
+    """Minimal runtime stub — records ``execute`` calls and
+    returns a pre-scripted ``decision`` payload. Avoids the
+    real NullRunRuntime construction path which would require
+    HMAC signing + WS plumbing."""
+
+    def __init__(self, decision_payload: dict[str, Any] | None = None) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self._payload = decision_payload or {
+            "decision": "allow",
+            "decision_source": "gateway",
+            "explanation": "stub allow",
+            "policy_version": 1,
+        }
+
+    def execute(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(kwargs)
+        return dict(self._payload)
+
+
+def test_call_tool_with_runtime_routes_through_execute_before_mcp_call():
+    """v3.53 audit #5 — runtime wired → gate runs BEFORE MCP client.
+
+    On ``decision="allow"`` the MCP client is called exactly once
+    with the original arguments, and ``runtime.execute`` is called
+    with the tool_name + input_data forwarded verbatim. Pins that
+    ``call_tool`` is no longer a silent pass-through.
+    """
+    from nullrun.breaker.exceptions import NullRunBlockedException
+
+    client = _MockMcpClient(_github_inventory())
+    runtime = _StubRuntime(
+        decision_payload={
+            "decision": "allow",
+            "decision_source": "gateway",
+            "explanation": "ok",
+            "policy_version": 1,
+        }
+    )
+    adapter = MCPAdapter(
+        server_name="github", mcp_client=client, runtime=runtime
+    )
+
+    result = adapter.call_tool("create_issue", {"repo": "acme/api"})
+
+    assert result == "ok:create_issue"
+    # The MCP client was called exactly once with the original payload.
+    assert client.calls == [("create_issue", {"repo": "acme/api"})]
+    # ``runtime.execute`` was called BEFORE the MCP client with the
+    # tool_name + input_data forwarded.
+    assert len(runtime.calls) == 1
+    assert runtime.calls[0]["tool_name"] == "create_issue"
+    assert runtime.calls[0]["input_data"] == {"repo": "acme/api"}
+    # Mode is forced to strict so /api/v1/execute is consulted even
+    # for non-sensitive MCP tools.
+    assert runtime.calls[0]["mode"] == "strict"
+
+
+def test_call_tool_with_runtime_blocked_does_not_invoke_mcp_client():
+    """v3.53 audit #5 — ``decision="block"`` from the gate raises
+    NullRunBlockedException and the MCP client is NEVER called.
+
+    This is the central security invariant: a permissive MCP
+    server cannot bypass the operator's tool-block policy by being
+    called outside a ``@protect`` wrapper. The gate's block
+    short-circuits the call.
+    """
+    from nullrun.breaker.exceptions import NullRunBlockedException
+
+    client = _MockMcpClient(_github_inventory())
+    runtime = _StubRuntime(
+        decision_payload={
+            "decision": "block",
+            "decision_source": "gateway",
+            "explanation": "Tool 'create_issue' is blocked by tool_pattern",
+            "policy_version": 1,
+            "workflow_id": "wf-test",
+        }
+    )
+    adapter = MCPAdapter(
+        server_name="github", mcp_client=client, runtime=runtime
+    )
+
+    with pytest.raises(NullRunBlockedException) as excinfo:
+        adapter.call_tool("create_issue", {"repo": "acme/api"})
+
+    # The MCP client was NEVER called — the gate short-circuited.
+    assert client.calls == []
+    assert excinfo.value.tool_name == "create_issue"
+    assert "blocked" in excinfo.value.reason.lower()
+
+
+def test_call_tool_with_runtime_require_approval_raises_with_approval_id():
+    """v3.53 audit #5 — ``decision="require_approval"`` raises
+    NullRunBlockedException with the approval_id attached so the
+    caller can route the user through the approval flow.
+
+    The MCP client is NOT invoked. The exception surfaces
+    ``approval_id`` so the caller's retry path can pass it back
+    via ``runtime.execute(..., approval_id=...)``.
+    """
+    from nullrun.breaker.exceptions import NullRunBlockedException
+
+    client = _MockMcpClient(_github_inventory())
+    runtime = _StubRuntime(
+        decision_payload={
+            "decision": "require_approval",
+            "decision_source": "gateway",
+            "explanation": "Operator approval required",
+            "policy_version": 1,
+            "approval_id": "apr-uuid-9876",
+            "workflow_id": "wf-test",
+        }
+    )
+    adapter = MCPAdapter(
+        server_name="github", mcp_client=client, runtime=runtime
+    )
+
+    with pytest.raises(NullRunBlockedException) as excinfo:
+        adapter.call_tool("delete_repo", {"repo": "acme/api"})
+
+    assert client.calls == []
+    assert excinfo.value.tool_name == "delete_repo"
+
+
+def test_call_tool_without_runtime_uses_legacy_contextvar_path():
+    """v3.53 audit #5 — back-compat: callers that omit ``runtime=``
+    get the legacy contextvar-only path. No /api/v1/execute call
+    is made; the next ``@protect``-wrapped function picks up the
+    contextvar on its next ``/check`` request.
+
+    Pins that introducing the runtime parameter did not break
+    existing integrations that rely on the contextvar pattern.
+    """
+    client = _MockMcpClient(_github_inventory())
+    adapter = MCPAdapter(server_name="github", mcp_client=client)
+    # No runtime was passed. The MCP client is called directly.
+    adapter.call_tool("get_file_contents", {"path": "README.md"})
+    assert client.calls == [("get_file_contents", {"path": "README.md"})]
+    # The contextvar was still stamped — legacy behavior preserved.
+    assert get_call_mcp_class() == "mcp"
+    ann = get_call_mcp_annotations()
+    assert ann["read_only"] is True
+
+
+def test_call_tool_with_runtime_executes_gate_before_underlying_client_even_on_unknown_tool():
+    """v3.53 audit #5 — even when the tool name is unknown to the
+    cached inventory, the gate runs BEFORE the MCP client would
+    raise ``KeyError`` on the unknown name. This is the regression
+    that motivated v3.53: a permissive MCP server could synthesize
+    tool names that bypass the cache lookup.
+
+    Pre-v3.53 the cache lookup happened first and raised KeyError
+    before any gate check could fire. Post-v3.53 the gate runs
+    first; ``KeyError`` only fires if the gate allows.
+    """
+    from nullrun.breaker.exceptions import NullRunBlockedException
+
+    client = _MockMcpClient(_github_inventory())
+    runtime = _StubRuntime(
+        decision_payload={
+            "decision": "block",
+            "decision_source": "gateway",
+            "explanation": "Unknown tool 'phantom_tool' not allowed",
+            "policy_version": 1,
+            "workflow_id": "wf-test",
+        }
+    )
+    adapter = MCPAdapter(
+        server_name="github", mcp_client=client, runtime=runtime
+    )
+
+    with pytest.raises(NullRunBlockedException):
+        adapter.call_tool("phantom_tool", {})
+
+    # The MCP client was never asked about 'phantom_tool' — the
+    # gate decided first. (Note: client.calls would catch a
+    # ``KeyError`` raised by the underlying mock, but the gate
+    # short-circuited so client.calls is empty.)
+    assert client.calls == []
+    assert len(runtime.calls) == 1
+    assert runtime.calls[0]["tool_name"] == "phantom_tool"
+
+
+def test_mcp_adapter_has_runtime_attribute():
+    """Source-pin: MCPAdapter exposes ``self._runtime`` so a
+    future refactor that silently drops the parameter is caught
+    here rather than at first /execute call in production.
+    """
+    client = _MockMcpClient(_github_inventory())
+    runtime = _StubRuntime()
+    adapter = MCPAdapter(
+        server_name="github", mcp_client=client, runtime=runtime
+    )
+    assert adapter._runtime is runtime
+
+    adapter_no_runtime = MCPAdapter(server_name="github", mcp_client=client)
+    assert adapter_no_runtime._runtime is None
