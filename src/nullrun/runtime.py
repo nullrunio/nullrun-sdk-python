@@ -1970,14 +1970,25 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                     # classified SDK errors. Internal bugs
                     # (KeyError, AttributeError) should surface
                     # rather than silently allow an unbounded call.
+                    # 2026-08-13 (sprint handoff Bug #4): emit metric
+                    # so sustained backend outages that bypass the
+                    # budget gate via the documented ADR-008 fail-OPEN
+                    # posture are visible in /health and alertable.
                     logger.warning(f"check_workflow_budget: /gate unavailable, failing open: {exc}")
+                    metrics.inc_runtime("gate_fail_open_total")
                     return
                 _GATE_CACHE[cache_key] = (time.monotonic(), response)
         else:
             try:
                 response = self._transport.check(check_req)
             except Exception as exc:  # noqa: BLE001
+                # 2026-08-13 (sprint handoff Bug #4): same metric emit
+                # as the cache-enabled arm above -- all three fail-OPEN
+                # paths in this method increment the same counter so an
+                # operator dashboard can graph "budget gate bypass
+                # rate" without per-site accounting.
                 logger.warning(f"check_workflow_budget: /gate unavailable, failing open: {exc}")
+                metrics.inc_runtime("gate_fail_open_total")
                 return
 
         # 2026-07-04 (v0.12.0 wiring fix — ):
@@ -1996,10 +2007,18 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             TransportErrorSource.BREAKER_OPEN,
             TransportErrorSource.AUTH_ERROR,
         }:
-            logger.debug(
+            # 2026-08-13 (sprint handoff Bug #4): the docblock above
+            # (lines 1763-1769) declares this path "logged at warning
+            # level and the caller proceeds" but the pre-fix code
+            # emitted DEBUG, making the fail-OPEN invisible to
+            # operators tailing INFO+ logs. Promote to WARNING so the
+            # contract matches the implementation; emit metric for
+            # parity with the two exception-path sites above.
+            logger.warning(
                 f"check_workflow_budget: synthetic decision_source="
                 f"{decision_source!r}, treating as transport error"
             )
+            metrics.inc_runtime("gate_fail_open_total")
             return
         if decision == "block":
             # FIX-2026-06-27: backend /gate sets both `explanation` (a

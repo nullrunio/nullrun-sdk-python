@@ -1,3 +1,26 @@
+## [0.15.2] - 2026-08-13
+
+Patch release — observability closure on `check_workflow_budget` fail-OPEN paths (sprint handoff `Bug #4 — SDK WS timeout → silent ALLOW`). No behaviour change. The fail-OPEN posture on SDK transport failure remains authoritative per ADR-008 and the top-of-`runtime.py` table; this release makes the bypass visible at INFO+ log level and via a new counter so a sustained backend outage can't silently eat the budget gate without operator visibility. Drop-in replacement for 0.15.1.
+
+### Fixed
+
+- **`check_workflow_budget` synthetic FALLBACK path emits WARNING, not DEBUG** (sprint handoff Bug #4) — pre-0.15.2, when `transport.check` returned `decision_source=FALLBACK_*` (the synthetic-block on `httpx.RequestError` / 5xx), `runtime.py` logged at DEBUG, which contradicted the method docblock ("logged at warning level and the caller proceeds") and made the silent fail-OPEN invisible to operators tailing INFO+ logs. Post-0.15.2 the level is WARNING; the two exception-path sites (cache-enabled `except (httpx.HTTPError, NullRunError)`, cache-disabled `except Exception`) were already WARNING and now also emit the metric.
+- **`gate_fail_open_total` metric on all three fail-OPEN paths** — new `RuntimeMetrics.gate_fail_open_total` counter (`observability/__init__.py`) is incremented once per `check_workflow_budget` fail-OPEN, regardless of which of the three paths fired (cache-enabled exception, cache-disabled exception, synthetic FALLBACK decision_source). Exposed via `metrics.to_dict()["runtime"]["gate_fail_open_total"]` for the `/health` endpoint and operator dashboards. Operators alert on sustained rate to detect backend outages bypassing the budget gate via the documented ADR-008 fail-OPEN posture; pre-0.15.2 the failure mode was unobservable.
+
+### Housekeeping
+
+- **6 source-pin regression tests** in `tests/test_preflight_fail_policy.py::TestCheckWorkflowBudgetObservability`:
+  - `test_network_error_emits_warning_and_metric` — ConnectError → WARNING + metric.
+  - `test_timeout_emits_warning_and_metric` — TimeoutException → WARNING + metric.
+  - `test_synthetic_fallback_source_emits_warning_not_debug` — 503 + `FALLBACK_NETWORK_ERROR` → WARNING, NOT DEBUG (pins the exact level regression).
+  - `test_real_block_does_not_increment_metric` — real policy block does NOT increment (guards against future refactor that moves the metric emit above the decision-parse stage).
+  - `test_real_allow_does_not_increment_metric` — happy path stays at allow, no metric.
+  - `test_to_dict_includes_gate_fail_open_total` — JSON shape pin for `/health` integration.
+
+_Tests: 1556 passed (was 1550 in 0.15.1; +6 new), 7 skipped in 154.47s. Full suite green. ruff clean._
+
+_Compatibility:_ **No SDK_MIN_VERSION bump.** **No behaviour change.** Fail-OPEN on SDK transport failure remains the documented contract (ADR-008 §3, `runtime.py` top-of-file table on `check_workflow_budget`). Pre-0.15.2 callers that observed silent fail-OPEN at DEBUG level see the same fail-OPEN at WARNING level post-0.15.2; pre-0.15.2 callers that never read the metric observe nothing. Drop-in replacement for 0.15.1. Wire format unchanged, public API unchanged, `_fallback_mode` semantics unchanged.
+
 ## [0.15.1] - 2026-08-13
 
 Patch release — v3.53 audit fixes (H6 / L5 / L6 / M8 / audit #4 / #5 / #6) plus static-typing closure. No public API change, no wire-format change. Drop-in replacement for 0.15.0.
