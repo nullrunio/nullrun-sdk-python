@@ -2185,6 +2185,7 @@ def _parse_v3_error_envelope(
         NullRunAuthError,
         NullRunBackendError,
         NullRunBudgetError,
+        NullRunBudgetRecheckFailedError,
         NullRunChainError,
         NullRunConsumeOverbudgetError,
         NullRunProtocolError,
@@ -2258,6 +2259,20 @@ def _parse_v3_error_envelope(
             full_message,
             workflow_id=details.get("workflow_id"),
             status_code=status,  # 403 per backend mapping
+        )
+
+    if backend_code == "BUDGET_RECHECK_FAILED":
+        # H6 / 2026-08-12 audit: dedicated typed dispatch so callers
+        # can branch on the post-approval recheck failure (NR-B006)
+        # vs a fresh /gate block (NR-B004). The dispatcher surfaces
+        # ``current_spend_cents`` / ``budget_cents`` from the wire
+        # envelope so callers can compute the remaining cap and
+        # decide whether to retry after re-/gate.
+        return NullRunBudgetRecheckFailedError(
+            full_message,
+            current_spend_cents=details.get("current_spend_cents"),
+            budget_cents=details.get("budget_cents"),
+            status_code=status,  # 402 per backend mapping
         )
 
     if backend_code == "RATE_LIMIT_REDIS_UNAVAILABLE":
@@ -2457,6 +2472,15 @@ def _build_v3_error_code_map() -> dict[str, type[BaseException]]:
         "APPROVAL_CONFLICT": NullRunBlockedException,
         "APPROVAL_NOT_FOUND": NullRunBlockedException,
         "APPROVAL_CREATE_FAILED": NullRunBlockedException,
+        # 402 — post-approval budget recheck (H6 / 2026-08-12 audit).
+        # Distinct from BUDGET_HARD_BLOCKED: the operator explicitly
+        # approved the grant at /gate, but the period-bound counter
+        # moved between /gate and /execute (another concurrent
+        # execution spent the budget). Caller should re-/gate to
+        # refresh the reservation envelope and retry /execute.
+        # Backed by GateErrorCode::BudgetRecheckFailed in the
+        # backend (error_codes.rs).
+        "BUDGET_RECHECK_FAILED": NullRunBudgetError,
     }
 
 

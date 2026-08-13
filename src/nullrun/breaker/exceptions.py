@@ -789,6 +789,59 @@ class NullRunBudgetError(NullRunBlockedException):
     retryable = False
 
 
+class NullRunBudgetRecheckFailedError(NullRunBudgetError):
+    """Budget authorization failed during the post-approval re-check on /execute.
+
+    Distinct from :class:`NullRunBudgetError` (which is raised when /gate
+    itself blocks) — this is raised on the SECOND authorization decision:
+    the operator approved the grant at /gate, but the period-bound
+    budget counter moved between /gate reserve and /execute (typically
+    another concurrent execution spent the budget). Wire code
+    ``BUDGET_RECHECK_FAILED`` from `GateErrorCode::BudgetRecheckFailed`
+    on the backend (error_codes.rs).
+
+    Carries ``current_spend_cents`` and ``budget_cents`` (from the
+    backend ``details`` envelope) so callers can compute the remaining
+    cap and decide whether to retry after re-``/gate``.
+
+    Subclass of :class:`NullRunBudgetError` so the existing
+    ``except NullRunBudgetError:`` pattern keeps matching. New
+    ``except NullRunBudgetRecheckFailedError:`` branches on the typed
+    shape (recommended: re-/gate then re-/execute).
+
+    Audit: H6 (2026-08-12). Pre-fix SDK 0.14.x collapsed this code
+    into a generic ``NullRunBudgetError("Budget authorization failed")``
+    with no introspection on the running counter.
+    """
+
+    error_code = "NR-B006"
+    user_action = (
+        "Post-approval budget re-check failed — another execution "
+        "spent the budget between /gate and /execute. Call /gate "
+        "again to refresh the reservation, then retry /execute."
+    )
+    retryable = True
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        current_spend_cents: int | None = None,
+        budget_cents: int | None = None,
+        status_code: int | None = None,
+    ) -> None:
+        super().__init__(
+            workflow_id="<recheck>",
+            reason=message,
+            status_code=status_code,
+        )
+        # First-class attributes so callers can read the running
+        # counter without indexing into ``details``.
+        self.current_spend_cents: int | None = current_spend_cents
+        self.budget_cents: int | None = budget_cents
+        self.recheck_retryable: bool = True
+
+
 class NullRunToolBlockedError(NullRunBlockedException):
     """The tool is in the workflow's block list.
 

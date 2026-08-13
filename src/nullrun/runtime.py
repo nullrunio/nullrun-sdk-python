@@ -1713,6 +1713,19 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # None only on legacy keys that have never been
         # workflow-bound -- in that case the check is silently
         # skipped.
+        #
+        # L6 audit 2026-08-12: workflow_id is intentionally NOT
+        # forwarded to the /gate wire body. The server derives it
+        # server-side from the API key's 1:1 binding (CLAUDE.md §12
+        # "1 API key = 1 workflow" invariant). Adding it to the wire
+        # would be additive telemetry only — the per-workflow budget
+        # aggregator (`wf:{id}:monthly_cost` + `wf:{id}:bp:{ts}`)
+        # operates on the server's binding, not on a client-claimed
+        # value. The `mode='hard'` corner the audit flagged is a
+        # non-issue: the field is omitted unconditionally, regardless
+        # of enforcement_mode. Workflow_id flows into /track + /events
+        # via `_enrich_event` (line ~2697) for cost attribution; /gate
+        # intentionally keeps the wire minimal.
         workflow_id = self._resolve_workflow_id(get_workflow_id())
         if not workflow_id:
             return

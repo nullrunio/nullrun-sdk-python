@@ -208,6 +208,71 @@ def _parse_rate_limit_scope(payload: Any) -> RateLimitFailScope:
     )
 
 
+def _validate_capabilities_payload(payload: Any) -> list[str]:
+    """Validate the shape of the ``/api/v1/capabilities`` JSON payload.
+
+    Returns a list of validation errors. Empty list = valid. Used as
+    a Zod-style guard around :func:`parse_capabilities` so a malformed
+    probe response (e.g. non-dict top level, capabilities array instead
+    of dict) surfaces a typed warning instead of silently falling
+    through to legacy defaults.
+
+    M8 (audit 2026-08-12): pre-fix, a malformed probe payload silently
+    yielded the conservative defaults via ``payload.get("capabilities")
+    or {}`` and the SDK continued in compatibility mode without
+    informing the operator. Post-fix, the operator sees a structured
+    ``NullRunCapabilitiesValidationError`` at ``init()`` and can
+    diagnose the probe failure before the first /check.
+
+    Note: validation is intentionally permissive about MISSING fields
+    (the backend may add new fields at any time without bumping the
+    SDK version). It rejects only SHAPE errors — wrong types,
+    wrong container kinds, etc.
+    """
+    errors: list[str] = []
+    if not isinstance(payload, dict):
+        errors.append(
+            f"top-level payload must be a dict, got {type(payload).__name__}"
+        )
+        return errors
+    caps = payload.get("capabilities")
+    if caps is not None and not isinstance(caps, dict):
+        errors.append(
+            f"'capabilities' must be a dict when present, got {type(caps).__name__}"
+        )
+    # Type guards on the numeric top-level fields. Strings are common
+    # in test fixtures but real backend always emits int.
+    for field_name in ("min_protocol_version", "max_protocol_version", "protocol_version"):
+        v = payload.get(field_name)
+        if v is not None and not isinstance(v, int) and not (
+            isinstance(v, str) and v.isdigit()
+        ):
+            errors.append(
+                f"'{field_name}' must be int (or numeric string), got {type(v).__name__}"
+            )
+    # Numeric nested fields
+    if isinstance(caps, dict):
+        for field_name in (
+            "heartbeat_interval_seconds",
+            "heartbeat_skew_tolerance_seconds",
+            "chain_idle_ttl_seconds",
+        ):
+            v = caps.get(field_name)
+            if v is not None and not isinstance(v, int) and not (
+                isinstance(v, str) and v.isdigit()
+            ):
+                errors.append(
+                    f"capabilities.{field_name} must be int, got {type(v).__name__}"
+                )
+        rl_scope = caps.get("rate_limit_fail_scope")
+        if rl_scope is not None and not isinstance(rl_scope, dict):
+            errors.append(
+                f"capabilities.rate_limit_fail_scope must be a dict, "
+                f"got {type(rl_scope).__name__}"
+            )
+    return errors
+
+
 def parse_capabilities(payload: dict[str, Any]) -> ServerCapabilities:
     """Parse the backend's ``/api/v1/capabilities`` JSON.
 
@@ -228,7 +293,20 @@ def parse_capabilities(payload: dict[str, Any]) -> ServerCapabilities:
 
     Nested wins when both are present so the test fixtures and the
     canonical shape are unambiguous.
+
+    M8 (audit 2026-08-12): shape errors surface via
+    :func:`_validate_capabilities_payload` before parsing. The
+    caller (``probe_capabilities``) logs them at WARNING so the
+    operator sees the malformed payload without silent fallback to
+    legacy mode.
     """
+    # Shape validation — fail loud on type errors, stay quiet on
+    # missing keys (permissive forward-compat invariant).
+    shape_errors = _validate_capabilities_payload(payload)
+    if shape_errors:
+        for err in shape_errors:
+            logger.warning("capabilities probe: %s", err)
+
     caps = payload.get("capabilities") or {}
     if not isinstance(caps, dict):
         caps = {}
@@ -337,6 +415,7 @@ __all__ = [
     "RateLimitFailScope",
     "SDK_MIN_VERSION_FOR_V3",
     "ServerCapabilities",
+    "_validate_capabilities_payload",
     "parse_capabilities",
     "probe_capabilities",
     "validate_sdk_version",
