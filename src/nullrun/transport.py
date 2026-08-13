@@ -307,9 +307,17 @@ class FallbackMode:
     block agent execution, but behavior must be defined and logged.
     """
 
-    # Block if Gateway unavailable (for critical tools)
+    # Block if Gateway unavailable. v3.53 audit #4 — DEFAULT for
+    # ``Transport.execute()`` and ``ExecuteConfig.fallback_mode``.
+    # Per CLAUDE.md §4 "DEFAULT: fail-CLOSED для всех enforcement
+    # путей", the /execute enforcement path must not silently allow
+    # local execution when the policy engine is unreachable.
     STRICT = "strict"
-    # Allow if Gateway unavailable, log locally (DEFAULT)
+    # Allow if Gateway unavailable, log locally. **Opt-in only** —
+    # pass ``fallback_mode=FallbackMode.PERMISSIVE`` explicitly when
+    # the caller accepts silent fail-OPEN on the enforcement path.
+    # Required for any test / dev harness that intentionally runs
+    # without a live policy engine.
     PERMISSIVE = "permissive"
 
 
@@ -341,8 +349,12 @@ class FlushConfig:
 class ExecuteConfig:
     """Configuration for execute (strict mode) behavior."""
 
-    # Fallback mode when Gateway is unavailable
-    fallback_mode: str = FallbackMode.PERMISSIVE
+    # Fallback mode when Gateway is unavailable. v3.53 audit #4 —
+    # default is STRICT (fail-CLOSED on enforcement) per CLAUDE.md §4.
+    # Pre-v3.53 the default was PERMISSIVE which silently allowed
+    # local execution on transport failure; that was fail-OPEN on the
+    # primary enforcement path (Transport.execute → /api/v1/execute).
+    fallback_mode: str = FallbackMode.STRICT
     # Gateway timeout in seconds
     timeout: float = 5.0
     # Max retries for execute calls
@@ -1007,7 +1019,15 @@ class Transport:
         tool: str,
         input_data: dict[str, Any],
         mode: str = "auto",
-        fallback_mode: str = FallbackMode.PERMISSIVE,
+        # v3.53 audit #4 — default flipped from PERMISSIVE to STRICT
+        # to match CLAUDE.md §4 ("DEFAULT: fail-CLOSED для всех
+        # enforcement путей"). /execute is the primary enforcement
+        # point (see docstring) — when the gateway is unreachable the
+        # body MUST NOT run on a silent local pass. Callers that
+        # intentionally want fail-OPEN on this path (dev / test
+        # harnesses without a live engine) must opt in by passing
+        # ``fallback_mode=FallbackMode.PERMISSIVE`` explicitly.
+        fallback_mode: str = FallbackMode.STRICT,
         operation_id: str | None = None,
         approval_id: str | None = None,
         # Typed-impact + digest-bound approval. Forwarded when @sensitive(impact=...)
@@ -1150,7 +1170,12 @@ class Transport:
                 "explanation": "Gateway unavailable, fallback=STRICT",
                 "policy_version": 0,
             }
-        else:  # PERMISSIVE (default)
+        else:  # PERMISSIVE (opt-in)
+            # v3.53 audit #4 — PERMISSIVE no longer the default; it
+            # requires the caller to pass fallback_mode=FallbackMode.
+            # PERMISSIVE explicitly. Synthesizes an allow + decision_
+            # source=FALLBACK so the caller / @sensitive decorator can
+            # still observe that the engine was unreachable.
             return {
                 "decision": "allow",
                 "decision_source": DecisionSource.FALLBACK,

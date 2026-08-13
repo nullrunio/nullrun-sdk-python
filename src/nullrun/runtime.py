@@ -19,8 +19,8 @@ the authoritative table; deviations require an ADR amendment (Rule 5).
 |---|---|---|---|
 | `check_workflow_budget` | OPEN (skip check, log warning) | silent post-hoc correction in `/track` events via `cost_correction_applied=true` | `NULLRUN_SKIP_BUDGET_CHECK=1` -- **full billing bypass**, not just check bypass (see docstring WARNING) |
 | `check_control_plane` | OPEN (treat state as `Normal`) | deferred enforcement -- next WS-push or `/status` poll sees the true state | none |
-| `_enforce_sensitive_tool` (default `_fallback_mode=permissive`) | CLOSED -- body MUST NOT run when `decision_source` is any `FALLBACK_*` | n/a (body did not run) | `NULLRUN_SENSITIVE_FAIL_OPEN=1` -- explicitly documented as "OPEN-when-engine-unavailable" |
-| `_enforce_sensitive_tool` (`_fallback_mode=strict`) | CLOSED -- transport returns `decision=block, decision_source=FALLBACK_*` | n/a | none |
+| `_enforce_sensitive_tool` (default `_fallback_mode=strict` since v3.53) | CLOSED -- transport returns `decision=block, decision_source=FALLBACK_*` | n/a | none for the strict path; `NULLRUN_SENSITIVE_FAIL_OPEN=1` opts into the legacy permissive override |
+| `_enforce_sensitive_tool` (`_fallback_mode=permissive`, opt-in) | CLOSED -- body MUST NOT run when `decision_source` is any `FALLBACK_*` | n/a (body did not run) | `NULLRUN_SENSITIVE_FAIL_OPEN=1` -- explicitly documented as "OPEN-when-engine-unavailable" |
 | `_emit_span_start` / `_emit_span_end` | n/a -- never blocks | n/a | n/a |
 | `/track` batch path (legacy) | OPEN-on-network-error (event dropped, no retry) | n/a -- circuit breaker backoff applies | none |
 
@@ -491,7 +491,13 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             - `api_key` is required as of 0.3.0 (T3-S2). The previous
               `local_mode` flag was removed because it silently bypassed
               every backend gate.
-            - `fallback_mode` is fixed at PERMISSIVE (no public override).
+            - `fallback_mode` is fixed at STRICT (no public override).
+              v3.53 audit #4 — was PERMISSIVE pre-v3.53; flipped to
+              STRICT to honor CLAUDE.md §4 ("DEFAULT: fail-CLOSED для
+              всех enforcement путей"). Existing callers passing
+              ``fallback_mode="permissive"`` continue to opt into the
+              legacy fail-OPEN path; the default-only change is the
+              break.
             - `timeout`/`max_retries` are fixed at 30s / 3 (no public override).
 
         Raises:
@@ -535,12 +541,16 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # The string ``fallback_mode`` parameter is deprecated and
         # accepted only for backward compat — the CACHED variant
         # was removed in 0.7.0 because the SDK no longer maintains
-        # a local policy cache (see CHANGELOG D-01).
-        fb_upper = str(fallback_mode).upper() if fallback_mode is not None else "PERMISSIVE"
-        if fb_upper == "STRICT":
-            self._fallback_mode = FallbackMode.STRICT
-        else:
+        # a local policy cache (see CHANGELOG D-01). v3.53 audit #4
+        # flipped the default from PERMISSIVE to STRICT so a future
+        # caller who omits the kwarg lands on fail-CLOSED per
+        # CLAUDE.md §4 instead of silently allowing local execution
+        # on transport failure.
+        fb_upper = str(fallback_mode).upper() if fallback_mode is not None else "STRICT"
+        if fb_upper == "PERMISSIVE":
             self._fallback_mode = FallbackMode.PERMISSIVE
+        else:
+            self._fallback_mode = FallbackMode.STRICT
         # DEF-ERRHDL-NO-TIMEOUT-01: precedence kwarg > env > default(30)
         env_timeout = os.getenv("NULLRUN_REQUEST_TIMEOUT")
         try:

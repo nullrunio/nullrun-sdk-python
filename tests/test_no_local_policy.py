@@ -111,6 +111,106 @@ def test_fallback_mode_cached_removed():
     )
 
 
+def test_execute_config_default_fallback_mode_is_strict():
+    """v3.53 audit #4 — ExecuteConfig.fallback_mode default flipped to STRICT.
+
+    Per CLAUDE.md §4 ("DEFAULT: fail-CLOSED для всех enforcement
+    путей") the SDK must default to blocking local execution when the
+    /execute endpoint is unreachable. The pre-v3.53 PERMISSIVE default
+    was a silent fail-OPEN on the primary enforcement path — a body
+    could run when the policy engine was unreachable without any
+    explicit opt-out from the caller.
+
+    Source-pin on ``ExecuteConfig.fallback_mode: str = FallbackMode.STRICT``
+    so a future refactor that flips the default back to PERMISSIVE
+    fails loudly in CI rather than silently re-introducing the
+    fail-OPEN enforcement path.
+    """
+    from nullrun.transport import ExecuteConfig, FallbackMode
+
+    cfg = ExecuteConfig()
+    assert cfg.fallback_mode == FallbackMode.STRICT, (
+        "ExecuteConfig.fallback_mode default flipped back to PERMISSIVE — "
+        "v3.53 audit #4 closure REGRESSED. /execute is the primary "
+        "enforcement path per transport.py docstring; the default "
+        "must be fail-CLOSED (STRICT) per CLAUDE.md §4."
+    )
+
+
+def test_transport_execute_kwarg_default_fallback_mode_is_strict():
+    """v3.53 audit #4 — Transport.execute() fallback_mode kwarg default is STRICT.
+
+    Pin on the kwarg signature so a future refactor that flips the
+    default back to PERMISSIVE breaks here. ``Transport.execute`` is
+    the primary /api/v1/execute caller — see transport.py docstring
+    lines 1022-1024 ("PRIMARY enforcement point").
+    """
+    import inspect
+
+    from nullrun.transport import FallbackMode, Transport
+
+    sig = inspect.signature(Transport.execute)
+    param = sig.parameters["fallback_mode"]
+    assert param.default == FallbackMode.STRICT, (
+        "Transport.execute() fallback_mode kwarg default flipped back to "
+        "PERMISSIVE — v3.53 audit #4 closure REGRESSED. The /execute "
+        "enforcement path must default to fail-CLOSED per CLAUDE.md §4."
+    )
+
+
+def test_runtime_init_default_fallback_mode_is_strict():
+    """v3.53 audit #4 — NullRunRuntime(fallback_mode=None) lands on STRICT.
+
+    Pre-v3.53 ``None`` / unset silently mapped to PERMISSIVE. Now
+    None → STRICT (fail-CLOSED). Only an explicit
+    ``fallback_mode="permissive"`` / ``"PERMISSIVE"`` opt-in flips
+    to the legacy fail-OPEN path.
+    """
+    from nullrun.breaker.exceptions import BreakerTransportError
+    from nullrun.transport import FallbackMode
+
+    import nullrun
+
+    # Build a runtime with ``_test_mode=True`` so the constructor
+    # short-circuits auth + WS plumbing — we only care about the
+    # default of ``_fallback_mode``.
+    rt = nullrun.NullRunRuntime(
+        api_key="nr_test_dummy_for_v3_53_source_pin",
+        _test_mode=True,
+        polling=False,
+    )
+    assert rt._fallback_mode == FallbackMode.STRICT, (
+        "NullRunRuntime(fallback_mode=None) default flipped back to "
+        "PERMISSIVE — v3.53 audit #4 closure REGRESSED. The default "
+        "must be STRICT per CLAUDE.md §4."
+    )
+
+    # Suppress unused-import lint; BreakerTransportError referenced
+    # so a future code path change that introduces a new import here
+    # triggers a name-resolution check.
+    del BreakerTransportError
+
+
+def test_runtime_init_permissive_kwarg_still_opt_in():
+    """v3.53 audit #4 — explicit fallback_mode="permissive" still opt-in.
+
+    The legacy behavior must remain reachable for dev / test harnesses
+    that intentionally run without a live policy engine. This test
+    pins the opt-in path so a future refactor that "removes the
+    deprecated kwarg" doesn't break CI workflows that depend on it.
+    """
+    import nullrun
+    from nullrun.transport import FallbackMode
+
+    rt = nullrun.NullRunRuntime(
+        api_key="nr_test_dummy_for_v3_53_source_pin",
+        _test_mode=True,
+        polling=False,
+        fallback_mode="permissive",
+    )
+    assert rt._fallback_mode == FallbackMode.PERMISSIVE
+
+
 def test_runtime_init_has_no_policy_kwarg():
     """NullRunRuntime(policy=...) kwarg was removed in 0.7.0."""
     import inspect
