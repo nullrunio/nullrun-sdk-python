@@ -675,7 +675,6 @@ class TestPingChainScheduler:
         # sleep.
         import threading as _threading
 
-        from nullrun.runtime import NullRunRuntime
 
         rt = NullRunRuntime(api_key="nr_live_x", _test_mode=True, polling=False)
         try:
@@ -710,7 +709,6 @@ class TestPingChainScheduler:
             rt.shutdown()
 
     def test_ping_chain_rejects_out_of_range_interval(self):
-        from nullrun.runtime import NullRunRuntime
 
         rt = NullRunRuntime(api_key="nr_live_x", _test_mode=True, polling=False)
         try:
@@ -723,7 +721,6 @@ class TestPingChainScheduler:
 
     @respx.mock
     def test_ping_chain_stop_is_idempotent(self):
-        from nullrun.runtime import NullRunRuntime
 
         rt = NullRunRuntime(api_key="nr_live_x", _test_mode=True, polling=False)
         try:
@@ -1055,7 +1052,6 @@ class TestGateCacheRuntimeFlow:
           runtime.py:1302 (cache hit `response = cached[1]`)
           runtime.py:1306 (cache miss → transport.check + store).
         """
-        from nullrun.runtime import NullRunRuntime
 
         respx.post(f"{BASE_URL}/api/v1/gate").mock(
             return_value=Response(
@@ -1108,7 +1104,6 @@ class TestGateCacheRuntimeFlow:
         import json as _json
         import os
 
-        from nullrun.runtime import NullRunRuntime
 
         os.environ["NULLRUN_GATE_CACHE_DISABLE"] = "1"
         try:
@@ -1159,7 +1154,6 @@ class TestGateCacheRuntimeFlow:
         """
         import os
 
-        from nullrun.runtime import NullRunRuntime
 
         os.environ["NULLRUN_GATE_CACHE_DISABLE"] = "1"
         try:
@@ -1232,12 +1226,9 @@ the drift. Pattern follows
 strict-URL assertions, no live backend required.
 """
 
-import time
-from unittest.mock import patch
 
 import pytest
 import respx
-from httpx import Response
 
 from nullrun.context import (
     _server_minted_execution_id_var,
@@ -1890,7 +1881,6 @@ than at first production /check.
 
 from pathlib import Path
 
-import httpx
 import pytest
 import respx
 
@@ -1899,7 +1889,6 @@ from nullrun.capabilities import (
     CAPABILITIES_PATH,
     probe_capabilities,
 )
-from nullrun.transport import _V3_ERROR_CODE_MAP, _parse_v3_error_envelope
 
 BASE_URL = "https://api.test.nullrun.io"
 

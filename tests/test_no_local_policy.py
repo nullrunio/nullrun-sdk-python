@@ -166,10 +166,9 @@ def test_runtime_init_default_fallback_mode_is_strict():
     ``fallback_mode="permissive"`` / ``"PERMISSIVE"`` opt-in flips
     to the legacy fail-OPEN path.
     """
+    import nullrun
     from nullrun.breaker.exceptions import BreakerTransportError
     from nullrun.transport import FallbackMode
-
-    import nullrun
 
     # Build a runtime with ``_test_mode=True`` so the constructor
     # short-circuits auth + WS plumbing — we only care about the

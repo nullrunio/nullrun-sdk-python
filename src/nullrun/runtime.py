@@ -199,7 +199,7 @@ def _is_production_environment(api_url: str | None = None) -> bool:
     # Signal 2: explicit NULLRUN_ENV=production (or "prod") AND
     # the api_url does not point at a known dev/staging host.
     explicit_env = os.getenv("NULLRUN_ENV", "").strip().lower()
-    non_prod_hosts = ("localhost", "127.0.0.1", "0.0.0.0", "staging", "test")
+    non_prod_hosts = ("localhost", "127.0.0.1", "0.0.0.0", "staging", "test")  # noqa: S104  -- string marker, not a bind address
     if explicit_env in {"production", "prod"} and not any(
         marker in host_lc for marker in non_prod_hosts
     ):

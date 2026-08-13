@@ -2467,7 +2467,7 @@ def _parse_v3_error_envelope(
 # (rather than at the top of transport.py) keeps the legacy import
 # graph identical and avoids breaking the frozen
 # ``_parse_error_envelope`` test contract.
-def _build_v3_error_code_map() -> dict[str, type[BaseException]]:
+def _build_v3_error_code_map() -> dict[str, type[Exception]]:
     """Construct the v3 error_code → exception class mapping.
 
     Imported lazily because the exception classes import the
@@ -2576,7 +2576,7 @@ def _build_v3_error_code_map() -> dict[str, type[BaseException]]:
     }
 
 
-_V3_ERROR_CODE_MAP: dict[str, type[BaseException]] = _build_v3_error_code_map()
+_V3_ERROR_CODE_MAP: dict[str, type[Exception]] = _build_v3_error_code_map()
 
 
 # ADR (2026-06-28, audit P2.2 close): ``_parse_error_envelope`` below

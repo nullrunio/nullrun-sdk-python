@@ -457,11 +457,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from nullrun.breaker.exceptions import (
-    NullRunBlockedException,
     WorkflowKilledInterrupt,
     WorkflowPausedException,
 )
-from nullrun.runtime import NullRunRuntime
 
 
 @pytest.fixture(autouse=True)

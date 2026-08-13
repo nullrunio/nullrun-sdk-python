@@ -1073,7 +1073,6 @@ Additional transport branch tests covering gaps in
   - ``_parse_error_envelope`` for 401 / 403 / 429 / 500 / 502 / 400
 """
 
-import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -1086,7 +1085,6 @@ from nullrun.breaker.exceptions import (
 )
 from nullrun.transport import (
     FlushConfig,
-    Transport,
     _parse_error_envelope,
     verify_hmac_signature,
 )

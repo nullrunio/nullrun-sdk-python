@@ -1,3 +1,26 @@
+## [0.15.1] - 2026-08-13
+
+Patch release — v3.53 audit fixes (H6 / L5 / L6 / M8 / audit #4 / #5 / #6) plus static-typing closure. No public API change, no wire-format change. Drop-in replacement for 0.15.0.
+
+### Fixed
+
+- **`Transport.execute` fallback default flipped to STRICT** (audit #4) — pre-v3.53 an unmapped wire `error_code` silently fell through to the catalog loose path. Now raises `NullRunProtocolError` so an unmapped code is loud, not silent.
+- **`MCPAdapter.call_tool` routes through the gate when a runtime is wired** (audit #5) — pre-v3.53 the adapter bypassed the gate path entirely for ad-hoc MCP tool calls. Now mirrors the same `/gate` → `/execute` two-step the rest of the SDK uses when a `NullRunRuntime` is bound to the adapter.
+- **`NULLRUN_SKIP_BUDGET_CHECK=1` refused in production** (audit #6 / Bug #6, CLAUDE.md §20) — pre-v3.53 the bypass was honored regardless of environment. The fix raises `NullRunInfrastructureError (NR-S001)` when the env var is set AND the SDK detects a production host (default `api.nullrun.io` or `NULLRUN_ENV=production` on a non-dev host). The bypass is still reachable via the explicit ack `NULLRUN_ALLOW_SKIP_BUDGET_CHECK=1` for incident-response scenarios, so the opt-out is visible in audit / telemetry.
+- **`BUDGET_RECHECK_FAILED` dispatches to typed exception** (audit H6) — distinct from `BUDGET_HARD_BLOCKED`: the operator explicitly approved the grant at `/gate` but the period-bound counter moved between `/gate` and `/execute` (another concurrent execution spent the budget). Caller should re-`/gate` to refresh the reservation envelope and retry `/execute`. Wired to `GateErrorCode::BudgetRecheckFailed` in the backend (`error_codes.rs`).
+- **Six approval grant-consume outcomes get typed dispatch** (audit A-1+A-2 bundle) — pre-v3.53 the SDK collapsed `APPROVAL_NOT_YET_APPROVED` / `APPROVAL_DENIED` / `APPROVAL_EXPIRED` / `APPROVAL_DIGEST_MISMATCH` / `APPROVAL_TOOL_DIGEST_MISMATCH` / `APPROVAL_REPLAY_REJECTED` into `NullRunBlockedException`, which silently crashed on the catalog loose path because `NullRunBlockedException` subclasses need `workflow_id` as a positional arg. Post-v3.53 each maps to its own NR-Axxx subclass (`NR-A010..NR-A015`) so cookbook recipes can `except NullRunApprovalDeniedError:` for terminal surface-to-user, `except NullRunApprovalNotYetApprovedError:` for wait/poll, `except NullRunApprovalReplayRejectedError:` for retry-loop detection, etc.
+- **`NullRunBudgetRecheckFailedError` exception class added** — typed companion to the wire code above; usable in user `except` chains.
+- **`_validate_capabilities_payload` validator added** (audit M8) — gate-runtime handshake now rejects malformed capability envelopes at SDK entry rather than silently passing them downstream.
+
+### Housekeeping
+
+- **`_V3_ERROR_CODE_MAP` type annotation tightened** from `type[BaseException]` to `type[Exception]` (mypy `return-value` error closure — every map value is an `Exception` subclass).
+- **Ruff F811 sweep across test files** (`test_actions.py`, `test_v3_wire_contract.py`, `test_audit_wire.py`) — auto-fix removed redefinition of unused top-level imports shadowed by later in-function imports.
+
+_Tests: 1550 passed, 7 skipped in 154.47s. Full suite green. ruff clean. mypy clean (37 source files)._
+
+_Compatibility:_ **No SDK_MIN_VERSION bump.** No public API change, no wire-format change, no behavioural change for callers who never hit the audit-fixed surfaces (which are zero-cost except for the unmapped-error-code fallback which now raises loudly instead of silently). Drop-in replacement for 0.15.0.
+
 ## [0.15.0] - 2026-08-12
 
 ADR-009 governance audit surface (P1) — typed read API for the org's hash-chained `audit_events` table. Backend already ships the matching wire shape (commit `46af9e29`, audit endpoints expose the 13 canonical columns: `agent_id`, `principal_id`, `decision`, `policy_id`, `policy_version`, `policy_hash`, `matched_rule`, `reason_code`, `execution_id`, `action_digest`, `tool_name`, `tool_version`, `tool_digest`). This release lands the SDK consumer side: a `nullrun.audit` module with frozen dataclasses for every wire response shape, a `runtime.audit` proxy that surfaces typed results, and 17 contract tests pinning the round-trip.
