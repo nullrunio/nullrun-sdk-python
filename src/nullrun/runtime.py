@@ -87,6 +87,7 @@ from nullrun.breaker.exceptions import (
     NullRunBackendError,
     NullRunBlockedException,
     NullRunError,
+    NullRunInfrastructureError,
     NullRunTransportError,
     WorkflowKilledInterrupt,
     WorkflowPausedException,
@@ -126,6 +127,85 @@ _GATE_CACHE_TTL_SECONDS: float = 5.0
 
 # 2026-07-24 (Root-cause fix for the ``@sensitive`` reinit gap):
 _STRICT_MODE_FORCED: set[str] = set()
+
+
+# v3.53 audit #6 — production-environment detection for security
+# opt-out enforcement. ``NULLRUN_SKIP_BUDGET_CHECK=1`` is documented
+# as a DEV / TEST bypass (CLAUDE.md §20 "Никогда не выставлять
+# NULLRUN_SKIP_BUDGET_CHECK в production env"); pre-v3.53 the SDK
+# silently honored the opt-out regardless of environment, which
+# meant an operator who accidentally exported the var in prod got
+# a silent fail-OPEN on the budget gate.
+#
+# Two signals combine to flag a production environment:
+# 1. The configured ``api_url`` hostname matches the prod host
+#    (``api.nullrun.io``) — the SDK's hard-coded default per the
+#    constructor docstring.
+# 2. The operator set ``NULLRUN_ENV`` to ``production`` / ``prod``
+#    (explicit override for non-standard deployments that point at
+#    a custom URL but still serve prod traffic).
+#
+# Test / dev harnesses that override ``api_url`` to a local /
+# staging host are NOT flagged as production regardless of
+# ``NULLRUN_ENV`` — operators who DO want the bypass in prod can
+# set ``NULLRUN_ALLOW_SKIP_BUDGET_CHECK=1`` to acknowledge the
+# risk explicitly (analogous to ``NULLRUN_SENSITIVE_FAIL_OPEN``).
+_PROD_API_HOST: str = "api.nullrun.io"
+
+
+def _is_production_environment(api_url: str | None = None) -> bool:
+    """Return True when the SDK is running against the production
+    NullRun backend.
+
+    v3.53 audit #6 — used by ``check_workflow_budget`` to refuse
+    ``NULLRUN_SKIP_BUDGET_CHECK=1`` outside dev / test environments.
+    Detection rules (in order):
+
+    1. ``api_url`` is None or matches the prod host
+       (``api.nullrun.io``) — the default constructor value.
+    2. ``NULLRUN_ENV`` is set to ``production`` / ``prod`` (case
+       insensitive) AND the api_url is not explicitly pointed at a
+       known non-prod host (``localhost``, ``127.0.0.1``,
+       ``staging``, ``test``).
+
+    Local / staging / test deployments are NOT flagged so the dev
+    bypass keeps working. Operators who insist on the bypass in
+    prod can set ``NULLRUN_ALLOW_SKIP_BUDGET_CHECK=1`` — but the
+    env var is then surfaced in audit / telemetry so it's not a
+    silent fail-OPEN.
+    """
+    from urllib.parse import urlparse
+
+    effective_url = api_url or os.getenv(
+        "NULLRUN_API_URL", "https://api.nullrun.io"
+    )
+    # Strip any trailing slash before parsing for consistent
+    # ``hostname`` extraction.
+    effective_url = effective_url.rstrip("/")
+    try:
+        parsed = urlparse(effective_url)
+    except (TypeError, ValueError):
+        parsed = None
+    host = parsed.hostname if parsed is not None else None
+    host_lc = (host or "").lower()
+
+    # Signal 1: explicit prod host. ``api.nullrun.io`` is the
+    # canonical production endpoint; the constructor's default
+    # value is exactly this URL so any caller that did not
+    # override ``api_url`` lands here.
+    if host_lc == _PROD_API_HOST:
+        return True
+
+    # Signal 2: explicit NULLRUN_ENV=production (or "prod") AND
+    # the api_url does not point at a known dev/staging host.
+    explicit_env = os.getenv("NULLRUN_ENV", "").strip().lower()
+    non_prod_hosts = ("localhost", "127.0.0.1", "0.0.0.0", "staging", "test")
+    if explicit_env in {"production", "prod"} and not any(
+        marker in host_lc for marker in non_prod_hosts
+    ):
+        return True
+
+    return False
 
 
 def register_strict_mode_forced(tool_name: str) -> None:
@@ -1697,9 +1777,70 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         pre-flight. Useful in tests where the org's API key has
         exhausted its budget from previous runs and the test only
         wants to exercise a non-budget code path.
+
+        Production guard (v3.53 audit #6): the opt-out is
+        REFUSED in production environments (api_url matches
+        ``api.nullrun.io`` or ``NULLRUN_ENV=production``). This
+        closes the silent fail-OPEN class where an operator
+        accidentally exported the var in a prod deployment and
+        silently lost the budget gate. To explicitly acknowledge
+        the risk in prod (e.g. an incident-response runbook
+        scenario), set ``NULLRUN_ALLOW_SKIP_BUDGET_CHECK=1`` as
+        well — the SDK logs the explicit ack at WARNING level
+        and emits a metric so the opt-in is visible in
+        observability.
         """
         if os.environ.get("NULLRUN_SKIP_BUDGET_CHECK", "").strip() == "1":
-            logger.debug("check_workflow_budget: skipped via NULLRUN_SKIP_BUDGET_CHECK=1")
+            # Production guard: refuse the opt-out unless the
+            # operator explicitly acked via
+            # ``NULLRUN_ALLOW_SKIP_BUDGET_CHECK=1``. CLAUDE.md §20
+            # marks NULLRUN_SKIP_BUDGET_CHECK as DEV/TEST only;
+            # pre-v3.53 the SDK silently honored it in any env
+            # which made accidental prod misuse a silent fail-OPEN.
+            if _is_production_environment(self.api_url):
+                allow_ack = (
+                    os.environ.get(
+                        "NULLRUN_ALLOW_SKIP_BUDGET_CHECK", ""
+                    ).strip()
+                    == "1"
+                )
+                if not allow_ack:
+                    logger.error(
+                        "check_workflow_budget: NULLRUN_SKIP_BUDGET_CHECK=1 "
+                        "is set but the SDK is configured for production "
+                        "(api_url=%r). Refusing to bypass the budget gate. "
+                        "Unset the var, or — only for incident-response "
+                        "scenarios — also set NULLRUN_ALLOW_SKIP_BUDGET_CHECK=1 "
+                        "to acknowledge the risk. See CLAUDE.md §20.",
+                        self.api_url,
+                    )
+                    try:
+                        metrics.inc_runtime("skip_budget_blocked_in_prod")
+                    except Exception:  # noqa: BLE001
+                        pass
+                    raise NullRunInfrastructureError(
+                        f"NULLRUN_SKIP_BUDGET_CHECK=1 is not allowed in "
+                        f"production (api_url={self.api_url!r}). Unset "
+                        "the env var or set NULLRUN_ALLOW_SKIP_BUDGET_CHECK=1 "
+                        "to acknowledge the risk. CLAUDE.md §20.",
+                        error_code="NR-S001",
+                        retryable=False,
+                    )
+                logger.warning(
+                    "check_workflow_budget: skipping via "
+                    "NULLRUN_SKIP_BUDGET_CHECK=1 in production "
+                    "(NULLRUN_ALLOW_SKIP_BUDGET_CHECK=1 also set). "
+                    "This is an explicit operator ack of the risk; "
+                    "ensure the incident-response runbook drove this."
+                )
+                try:
+                    metrics.inc_runtime("skip_budget_allowed_in_prod")
+                except Exception:  # noqa: BLE001
+                    pass
+                return
+            logger.debug(
+                "check_workflow_budget: skipped via NULLRUN_SKIP_BUDGET_CHECK=1"
+            )
             return
 
         # Bump the ``check_calls`` counter so the dashboard can show
