@@ -26,6 +26,7 @@ from this module:
 """
 
 import logging
+import threading
 from typing import Any
 
 from langchain_core.callbacks import BaseCallbackHandler
@@ -417,6 +418,25 @@ class NullRunCallback(BaseCallbackHandler):
 
         self._active_runs: OrderedDict[str, SpanContext] = OrderedDict()
         self._active_runs_max: int = _ACTIVE_RUNS_MAX
+        # F-28 (UI-UX-AUDIT 2026-08-14): protect ``_active_runs`` with
+        # a reentrant lock so concurrent callbacks on multi-threaded
+        # LangChain runners (and free-threaded CPython PEP 703 builds)
+        # cannot interleave ``on_chain_start`` / ``on_chain_end`` in a
+        # way that orphans the lookup. ``RLock`` (not ``Lock``) is
+        # required because ``_begin_run`` -> ``_register_active_run``
+        # nests two acquisitions on the same thread — reentrant
+        # acquisition is the entire point.
+        #
+        # Trade-off: the lock briefly spans the ``runtime.track_event``
+        # call inside ``_register_active_run`` / ``_end_run``. Per
+        # callback that's one outbound HTTP round-trip holding the
+        # lock; acceptable because the callback is per-instance
+        # (the Lock protects one NullRunCallback's dict, not all of
+        # them) and concurrent chains on the SAME callback are rare.
+        # Documented inline so a future maintainer doesn't try to
+        # optimise it away by deferring the lock acquisition and
+        # reintroducing the orphan-span race.
+        self._lock: threading.RLock = threading.RLock()
 
     def _register_active_run(self, run_id: str, ctx: SpanContext) -> None:
         """Insert ``run_id -> ctx`` into ``_active_runs`` with FIFO cap.
@@ -424,14 +444,23 @@ class NullRunCallback(BaseCallbackHandler):
         If the dict is at capacity, evict the oldest-inserted entry
         and log a warning so operators can detect chain-end drops.
         """
-        if len(self._active_runs) >= self._active_runs_max:
-            evicted_id, _ = self._active_runs.popitem(last=False)
-            logger.warning(
-                f"NullRunCallback._active_runs cap reached "
-                f"({self._active_runs_max}); evicted oldest run_id "
-                f"{evicted_id!r} — on_*_end for that run will be a no-op"
-            )
-        self._active_runs[run_id] = ctx
+        # F-28 (UI-UX-AUDIT 2026-08-14): the cap-check + eviction +
+        # insertion must be atomic against ``_end_run`` on a different
+        # thread, otherwise two threads can both pass the cap check
+        # and one eviction races the other insert (the dict grows
+        # by one entry past the cap, plus the evicted entry stays
+        # alive in the OTHER thread's local ``ctx`` — orphan
+        # span_end). RLock is reentrant: this method is also called
+        # from ``_begin_run`` which already holds the lock.
+        with self._lock:
+            if len(self._active_runs) >= self._active_runs_max:
+                evicted_id, _ = self._active_runs.popitem(last=False)
+                logger.warning(
+                    f"NullRunCallback._active_runs cap reached "
+                    f"({self._active_runs_max}); evicted oldest run_id "
+                    f"{evicted_id!r} — on_*_end for that run will be a no-op"
+                )
+            self._active_runs[run_id] = ctx
 
     # ------------------------------------------------------------------
     # LLM hooks (existing — token extraction only, no span bookkeeping)
@@ -473,7 +502,15 @@ class NullRunCallback(BaseCallbackHandler):
 
         parent_ctx: SpanContext | None = None
         if parent_run_id:
-            parent_ctx = self._active_runs.get(str(parent_run_id))
+            # F-28 (UI-UX-AUDIT 2026-08-14): the lookup is a single
+            # ``.get()`` (no nested acquire), but we still hold the
+            # lock so a concurrent ``_register_active_run`` /
+            # ``_end_run`` cannot observe a partial state where the
+            # parent span is being evicted. RLock allows the nested
+            # ``_register_active_run`` below to re-acquire on the
+            # same thread without deadlock.
+            with self._lock:
+                parent_ctx = self._active_runs.get(str(parent_run_id))
         if parent_ctx is None:
             parent_ctx = get_current_span()
         if parent_ctx is not None:
@@ -675,9 +712,16 @@ class NullRunCallback(BaseCallbackHandler):
             # upcoming tree-renderer that wants to walk children by
             # the parent's trace bucket.
             llm_run_id = kwargs.get("run_id")
-            llm_ctx = (
-                self._active_runs.get(str(llm_run_id)) if llm_run_id else None
-            )
+            # F-28 (UI-UX-AUDIT 2026-08-14): the lookup must hold the
+            # lock so a concurrent ``_end_run`` cannot pop the entry
+            # between this ``.get()`` and the (later) ``_end_run`` at
+            # the bottom of this method — that race produced the
+            # orphan-span finding (parent_span_id points at a run_id
+            # that no longer exists in ``_active_runs``).
+            with self._lock:
+                llm_ctx = (
+                    self._active_runs.get(str(llm_run_id)) if llm_run_id else None
+                )
             if llm_ctx is not None:
                 event["trace_id"] = llm_ctx.trace_id
                 event["span_id"] = llm_ctx.span_id
@@ -806,7 +850,14 @@ class NullRunCallback(BaseCallbackHandler):
         """
         parent_ctx: SpanContext | None = None
         if parent_run_id:
-            parent_ctx = self._active_runs.get(parent_run_id)
+            # F-28 (UI-UX-AUDIT 2026-08-14): same orphan-span race as
+            # ``on_llm_start``. The subsequent ``_register_active_run``
+            # call already acquires the lock; the reentrant ``RLock``
+            # lets us hold it across BOTH the lookup AND the
+            # registration so a concurrent ``_end_run`` on a sibling
+            # cannot evict the parent we're reading.
+            with self._lock:
+                parent_ctx = self._active_runs.get(parent_run_id)
         if parent_ctx is None:
             # Fall back to contextvar (e.g. we're inside an
             # @protect-wrapped function or a manual `set_span`).
@@ -832,7 +883,14 @@ class NullRunCallback(BaseCallbackHandler):
     def _end_run(self, run_id: Any, error: str | None = None) -> None:
         if run_id is None:
             return
-        ctx = self._active_runs.pop(str(run_id), None)
+        # F-28 (UI-UX-AUDIT 2026-08-14): the pop must be atomic so a
+        # concurrent ``_register_active_run`` cannot INSERT an entry
+        # for the same ``run_id`` between this pop and the
+        # ``runtime.track_event`` call below — the freshly-inserted
+        # entry would then be lost to the cap eviction (the entry
+        # appears in the dict but no ``span_end`` matches it).
+        with self._lock:
+            ctx = self._active_runs.pop(str(run_id), None)
         if ctx is None:
             return
         try:
