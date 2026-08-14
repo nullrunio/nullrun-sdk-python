@@ -91,6 +91,15 @@ class RuntimeMetrics:
     cost_limit_exceeded: int = 0
     timeouts: int = 0
     loop_detections: int = 0
+    # 2026-08-13 (sprint handoff Bug #4): counter for the
+    # fail-OPEN paths in ``check_workflow_budget``. Incremented on
+    # three sites (cache-enabled exception, cache-disabled exception,
+    # synthetic FALLBACK decision_source). Operators alert on
+    # sustained rate to detect backend outages that bypass the budget
+    # gate via the documented ADR-008 fail-OPEN posture. Pre-this
+    # counter, the failure mode was invisible at INFO log level on
+    # the FALLBACK path.
+    gate_fail_open_total: int = 0
 
 
 class MetricsRegistry:
@@ -185,6 +194,7 @@ class MetricsRegistry:
                     "cost_limit_exceeded": self.runtime.cost_limit_exceeded,
                     "timeouts": self.runtime.timeouts,
                     "loop_detections": self.runtime.loop_detections,
+                    "gate_fail_open_total": self.runtime.gate_fail_open_total,
                 },
             }
 

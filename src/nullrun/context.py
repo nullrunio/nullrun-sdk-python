@@ -24,6 +24,22 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 
+# 2026-08-14 (F-19 fix): ``nullrun.tracing`` provides the structured
+# SpanContext that models the parent/child hierarchy a trace timeline
+# needs. ``nullrun.context`` previously owned loose ``_trace_id`` /
+# ``_span_id`` contextvars and now keeps them in lockstep via the
+# ``_mirror_to_span_context`` / ``_mirror_to_legacy_span`` helpers
+# below; ``@protect`` (decorators.py:441) and any other writer must
+# call BOTH sides so runtime readers (``get_trace_id`` /
+# ``get_span_id``) and SpanContext readers (``get_current_span``) see
+# the same trace id. See audit_ui/UI-UX-AUDIT-REPORT.md F-19.
+from .tracing import (
+    SpanContext,
+    _current_span,
+    reset_span,
+    set_span,
+)
+
 # Context variables for workflow/trace propagation.
 _workflow_id_var: ContextVar[str | None] = ContextVar("workflow_id", default=None)
 _trace_id_var: ContextVar[str | None] = ContextVar("trace_id", default=None)
@@ -49,15 +65,13 @@ _call_tools_var: ContextVar[tuple[str, ...]] = ContextVar("call_tools", default=
 # ``None`` means "I don't know" — the gate treats absent values
 # as unknown (NOT as false), so a server that forgets to set
 # annotations cannot accidentally get a read-only bypass.
-_call_mcp_class_var: ContextVar[str | None] = ContextVar(
-    "call_mcp_class", default=None
-)
+_call_mcp_class_var: ContextVar[str | None] = ContextVar("call_mcp_class", default=None)
 _call_mcp_annotations_var: ContextVar[dict[str, bool | None] | None] = ContextVar(
     "call_mcp_annotations", default=None
 )
 
 # 2026-07-02 (v0.11.0): chain_id contextvar for soft-mode gate
-#.
+# .
 #
 # Soft-mode budget enforcement ONLY allows overdrafts when an
 # active chain is registered against the org. The SDK must forward
@@ -188,7 +202,7 @@ def set_chain_op(op: str) -> None:
     """Manually set the chain_op for the next /check call.
 
     Valid values: ``"auto"`` (default), ``"start"``, ``"continue"``
-    ``"end"``. Mirrors the wire-contract enum in 
+    ``"end"``. Mirrors the wire-contract enum in
     decision matrix. Use ``"start"`` to force REGISTERED-state
     semantics on the next call (no auto-register); use ``"end"``
     on a /check to close the chain in the same atomic operation
@@ -289,16 +303,16 @@ def get_server_minted_reservation_at() -> float:
 
 def get_server_minted_idempotency_key() -> str | None:
     """Return the /check ``idempotency_key`` for the in-scope
-    reservation, or ``None`` if none captured.
+        reservation, or ``None`` if none captured.
 
-    Read by ``NullRunRuntime._enrich_event`` to tag the /track
-    v3 single-event payload. The /check request sets
-    ``idempotency_key = operation_id`` (a UUID v4) at
-    runtime.py:1260; the /track handler honors it for replay
-.
+        Read by ``NullRunRuntime._enrich_event`` to tag the /track
+        v3 single-event payload. The /check request sets
+        ``idempotency_key = operation_id`` (a UUID v4) at
+        runtime.py:1260; the /track handler honors it for replay
+    .
 
-    Pairs with:func:`get_server_minted_execution_id` and shares
-    the same capture token; ``None`` on the legacy v1/v2 path.
+        Pairs with:func:`get_server_minted_execution_id` and shares
+        the same capture token; ``None`` on the legacy v1/v2 path.
     """
     return _server_minted_idempotency_key_var.get()
 
@@ -334,13 +348,13 @@ def set_server_minted_reservation_at(value: float) -> Token[float]:
 
 def set_server_minted_idempotency_key(value: str | None) -> Token[str | None]:
     """Capture the /check ``idempotency_key`` (the operation_id UUID v4
-    on the v3 path) alongside the matching execution_id.
+        on the v3 path) alongside the matching execution_id.
 
-    Lifetime is symmetric with
-:func:`set_server_minted_execution_id` — the runtime captures
-    both at the same instant and resets both at the matching
-    /track emission (or workflow/chain block exit). Returns the
-    matching Token.
+        Lifetime is symmetric with
+    :func:`set_server_minted_execution_id` — the runtime captures
+        both at the same instant and resets both at the matching
+        /track emission (or workflow/chain block exit). Returns the
+        matching Token.
     """
     return _server_minted_idempotency_key_var.set(value)
 
@@ -394,6 +408,129 @@ def clear_server_minted_execution_id() -> None:
 def set_attempt_index(index: int) -> None:
     """Set current attempt index for retry correlation."""
     _attempt_index_var.set(index)
+
+
+# ---------------------------------------------------------------------------
+# F-19 (2026-08-14): legacy _trace_id / _span_id token-based setters
+# ---------------------------------------------------------------------------
+#
+# ``nullrun.tracing.SpanContext`` is the canonical source-of-truth at
+# write time (audit F-19: ``@protect`` derives a SpanContext, then
+# emits ``span_start``/``span_end`` with ``ctx.trace_id``). The runtime
+# still reads ``get_trace_id`` / ``get_span_id`` for cost-event
+# enrichment (``runtime.py:2679``, ``2903-2907``, ``2967-2972``) and
+# for ``parent_trace_id`` derivation; without a mirror, those readers
+# see ``None`` and fall back to ``generate_trace_id`` — different
+# uuid from the SpanContext's trace_id, so the dashboard sees two
+# trace rows for a single ``@protect`` call.
+#
+# These setters let ``decorators._protect_body`` mirror the new
+# SpanContext back to legacy AFTER ``set_span``. Token-based (PEP 567)
+# so a nested ``@protect`` inside an outer ``@protect`` (or inside
+# ``with workflow``) restores the outer trace on reset — same shape
+# as ``reset_server_minted_execution_id`` and ``reset_span``.
+def set_trace_id(value: str) -> Token[str | None]:
+    """Mirror a SpanContext's trace_id into the legacy ``_trace_id_var``.
+
+    Token-based (matches ``reset_span`` / ``reset_server_minted_*``
+    helpers). Returns the matching Token so the caller can restore
+    the previous value via :func:`reset_trace_id`. Read by
+    ``runtime._enrich_event`` and the ``parent_trace_id`` enrichment
+    branch; without this mirror the dashboard's span tree is
+    detached from the cost events the runtime emits.
+    """
+    return _trace_id_var.set(value)
+
+
+def reset_trace_id(token: Token[str | None]) -> None:
+    """Restore the previous ``_trace_id_var`` value (paired with
+    :func:`set_trace_id`).
+    """
+    _trace_id_var.reset(token)
+
+
+def set_span_id(value: str) -> Token[str | None]:
+    """Mirror a SpanContext's span_id into the legacy ``_span_id_var``.
+
+    Token-based; pairs with :func:`reset_span_id`. Same audit
+    motivation as :func:`set_trace_id` (F-19, 2026-08-14).
+    """
+    return _span_id_var.set(value)
+
+
+def reset_span_id(token: Token[str | None]) -> None:
+    """Restore the previous ``_span_id_var`` value."""
+    _span_id_var.reset(token)
+
+
+# ---------------------------------------------------------------------------
+# F-19 (2026-08-14): helpers used by ``with workflow`` / ``with span``
+# ---------------------------------------------------------------------------
+#
+# ``with workflow`` writes a fresh root ``SpanContext``; ``with span``
+# derives a child SpanContext from whatever ``_current_span`` already
+# has (or no-ops if no span is active, preserving bare-``with span``
+# corner-case behavior for legacy readers).
+def _set_workflow_root_span(trace_id: str, span_id: str) -> Token[SpanContext | None]:
+    """Push a fresh root ``SpanContext`` onto ``_current_span``.
+
+    Called from ``with workflow`` once the legacy
+    ``_workflow_id_var`` / ``_trace_id_var`` / ``_span_id_var`` tokens
+    are minted. Returns the matching Token; the caller MUST pair it
+    with :func:`reset_span` in a ``finally`` block (the wrapping
+    ``with workflow`` does).
+    """
+    return set_span(
+        SpanContext(
+            trace_id=trace_id,
+            span_id=span_id,
+            parent_span_id=None,
+            depth=0,
+        )
+    )
+
+
+def _set_child_span_context(span_id: str) -> Token[SpanContext | None] | None:
+    """Push a child ``SpanContext`` derived from the active parent.
+
+    Called from ``with span`` only when a parent ``SpanContext`` is
+    active (i.e. we're inside a workflow / ``@protect`` block). If
+    no parent is set, returns ``None`` and the caller does NOT push
+    anything onto ``_current_span`` — preserving the legacy
+    corner-case behavior of bare ``with span(...)`` (the runtime's
+    ``_enrich_event`` falls back to ``generate_trace_id()`` for
+    legacy readers; that path was correct pre-F-19 and stays so).
+
+    Returns the matching Token; ``with span`` pairs it with
+    :func:`reset_span` in its ``finally``.
+    """
+    parent = _current_span.get()
+    if parent is None:
+        return None
+    return set_span(create_child_span_with_id(parent, span_id))
+
+
+def create_child_span_with_id(parent: SpanContext, span_id: str) -> SpanContext:
+    """Build a child ``SpanContext`` reusing a caller-supplied span_id.
+
+    Same semantics as ``tracing.create_child_span`` (inherits
+    ``trace_id`` + ``parent_span_id``; ``depth = parent.depth + 1``),
+    but takes the ``span_id`` verbatim rather than generating a new
+    one. Used by ``with span`` so its externally-observable
+    ``span_id`` stays in lockstep with the legacy ``_span_id_var``
+    it sets.
+
+    Why not just ``create_child_span(parent)``: that path mints a
+    fresh span_id, so the legacy ``_span_id_var`` (set by
+    ``with span`` to ``name or generate_span_id()``) and the new
+    SpanContext.span_id would diverge — defeating the F-19 fix.
+    """
+    return SpanContext(
+        trace_id=parent.trace_id,
+        span_id=span_id,
+        parent_span_id=parent.span_id,
+        depth=parent.depth + 1,
+    )
 
 
 def set_call_context(
@@ -511,6 +648,18 @@ def workflow(name: str | None = None) -> Generator[str, None, None]:
     wf_token = _workflow_id_var.set(workflow_id)
     trace_token = _trace_id_var.set(trace_id)
     span_token = _span_id_var.set(span_id)
+    # F-19 (2026-08-14): dual-write a root SpanContext onto
+    # ``_current_span`` so an inner ``@protect`` (or nested
+    # ``with span``) derives child spans from THIS workflow's
+    # trace_id rather than minting a fresh disconnected root.
+    # Before this bridge the two contextvar systems diverged:
+    # span_start events carried SpanContext.trace_id while cost
+    # events read legacy ``_trace_id_var`` — the dashboard saw
+    # two trace rows per ``@protect`` call inside a workflow.
+    # ``reset_span(span_ctx_token)`` in the ``finally`` restores
+    # the previous SpanContext (could be ``None`` or an outer
+    # workflow's root).
+    span_ctx_token = _set_workflow_root_span(trace_id, span_id)
 
     try:
         yield workflow_id
@@ -519,6 +668,12 @@ def workflow(name: str | None = None) -> Generator[str, None, None]:
         _workflow_id_var.reset(wf_token)
         _trace_id_var.reset(trace_token)
         _span_id_var.reset(span_token)
+        # Restore the previous SpanContext (mirrors the legacy
+        # token resets above). Resetting before yielding was lost
+        # the parent chain — reordering doesn't matter here since
+        # finally runs after the body exits and the body has
+        # already finished emitting events.
+        reset_span(span_ctx_token)
 
 
 @contextmanager
@@ -534,11 +689,24 @@ def span(name: str | None = None) -> Generator[str, None, None]:
     """
     span_id = name or generate_span_id()
     token = _span_id_var.set(span_id)
+    # F-19 (2026-08-14): when a SpanContext is already active
+    # (e.g. we're inside ``with workflow(...)`` or ``@protect``),
+    # push a child SpanContext onto ``_current_span`` so that nested
+    # ``@protect`` calls and the runtime's
+    # ``_enrich_event → parent_trace_id`` path both see this span
+    # as a real parent. ``_set_child_span_context`` returns
+    # ``None`` if no parent is active — bare ``with span(...)``
+    # outside any workflow/protect block keeps the legacy behavior
+    # (legacy readers fall through to ``generate_trace_id()``
+    # enrichment, which was correct pre-F-19 and stays so).
+    span_ctx_token = _set_child_span_context(span_id)
 
     try:
         yield span_id
     finally:
         _span_id_var.reset(token)
+        if span_ctx_token is not None:
+            reset_span(span_ctx_token)
 
 
 @contextmanager
@@ -656,9 +824,7 @@ def chain(
         ``workflow ``).
     """
     if op not in ("start", "continue", "end", "auto"):
-        raise ValueError(
-            f"chain() op must be one of start/continue/end/auto, got {op!r}"
-        )
+        raise ValueError(f"chain() op must be one of start/continue/end/auto, got {op!r}")
     chain_token = _chain_id_var.set(chain_id)
     op_token = _chain_op_var.set(op)
     try:

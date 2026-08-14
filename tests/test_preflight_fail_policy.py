@@ -199,6 +199,182 @@ class TestCheckWorkflowBudgetFailOpen:
 
 
 # ──────────────────────────────────────────────────────────────
+# Sprint handoff Bug #4 — observability closure on fail-OPEN paths
+# ──────────────────────────────────────────────────────────────
+#
+# The fail-OPEN posture is documented as authoritative (ADR-008 +
+# the top-of-file docstring table on `check_workflow_budget`). The
+# sprint handoff `enforcement-certainty-sprint-handoff.md` flagged
+# that pre-fix the FALLBACK `decision_source` path emitted DEBUG-level
+# logs and had no metric -- making the silent bypass invisible to
+# operators tailing INFO+ logs and unreachable for alerting.
+#
+# These tests pin the observability closure (WARNING log + metric
+# increment) without changing the fail-OPEN behaviour itself.
+# Existing tests above continue to assert "body runs, no raise".
+
+
+class TestCheckWorkflowBudgetObservability:
+    """Source-pin regression suite for the sprint handoff Bug #4 fix."""
+
+    def test_network_error_emits_warning_and_metric(self, make_runtime, mock_api, caplog):
+        """httpx.ConnectError on /gate → WARNING log + gate_fail_open_total+=1.
+
+        Pre-fix this path logged at WARNING already (see the existing
+        ``test_network_error_returns_normally`` behaviour) but emitted
+        no metric, so a sustained outage looked identical to a
+        one-off blip. The metric is the operator's primary signal.
+        """
+        import logging
+
+        from nullrun.observability import metrics
+
+        before = metrics.runtime.gate_fail_open_total
+        respx.post(f"{BASE_URL}/api/v1/gate").mock(
+            side_effect=httpx.ConnectError("connection refused")
+        )
+        rt = make_runtime()
+        with caplog.at_level(logging.WARNING, logger="nullrun.runtime"):
+            rt.check_workflow_budget()
+        # Metric incremented exactly once for the single fail-OPEN.
+        assert metrics.runtime.gate_fail_open_total == before + 1
+        # At least one WARNING from check_workflow_budget's fail-OPEN
+        # path was emitted (the exact wording is not pinned -- only
+        # the level, since the docblock on the method already declares
+        # "logged at warning level" as the contract).
+        warnings = [
+            r for r in caplog.records
+            if r.name == "nullrun.runtime"
+            and r.levelno == logging.WARNING
+            and "check_workflow_budget" in r.getMessage()
+        ]
+        assert warnings, "expected WARNING log from check_workflow_budget fail-OPEN"
+
+    def test_timeout_emits_warning_and_metric(self, make_runtime, mock_api, caplog):
+        """httpx.TimeoutException on /gate → WARNING log + metric++.
+
+        Same contract as the ConnectError test; covers the timeout
+        code path that the journal evidence flagged (transport.py
+        returns synthetic-block with DecisionSource.FALLBACK after
+        exhausting retries).
+        """
+        import logging
+
+        from nullrun.observability import metrics
+
+        before = metrics.runtime.gate_fail_open_total
+        respx.post(f"{BASE_URL}/api/v1/gate").mock(
+            side_effect=httpx.TimeoutException("read timeout")
+        )
+        rt = make_runtime()
+        with caplog.at_level(logging.WARNING, logger="nullrun.runtime"):
+            rt.check_workflow_budget()
+        assert metrics.runtime.gate_fail_open_total == before + 1
+
+    def test_synthetic_fallback_source_emits_warning_not_debug(
+        self, make_runtime, mock_api, caplog
+    ):
+        """When transport returns 5xx, it emits ``decision_source =
+        FALLBACK_*`` (synthetic-block). Pre-fix the runtime logged
+        this at DEBUG, which violated the docblock contract ("logged
+        at warning level"). Pin WARNING post-fix.
+        """
+        import logging
+
+        from nullrun.observability import metrics
+
+        before = metrics.runtime.gate_fail_open_total
+        respx.post(f"{BASE_URL}/api/v1/gate").mock(
+            return_value=httpx.Response(
+                503,
+                json={
+                    "decision": "block",
+                    "decision_source": "FALLBACK_NETWORK_ERROR",
+                    "explanation": "Gateway unavailable",
+                },
+            )
+        )
+        rt = make_runtime()
+        with caplog.at_level(logging.WARNING, logger="nullrun.runtime"):
+            rt.check_workflow_budget()
+        # Metric incremented.
+        assert metrics.runtime.gate_fail_open_total == before + 1
+        # No DEBUG-level record from check_workflow_budget's synthetic
+        # fallback arm -- the only post-fix log level for that path
+        # is WARNING. (Other DEBUG records from unrelated code paths
+        # may exist; we filter by message prefix.)
+        debug_fallback = [
+            r for r in caplog.records
+            if r.name == "nullrun.runtime"
+            and r.levelno == logging.DEBUG
+            and "synthetic decision_source" in r.getMessage()
+        ]
+        assert not debug_fallback, (
+            "synthetic decision_source arm must NOT log at DEBUG -- "
+            "this was the sprint handoff Bug #4 silent-fail-OPEN bug"
+        )
+
+    def test_real_block_does_not_increment_metric(self, make_runtime, mock_api):
+        """Real `decision=block` from the gateway is a policy block,
+        NOT a transport fail-OPEN -- must NOT increment the
+        gate_fail_open_total counter. Guards against a future
+        refactor that mistakenly moves the metric emit above the
+        decision-parse stage.
+        """
+        from nullrun.observability import metrics
+
+        before = metrics.runtime.gate_fail_open_total
+        respx.post(f"{BASE_URL}/api/v1/gate").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "decision": "block",
+                    "decision_source": "gateway",
+                    "explanations": ["budget_exceeded"],
+                },
+            )
+        )
+        rt = make_runtime()
+        with pytest.raises(WorkflowKilledInterrupt):
+            rt.check_workflow_budget()
+        assert metrics.runtime.gate_fail_open_total == before, (
+            "real policy block must not increment the fail-OPEN metric"
+        )
+
+    def test_real_allow_does_not_increment_metric(self, make_runtime, mock_api):
+        """Real `decision=allow` from the gateway is the happy path --
+        must NOT increment the fail-OPEN counter. Pin the
+        allow-path stays allow."""
+        from nullrun.observability import metrics
+
+        before = metrics.runtime.gate_fail_open_total
+        respx.post(f"{BASE_URL}/api/v1/gate").mock(
+            return_value=httpx.Response(
+                200,
+                json={"decision": "allow", "decision_source": "gateway"},
+            )
+        )
+        rt = make_runtime()
+        rt.check_workflow_budget()  # must not raise
+        assert metrics.runtime.gate_fail_open_total == before
+
+    def test_to_dict_includes_gate_fail_open_total(self):
+        """Pin the metric field is reachable from /health via
+        ``metrics.to_dict()`` so operator dashboards can graph it.
+        Without this pin, a future refactor that adds the counter
+        to RuntimeMetrics but forgets to_dict would silently break
+        observability -- the field exists, the JSON shape doesn't.
+        """
+        from nullrun.observability import metrics
+
+        d = metrics.to_dict()
+        assert "gate_fail_open_total" in d["runtime"], (
+            "metrics.to_dict() must expose gate_fail_open_total for "
+            "/health and operator dashboards"
+        )
+
+
+# ──────────────────────────────────────────────────────────────
 # Bug #2 — _enforce_sensitive_tool fail-CLOSED on transport error
 # ──────────────────────────────────────────────────────────────
 

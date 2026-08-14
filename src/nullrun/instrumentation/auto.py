@@ -964,14 +964,26 @@ class NullRunAsyncTransport(httpx.AsyncBaseTransport):
         body: bytes,
         status: int,
     ) -> None:
-        # 0.9.0: emit llm_call with metadata.tracked: True (sync
-        # path is identical). Async path doesn't have the request-
-        # body model fallback yet (sync path's
-        # `_extract_model_from_request_body` is sync-only); leave
-        # model as the response-body value or None.
+        # F-29 (UI-UX-AUDIT 2026-08-14): mirror the sync path's
+        # request-body model fallback (lines 882-885) so async
+        # Anthropic / OpenAI streaming clients without ``usage.model``
+        # don't silently zero-bill. ``_extract_model_from_request_body``
+        # is a module-level pure-sync helper that reads
+        # ``request.content`` and ``json.loads`` it — safe to call
+        # from the async event loop (no I/O, no blocking). The
+        # response body is tried first, the request body is the
+        # fallback when the response omits the field.
+        #
+        # Pre-fix the async path stopped at ``usage.get("model")``
+        # only, so async Anthropic streaming without usage.model ->
+        # silent zero-billing -> cost_events.cost_cents = 0.
+        model_for_event = (
+            usage.get("model")
+            or _extract_model_from_request_body(request)
+        )
         try:
             self._runtime.track(
-                _build_llm_call_event(host, usage, usage.get("model"))
+                _build_llm_call_event(host, usage, model_for_event)
             )
         except Exception as e:
             logger.debug("NullRun transport: async track failed: %s", e)

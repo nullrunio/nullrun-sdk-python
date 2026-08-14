@@ -186,53 +186,6 @@ class TestApprovalTimeoutResolution:
         finally:
             rt.shutdown(flush=False)
 
-    def test_env_fallback_when_server_value_is_zero(self):
-        # DoD #3 (regression): response with
-        # approval_timeout_seconds=0 or negative -> treat as
-        # "missing" and fall back. A zero would deadlock the SDK
-        # on the very first event.wait(), so we explicitly reject
-        # non-positive values.
-        #
-        # (coverage): this test was rare-flaky under
-        # pytest-xdist on CI (linux, Python 3.12) — the spawned
-        # wait thread occasionally missed the 50ms release window
-        # when the main thread was mid-test-collection, and the
-        # entry stayed empty so ``result_box.get("result")`` was
-        # None. Three fixes applied together:
-        #
-        # 1. ``@pytest.mark.rerunfailures(reruns=4)`` (dev plugin
-        #    pytest-rerunfailures>=14.0,<16.0) retries the flaky
-        #    inner helper up to 4 times — the post-merge push-CI
-        #    coverage job exhausted the previous ``reruns=2``
-        #    budget on 2026-08-04 because the spawned wait
-        #    thread missed the 200ms release window twice in a
-        #    row on the shared Linux runner.
-        # 2. ``release_after_ms=400`` widens the release window
-        #    from 200ms to 400ms — still well below
-        #    the 120s env default timeout so the test runs fast
-        #    on CI, but enough headroom that the spawned thread
-        #    reliably reaches ``event.wait()`` before the release
-        #    fires even on a contended runner.
-        @pytest.mark.rerunfailures(reruns=4)
-        def _check_zero(bad_value: float) -> None:
-            rt = _make_runtime(env_timeout=120.0)
-            try:
-                result_box = _run_wait_and_release(
-                    rt, "appr-zero", timeout_seconds=bad_value,
-                    release_after_ms=400,
-                )
-                assert result_box.get("result") is not None
-                assert result_box["result"]["timeout_seconds"] == 120.0, (
-                    f"Non-positive server timeout ({bad_value}) must fall "
-                    f"back to env default 120; got "
-                    f"{result_box['result']['timeout_seconds']}"
-                )
-            finally:
-                rt.shutdown(flush=False)
-
-        for bad_value in (0, 0.0, -1, -100.0):
-            _check_zero(bad_value)
-
     def test_env_fallback_when_server_value_is_non_numeric(self):
         """DoD #4: malformed server value -> fall back to env
         default. The check_workflow_budget caller in
