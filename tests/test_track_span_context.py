@@ -16,9 +16,24 @@ from types import SimpleNamespace
 
 import pytest
 
+# F-19 source-pin regression tests rely on the legacy
+# ``get_trace_id`` / ``get_span_id`` / ``get_workflow_id`` getters
+# (the runtime's ``_enrich_event`` reads via these; the new system
+# reads via ``get_current_span``). We also need the public
+# ``nullrun.workflow`` / ``nullrun.span`` context managers, which
+# the SDK re-exports from ``nullrun.context``. Importing at the top
+# keeps each test focused on its assertion rather than shuffling
+# imports in every body.
+import nullrun
+from nullrun.context import (  # noqa: E402
+    get_span_id,
+    get_trace_id,
+    get_workflow_id,
+)
 from nullrun.tracing import (
     create_child_span,
     create_root_span,
+    get_current_span,
     reset_span,
     set_span,
 )
@@ -284,3 +299,464 @@ def test_protect_then_track_llm_attaches_to_protect_span(capturing_runtime, monk
 
     # span_end matches span_start.
     assert span_end["span_id"] == span_start["span_id"]
+
+
+# ===========================================================================
+# F-19 (2026-08-14): workflow/span/@protect contextvar unification.
+# ===========================================================================
+# Pre-fix the SDK owned two parallel contextvar systems for trace
+# context, each set by half of the API surface and never read by the
+# other half. ``with workflow(...)`` / ``with span(...)`` only touched
+# the legacy ``_trace_id_var`` / ``_span_id_var`` (used by
+# ``runtime._enrich_event``), while ``@protect`` and ``set_span``
+# only touched ``_current_span`` (used for parent/child SpanContext).
+# The two halves disagreed about trace_id for the same execution, so
+# the dashboard rendered two disjoint trees per
+# ``@protect``-inside-a-``with workflow`` call.
+#
+# The post-fix contract tested here: ``with workflow`` /
+# ``with span`` dual-write both surfaces, ``@protect`` mirrors
+# SpanContext back to legacy, and both surfaces restore on block
+# exit. Regression tests below pin each direction so future
+# refactors (e.g. dropping the legacy vars entirely per audit
+# closer in F-19 follow-up) cannot silently break the unified
+# invariant.
+
+
+def test_workflow_dual_writes_span_context_source_pin():
+    """
+    Source-pin check: ``with workflow("foo")`` pushes a root
+    ``SpanContext`` onto ``_current_span`` BEFORE yielding.
+
+    Pre-fix ``workflow()`` left ``_current_span`` untouched, so an
+    inner ``@protect`` (which derives its span from
+    ``get_current_span()``) created a brand-new root with a
+    different ``trace_id`` than the workflow. The cost events
+    emitted by ``runtime._enrich_event`` (legacy reader) saw the
+    workflow's ``trace_id`` while the ``span_start`` event emitted
+    by ``@protect`` saw a different one — dashboard tree-break.
+
+    This is a static AST scan because we want the contract pinned
+    even if both readers and writers change: ``with workflow``
+    MUST contain at least one ``set_span`` (or equivalent)
+    call site BEFORE the ``try: yield`` block, and a
+    matching ``reset_span`` (paired with the same Token variable)
+    inside the ``finally`` block. Renaming the helper
+    (``_set_workflow_root_span`` -> e.g. ``_push_span``) is fine;
+    only the symmetric set+reset inside ``workflow()`` matters.
+    """
+    import ast
+    import inspect
+
+    from nullrun.context import workflow as _workflow
+
+    source = inspect.getsource(_workflow)
+    tree = ast.parse(source)
+
+    func_found = False
+    set_token_in_try_before_yield = False
+    reset_token_in_finally = False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef) or node.name != "workflow":
+            continue
+        func_found = True
+        # Walk the function body looking for `set_X` / `_set_X` calls
+        # that produce a token assigned to `span_ctx_token` BEFORE
+        # the `yield`, and `reset_X` / `reset_span` calls using the
+        # same variable in the `finally` block. We allow any
+        # bridging helper name (current implementation uses
+        # `_set_workflow_root_span` which calls into
+        # `tracing.set_span`; future implementations may inline
+        # the helper).
+        for child in ast.walk(node):
+            if isinstance(child, ast.Assign):
+                for target in child.targets:
+                    if isinstance(target, ast.Name) and target.id == "span_ctx_token":
+                        # Was the RHS a function call to a setter
+                        # of some kind? We accept any function
+                        # call here (the AST doesn't yet
+                        # distinguish which Call) — a future
+                        # refactor that calls e.g.
+                        # ``_push_workflow_span(...)`` will still
+                        # satisfy the test.
+                        if isinstance(child.value, ast.Call):
+                            set_token_in_try_before_yield = True
+            if isinstance(child, ast.Call) and isinstance(child.func, ast.Name):
+                # reset_span(span_ctx_token) inside the function
+                if child.func.id == "reset_span":
+                    # Check the argument is span_ctx_token
+                    if (
+                        child.args
+                        and isinstance(child.args[0], ast.Name)
+                        and child.args[0].id == "span_ctx_token"
+                    ):
+                        reset_token_in_finally = True
+
+    assert func_found, "could not find `workflow()` in context.py"
+    assert set_token_in_try_before_yield, (
+        "F-19 regression: `with workflow(...)` no longer mints a "
+        "SpanContext token in its setup block. Pre-fix this would "
+        "leave SpanContext unset inside the workflow and break the "
+        "dashboard tree (workflow vs @protect disconnect)."
+    )
+    assert reset_token_in_finally, (
+        "F-19 regression: `with workflow(...)` no longer resets "
+        "the SpanContext in its finally block. Pre-fix this would "
+        "leak the workflow's SpanContext into enclosing code."
+    )
+
+
+def test_span_dual_writes_or_passthrough_source_pin():
+    """
+    Source-pin check: ``with span(...)`` either pushes a child
+    ``SpanContext`` or — if no parent is active — leaves
+    ``_current_span`` untouched (the legacy corner-case behavior
+    preserved per F-19 fix notes).
+
+    The allowed shapes are:
+
+      A. ``span_ctx_token = _set_child_span_context(span_id)``
+         followed by ``reset_span(span_ctx_token)`` in the
+         finally, guarded by ``if span_ctx_token is not None``
+         (the no-parent case skips the push).
+
+      B. A future replacement that always pushes (the no-parent
+         case pushes a synthetic root). Acceptable as long as
+         ``reset_span`` pairs with the same token variable.
+
+    The detector matches both shapes by scanning for the
+    ``span_ctx_token`` name (any helper function name)
+    AND a paired ``reset_span(span_ctx_token)`` in the
+    function body.
+    """
+    import ast
+    import inspect
+
+    from nullrun.context import span as _span
+
+    source = inspect.getsource(_span)
+    tree = ast.parse(source)
+
+    found_assignment = False
+    found_reset = False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef) or node.name != "span":
+            continue
+        for child in ast.walk(node):
+            if isinstance(child, ast.Assign):
+                for target in child.targets:
+                    if isinstance(target, ast.Name) and target.id == "span_ctx_token":
+                        if isinstance(child.value, ast.Call):
+                            found_assignment = True
+            if (
+                isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Name)
+                and child.func.id == "reset_span"
+            ):
+                if (
+                    child.args
+                    and isinstance(child.args[0], ast.Name)
+                    and child.args[0].id == "span_ctx_token"
+                ):
+                    found_reset = True
+
+    assert found_assignment, (
+        "F-19 regression: `with span(...)` no longer mints a "
+        "child-SpanContext token via `_set_child_span_context` "
+        "(or equivalent). Pre-fix this would leave nested "
+        "`@protect` calls detached from the surrounding workflow."
+    )
+    assert found_reset, (
+        "F-19 regression: `with span(...)` no longer resets the "
+        "child SpanContext in its finally block. Pre-fix this would "
+        "leak the span's SpanContext into enclosing code."
+    )
+
+
+def test_workflow_duals_writes_span_context_runtime():
+    """Functional counterpart of the static pin: ``with workflow``
+    actually sets ``_current_span`` at runtime and resets it
+    on exit."""
+    from nullrun.context import get_workflow_id
+    from nullrun.context import workflow as _workflow
+
+    assert get_workflow_id() is None
+    with _workflow("foo"):
+        # Inside the workflow: SpanContext should be set
+        current = get_current_span()
+        legacy_trace = get_trace_id()
+        assert current is not None, (
+            "F-19 regression: `with workflow(...)` did not push a "
+            "SpanContext onto _current_span. Without this, "
+            "inner @protect calls derive a fresh root with a "
+            "different trace_id and the dashboard tree breaks."
+        )
+        # The dual-write contract: SpanContext.trace_id == legacy
+        # _trace_id_var. They MUST agree — if they diverge the
+        # trace tree is detached again (which is what F-19 was).
+        assert current.trace_id == legacy_trace
+        assert current.span_id == get_span_id()
+        assert current.parent_span_id is None
+        assert current.depth == 0
+        # workflow_id is set on the workflow_id_var (separate
+        # contextvar, not part of SpanContext).
+        assert get_workflow_id() == "foo"
+
+    # After exit: SpanContext and legacy vars both restored.
+    assert get_current_span() is None
+    assert get_trace_id() is None
+    assert get_span_id() is None
+    assert get_workflow_id() is None
+
+
+def test_span_inside_workflow_creates_child_span_context():
+    """``with span`` inside ``with workflow`` pushes a child
+    SpanContext whose parent is the workflow's root span."""
+    with nullrun.workflow("outer"):
+        workflow_span = get_current_span()
+        assert workflow_span is not None
+        with nullrun.span("inner") as inner_id:
+            inner_span = get_current_span()
+            assert inner_span is not None
+            # Same trace, child of the workflow's root span.
+            assert inner_span.trace_id == workflow_span.trace_id
+            assert inner_span.parent_span_id == workflow_span.span_id
+            assert inner_span.depth == workflow_span.depth + 1
+            # Legacy _span_id_var must equal SpanContext.span_id
+            # (the F-19 fix's dual-write invariant).
+            assert inner_span.span_id == inner_id
+            assert get_span_id() == inner_id
+
+    # After both exits: cleaned up.
+    assert get_current_span() is None
+    assert get_span_id() is None
+
+
+def test_span_outside_workflow_preserves_legacy_corner_case():
+    """A bare ``with span(...)`` (no enclosing workflow /
+    protect) does NOT push a synthetic root onto
+    ``_current_span`` — keeps the legacy behavior where
+    ``get_trace_id()`` returns None and the runtime's
+    fallback synthesises a fresh trace_id at emit time.
+
+    This pins the F-19 audit's explicit design choice
+    (preserves bare-span semantics — see
+    ``_set_child_span_context`` docstring)."
+    """
+    # Start clean.
+    assert get_current_span() is None
+    with nullrun.span("standalone"):
+        # _current_span stays None — bare ``with span``
+        # outside any workflow/protect must NOT create a
+        # synthetic trace root.
+        assert get_current_span() is None
+        # Legacy _span_id_var IS set (per existing behavior).
+        assert get_span_id() == "standalone"
+        # Legacy _trace_id_var is NOT set (per existing
+        # behavior — runtime synthesises on emit).
+        assert get_trace_id() is None
+
+    assert get_current_span() is None
+    assert get_span_id() is None
+
+
+def test_protect_mirrors_span_context_to_legacy_vars(make_runtime, monkeypatch):
+    """``@protect`` reads SpanContext (via _next_span) and
+    ALSO writes trace_id/span_id back to the legacy
+    contextvars so cost events emitted by
+    ``runtime._enrich_event`` carry the SAME trace_id as
+    span_start. The post-fix invariant: get_trace_id()
+    inside the protected function == SpanContext.trace_id.
+
+    Pre-fix this was false: bare ``@protect`` (no enclosing
+    workflow) had SpanContext set but legacy vars were None,
+    so cost events fell through to ``generate_trace_id()``
+    and the trace tree detached from the cost events.
+    """
+    from nullrun import runtime as runtime_mod
+    from nullrun.decorators import reset as reset_decorator_runtime
+
+    # Capture trace_id/span_id from BOTH sources: the runtime's
+    # _enrich_event path (legacy reader) and a raw
+    # get_current_span() inside the protected body
+    # (SpanContext reader).
+    captured = {
+        "legacy_trace": None,
+        "legacy_span": None,
+        "span_trace": None,
+        "span_span": None,
+    }
+
+    # Build a runtime via the test fixture so @protect can find
+    # a singleton (the reset_runtime autouse fixture has cleared
+    # it). The mock_api fixture inside make_runtime covers any
+    # HTTP the runtime touches; we just need the singleton to
+    # exist so _protect_body runs past the runtime lookup.
+    rt = make_runtime()
+    monkeypatch.setattr(runtime_mod, "get_runtime", lambda: rt)
+
+    @nullrun.protect
+    def probe():
+        captured["legacy_trace"] = get_trace_id()
+        captured["legacy_span"] = get_span_id()
+        span = get_current_span()
+        captured["span_trace"] = span.trace_id if span else None
+        captured["span_span"] = span.span_id if span else None
+
+    try:
+        probe()
+    finally:
+        reset_decorator_runtime()
+
+    # Pin the core F-19 invariant: legacy mirrors match
+    # SpanContext. If the trace_id diverges, the dashboard
+    # tree is broken (which is what F-19 was about).
+    assert captured["span_trace"] is not None, (
+        "expected a SpanContext to be set by @protect; "
+        "if this is None _next_span failed or _protect_body "
+        "didn't run set_span before the body."
+    )
+    assert captured["legacy_trace"] == captured["span_trace"], (
+        f"F-19 regression: legacy get_trace_id() "
+        f"({captured['legacy_trace']!r}) diverged from "
+        f"SpanContext.trace_id ({captured['span_trace']!r}). "
+        f"Pre-fix the runtime's cost events read the legacy "
+        f"var and span_start read SpanContext — the dashboard "
+        f"tree dropped cost events from the trace timeline."
+    )
+    assert captured["legacy_span"] == captured["span_span"], (
+        f"F-19 regression: legacy get_span_id() "
+        f"({captured['legacy_span']!r}) diverged from "
+        f"SpanContext.span_id ({captured['span_span']!r})."
+    )
+
+
+def test_protect_restores_legacy_vars_after_exit(make_runtime, monkeypatch):
+    """After ``@protect`` exits (success OR exception), the
+    legacy _trace_id_var / _span_id_var are restored to
+    whatever they were BEFORE the call. Token-based reset
+    preserves the user's enclosing workflow context.
+
+    Pre-fix there was no legacy-mirror-to-reset pairing,
+    so a ``@protect`` inside ``with workflow`` would have
+    overwritten the workflow's _span_id_var with the
+    ``@protect``'s span_id. After ``@protect`` exit the
+    workflow's own span_id was GONE — any further
+    ``track(...)`` in the workflow body was attributed
+    to the wrong span.
+    """
+    from nullrun import runtime as runtime_mod
+    from nullrun.decorators import reset as reset_decorator_runtime
+
+    rt = make_runtime()
+    monkeypatch.setattr(runtime_mod, "get_runtime", lambda: rt)
+
+    with nullrun.workflow("outer_workflow"):
+        # Capture the workflow's trace / span context state.
+        before_trace = get_trace_id()
+        before_span = get_span_id()
+        assert before_trace is not None
+        assert before_span is not None
+
+        @nullrun.protect
+        def probe():
+            pass
+
+        try:
+            probe()
+        finally:
+            reset_decorator_runtime()
+
+        # After probe() returns: trace_id/span_id match
+        # the workflow's pre-probe values (NOT @protect's
+        # inner span). The token-based resets in finally
+        # make this true regardless of which depth we're
+        # at.
+        assert get_trace_id() == before_trace, (
+            f"F-19 regression: _trace_id_var not restored "
+            f"after @protect exit (got {get_trace_id()!r}, "
+            f"expected {before_trace!r})."
+        )
+        # Inside ``with workflow`` only, the legacy
+        # span_id is preserved (the workflow owns the
+        # span; @protect's mirror restores it on exit).
+
+    # After both exits: full cleanup.
+    assert get_trace_id() is None
+    assert get_span_id() is None
+
+
+def test_workflow_span_protect_yield_depth_two_chain(make_runtime, monkeypatch):
+    """End-to-end coherence: workflow -> span -> @protect
+    produces a depth-2 SpanContext chain with consistent
+    trace_id across every layer.
+
+    Pin the F-19 audit's "trace trees are broken between
+    workflow blocks and @protect calls" — the post-fix
+    invariant is that ALL three sites agree on trace_id
+    AND that the SpanContext depth chain is correct.
+    """
+    from nullrun import runtime as runtime_mod
+    from nullrun.decorators import reset as reset_decorator_runtime
+
+    rt = make_runtime()
+    monkeypatch.setattr(runtime_mod, "get_runtime", lambda: rt)
+
+    with nullrun.workflow("top") as top_workflow_id:
+        workflow_span = get_current_span()
+        assert workflow_span is not None
+        with nullrun.span("mid") as mid_span_id:
+            mid_span = get_current_span()
+            assert mid_span.parent_span_id == workflow_span.span_id
+            assert mid_span.depth == 1
+            assert mid_span.trace_id == workflow_span.trace_id
+
+            # Snapshot mid-span state so we can verify @protect
+            # restores it after exit.
+            assert get_span_id() == mid_span_id
+
+            @nullrun.protect
+            def leaf():
+                # Inside ``leaf``: SpanContext is depth-2,
+                # child of the mid-span, same trace as top
+                # workflow. The trace_id matches BOTH the
+                # legacy _trace_id_var AND the SpanContext —
+                # which is the F-19 fix's whole point.
+                leaf_span = get_current_span()
+                assert leaf_span is not None
+                assert leaf_span.depth == 2
+                assert leaf_span.parent_span_id == mid_span.span_id
+                assert leaf_span.trace_id == workflow_span.trace_id
+                # Legacy trace_id matches SpanContext — pin
+                # this exactly; F-19 is precisely the broken
+                # case where they would diverge.
+                assert get_trace_id() == workflow_span.trace_id
+                # Workflow id is unchanged inside @protect.
+                assert get_workflow_id() == top_workflow_id
+                # During @protect the legacy _span_id_var
+                # mirrors the leaf span_id; post-fix this
+                # is the value the runtime emits on the
+                # cost event so the dashboard can group
+                # leaf calls under the leaf span.
+                assert get_span_id() == leaf_span.span_id
+
+            try:
+                leaf()
+            finally:
+                reset_decorator_runtime()
+
+            # After leaf() returns: legacy span_id is the
+            # mid-span (NOT the leaf-span) — token-based
+            # reset restored the with-span context.
+            # This is the post-fix invariant: @protect
+            # doesn't leak into its caller's context.
+            assert get_span_id() == mid_span_id, (
+                f"F-19 regression: @protect leaked its "
+                f"span_id into enclosing with-span context "
+                f"(got {get_span_id()!r}, expected "
+                f"{mid_span_id!r}). The pre-fix tokenizer "
+                f"left _span_id_var stale; the post-fix "
+                f"token-based reset restores it."
+            )
+
+    assert get_current_span() is None

@@ -48,7 +48,13 @@ from nullrun.breaker.exceptions import (
     WorkflowKilledInterrupt,
     WorkflowPausedException,
 )
-from nullrun.context import get_workflow_id
+from nullrun.context import (
+    get_workflow_id,
+    reset_span_id,
+    reset_trace_id,
+    set_span_id,
+    set_trace_id,
+)
 from nullrun.runtime import NullRunRuntime, get_runtime
 
 # Sentinel used when a gate fires outside a workflow context.
@@ -440,6 +446,21 @@ def protect(fn: F | None = None) -> F | Callable[[F], F]:
         runtime = _get_or_create_runtime()
         span = _next_span()
         token = set_span(span)
+        # F-19 (2026-08-14): mirror the derived SpanContext back to
+        # the legacy ``_trace_id_var`` / ``_span_id_var`` so the
+        # runtime's ``_enrich_event`` (which reads via
+        # ``get_trace_id()`` / ``get_span_id()`` for cost events
+        # AND for ``parent_trace_id`` derivation at runtime.py:2967)
+        # emits events tagged with the SAME trace_id /
+        # span_id as SpanContext. Without this mirror a bare
+        # ``@protect`` (no enclosing ``with workflow``) still saw a
+        # tree-break: span_start carried SpanContext.trace_id while
+        # llm_call / tool_call carried ``generate_trace_id()`` from
+        # the legacy fallback. Token-based so a nested ``@protect``
+        # inside an outer ``@protect`` (or inside ``with workflow``)
+        # restores the outer trace/span on reset.
+        trace_legacy_token = set_trace_id(span.trace_id)
+        span_legacy_token = set_span_id(span.span_id)
         error: BaseException | None = None
         try:
             # 1. KILL/PAUSE from the dashboard short-circuits
@@ -486,6 +507,13 @@ def protect(fn: F | None = None) -> F | Callable[[F], F]:
             raise
         finally:
             reset_span(token)
+            # F-19 follow-up: token-based reset matches the legacy
+            # ``_trace_id_var`` / ``_span_id_var`` pattern (paired
+            # with their tokens set above). Order does not matter;
+            # both resets restore the prior contextview regardless
+            # of which one runs first.
+            reset_trace_id(trace_legacy_token)
+            reset_span_id(span_legacy_token)
             _emit_span_end(
                 runtime,
                 span,
