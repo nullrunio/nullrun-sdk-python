@@ -100,6 +100,15 @@ class RuntimeMetrics:
     # counter, the failure mode was invisible at INFO log level on
     # the FALLBACK path.
     gate_fail_open_total: int = 0
+    # 2026-08-20 (v0.16.0, backend v3.66.2 alignment): v1/v2 path
+    # `/track/batch` with `llm_call` events missing `reservation_id`
+    # is now fail-CLOSED at the backend (whole-batch 503 BUDGET_RECHECK_FAILED).
+    # Pre-0.16.0 the SDK fell back to that path for calls without a
+    # paired /check — amplification into 503-storm. Now the SDK
+    # explicitly drops those events and increments this counter.
+    # Operators alert on sustained rate to detect integration bugs
+    # (missing gate pairing around `track_llm`).
+    dropped_llm_call_no_reservation: int = 0
 
 
 class MetricsRegistry:

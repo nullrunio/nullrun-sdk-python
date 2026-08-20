@@ -1583,7 +1583,12 @@ class TestBuildV3TrackPayload:
         }
 
     def test_missing_workflow_id_returns_none(self):
-        # Caller falls back to /track/batch.
+        # v0.16.0 (backend v3.66.2 alignment): caller now DROPS
+        # llm_call events whose mapper refused (missing required
+        # field), not batch — backend v3.66.2 wire-validation would
+        # fail-CLOSE the batch anyway. Mapper returning None is the
+        # signal for the caller to drop instead of fabricating a
+        # malformed v3 payload.
         out = _build_v3_track_payload(
             {"type": "llm_call", "tokens": 1},
             SERVER_MINTED_V1,
@@ -1687,8 +1692,20 @@ class TestRouteTrack:
         assert batch_route.call_count == 1
 
     @respx.mock
-    def test_llm_call_without_smid_falls_back_to_batch(self, make_runtime):
-        # No /check in scope → no smid → legacy path.
+    def test_llm_call_without_smid_is_dropped(self, make_runtime):
+        # v0.16.0 (backend v3.66.2 alignment): no /check in scope →
+        # no smid → DROP. Previously (0.12.0–0.15.2) this fell back
+        # to /track/batch (the legacy v1/v2 no-reservation consume
+        # path). Backend v3.66.2 closed that path with per-event
+        # type-aware wire validation: any ``llm_call`` event in a
+        # batch WITHOUT ``reservation_id`` is rejected with 503
+        # BUDGET_RECHECK_FAILED (whole-batch fail-CLOSED). Falling
+        # back here would amplify into a tight retry loop producing
+        # 503-storm for every call site that forgot to pair
+        # ``track_llm`` with a prior ``check_workflow_budget`` (or
+        # ``@protect`` / ``with workflow(...)``).
+        from nullrun.observability import metrics
+
         rt = make_runtime()
 
         single_route = respx.post(f"{BASE_URL}/api/v1/track").mock(
@@ -1698,18 +1715,24 @@ class TestRouteTrack:
             return_value=Response(200, json={"ok": True, "accepted": 1})
         )
 
-        # No capture call here — contextvar stays empty.
+        # Snapshot the drop counter BEFORE the call so concurrent
+        # tests in the same suite can't make the assertion noisy.
+        before = metrics.runtime.dropped_llm_call_no_reservation
 
+        # No capture call here — contextvar stays empty.
         rt.track_llm(
             input_tokens=10,
             output_tokens=5,
             model="claude-sonnet-4-6",
         )
-        # Buffer + flush.
+        # Buffer + flush — neither endpoint should fire.
         rt._transport.flush_now()
 
         assert single_route.call_count == 0
-        assert batch_route.call_count == 1
+        assert batch_route.call_count == 0
+        assert (
+            metrics.runtime.dropped_llm_call_no_reservation == before + 1
+        ), "drop counter must increment by 1 on a no-smid llm_call"
 
     @respx.mock
     def test_v3_track_disable_env_forces_legacy(self, make_runtime, monkeypatch):
@@ -1820,6 +1843,13 @@ class TestEndToEndCaptureFlow:
 
         from nullrun.breaker.exceptions import WorkflowKilledInterrupt
         from nullrun.context import workflow
+        from nullrun.observability import metrics
+
+        # Snapshot the drop counter BEFORE the block+track so the
+        # assertion is isolated from concurrent tests in the same
+        # suite.
+        before = metrics.runtime.dropped_llm_call_no_reservation
+
         with workflow("wf-1"):
             # Block path raises — WorkflowKilledInterrupt is a
             # BaseException (carries the kill signal
@@ -1837,9 +1867,18 @@ class TestEndToEndCaptureFlow:
             )
             rt._transport.flush_now()
 
-        # No reservation_id was minted → falls back to batch.
+        # v0.16.0 (backend v3.66.2 alignment): no reservation_id
+        # was minted (block response carries no reservation_id; the
+        # capture helper clears the contextvar) → event is DROPPED,
+        # not batched. Pre-0.16.0 this fell back to /track/batch,
+        # which v3.66.2 rejects with 503 BUDGET_RECHECK_FAILED.
+        # The semantic intent of the test is preserved: no smid
+        # leaks from the block into the subsequent track.
         assert single_route.call_count == 0
-        assert batch_route.call_count == 1
+        assert batch_route.call_count == 0
+        assert (
+            metrics.runtime.dropped_llm_call_no_reservation == before + 1
+        ), "drop counter must increment by 1 on a post-block llm_call"
 
 
 # ─── v3.38 wire-drift fixes ─────────────────────────────────
