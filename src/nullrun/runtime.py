@@ -1849,6 +1849,12 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # always-skipped).
         metrics.inc_runtime("check_calls")
 
+        from nullrun.business_impact import (
+            BusinessImpact as _BusinessImpact,
+        )
+        from nullrun.business_impact import (
+            compute_action_digest as _compute_action_digest,
+        )
         from nullrun.context import (
             get_call_mcp_annotations,
             get_call_mcp_class,
@@ -1857,10 +1863,6 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             get_chain_id,
             get_chain_op,
             get_workflow_id,
-        )
-        from nullrun.business_impact import (
-            BusinessImpact as _BusinessImpact,
-            compute_action_digest as _compute_action_digest,
         )
 
         # Prefer the user-set contextvar (explicit `with workflow(...)`
