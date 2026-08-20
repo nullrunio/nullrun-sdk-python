@@ -1849,6 +1849,12 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # always-skipped).
         metrics.inc_runtime("check_calls")
 
+        from nullrun.business_impact import (
+            BusinessImpact as _BusinessImpact,
+        )
+        from nullrun.business_impact import (
+            compute_action_digest as _compute_action_digest,
+        )
         from nullrun.context import (
             get_call_mcp_annotations,
             get_call_mcp_class,
@@ -1910,6 +1916,21 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             "estimated_tokens": 1,
             "stream": False,
         }
+
+        # v0.16.1 (Phase-1+ wire-shape fix): Phase-1+ SDKs MUST
+        # populate `action_digest` on every /gate call, even when no
+        # typed business impact is extracted (`@protect`-decorated
+        # LLM-only calls). Per `backend/src/proxy/http/gate/gate.rs:56`
+        # v3.62.1 / ADR-023 P1-6 the gate fail-CLOSED-rejects any
+        # proto>=3 client that omits the digest. We always emit a
+        # NoImpact sentinel here — typed Money/ToolCall impacts are
+        # forwarded by `runtime.execute(...)` directly (see
+        # `transport.py::execute`) and do not pass through this
+        # pre-flight gate. Computing once per call (not cached) is
+        # fine: compute_action_digest is ~5µs of pure stdlib.
+        check_req["action_digest"] = _compute_action_digest(
+            _BusinessImpact.no_impact()
+        )
 
         # Forward the tool list so backend (T3) can match each tool
         # against the workflow's effective `blocked_tools` aggregate.

@@ -51,8 +51,13 @@ EQ = "eq"
 # `money` kind for per-call flat amounts.
 # `tool_call` kind for free-form tool-call argument bags matched
 # against ToolParameters Approval Rules on the backend.
+# `none` kind for non-impact LLM/tool calls that still need an
+# `action_digest` on the wire (per `backend/src/proxy/http/gate/gate.rs:56`
+# v3.62.1 / ADR-023 P1-6 — Phase-1+ SDKs MUST supply `action_digest`
+# even when there is no typed business impact to extract).
 KIND_MONEY = "money"
 KIND_TOOL_CALL = "tool_call"
+KIND_NONE = "none"
 
 
 # Mirrors the backend constant at
@@ -261,6 +266,42 @@ def business_impact_to_dict(impact: BusinessImpact) -> dict[str, Any]:
 # in-process layer. The SDK validates the variant at construction
 # time so the backend never sees malformed output.
 @dataclass
+class NoImpactPayload:
+    """Sentinel payload for non-impact calls (plain LLM chat, etc.).
+
+    Phase-1+ SDKs MUST populate `action_digest` on every `/gate`
+    call (per `backend/src/proxy/http/gate/gate.rs:56` v3.62.1 /
+    ADR-023 P1-6 — fail-CLOSED wire-shape version-gate). Calls
+    that have no typed business impact (regular LLM chat,
+    read-only tool calls without an approval rule) need a
+    deterministic digest that the wire-shape check accepts.
+
+    The canonical JSON of this payload is ``{"kind":"none"}``
+    (compact, key-sorted). The corresponding digest is the SHA-256
+    of ``nullrun/v1/business_impact:{"kind":"none"}`` and is
+    pinned as a literal in
+    ``tests/test_business_impact.py::test_no_impact_digest_pins_hex``
+    so a drift between SDK and backend (or a stray canonicalisation
+    change) is caught at unit-test time.
+
+    This variant exists ONLY on the SDK side. The backend's
+    `GateRequestBody.business_impact` field stays ``None`` for
+    non-impact calls — the `action_digest` field is the one the
+    wire-shape gate checks. Adding a NoImpact arm to the backend's
+    ``BusinessImpact`` enum is a follow-up if / when the digest
+    re-check path needs to reverse-hash the impact (currently
+    it doesn't — the re-check only fires when an approval row
+    is involved, which requires a typed impact by definition).
+    """
+
+    def validate(self) -> None:
+        """No-op: NoImpact carries no field constraints."""
+
+    def to_wire_dict(self) -> dict[str, Any]:
+        return {"kind": KIND_NONE}
+
+
+@dataclass
 class BusinessImpact:
     """Top-level BusinessImpact union.
 
@@ -268,12 +309,18 @@ class BusinessImpact:
         `Money`: flat per-call money amount (cents, USD-centric).
         `ToolCall`: free-form tool-call argument bag matched
             against ToolParameters Approval Rules on the backend.
+        `NoImpact`: sentinel for non-impact calls (regular LLM
+            chat, tool calls without a typed approval rule).
+            Wire shape: ``{"kind":"none"}``. Lets the SDK
+            compute an `action_digest` that satisfies the
+            Phase-1+ wire-shape version-gate without inventing
+            a fake typed impact.
 
     The SDK validates the variant at construction time so the
     backend never sees malformed output.
     """
 
-    impact: Any  # MoneyImpact | ToolCallParams
+    impact: Any  # MoneyImpact | ToolCallParams | NoImpactPayload
 
     @property
     def kind(self) -> str:
@@ -281,6 +328,8 @@ class BusinessImpact:
             return KIND_MONEY
         if isinstance(self.impact, ToolCallParams):
             return KIND_TOOL_CALL
+        if isinstance(self.impact, NoImpactPayload):
+            return KIND_NONE
         raise TypeError(f"unknown impact type: {type(self.impact)}")
 
     def validate(self) -> None:
@@ -328,6 +377,19 @@ class BusinessImpact:
         )
         p.validate()
         return cls(impact=p)
+
+    @classmethod
+    def no_impact(cls) -> BusinessImpact:
+        """Sentinel ``kind="none"`` BusinessImpact for non-impact calls.
+
+        Use this in ``runtime.check_workflow_budget`` and other
+        /gate sites that don't extract a typed impact but still
+        need to compute an `action_digest` to satisfy the
+        backend's Phase-1+ wire-shape version-gate.
+        """
+        n = NoImpactPayload()
+        n.validate()
+        return cls(impact=n)
 
 
 def _canonicalize_json(value: Any) -> Any:

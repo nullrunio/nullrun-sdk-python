@@ -1245,6 +1245,15 @@ class Transport:
             gate_request["idempotency_key"] = check_request["idempotency_key"]
         if "stream" in check_request:
             gate_request["stream"] = bool(check_request["stream"])
+        # v0.16.1 (Phase-1+ wire-shape fix): runtime.check_workflow_budget
+        # always sets `action_digest` so the gate's
+        # `if req.action_digest.is_none()` version-gate passes
+        # (`backend/src/proxy/http/gate/gate.rs:56`, ADR-023 P1-6).
+        # Pre-v0.16.1 / Phase-0 callers can still omit it (forwarded
+        # only when truthy) without triggering a "field present
+        # but None" wire-shape drift.
+        if check_request.get("action_digest"):
+            gate_request["action_digest"] = check_request["action_digest"]
         # Forward the `tool_arguments` bag alongside `tool` so
         # the gate can hash it via `signature::compute_schema_hash`
         # and write the fingerprint into `mcp_tool_signatures`.

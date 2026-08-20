@@ -1,3 +1,19 @@
+## [0.16.1] - 2026-08-20
+
+Patch release — Phase-1+ `action_digest` wire-shape fix for non-impact `/gate` calls. Wire-format is additive (new optional field); SDK_MIN_VERSION unchanged. **Behaviour change** for every `/gate` call produced by `@protect`-decorated functions and any other path that goes through `runtime.check_workflow_budget`.
+
+### Changed
+
+- **`runtime.check_workflow_budget` now populates `action_digest` on every `/gate` call.** Pre-0.16.1 the field was only forwarded on `/execute` (where `@sensitive(impact=...)` had already wired a typed Money/ToolCall impact). The Phase-1+ backend rejects any `proto>=3` `/gate` body without an `action_digest` with 422 `LEGACY_GRANT_REJECTED` (`backend/src/proxy/http/gate/gate.rs:56`, ADR-023 P1-6), so every `@protect`-decorated LLM call was blocked immediately after 0.16.0 promoted the SDK to proto=3. The fix:
+  - new `BusinessImpact.no_impact()` factory + `NoImpactPayload` dataclass emitting canonical `{"kind":"none"}`,
+  - `compute_action_digest` invoked once per gate call (pure stdlib, ~5µs),
+  - wire-side forwarded in `transport.check` via `if check_request.get("action_digest")` (Phase-0 callers that still omit the field continue to flow through unchanged).
+- **New source-pin regression test** `tests/test_business_impact.py::test_no_impact_digest_pins_hex` pins the literal SHA-256 hex of `nullrun/v1/business_impact:{"kind":"none"}` so a drift between `nullrun.business_impact.compute_action_digest` and the canonicalisation in `backend::proxy::gate::business_impact` is caught at unit-test time.
+
+### Why this is needed
+
+`@protect`-decorated LLM calls produce a `/gate` body that previously had no `action_digest` field — Phase-1+ gate was reject-CLOSED for that case (`LEGACY_GRANT_REJECTED` 422, `details.action_message: "action_digest is required when X-NULLRUN-PROTOCOL >= 3"`). Surfaced 2026-08-20 when the first `langgraph_basic.py` run with SDK 0.16.0 hit the gate for `wf = e4ada1c0-…`. Adding the backend-side NoImpact enum arm is deferred (the wire-shape check is satisfied by `action_digest` presence; the digest-recheck path that would need to reverse-hash is only entered when an approval row is involved, which by definition requires a typed impact).
+
 ## [0.16.0] - 2026-08-20
 
 Minor release — backend v3.66.2 wire-validation alignment. **Behaviour change** for callers that invoke `track_llm()` / `track({"type": "llm_call", ...})` outside a paired `/check` scope. Wire-format unchanged. SDK_MIN_VERSION unchanged.
