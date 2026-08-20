@@ -41,9 +41,11 @@ import pytest
 
 from nullrun.business_impact import (
     INFLOW,
+    KIND_NONE,
     OUTFLOW,
     BusinessImpact,
     MoneyImpact,
+    NoImpactPayload,
     ToolCallParams,
     business_impact_to_dict,
     compute_action_digest,
@@ -55,6 +57,24 @@ from nullrun.extractor import money_outflow
 # this test before a customer runtime sees the regression.
 GOLDEN_HEX_USD_50_DOLLARS_OUTFLOW = (
     "dfc96387ca539b7130caebe705e042f2e34e52ab44352ae5e527bcef64f0df27"
+)
+
+# v0.16.1 (Phase-1+ wire-shape fix): the NoImpact sentinel
+# digest is `sha256("nullrun/v1/business_impact:{" + "\"kind\":\"none\"" + "}")`.
+# Pinned here so a drift in canonicalisation (sort-keys,
+# non-ASCII handling, prefix bytes) is caught at unit-test
+# time, before the SDK ships a /gate body that the backend's
+# `gate.rs:56` version-gate still accepts but the audit-event
+# row would silently lose the digest equivalence pin.
+#
+# Cross-language parity note: this hex MUST stay in lockstep
+# with the Rust constant used by the hypothetical backend
+# mirror if/when a `BusinessImpact::NoImpact` enum arm is
+# added there (currently the backend computes digest only
+# from typed impacts on the re-check path; the SDK emits
+# the NoImpact sentinel so the wire-shape gate passes).
+GOLDEN_HEX_NO_IMPACT = (
+    "0049d93a36f0710269a6deb733ca78d57a770ef640a2698d0fddaa9653b7c3de"
 )
 
 # Cross-language parity pin for the
@@ -113,6 +133,47 @@ class TestComputeActionDigestPins:
         a = compute_action_digest(BusinessImpact.money(OUTFLOW, 5_000, "USD"))
         b = compute_action_digest(BusinessImpact.money(INFLOW, 5_000, "USD"))
         assert a != b
+
+    def test_no_impact_digest_pins_hex(self) -> None:
+        # `BusinessImpact.no_impact()` emits canonical
+        # `{"kind":"none"}` and computes the SHA-256 of
+        # `nullrun/v1/business_impact:` || `{"kind":"none"}`.
+        # The hex is pinned so a canonicalisation drift
+        # trips here (the wire-shape gate would otherwise
+        # silently accept any 64-hex string).
+        impact = BusinessImpact.no_impact()
+        assert impact.kind == KIND_NONE
+        d = business_impact_to_dict(impact)
+        assert d == {"kind": "none"}
+        assert compute_action_digest(impact) == GOLDEN_HEX_NO_IMPACT
+
+    def test_no_impact_is_deterministic(self) -> None:
+        # Two independent NoImpact constructions must produce
+        # the same digest — the gate uses it as a bind token
+        # (every /gate from a non-impact call site shares
+        # this sentinel).
+        a = compute_action_digest(BusinessImpact.no_impact())
+        b = compute_action_digest(BusinessImpact.no_impact())
+        assert a == b == GOLDEN_HEX_NO_IMPACT
+
+    def test_no_impact_differs_from_money(self) -> None:
+        # The NoImpact sentinel must NOT collide with any
+        # real Money digest — a hash collision would let a
+        # trivial "no impact" call reuse an existing
+        # approval row's grant.
+        no_impact = compute_action_digest(BusinessImpact.no_impact())
+        money = compute_action_digest(BusinessImpact.money(OUTFLOW, 5_000, "USD"))
+        assert no_impact != money
+
+    def test_no_impact_payload_direct(self) -> None:
+        # `NoImpactPayload.validate()` is a no-op by design
+        # (no fields to validate). `to_wire_dict()` always
+        # returns the single-key dict. Pinning the no-op
+        # contract so a future refactor that adds a field
+        # changes the digest literal and the audit row.
+        p = NoImpactPayload()
+        p.validate()
+        assert p.to_wire_dict() == {"kind": "none"}
 
 
 # ---------------------------------------------------------------------------
