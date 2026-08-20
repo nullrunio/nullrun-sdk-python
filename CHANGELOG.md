@@ -1,3 +1,35 @@
+## [0.16.0] - 2026-08-20
+
+Minor release — backend v3.66.2 wire-validation alignment. **Behaviour change** for callers that invoke `track_llm()` / `track({"type": "llm_call", ...})` outside a paired `/check` scope. Wire-format unchanged. SDK_MIN_VERSION unchanged.
+
+### Changed
+
+- **`_route_track` no-smid branch drops llm_call events instead of falling back to /track/batch** — backend v3.66.2 closed the v1/v2 no-reservation consume path with per-event type-aware wire validation: any `llm_call` event in a batch WITHOUT `reservation_id` is rejected with 503 `BUDGET_RECHECK_FAILED` (whole-batch fail-CLOSED). The 0.12.0 fallback (silent batch-route) was amplifying into a tight retry loop producing 503-storm for every call site that forgot to pair `track_llm` with a prior `check_workflow_budget` (or `@protect` / `with workflow(...)`). Post-0.16.0 the no-smid branch:
+  1. increments `metrics.runtime.dropped_llm_call_no_reservation` (new counter, exposed via `metrics.to_dict()["runtime"]["dropped_llm_call_no_reservation"]` for `/health` + operator dashboards),
+  2. emits a WARNING log (not DEBUG — mirrors the 0.15.2 fail-OPEN observability fix) naming the `event_type` + `workflow_id` so operators can locate the offending call site,
+  3. drops the event (no batch POST, no retry; the fix is upstream at the call site).
+- **Source-pin regression tests updated to pin the corrected drop behaviour** — `tests/test_v3_wire_contract.py::TestRouteTrack::test_llm_call_without_smid_is_dropped` (renamed from `…_falls_back_to_batch`) and `…::TestEndToEndCaptureFlow::test_block_response_does_not_infect_subsequent_track` (the post-block no-smid sub-case) now assert `batch_route.call_count == 0` + drop-counter increment. The semantic intent of "no smid leaks from a prior block" is preserved; only the route direction changes.
+
+### Migration
+
+Operations hitting the new `dropped_llm_call_no_reservation` counter on `/health` are calling `track_llm()` (or `track({"type": "llm_call", ...})`) outside a paired `/check` scope. The fix is always at the call site — wrap the tracking call in one of:
+
+- `@protect(...)` decorator (wraps in `with workflow(...)` + `check_workflow_budget()` automatically),
+- `check_workflow_budget()` before `track_llm()` (explicit two-step),
+- `with workflow("wf-id"):` context manager + `check_workflow_budget()` inside.
+
+Bare `track_llm()` calls (no surrounding gate) silently drop the event post-0.16.0 — the call still returns its usual `{"allowed": True, ...}` dict, but no `cost_events` row is written. Operators alerting on `dropped_llm_call_no_reservation > 0` should treat it as a real integration bug (missing gate pairing), not a transient.
+
+### Why this is needed
+
+Backend v3.66.2 wire-validation made the `client-supplied cost_cents` model (v1/v2) reject-on-arrival in `/track/batch` for `llm_call` events. The 0.12.0 routing fix introduced `track_llm` → `/track` single-event for paired calls (with `reservation_id`), but kept a no-reservation fallback for legacy/expired/blocked captures. Three years of v1/v2 SDK versions shipped that no-reservation path; v3.66.2 closed it. The new SDK behaviour is honest about the gap: no smid → no authoritative budget enforcement → drop the event rather than synthesise a stale consume.
+
+### Compatibility
+
+**No SDK_MIN_VERSION bump.** Backend v3.66.2 ships since 2026-08-18 (commit `e262f1c3`). Wire-format unchanged. No public API change. Drop-in replacement for 0.15.2 for callers that always pair `track_llm` with a prior gate — those observe zero behaviour change. Callers that relied on bare `track_llm()` hitting `/track/batch` will see `dropped_llm_call_no_reservation` increment on the metrics endpoint and WARNING logs at the call site; the migration is the wrapping fix above.
+
+_Tests: 2 source-pin regression tests updated; both pin the new drop behaviour. No regressions in the other 1611 tests expected (the only test paths that hit the no-smid branch are the two updated above)._
+
 ## [0.15.2] - 2026-08-14
 
 Patch release — observability closure + UI-UX-AUDIT 2026-08-14 fixes (F-19, F-28, F-29) + flaky-test removal. No public API change, no wire-format change, no SDK_MIN_VERSION bump. Drop-in replacement for 0.15.1.

@@ -90,9 +90,17 @@ class TestNullRunRuntimeTrack:
         captured: list[dict] = []
         rt._transport.track = lambda event: captured.append(dict(event))
 
+        # v0.16.0 (backend v3.66.2 alignment): use a non-llm_call
+        # event type so the strip assertion exercises the batch path
+        # (the v3 single-event path would drop the event on no-smid
+        # before transport.track is observable — the strip is the
+        # same logic for both paths, but the batch path is the
+        # only one that reaches the captured buffer in this test).
+        # ``tool_call`` events always go through batch regardless of
+        # /check scope (no reservation to release).
         rt.track(
             {
-                "type": "llm_call",
+                "type": "tool_call",
                 "provider": "openai",
                 "model": "gpt-4o",
                 "tokens": 15,
@@ -101,6 +109,7 @@ class TestNullRunRuntimeTrack:
                 "cache_read_tokens": 7,
                 "finish_reason": "stop",
                 "tool_names": ["search"],
+                "tool_name": "search",
                 "has_usage": True,
                 # These three MUST be stripped before the transport
                 # buffer sees the event.
@@ -124,7 +133,7 @@ class TestNullRunRuntimeTrack:
         assert "secret_routing_info" not in sent
 
         # Normalised fields pass through unchanged
-        assert sent["type"] == "llm_call"
+        assert sent["type"] == "tool_call"
         assert sent["input_tokens"] == 10
         assert sent["cache_read_tokens"] == 7
         assert sent["finish_reason"] == "stop"

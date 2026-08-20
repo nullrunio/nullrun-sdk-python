@@ -3035,14 +3035,45 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
 
         smid = get_server_minted_execution_id()
         if not smid:
-            # Either no /check landed in this scope (legacy v1/v2
-            # path) or the capture expired past the 295s safety
-            # window. Don't make up an id — fall back to batch
-            # which uses the no-reservation v1/v2 consume path.
-            self._transport.track(wire_event)
-            logger.debug(
-                "_route_track: llm_call without server-minted "
-                "execution_id in scope — routing via /track/batch"
+            # v0.16.0 (2026-08-20, backend v3.66.2 alignment): the
+            # 0.12.0 routing here used to fall back to /track/batch
+            # (the legacy v1/v2 no-reservation consume path). Backend
+            # v3.66.2 closed that path with per-event type-aware wire
+            # validation: any ``llm_call`` event in a batch WITHOUT
+            # ``reservation_id`` is rejected with 503
+            # BUDGET_RECHECK_FAILED (whole-batch fail-CLOSED). Falling
+            # back here would amplify into a tight retry loop
+            # producing 503-storm for every call site that forgot to
+            # pair ``track_llm`` with a prior ``check_workflow_budget``
+            # (or ``@protect`` / ``with workflow(...)``).
+            #
+            # Server-authoritative model (CLAUDE.md §22): an llm_call
+            # event without a paired /check reservation has no
+            # authoritative budget authority. Don't make up an id —
+            # drop the event explicitly so the operator sees the gap
+            # (WARNING + counter) instead of a silent batch loop.
+            #
+            # Trigger conditions:
+            #   * no /check landed in this scope (legacy v1/v2 path)
+            #   * capture expired past the 295s safety window
+            #   * /check returned ``decision: "block"`` (no
+            #     reservation_id minted on a hard block — see
+            #     ``_capture_server_minted_execution_id``)
+            metrics.inc_runtime("dropped_llm_call_no_reservation")
+            # WARNING not DEBUG: matches the 0.15.2 fix that moved
+            # ``check_workflow_budget`` synthetic FALLBACK from DEBUG
+            # to WARNING (CHANGELOG 0.15.2). Operators should see this
+            # at INFO+ — a missing reservation pairing is a real
+            # integration bug, not a debug curiosity.
+            logger.warning(
+                "_route_track: dropping llm_call event — no "
+                "server-minted reservation_id in scope (no /check "
+                "paired, capture expired >295s, or /check returned "
+                "block). Wrap track_llm in @protect / "
+                "check_workflow_budget() / with workflow(...). "
+                "event_type=%s workflow_id=%s",
+                wire_event.get("type"),
+                wire_event.get("workflow_id"),
             )
             return
 

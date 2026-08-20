@@ -160,11 +160,23 @@ def test_empty_string_in_llm_output_falls_through():
 # can reject with HTTP 422.
 
 
-def test_track_promotes_missing_model_to_error_and_tags_event(make_runtime, caplog):
+def test_track_promotes_missing_model_to_error_and_tags_event(
+    make_runtime, caplog, monkeypatch
+):
     """Regression: an ``llm_call`` event with ``model=None`` reaches
     ``track `` and (a) is logged at ERROR, (b) gets the
     ``__missing_model: True`` flag, (c) is still sent on the wire
     so the backend can reject with HTTP 422 (not silently free)."""
+    # v0.16.0 (backend v3.66.2 alignment): force the legacy batch
+    # route so the ``__missing_model`` flag actually reaches the
+    # captured buffer. Without the env var, the no-smid branch in
+    # ``_route_track`` would drop the event before the wire
+    # flag-and-log assertions can observe it. The flag/log logic
+    # in ``track`` is unchanged; the env var just opts out of the
+    # v3 routing's drop-on-no-smid so this test stays focused on
+    # the missing-model fail-loud surface.
+    monkeypatch.setenv("NULLRUN_V3_TRACK_DISABLE", "1")
+
     rt = make_runtime()
     captured = []
 
@@ -195,9 +207,15 @@ def test_track_promotes_missing_model_to_error_and_tags_event(make_runtime, capl
     )
 
 
-def test_track_does_not_tag_when_model_is_set(make_runtime):
+def test_track_does_not_tag_when_model_is_set(make_runtime, monkeypatch):
     """The happy path: ``llm_call`` event with a model passes
     through unchanged (no ERROR, no __missing_model flag)."""
+    # v0.16.0 (backend v3.66.2 alignment): same as the missing-model
+    # test above — opt out of the v3 routing's drop-on-no-smid so
+    # the captured buffer observes the wire event. The
+    # happy-path model field pass-through is the focus of this test.
+    monkeypatch.setenv("NULLRUN_V3_TRACK_DISABLE", "1")
+
     rt = make_runtime()
     captured = []
     rt._transport.track = lambda e: captured.append(e)
