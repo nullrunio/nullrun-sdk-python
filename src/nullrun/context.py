@@ -194,8 +194,62 @@ def set_chain_id(chain_id: str | None) -> None:
     calls become single-shot Hard. The setter does NOT issue a
     /chain/end — call ``nullrun.chain_end(chain_id)`` explicitly
     when you want to close the chain on the server.
+
+    Per CLAUDE.md §6 the chain_id field MUST be a UUID v4. The
+    setter validates the format (length, canonical UUID
+    structure, version=4) and raises ``ValueError`` on
+    malformed input. ``None`` is accepted (clears the context).
     """
+    if chain_id is not None:
+        _validate_chain_id(chain_id)
     _chain_id_var.set(chain_id)
+
+
+def _validate_chain_id(chain_id: str) -> None:
+    """Validate ``chain_id`` is a UUID v4 string per CLAUDE.md §6.
+
+    The backend owns the race guard (``HGET chain_key 'org_id'`` per
+    §6 Q2) but does NOT validate the chain_id format — non-UUID or
+    malformed chain_ids silently auto-register as new ACTIVE
+    chains. The SDK is the authoritative client-side validator;
+    failing fast here surfaces typos and predictable-UUID attacks
+    before they hit the network.
+
+    Args:
+        chain_id: The candidate chain_id string.
+
+    Raises:
+        ValueError: If ``chain_id`` is not a syntactically valid
+            UUID v4 string. The error message includes the
+            offending value (truncated for readability) and the
+            specific reason (parse failure / non-v4 version).
+
+    Why UUID v4 and not v7 / v1: per CLAUDE.md §6 the chain_id is
+    server-generated and sent back to the SDK for hash-chain
+    integrity (the chain_id is the second key in the
+    `chain:{org_id}:{chain_id}` Redis hash). UUID v4 has the
+    lowest collision probability at 2^122 bits of randomness and
+    is the canonical format the backend has used since v0.11.0.
+    Future versions MAY migrate to v7 (time-ordered) but require
+    a wire-contract bump + cross-SDK migration.
+    """
+    try:
+        parsed = uuid.UUID(chain_id)
+    except (ValueError, AttributeError, TypeError) as exc:
+        raise ValueError(
+            f"chain_id must be a syntactically valid UUID v4 string per "
+            f"CLAUDE.md §6; got {chain_id!r:.80} (parse error: {exc}). "
+            f"Generate one via uuid.uuid4() or pass chain_id=None to "
+            f"clear the chain context."
+        ) from exc
+    if parsed.version != 4:
+        raise ValueError(
+            f"chain_id must be a UUID v4 (version=4) per CLAUDE.md §6; "
+            f"got version={parsed.version} from {chain_id!r:.80}. "
+            f"The backend's chain race guard relies on UUID v4 entropy "
+            f"and will silently auto-register non-v4 chain_ids as new "
+            f"ACTIVE chains without format validation."
+        )
 
 
 def set_chain_op(op: str) -> None:
@@ -810,14 +864,15 @@ def chain(
     """Context manager for chain scope.
 
     Args:
-        chain_id: UUID v4 (or any unique string) identifying this
-            chain. Persists in Redis with idle TTL 300s; auto-extended
-            by every /check inside the block.
+        chain_id: UUID v4 string identifying this chain. Persists
+            in Redis with idle TTL 300s; auto-extended by every
+            /check inside the block. Per CLAUDE.md §6 the chain_id
+            MUST be a UUID v4 — the context manager validates the
+            format (length, canonical UUID structure, version=4)
+            and raises ``ValueError`` on malformed input. Generate
+            one via ``uuid.uuid4()``.
         op: Chain operation for the FIRST /check call inside the
-            block. ``"start"`` creates REGISTERED-state, ``"continue"``
-            extends TTL (auto-recover if the chain was lost)
-            ``"end"`` closes the chain on the same call. Subsequent
-            calls inside the block always send ``op="continue"``.
+            block.
 
     Yields:
         The chain_id (so callers can ``as cid`` for symmetry with
@@ -825,6 +880,13 @@ def chain(
     """
     if op not in ("start", "continue", "end", "auto"):
         raise ValueError(f"chain() op must be one of start/continue/end/auto, got {op!r}")
+    # Per CLAUDE.md §6 the chain_id field MUST be a UUID v4. The
+    # backend owns the race guard (HGET chain_key 'org_id') but does
+    # NOT validate the chain_id format — non-UUID chain_ids silently
+    # auto-register as new ACTIVE chains. SDK validates client-side
+    # so typos and predictable-UUID attacks surface before they hit
+    # the network. See _validate_chain_id for the version=4 check.
+    _validate_chain_id(chain_id)
     chain_token = _chain_id_var.set(chain_id)
     op_token = _chain_op_var.set(op)
     try:
