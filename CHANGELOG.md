@@ -1,3 +1,19 @@
+## [Unreleased]
+
+Patch release — `Runtime.execute()` now populates the per-call `tools` array on the `/execute` wire body. Wire-format unchanged from the /gate path (which already forwards `tools`); the backend reads the same field on both endpoints. Closes `DEF-LATEST_PLAN-F01` (2026-08-21).
+
+### Changed
+
+- **`Runtime.execute()` now populates `tools` on every `/execute` call.** Pre-this-fix the field was only forwarded on `/gate` (via `runtime.check_workflow_budget` + `set_call_context(tools=...)`). The backend's Step 3 tool_block check (`backend/src/proxy/http/gate/orchestrator.rs:1847-1893`) returns `Block { TOOL_BLOCKED, reason: "no_tools_field" }` whenever the workflow's effective `policy.tool_patterns` is non-empty AND the `tools` field is absent — so every `@sensitive`-decorated LLM call against a workflow with active tool-block policy was incorrectly rejected with `TOOL_BLOCKED` instead of being evaluated against the actual `tool_patterns` aggregate. The fix:
+  - `runtime.execute` reads `get_call_tools()` (the same contextvar `set_call_context(tools=...)` populates) and conditionally adds `tools=list(...)` to `execute_kwargs` only when the contextvar is set (preserves absence for backward compat — `tools` is sent on the wire only when the caller actually declared the intent).
+  - `transport.execute` gains `tools: tuple[str, ...] | None = None` parameter and forwards to the wire body when set.
+  - `_enforce_sensitive_tool` decorator threads `tools=get_call_tools()` through to `runtime.execute(...)` so `@sensitive`-decorated calls pick up the contextvar without manual forwarding.
+- **New regression test** `tests/test_execute_tools_propagation.py` mirrors the /gate counterpart in `test_gate_real_path.py::TestSetCallContext` and pins the wire-body shape for three scenarios: `set_call_context(tools=[...])` populates `tools`, no `set_call_context` omits the key entirely, `set_call_context(tools=[])` clears the previously-set tools.
+
+### Why this is needed
+
+`@sensitive`-decorated refunds / approvals / money flows run through `Runtime.execute()` which hits `/api/v1/execute`. A workflow with `Manual approval required` rule (e.g. `RuntimeApprovalWF` from `LATEST_PLAN.md`) plus an active `tool_patterns` block (e.g. `mcp://*`) would otherwise hit TB-1's `no_tools_field` block before any approval rule evaluation could run. Surfaced 2026-08-21 in the `LATEST_PLAN.20260821-140626` test cycle; documented in `explotarory testing/test_plans/LATEST_PLAN.20260821-140626.journal.md` as `DEF-LATEST_PLAN-F01` (HIGH severity).
+
 ## [0.16.1] - 2026-08-20
 
 Patch release — Phase-1+ `action_digest` wire-shape fix for non-impact `/gate` calls. Wire-format is additive (new optional field); SDK_MIN_VERSION unchanged. **Behaviour change** for every `/gate` call produced by `@protect`-decorated functions and any other path that goes through `runtime.check_workflow_budget`.

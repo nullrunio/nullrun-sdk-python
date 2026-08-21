@@ -1037,6 +1037,15 @@ class Transport:
         # Tool-call argument bag forwarded on /execute so the gate can compute
         # a schema fingerprint and write it to mcp_tool_signatures.
         tool_arguments: dict[str, Any] | None = None,
+        # Per-call `tools` list forwarded on /execute so the backend's
+        # Step 3 tool_block check (`backend/src/proxy/http/gate/orchestrator.rs:1847-1893`)
+        # can match each tool against the workflow's effective `tool_patterns`
+        # aggregate. Without this, TB-1 fails closed with `no_tools_field`
+        # whenever the workflow has an active `policy.tool_patterns` block.
+        # Populated by `runtime.execute` from the `get_call_tools()` contextvar
+        # when the caller invoked `set_call_context(tools=...)` (or the
+        # `_enforce_sensitive_tool` decorator did so on their behalf).
+        tools: tuple[str, ...] | None = None,
         on_transport_error: Callable[[Exception], dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Pre-execution policy evaluation via /api/v1/execute (PRIMARY enforcement point).
@@ -1085,6 +1094,8 @@ class Transport:
             gate_request["action_digest"] = action_digest
         if tool_arguments is not None:
             gate_request["tool_arguments"] = tool_arguments
+        if tools is not None:
+            gate_request["tools"] = list(tools)
 
         body = _signed_request_body(gate_request)
         headers = self._build_signed_headers(body=body)

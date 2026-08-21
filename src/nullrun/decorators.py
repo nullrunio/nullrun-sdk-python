@@ -49,6 +49,7 @@ from nullrun.breaker.exceptions import (
     WorkflowPausedException,
 )
 from nullrun.context import (
+    get_call_tools,
     get_workflow_id,
     reset_span_id,
     reset_trace_id,
@@ -725,6 +726,7 @@ def _enforce_sensitive_tool(
             on_transport_error="raise",
             business_impact=business_impact_dict,
             action_digest=action_digest_hex,
+            tools=get_call_tools(),
         )
     except NullRunBlockedException:
         # Real policy-block decision from the gateway — propagate as-is.

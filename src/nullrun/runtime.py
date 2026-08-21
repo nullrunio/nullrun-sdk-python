@@ -2736,6 +2736,15 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # post-approval re-check so the backend can bind both requests
         # to the same logical action.
         operation_id = str(uuid.uuid4())
+        # Populate the per-call `tools` array so the backend's Step 3
+        # tool_block check (`backend/src/proxy/http/gate/orchestrator.rs:1847-1893`)
+        # can match each tool against the workflow's effective
+        # `tool_patterns` aggregate instead of failing closed via TB-1
+        # (`no_tools_field`). Mirrors the /gate path at
+        # `check_workflow_budget` which already threads the same
+        # contextvar onto the wire body.
+        from nullrun.context import get_call_tools as _get_call_tools_for_execute
+        _execute_call_tools = _get_call_tools_for_execute()
         execute_kwargs: dict[str, Any] = {
             "organization_id": organization_id,
             "execution_id": uuid7_str(),
@@ -2747,6 +2756,8 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             "operation_id": operation_id,
             "on_transport_error": on_transport_error,
         }
+        if _execute_call_tools:
+            execute_kwargs["tools"] = list(_execute_call_tools)
         # Digest-bound approval: forward the typed impact + digest
         # to the wire when supplied. The backend stamps the approval
         # row with the digest and verifies it on the post-approval
