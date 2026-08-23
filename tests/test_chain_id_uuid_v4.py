@@ -30,7 +30,6 @@ import uuid
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # _validate_chain_id — pure function tests
 # ---------------------------------------------------------------------------
@@ -207,7 +206,7 @@ def test_chain_context_manager_resets_after_invalid_chain_id():
 def test_set_chain_id_rejects_invalid_uuid():
     """``set_chain_id()`` MUST validate the chain_id before writing
     to the contextvar (mirrors the context manager)."""
-    from nullrun.context import set_chain_id, get_chain_id
+    from nullrun.context import get_chain_id, set_chain_id
 
     original = get_chain_id()
     try:
@@ -225,7 +224,7 @@ def test_set_chain_id_rejects_invalid_uuid():
 def test_set_chain_id_accepts_none_to_clear():
     """``set_chain_id(None)`` MUST be accepted (clears the context)
     — the ``None`` value is the documented "no chain" state."""
-    from nullrun.context import set_chain_id, get_chain_id
+    from nullrun.context import get_chain_id, set_chain_id
 
     set_chain_id(str(uuid.uuid4()))
     assert get_chain_id() is not None
@@ -236,7 +235,7 @@ def test_set_chain_id_accepts_none_to_clear():
 def test_set_chain_id_accepts_uuid_v4():
     """``set_chain_id()`` MUST accept a UUID v4 string and write
     it to the contextvar."""
-    from nullrun.context import set_chain_id, get_chain_id
+    from nullrun.context import get_chain_id, set_chain_id
 
     cid = str(uuid.uuid4())
     original = get_chain_id()

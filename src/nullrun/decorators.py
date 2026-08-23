@@ -482,7 +482,7 @@ def protect(fn: F | None = None) -> F | Callable[[F], F]:
         # ``_trace_id_var`` / ``_span_id_var`` resets above.
         _existing_call_tools = get_call_tools()
         if not _existing_call_tools:
-            call_tools_token: Token | None = _call_tools_var.set(
+            call_tools_token: Token[tuple[str, ...]] | None = _call_tools_var.set(
                 (fn.__name__,),
             )
         else:

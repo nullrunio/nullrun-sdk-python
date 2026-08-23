@@ -623,8 +623,15 @@ class TestChainContextHelpers:
         assert get_chain_id() is None
 
     def test_set_chain_id_persists(self):
-        set_chain_id("chain-1")
-        assert get_chain_id() == "chain-1"
+        # v0.16.2: set_chain_id now requires a UUID v4 string (see
+        # src/nullrun/context.py::_validate_chain_id, F5 sdk_checks
+        # 2026-08-21). The pre-validation `"chain-1"` literal here
+        # would raise ValueError after ebbe4ef — use a real UUID v4
+        # so the persistence contract is still asserted without
+        # tripping the new strict validator.
+        cid = str(uuid.uuid4())
+        set_chain_id(cid)
+        assert get_chain_id() == cid
 
     def test_chain_contextmanager_sets_and_resets(self):
         cid = str(uuid.uuid4())
@@ -636,16 +643,24 @@ class TestChainContextHelpers:
         assert get_chain_id() is None
 
     def test_chain_contextmanager_rejects_invalid_op(self):
+        # v0.16.2: chain() now validates chain_id BEFORE op. To test
+        # op-rejection specifically, supply a syntactically valid
+        # UUID v4 with an invalid op — otherwise the chain_id check
+        # would fire first and shadow the op-rejection assertion.
+        valid_cid = str(uuid.uuid4())
         with pytest.raises(ValueError, match="chain\\(\\) op must be"):
-            with chain("cid", op="garbage"):
+            with chain(valid_cid, op="garbage"):
                 pass
 
     def test_chain_nested_restores_outer_on_exit(self):
-        with chain("outer", op="start"):
-            with chain("inner", op="continue"):
-                assert get_chain_id() == "inner"
+        # v0.16.2: chain() requires UUID v4 per context._validate_chain_id.
+        outer_cid = str(uuid.uuid4())
+        inner_cid = str(uuid.uuid4())
+        with chain(outer_cid, op="start"):
+            with chain(inner_cid, op="continue"):
+                assert get_chain_id() == inner_cid
             # Inner exited — outer restored.
-            assert get_chain_id() == "outer"
+            assert get_chain_id() == outer_cid
         # Both exited.
         assert get_chain_id() is None
 
@@ -1067,7 +1082,7 @@ class TestGateCacheRuntimeFlow:
         )
         try:
             with workflow("wf-runtime-cache") as _wf_id, chain(
-                "chain-runtime-cache"
+                str(uuid.uuid4())
             ) as _cid:
                 # Direct calls in chain scope — bypasses @protect but
                 # exercises the same check_workflow_budget codepath.
@@ -1120,7 +1135,7 @@ class TestGateCacheRuntimeFlow:
                 polling=False,
             )
             try:
-                with workflow("wf-runtime-uuid7"), chain("chain-runtime-uuid7"):
+                with workflow("wf-runtime-uuid7"), chain(str(uuid.uuid4())):
                     rt_inst.check_workflow_budget()
                     rt_inst.check_workflow_budget()
                 gate_calls = [
@@ -1170,7 +1185,7 @@ class TestGateCacheRuntimeFlow:
                 polling=False,
             )
             try:
-                with workflow("wf-no-cache"), chain("chain-no-cache"):
+                with workflow("wf-no-cache"), chain(str(uuid.uuid4())):
                     rt_inst.check_workflow_budget()
                     rt_inst.check_workflow_budget()
                 gate_calls = [

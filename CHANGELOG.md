@@ -1,6 +1,6 @@
-## [Unreleased]
+## [0.16.2] - 2026-08-23
 
-Patch release — `Runtime.execute()` now populates the per-call `tools` array on the `/execute` wire body. Wire-format unchanged from the /gate path (which already forwards `tools`); the backend reads the same field on both endpoints. Closes `DEF-LATEST_PLAN-F01` (2026-08-21).
+Patch release — `Runtime.execute()` now populates the per-call `tools` array on the `/execute` wire body. Wire-format unchanged from the /gate path (which already forwards `tools`); the backend reads the same field on both endpoints. Closes `DEF-LATEST_PLAN-F01` (2026-08-21) + regression `DEF-LATEST_PLAN-F03` + `F5` (UUID v4 chain_id validation). Wire-format additive only.
 
 **Patch .2 (2026-08-23) — closes the F01 regression (`DEF-LATEST_PLAN-F03`).** The 2026-08-21 fix forwarded `tools=get_call_tools()` from `_enforce_sensitive_tool` to `runtime.execute(...)`, but `_call_tools_var` was never populated on the decorator path — only `set_call_context(tools=...)` (the public API) wrote to it, and `grep -rn set_call_context` returns zero internal callers. Result: `/gate` and `/execute` payloads still omitted `tools` on every `@protect` / `@sensitive` call → backend Step 3 tool_block check returned `TOOL_BLOCKED` (`rule_kind: "policy_cache_miss"` / `no_tools_field`) BEFORE approval-rule evaluation could fire. Surfaced 2026-08-22 by `LATEST_PLAN.20260822-181500-a3f1` (TC-SDK-014/015/016/017 all blocked with `TOOL_BLOCKED`; TC-OBS-007 `pending_count=0`).
 
