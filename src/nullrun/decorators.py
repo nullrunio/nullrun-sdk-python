@@ -40,6 +40,7 @@ import inspect
 import logging
 import os
 from collections.abc import Callable
+from contextvars import Token
 from typing import Any, TypeVar
 
 from nullrun._registry import get_active_runtime
@@ -49,6 +50,8 @@ from nullrun.breaker.exceptions import (
     WorkflowPausedException,
 )
 from nullrun.context import (
+    _call_tools_var,
+    get_call_tools,
     get_workflow_id,
     reset_span_id,
     reset_trace_id,
@@ -461,6 +464,29 @@ def protect(fn: F | None = None) -> F | Callable[[F], F]:
         # restores the outer trace/span on reset.
         trace_legacy_token = set_trace_id(span.trace_id)
         span_legacy_token = set_span_id(span.span_id)
+        # F03 (2026-08-22): populate `_call_tools_var` from
+        # ``fn.__name__`` when the user did NOT explicitly call
+        # ``set_call_context(tools=...)``. The F01 fix
+        # (``runtime.execute`` body at runtime.py:2746-2760 and the
+        # /gate path at runtime.py:1903-1941) conditionally forwards
+        # the per-call tools contextvar onto the wire body, but the
+        # upstream contextvar was never populated for the @protect /
+        # @sensitive decorator path. Without this fix every wire
+        # round-trip omits the `tools` field, the backend's Step 3
+        # tool_block check fails-CLOSED via TB-1
+        # (``no_tools_field``), and approval-rule probes (TC-SDK-014
+        # /015/016/017) never reach the approval_rule_eval step.
+        # Token-based so a nested @protect inside an outer @protect
+        # (or inside ``with workflow``) restores the outer contextvar
+        # on reset — same shape as the legacy
+        # ``_trace_id_var`` / ``_span_id_var`` resets above.
+        _existing_call_tools = get_call_tools()
+        if not _existing_call_tools:
+            call_tools_token: Token[tuple[str, ...]] | None = _call_tools_var.set(
+                (fn.__name__,),
+            )
+        else:
+            call_tools_token = None
         error: BaseException | None = None
         try:
             # 1. KILL/PAUSE from the dashboard short-circuits
@@ -514,6 +540,13 @@ def protect(fn: F | None = None) -> F | Callable[[F], F]:
             # of which one runs first.
             reset_trace_id(trace_legacy_token)
             reset_span_id(span_legacy_token)
+            # F03 follow-up: reset the per-call tools contextvar if
+            # we set it. Outer ``with workflow`` / nested @protect
+            # callers that previously set the contextvar see their
+            # prior value restored; bare @protect leaves the
+            # contextvar empty again (the default).
+            if call_tools_token is not None:
+                _call_tools_var.reset(call_tools_token)
             _emit_span_end(
                 runtime,
                 span,
@@ -725,6 +758,7 @@ def _enforce_sensitive_tool(
             on_transport_error="raise",
             business_impact=business_impact_dict,
             action_digest=action_digest_hex,
+            tools=get_call_tools(),
         )
     except NullRunBlockedException:
         # Real policy-block decision from the gateway — propagate as-is.

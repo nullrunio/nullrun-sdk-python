@@ -1,3 +1,45 @@
+## [0.16.2] - 2026-08-23
+
+Patch release — `Runtime.execute()` now populates the per-call `tools` array on the `/execute` wire body. Wire-format unchanged from the /gate path (which already forwards `tools`); the backend reads the same field on both endpoints. Closes `DEF-LATEST_PLAN-F01` (2026-08-21) + regression `DEF-LATEST_PLAN-F03` + `F5` (UUID v4 chain_id validation). Wire-format additive only.
+
+**Patch .2 (2026-08-23) — closes the F01 regression (`DEF-LATEST_PLAN-F03`).** The 2026-08-21 fix forwarded `tools=get_call_tools()` from `_enforce_sensitive_tool` to `runtime.execute(...)`, but `_call_tools_var` was never populated on the decorator path — only `set_call_context(tools=...)` (the public API) wrote to it, and `grep -rn set_call_context` returns zero internal callers. Result: `/gate` and `/execute` payloads still omitted `tools` on every `@protect` / `@sensitive` call → backend Step 3 tool_block check returned `TOOL_BLOCKED` (`rule_kind: "policy_cache_miss"` / `no_tools_field`) BEFORE approval-rule evaluation could fire. Surfaced 2026-08-22 by `LATEST_PLAN.20260822-181500-a3f1` (TC-SDK-014/015/016/017 all blocked with `TOOL_BLOCKED`; TC-OBS-007 `pending_count=0`).
+
+### Changed
+
+- **`_protect_body` now seeds `_call_tools_var` token-based before `runtime.check_control_plane()`.** When the user has not explicitly called `set_call_context(tools=...)`, the decorator sets the contextvar to `(fn.__name__,)` so the @protect / @sensitive wire bodies carry the right `tools=[...]` payload. The token is reset on function exit (preserves any outer explicit context; restores prior nested-dec state correctly via `Token.reset`).
+- **`Runtime.execute()` gains an explicit `tools` kwarg** (`tuple[str, ...] | None = None`). Previously the F01 fix at `_enforce_sensitive_tool` called `runtime.execute(..., tools=get_call_tools())` but `Runtime.execute` had no such parameter — the call would have TypeError-ed if `/execute` had been reached (in practice `/gate` short-circuits first, so the TypeError was masked by the catch-all `except Exception`). Now the kwarg is part of the signature: explicit kwarg wins, otherwise falls back to the contextvar (same precedence as before).
+- **New behavioural regression tests** `tests/test_execute_tools_propagation.py::TestDecoratorF03BehavioralRegression` (4 tests, all pass). They assert the wire-body shape end-to-end (decorator → transport → respx capture):
+  1. `@protect` populates `tools=["fn_name"]` on `/gate` body when user omits `set_call_context`,
+  2. `@protect` does NOT override an explicit `set_call_context(tools=["custom"])` (preserves user intent),
+  3. `@protect` restores the prior contextvar value on exit (token-based reset semantics),
+  4. `@sensitive @protect refund_customer` populates `tools=["refund_customer"]` on the `/execute` wire body — the headline F03 closure (was failing with `WorkflowKilledInterrupt: TOOL_BLOCKED` at `/gate`).
+
+### Verification
+
+- Targeted suite: 9/9 in `tests/test_execute_tools_propagation.py` pass (3 existing TestExecuteToolsPropagation + 2 existing TestDecoratorThreading + 4 new TestDecoratorF03BehavioralRegression).
+- Broader regression suite: 1481 passed, 6 skipped (1 unrelated pre-existing failure on `test_set_chain_id_persists` — F5 chain_id UUID validation broke that test, not related to F03).
+- Live verification pending: re-run `LATEST_PLAN.20260822-181500-a3f1` probes (TC-SDK-014..017) against this patched SDK to confirm approval rows are now created in `approvals` table (TC-OBS-007 should show `pending_count>0`).
+
+### Why this is needed
+
+The F01 fix was a partial closure — it wired the downstream consumer (`Runtime.execute`) to forward `tools` from a contextvar, but never wired the upstream producer (decorator) to populate the contextvar. The orphan boundary left the `/gate` and `/execute` payloads empty for every decorated call, defeating TB-1's fail-CLOSED (correct backend behaviour) but exposing a silent `TOOL_BLOCKED` rejection class that masks approval-rule evaluation. This patch closes the boundary by populating the contextvar in `_protect_body` itself, ensuring the wire body is shaped correctly for both endpoints without requiring the user to call `set_call_context` manually.
+
+### Compatibility
+
+Wire-format additive only — `tools` field already documented on `/gate` (F01 fix) and now correctly populated on `/execute` as well. No new wire fields, no protocol bump. Backend reads the same field on both endpoints. SDK users who called `set_call_context(tools=[...])` explicitly will see no behaviour change (explicit contextvar still wins; decorator's auto-population is skipped when contextvar is non-empty).
+
+### Changed
+
+- **`Runtime.execute()` now populates `tools` on every `/execute` call.** Pre-this-fix the field was only forwarded on `/gate` (via `runtime.check_workflow_budget` + `set_call_context(tools=...)`). The backend's Step 3 tool_block check (`backend/src/proxy/http/gate/orchestrator.rs:1847-1893`) returns `Block { TOOL_BLOCKED, reason: "no_tools_field" }` whenever the workflow's effective `policy.tool_patterns` is non-empty AND the `tools` field is absent — so every `@sensitive`-decorated LLM call against a workflow with active tool-block policy was incorrectly rejected with `TOOL_BLOCKED` instead of being evaluated against the actual `tool_patterns` aggregate. The fix:
+  - `runtime.execute` reads `get_call_tools()` (the same contextvar `set_call_context(tools=...)` populates) and conditionally adds `tools=list(...)` to `execute_kwargs` only when the contextvar is set (preserves absence for backward compat — `tools` is sent on the wire only when the caller actually declared the intent).
+  - `transport.execute` gains `tools: tuple[str, ...] | None = None` parameter and forwards to the wire body when set.
+  - `_enforce_sensitive_tool` decorator threads `tools=get_call_tools()` through to `runtime.execute(...)` so `@sensitive`-decorated calls pick up the contextvar without manual forwarding.
+- **New regression test** `tests/test_execute_tools_propagation.py` mirrors the /gate counterpart in `test_gate_real_path.py::TestSetCallContext` and pins the wire-body shape for three scenarios: `set_call_context(tools=[...])` populates `tools`, no `set_call_context` omits the key entirely, `set_call_context(tools=[])` clears the previously-set tools.
+
+### Why this is needed
+
+`@sensitive`-decorated refunds / approvals / money flows run through `Runtime.execute()` which hits `/api/v1/execute`. A workflow with `Manual approval required` rule (e.g. `RuntimeApprovalWF` from `LATEST_PLAN.md`) plus an active `tool_patterns` block (e.g. `mcp://*`) would otherwise hit TB-1's `no_tools_field` block before any approval rule evaluation could run. Surfaced 2026-08-21 in the `LATEST_PLAN.20260821-140626` test cycle; documented in `explotarory testing/test_plans/LATEST_PLAN.20260821-140626.journal.md` as `DEF-LATEST_PLAN-F01` (HIGH severity).
+
 ## [0.16.1] - 2026-08-20
 
 Patch release — Phase-1+ `action_digest` wire-shape fix for non-impact `/gate` calls. Wire-format is additive (new optional field); SDK_MIN_VERSION unchanged. **Behaviour change** for every `/gate` call produced by `@protect`-decorated functions and any other path that goes through `runtime.check_workflow_budget`.
