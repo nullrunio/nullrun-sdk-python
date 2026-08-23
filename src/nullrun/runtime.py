@@ -2650,6 +2650,17 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         on_transport_error: Callable[[Exception], dict[str, Any]] | None = None,
         business_impact: dict[str, Any] | None = None,
         action_digest: str | None = None,
+        # F03 (2026-08-22): accept `tools` kwarg from the
+        # ``@sensitive`` decorator (``_enforce_sensitive_tool``)
+        # so the bridge from decorators.py:735 stays
+        # source-pin-compatible with test_execute_tools_propagation.py
+        # while the runtime also reads ``get_call_tools()``
+        # internally. The kwarg and the contextvar are merged
+        # below — kwarg wins when supplied, otherwise the
+        # contextvar flows through (which the F03 fix in
+        # decorators.py populates from ``fn.__name__`` before
+        # this method is called).
+        tools: tuple[str, ...] | None = None,
     ) -> dict[str, Any]:
         """
         Pre-execution policy evaluation via /execute endpoint.
@@ -2743,8 +2754,19 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # (`no_tools_field`). Mirrors the /gate path at
         # `check_workflow_budget` which already threads the same
         # contextvar onto the wire body.
-        from nullrun.context import get_call_tools as _get_call_tools_for_execute
-        _execute_call_tools = _get_call_tools_for_execute()
+        #
+        # F03 (2026-08-22) precedence: the `tools` kwarg wins when
+        # supplied (allows callers like `_enforce_sensitive_tool` to
+        # forward an explicit list); otherwise fall back to the
+        # ``_call_tools_var`` contextvar which the F03 fix in
+        # decorators.py populates from ``fn.__name__`` before this
+        # method is called. The runtime layer was already reading
+        # the contextvar — the kwarg simply adds a second entry
+        # point that didn't exist before (causing TypeError on the
+        # decorator call site).
+        if tools is None:
+            from nullrun.context import get_call_tools as _get_call_tools_for_execute
+            tools = _get_call_tools_for_execute()
         execute_kwargs: dict[str, Any] = {
             "organization_id": organization_id,
             "execution_id": uuid7_str(),
@@ -2756,8 +2778,8 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             "operation_id": operation_id,
             "on_transport_error": on_transport_error,
         }
-        if _execute_call_tools:
-            execute_kwargs["tools"] = list(_execute_call_tools)
+        if tools:
+            execute_kwargs["tools"] = list(tools)
         # Digest-bound approval: forward the typed impact + digest
         # to the wire when supplied. The backend stamps the approval
         # row with the digest and verifies it on the post-approval

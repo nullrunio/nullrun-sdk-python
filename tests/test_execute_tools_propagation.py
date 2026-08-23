@@ -37,6 +37,7 @@ This file asserts the fixed behaviour:
 from __future__ import annotations
 
 import json
+import os
 import threading
 
 import httpx
@@ -47,6 +48,7 @@ from nullrun.breaker.exceptions import NullRunBlockedException
 
 BASE_URL = "https://api.test.nullrun.io"
 EXECUTE_URL = f"{BASE_URL}/api/v1/execute"
+GATE_URL = f"{BASE_URL}/api/v1/gate"
 
 
 @pytest.fixture
@@ -258,4 +260,247 @@ class TestDecoratorThreading:
             "decorators.py must import `get_call_tools` from "
             "nullrun.context — the F01 fix reads the per-call "
             "tools contextvar via this helper"
+        )
+
+
+class TestDecoratorF03BehavioralRegression:
+    """F03 (2026-08-22) behavioural regression: ``@protect`` /
+    ``@sensitive`` must populate the per-call ``_call_tools_var``
+    contextvar from ``fn.__name__`` when the user did NOT explicitly
+    call ``set_call_context(tools=...)``.
+
+    Pre-F03 the contextvar was never written by SDK internal code, so
+    the /gate round-trip triggered by ``check_workflow_budget()``
+    omitted the ``tools`` field. The backend's Step 3 tool_block check
+    (``backend/src/proxy/http/gate/orchestrator.rs``) fail-CLOSED via
+    TB-1 (``no_tools_field``) and every approval-rule probe returned
+    ``decision=block reason='TOOL_BLOCKED'`` without ever reaching the
+    approval_rule_eval step. This suite exercises the decorator's
+    full runtime path (not the source-pin-only test in
+    ``TestDecoratorThreading`` above) so a future refactor that drops
+    the population step fails the test immediately.
+
+    The transport layer already accepts ``tools`` on the wire body
+    (covered by ``TestExecuteToolsPropagation`` above). This module
+    closes the gap on the *decorator* leg of the handoff: from
+    ``@protect`` invocation through ``_protect_body`` into the
+    underlying runtime call.
+    """
+
+    @pytest.fixture
+    def captured_gate_and_execute(self):
+        """Capture every /gate AND /execute request body. Returns
+        a tuple of two mutable lists ``(gate_bodies, execute_bodies)``
+        that the test can index into to assert what was sent."""
+        gate_bodies: list[dict] = []
+        execute_bodies: list[dict] = []
+
+        def _gate_capture(request: httpx.Request) -> httpx.Response:
+            gate_bodies.append(json.loads(request.content.decode("utf-8")))
+            return httpx.Response(
+                200,
+                json={
+                    "decision": "allow",
+                    "decision_source": "gateway",
+                    "explanation": "allowed",
+                    "policy_version": 1,
+                    "explanations": [],
+                },
+            )
+
+        def _execute_capture(request: httpx.Request) -> httpx.Response:
+            execute_bodies.append(json.loads(request.content.decode("utf-8")))
+            return httpx.Response(
+                200,
+                json={
+                    "decision": "allow",
+                    "decision_source": "gateway",
+                    "explanation": "allowed",
+                    "policy_version": 1,
+                },
+            )
+
+        respx.post(GATE_URL).mock(side_effect=_gate_capture)
+        respx.post(EXECUTE_URL).mock(side_effect=_execute_capture)
+        return gate_bodies, execute_bodies
+
+    def test_protect_populates_tools_on_gate_body_when_user_omits_set_call_context(
+        self, make_runtime, mock_api, captured_gate_and_execute
+    ):
+        """The decorator's ``_protect_body`` must seed
+        ``_call_tools_var = (fn.__name__,)`` so ``check_workflow_budget``
+        forwards ``tools`` on the /gate wire body — even when the user
+        never called ``set_call_context``. This is the headline F03
+        closure for the /gate leg."""
+        gate_bodies, _ = captured_gate_and_execute
+        from nullrun.context import get_call_tools
+
+        # Defensive: assert the precondition the F03 fix relies on
+        # (no caller-side set_call_context for this test).
+        assert get_call_tools() == ()
+
+        import nullrun.decorators as dec
+
+        rt = make_runtime()
+        dec._runtime = rt  # belt-and-braces — make_runtime already does this.
+
+        @dec.protect
+        def my_agent(query: str) -> str:
+            return f"answer:{query}"
+
+        result = my_agent("hello")
+        assert result == "answer:hello"
+
+        # /gate must have been called once and must carry
+        # tools=["my_agent"] — populated by _protect_body from
+        # fn.__name__ before check_workflow_budget().
+        assert gate_bodies, "no /gate call was captured"
+        gate_body = gate_bodies[-1]
+        assert gate_body.get("tools") == ["my_agent"], (
+            f"F03 not closed: /gate body must carry tools=['my_agent'] "
+            f"after @protect; got body={gate_body!r}. The fix is in "
+            f"decorators.py::_protect_body which seeds "
+            f"_call_tools_var from fn.__name__ before "
+            f"check_workflow_budget()."
+        )
+
+    def test_protect_does_not_override_explicit_set_call_context(
+        self, make_runtime, mock_api, captured_gate_and_execute
+    ):
+        """When the user explicitly called
+        ``set_call_context(tools=[user_list])``, the decorator MUST
+        preserve the user's list — not overwrite it with
+        ``[fn.__name__]``. Precedence: explicit > auto-populated."""
+        gate_bodies, _ = captured_gate_and_execute
+        from nullrun.context import get_call_tools, set_call_context
+
+        # User explicitly declared their tool list.
+        set_call_context(tools=["user_declared_tool", "another_tool"])
+        assert get_call_tools() == ("user_declared_tool", "another_tool")
+
+        import nullrun.decorators as dec
+
+        rt = make_runtime()
+        dec._runtime = rt
+
+        @dec.protect
+        def my_agent(query: str) -> str:
+            return f"answer:{query}"
+
+        try:
+            my_agent("hello")
+            assert gate_bodies, "no /gate call was captured"
+            gate_body = gate_bodies[-1]
+            # The user's explicit list survives — NOT fn.__name__.
+            assert gate_body.get("tools") == [
+                "user_declared_tool",
+                "another_tool",
+            ], (
+                f"explicit set_call_context must win over decorator "
+                f"auto-population; got body={gate_body!r}"
+            )
+        finally:
+            # Clean up so the test's explicit context doesn't leak.
+            set_call_context(tools=[])
+            assert get_call_tools() == ()
+
+    def test_protect_restores_prior_call_tools_context_after_call(
+        self, make_runtime, mock_api, captured_gate_and_execute
+    ):
+        """Token-based reset: a nested @protect inside an outer @protect
+        (or inside ``with workflow``) restores the prior
+        ``_call_tools_var`` value on exit. Bare @protect leaves the
+        contextvar empty again. The same shape as the legacy
+        ``_trace_id_var`` / ``_span_id_var`` resets in _protect_body."""
+        from nullrun.context import _call_tools_var, get_call_tools, set_call_context
+
+        # Outer: user explicitly set tools=["outer"]
+        set_call_context(tools=["outer"])
+        assert get_call_tools() == ("outer",)
+
+        import nullrun.decorators as dec
+
+        rt = make_runtime()
+        dec._runtime = rt
+
+        @dec.protect
+        def outer(query: str) -> str:
+            return f"outer:{query}"
+
+        # Before invocation: outer context is "outer"
+        assert get_call_tools() == ("outer",)
+
+        # Invoke outer — its _protect_body will see _existing="outer"
+        # and SKIP auto-population (call_tools_token stays None).
+        _ = outer("hello")
+
+        # After invocation: outer context STILL "outer" (unchanged).
+        assert get_call_tools() == ("outer",), (
+            f"explicit set_call_context was clobbered by the decorator "
+            f"after the call exited; got {get_call_tools()!r}"
+        )
+
+        # Clean up
+        set_call_context(tools=[])
+        assert get_call_tools() == ()
+
+    def test_sensitive_decorator_populates_tools_on_execute_body(
+        self, make_runtime, mock_api, captured_gate_and_execute
+    ):
+        """``@sensitive`` is the decorator combo reported in DEF-LATEST_PLAN-F03
+        (probes ``qa/approval_rules/ar_toolname_run.py``,
+        ``ar_toolname_run_chain.py``, ``ar_params_run.py``,
+        ``ar_threshold_run.py``). Pre-F03 the ``_enforce_sensitive_tool``
+        ``runtime.execute(..., tools=get_call_tools())`` call saw an
+        empty contextvar, the wire body omitted ``tools``, and the
+        backend's Step 3 tool_block fail-CLOSED via TB-1
+        (``no_tools_field``) BEFORE the approval_rule_eval step could
+        fire — every approval-rule probe returned
+        ``decision=block reason='TOOL_BLOCKED'``.
+
+        Post-F03 the decorator populates ``_call_tools_var`` from
+        ``fn.__name__`` in ``_protect_body`` (before /gate and
+        /execute are called), and ``runtime.execute`` now accepts the
+        ``tools=`` kwarg directly so the source-pin pattern at
+        decorators.py:735 no longer TypeErrors. The /execute wire body
+        must carry ``tools=["refund_customer"]``.
+        """
+        _gate_bodies, execute_bodies = captured_gate_and_execute
+        from nullrun.context import get_call_tools
+
+        assert get_call_tools() == ()  # precondition
+
+        import nullrun.decorators as dec
+
+        rt = make_runtime()
+        dec._runtime = rt
+
+        # The /sensitive registration flow warms the runtime
+        # singleton's sensitive-tools set. ``_do_sensitive_register``
+        # calls ``add_sensitive_tool(fn.__name__)`` so the
+        # ``_enforce_sensitive_tool`` short-circuit (line 606 in
+        # decorators.py) doesn't return early.
+        @dec.sensitive
+        @dec.protect
+        def refund_customer(refund_amount: float) -> str:
+            return f"refund:{refund_amount}"
+
+        # Register the tool manually (decoration-time registration
+        # uses the lazy singleton; in this test we pin the runtime
+        # directly via dec._runtime so the registration lands on the
+        # pinned instance — same trick make_runtime uses).
+        rt.add_sensitive_tool("refund_customer")
+
+        result = refund_customer(refund_amount=100.0)
+        assert result == "refund:100.0"
+
+        # /execute (the sensitive-tool round-trip) must carry
+        # tools=["refund_customer"] — the F03 headline closure.
+        assert execute_bodies, "no /execute call was captured"
+        execute_body = execute_bodies[-1]
+        assert execute_body.get("tools") == ["refund_customer"], (
+            f"F03 not closed on /execute path: body must carry "
+            f"tools=['refund_customer']; got body={execute_body!r}. "
+            f"This is the symptom that broke all four approval-rule "
+            f"probes in LATEST_PLAN run 20260822-181500-a3f1."
         )
