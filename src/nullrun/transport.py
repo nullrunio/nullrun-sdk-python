@@ -2620,8 +2620,9 @@ def _build_v3_error_code_map() -> dict[str, type[Exception]]:
         NullRunBudgetError,
         NullRunChainError,
         NullRunConsumeOverbudgetError,
-        NullRunProtocolError,
         NullRunRateLimitRedisError,
+        NullRunProtocolError,
+        NullRunToolBlockedError,
         NullRunWorkflowInactiveError,
         RateLimitError,
     )
@@ -2706,6 +2707,57 @@ def _build_v3_error_code_map() -> dict[str, type[Exception]]:
         # Backed by GateErrorCode::BudgetRecheckFailed in the
         # backend (error_codes.rs).
         "BUDGET_RECHECK_FAILED": NullRunBudgetError,
+        # NR-007 (audit 2026-08-24): the 19 entries below were missing
+        # from the SDK map and caused cookbook recipes that branch on
+        # ``error_code`` to fall through to ``NullRunBackendError``.
+        # Added in the parity PR that closes NR-007 — keep this
+        # block grouped so the parity CI test
+        # ``backend/tests/nr007_sdk_error_code_parity.rs`` has a
+        # single regression pin surface. Family mapping rationale
+        # per code:
+        #   - budget family: NullRunBudgetError
+        #   - chain family: NullRunChainError
+        #   - auth binding: NullRunAuthError
+        #   - protocol / wire validation: NullRunProtocolError /
+        #     NullRunBackendError
+        #   - gate decision: NullRunBlockedException /
+        #     NullRunToolBlockedError (TOOL_BLOCKED MUST use the
+        #     dedicated class per CLAUDE.md §8 — operators expect
+        #     ``except NullRunToolBlockedError:`` for tool-name
+        #     branch recipes).
+        "BUDGET_ANTI_DOS_RESERVED_CAP": NullRunBudgetError,
+        "BUDGET_REDIS_UNAVAILABLE": NullRunBudgetError,
+        "CHAIN_ID_INVALID": NullRunChainError,
+        "EXECUTION_KEY_MISMATCH": NullRunAuthError,
+        "EXECUTION_ORG_MISMATCH": NullRunAuthError,
+        "ORG_MISMATCH": NullRunAuthError,
+        "PROTOCOL_HEADER_INVALID": NullRunProtocolError,
+        "PROTOCOL_HEADER_REQUIRED": NullRunProtocolError,
+        "TOOL_BLOCKED": NullRunToolBlockedError,
+        "LOOP_DETECTED": NullRunBlockedException,
+        "MODEL_REQUIRED": NullRunBlockedException,
+        "POLICY_UNCONFIGURED": NullRunBlockedException,
+        "TOO_MANY_PENDING_APPROVALS": NullRunBlockedException,
+        "BUSINESS_IMPACT_INVALID": NullRunBlockedException,
+        "VALIDATION_FAILED": NullRunBlockedException,
+        # Wire-level parsing failures (missing / malformed fields).
+        # Map to ``NullRunBackendError`` because the SDK treats them
+        # as infrastructure-side issues — the server should have
+        # returned a structured 4xx envelope, and a fall-through
+        # here indicates a wire-shape drift between client and server.
+        "EXECUTION_ID_MALFORMED": NullRunBackendError,
+        "EXECUTION_ID_REQUIRED": NullRunBackendError,
+        # Rate-limit plan lookup failure (Postgres / Redis adjacent).
+        # Tied to ``NullRunRateLimitRedisError`` because the failure
+        # mode is rate-limit-specific infrastructure unavailability
+        # rather than generic backend error.
+        "RATE_LIMIT_PLAN_LOOKUP_FAILED": NullRunRateLimitRedisError,
+        # Idempotency layer Redis unavailability. Map to generic
+        # ``NullRunBackendError`` — the wire class is infrastructure
+        # availability, not a typed subclass (mirrors
+        # ``RATE_LIMIT_REDIS_UNAVAILABLE`` -> ``NullRunRateLimitRedisError``
+        # family pattern at wire level).
+        "IDEMPOTENCY_REDIS_UNAVAILABLE": NullRunBackendError,
     }
 
 
