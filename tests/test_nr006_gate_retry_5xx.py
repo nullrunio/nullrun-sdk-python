@@ -107,10 +107,10 @@ def test_check_retries_on_5xx_and_returns_real_decision(transport):
         f"never fired."
     )
     assert result.get("decision_source") != "fallback", (
-        f"NR-006: result carries decision_source='fallback' — the "
-        f"fallback path executed despite a successful real gate "
-        f"response after retry. decision_source must be 'gateway' "
-        f"when the wire response was real."
+        "NR-006: result carries decision_source='fallback' — the "
+        "fallback path executed despite a successful real gate "
+        "response after retry. decision_source must be 'gateway' "
+        "when the wire response was real."
     )
     assert result["remaining_budget_cents"] == 500
 
