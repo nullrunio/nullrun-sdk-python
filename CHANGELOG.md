@@ -44,6 +44,12 @@ Side-effect: `NullRunToolBlockedError` is now imported by `_build_v3_error_code_
 
 Companion: backend commit `8dbeaf4d` added the parity CI test `cargo test --test nr007_sdk_error_code_parity` that gates future drift between `GateErrorCode::all()` and `_V3_ERROR_CODE_MAP`. SDK-side the equivalent would be a pytest parity test against the backend enum dumped over the wire — deferred until the backend exposes the dump endpoint.
 
+**Removed**
+
+- **Deleted `tests/test_e2e_observation.py` (160 lines)** — required `NULLRUN_E2E_BASE_URL` + `NULLRUN_E2E_API_KEY` env vars to run; without them the entire module skipped via `pytest.mark.skipif(...)`. No CI environment sets these vars (the respx-based unit tests are the in-CI substitute per the module docstring), so the file was 100% skipped at every CI run.
+- **Deleted `tests/test_real_e2e_observation.py` (325 lines)** — sole test was permanently skipped via `@pytest.mark.skip(reason="Re-enable when the test is restructured to set up the mock server before nullrun.init()")`. The skip reason was added when the test broke against 0.4.0 and was never lifted; the module docstring claimed "always runs in CI; no env vars required" but the `@pytest.mark.skip` override prevented that. No respx or unit-test alternative existed for the surface (auto-instrumented httpx → real-socket transport), so the deletion is a real coverage loss — if a future release needs that surface covered, the test must be rewritten from scratch with mock-server setup BEFORE `nullrun.init()`, not after.
+- **Test fixtures kept and improved.** `tests/conftest.py::mock_api` and `tests/conftest.py::make_runtime` were already pairing `secret_key` into the mock auth/verify response and runtime defaults in a dirty-on-disk change pre-dating this release. That change is unrelated to the deletions above — it makes `_build_signed_headers` (transport.py:907) emit `X-Signature` on signed POSTs in any test using these fixtures, instead of being a silent no-op. Kept as-is.
+
 ### Verification
 
 - Targeted suite: `tests/test_nr006_gate_retry_5xx.py` — 3/3 pass.
