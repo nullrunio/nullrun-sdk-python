@@ -43,6 +43,11 @@ jobs:
       url: https://pypi.org/p/nullrun
     permissions:
       id-token: write
+      # contents: write is required by softprops/action-gh-release to
+      # create the GitHub Release (push the tag ref + draft release).
+      # The existing publish step only needs id-token for PyPI Trusted
+      # Publishing, so this is additive and scoped to the new step.
+      contents: write
 
     steps:
       - uses: actions/checkout@v4
@@ -63,3 +68,22 @@ jobs:
 
       - name: Publish to PyPI (Trusted Publishing)
         uses: pypa/gh-action-pypi-publish@release/v1
+
+      # GitHub Release creation — gated on tag pushes so the manual
+      # workflow_dispatch path (used for hotfix re-runs) doesn't create
+      # a duplicate release on the current HEAD's branch ref. The
+      # ``generate_release_notes`` flag asks GitHub to auto-aggregate
+      # merged PR titles + labels into the release body, which keeps
+      # the GitHub release page in sync with the CHANGELOG.md body
+      # without manual editing. Attached files mirror what PyPI receives
+      # (wheel + sdist) so the release page doubles as a download mirror
+      # for environments where pip isn't available.
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
