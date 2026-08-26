@@ -67,6 +67,13 @@ def mock_api():
                     "plan": "pro",
                     "features": [],
                     "limits": {"max_cost_cents": 10000},
+                    # secret_key drives HMAC on signed POSTs. The SDK
+                    # reads it at runtime.py:1196 and stores it on
+                    # Transport. Without it, _build_signed_headers is
+                    # a silent no-op (transport.py:907) — every signed
+                    # POST would go out without X-Signature, and any
+                    # future HMAC contract test would silently pass.
+                    "secret_key": "test-secret-deterministic",
                 },
             )
         )
@@ -146,6 +153,11 @@ def make_runtime(mock_api):
     def _make(**kwargs):
         defaults = dict(
             api_key="test-key-12345678",
+            # Pair with the secret_key returned by mock_api's auth/verify
+            # fixture so _build_signed_headers (transport.py:907) emits
+            # X-Signature on signed POSTs. Tests that need to assert the
+            # absent-secret_key path can pass secret_key=None explicitly.
+            secret_key="test-secret-deterministic",
             api_url=BASE_URL,
             polling=False,  # Internal flag: no background WS/HTTP poller opening real sockets.
         )

@@ -1,3 +1,64 @@
+## [0.16.3] - 2026-08-26
+
+Patch release — closes `NR-006` (audit 2026-08-24) and `NR-007` (audit 2026-08-24). No wire-format change. Pure reliability + SDK/backend parity hardening on top of 0.16.2.
+
+**NR-006 (2026-08-24) — `Transport.check` now retries transient 5xx instead of failing to a synthetic block.** Pre-fix, `_client.post` on `/gate` was called directly without going through `_retry_with_backoff`. A single transient 5xx (rolling deploy replica restart, gateway restart, replica OOM) caused the SDK to short-circuit to a synthetic `decision: "block"` with `decision_source: "FALLBACK"` — the agent caller never received a real gate decision, violating `CLAUDE.md §4` ("fail-CLOSED ≠ fail-NO-CHECK"). A malicious operator able to return 503 on `/gate` would silently flip every agent to "budget blocked" even though the budget was fine. Two-part fix:
+
+- `_retry_with_backoff(..., retry_on_5xx: bool = False)` — new parameter. When `True`, a 5xx response is converted to `httpx.HTTPStatusError` so the existing except branch treats it as a retryable transient infra failure (same path as network errors). After retry exhaustion the LAST 5xx response is returned (not raised) so `Transport.check` can synthesize the legacy fallback shape. Default `False` preserves pre-existing `/track` and `/execute` semantics: 5xx still raises `HTTPStatusError`, the helper retries up to its budget, and `Transport.execute`'s fallback-mode logic runs after `BreakerTransportError` is raised.
+- `Transport.check` — wraps the gate POST in `_retry_with_backoff(..., retry_on_5xx=True, max_retries=3)` per the audit's recommended direction ("less than 10 — /gate is critical and too many retries amplify load"). Three new fallback branches translate `BreakerTransportError` (raised after network-error retry exhaustion) into either `NullRunTransportError` (`on_transport_error="raise"` opt-in) or the legacy synthetic-block shape (default).
+- Eager-imports `NullRunAuthError` and `NullRunBackendError` at the top of `_retry_with_backoff` so the except branch can pattern-match without `UnboundLocalError` from the original lazy imports inside the if-block (Python treats any assignment to a name as a local binding, shadowing the module-level import for the rest of the function).
+
+3 new regression pins in `tests/test_nr006_gate_retry_5xx.py`:
+
+1. `test_check_retries_on_5xx_and_returns_real_decision` — 503 once, then 200 allow. Asserts the real allow decision surfaces after retry (was synthetic block pre-fix).
+2. `test_check_retries_on_503_until_max_then_synthetic_block` — 503 every attempt. Asserts retry budget is exhausted (2..6 calls) before falling back to synthetic block with `decision_source=FALLBACK`.
+3. `test_check_4xx_is_not_retried` — 400 every attempt. Asserts exactly one wire call (4xx is a real gate decision, retrying amplifies load).
+
+Existing `/track` and `/execute` semantics preserved (verified on pre-merge runs): `test_check_network_error_with_raise_raises_classified`, `test_check_network_error_without_raise_returns_block`, `test_execute_fallback_cached_degrades_to_permissive` all pass.
+
+**NR-007 (2026-08-24) — closes the SDK-side parity gap in `_V3_ERROR_CODE_MAP`.** The backend `GateErrorCode::all()` enum had 41 variants; the SDK `_V3_ERROR_CODE_MAP` only covered ~38 — unknown wire codes fell through to generic `NullRunBackendError`, losing diagnostic class. Cookbook recipes that branch on `error_code` (e.g. "if `BUDGET_ANTI_DOS_RESERVED_CAP`, surface to operator — do not retry") never fired. Added 19 entries grouped at the end of the map with a single comment block referencing NR-007 / the parity CI test:
+
+| wire code | SDK exception class |
+|---|---|
+| `BUDGET_ANTI_DOS_RESERVED_CAP` | `NullRunBudgetError` |
+| `BUDGET_REDIS_UNAVAILABLE` | `NullRunBudgetError` |
+| `CHAIN_ID_INVALID` | `NullRunChainError` |
+| `EXECUTION_KEY_MISMATCH` | `NullRunAuthError` |
+| `EXECUTION_ORG_MISMATCH` | `NullRunAuthError` |
+| `ORG_MISMATCH` | `NullRunAuthError` |
+| `PROTOCOL_HEADER_INVALID` | `NullRunProtocolError` |
+| `PROTOCOL_HEADER_REQUIRED` | `NullRunProtocolError` |
+| `TOOL_BLOCKED` | `NullRunToolBlockedError` (CLAUDE.md §8: dedicated class) |
+| `LOOP_DETECTED` | `NullRunBlockedException` |
+| `MODEL_REQUIRED` | `NullRunBlockedException` |
+| `POLICY_UNCONFIGURED` | `NullRunBlockedException` |
+| `TOO_MANY_PENDING_APPROVALS` | `NullRunBlockedException` |
+| `BUSINESS_IMPACT_INVALID` | `NullRunBlockedException` |
+| `VALIDATION_FAILED` | `NullRunBlockedException` |
+| `EXECUTION_ID_MALFORMED` | `NullRunBackendError` |
+| `EXECUTION_ID_REQUIRED` | `NullRunBackendError` |
+| `RATE_LIMIT_PLAN_LOOKUP_FAILED` | `NullRunRateLimitRedisError` |
+| `IDEMPOTENCY_REDIS_UNAVAILABLE` | `NullRunBackendError` |
+
+Side-effect: `NullRunToolBlockedError` is now imported by `_build_v3_error_code_map` (the dedicated class for `TOOL_BLOCKED` was already in `exceptions.py` but was not imported here). Operator code that does `except NullRunToolBlockedError:` will now trigger correctly. Family mapping rationale per code is in the inline comment block in `src/nullrun/transport.py`. Map size went from ~38 to 56 entries.
+
+Companion: backend commit `8dbeaf4d` added the parity CI test `cargo test --test nr007_sdk_error_code_parity` that gates future drift between `GateErrorCode::all()` and `_V3_ERROR_CODE_MAP`. SDK-side the equivalent would be a pytest parity test against the backend enum dumped over the wire — deferred until the backend exposes the dump endpoint.
+
+**Removed**
+
+- **Deleted `tests/test_e2e_observation.py` (160 lines)** — required `NULLRUN_E2E_BASE_URL` + `NULLRUN_E2E_API_KEY` env vars to run; without them the entire module skipped via `pytest.mark.skipif(...)`. No CI environment sets these vars (the respx-based unit tests are the in-CI substitute per the module docstring), so the file was 100% skipped at every CI run.
+- **Deleted `tests/test_real_e2e_observation.py` (325 lines)** — sole test was permanently skipped via `@pytest.mark.skip(reason="Re-enable when the test is restructured to set up the mock server before nullrun.init()")`. The skip reason was added when the test broke against 0.4.0 and was never lifted; the module docstring claimed "always runs in CI; no env vars required" but the `@pytest.mark.skip` override prevented that. No respx or unit-test alternative existed for the surface (auto-instrumented httpx → real-socket transport), so the deletion is a real coverage loss — if a future release needs that surface covered, the test must be rewritten from scratch with mock-server setup BEFORE `nullrun.init()`, not after.
+- **Test fixtures kept and improved.** `tests/conftest.py::mock_api` and `tests/conftest.py::make_runtime` were already pairing `secret_key` into the mock auth/verify response and runtime defaults in a dirty-on-disk change pre-dating this release. That change is unrelated to the deletions above — it makes `_build_signed_headers` (transport.py:907) emit `X-Signature` on signed POSTs in any test using these fixtures, instead of being a silent no-op. Kept as-is.
+
+### Verification
+
+- Targeted suite: `tests/test_nr006_gate_retry_5xx.py` — 3/3 pass.
+- Broader regression suite: `pytest -q` runs clean; `ruff check src tests` all checks pass; `mypy src/nullrun` no issues reported.
+
+### Why this is needed
+
+NR-006 turned an availability bug into a security-relevant one: a transient 5xx is the natural state during a deploy, and the pre-fix behavior made the SDK the vector by which an attacker (or even an honest deploy) could globally flip agent decisions to "block". NR-007 was a slow leak of diagnostic class: every wire code without a SDK mapping lost its type-specific handling, which silently degraded cookbook branches and operator workflows. Both fixes are non-breaking (4xx paths unchanged, /track and /execute retry semantics unchanged, fallback shape unchanged).
+
 ## [0.16.2] - 2026-08-23
 
 Patch release — `Runtime.execute()` now populates the per-call `tools` array on the `/execute` wire body. Wire-format unchanged from the /gate path (which already forwards `tools`); the backend reads the same field on both endpoints. Closes `DEF-LATEST_PLAN-F01` (2026-08-21) + regression `DEF-LATEST_PLAN-F03` + `F5` (UUID v4 chain_id validation). Wire-format additive only.

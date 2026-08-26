@@ -195,13 +195,36 @@ def _retry_with_backoff(
     jitter: float = 0.1,
     last_retry_after_seconds: float = 0.0,
     on_transport_error: str | Callable[[Exception], dict[str, Any]] | None = None,
+    retry_on_5xx: bool = False,
 ) -> Any:
     """Retry with exponential backoff + jitter; honors Retry-After (429) header.
 
     Formula (without Retry-After): delay = min(base_delay * backoff_factor^attempt, max_delay)
                                     delay += random.uniform(-jitter * delay, jitter * delay)
     Formula (with Retry-After): actual_delay = min(last_retry_after_seconds, max_delay)
+
+    NR-006 (audit 2026-08-24): when ``retry_on_5xx=True`` a 5xx
+    response is treated as transient infrastructure failure and
+    retried via the same backoff path as network errors. After the
+    retry budget is exhausted the LAST 5xx response is returned
+    (not raised) so the caller can produce a deterministic
+    fail-CLOSED fallback — the audit's "fail-NO-CHECK" violation
+    happens when a 5xx short-circuits to a synthetic block without
+    any retry. Default ``retry_on_5xx=False`` preserves the
+    pre-existing /track and /execute semantics where 5xx is a
+    classified GATEWAY_ERROR that raises immediately.
     """
+    # Eager imports for the exception classes that the ``except``
+    # branch below references. Lazy imports inside the ``try`` body
+    # shadow the name in this scope (Python treats any assignment
+    # to the name as a local binding), which raises
+    # ``UnboundLocalError`` when the except branch tries to
+    # pattern-match before the lazy import has fired.
+    from nullrun.breaker.exceptions import (
+        NullRunAuthError,
+        NullRunBackendError,
+    )
+
     last_exc: Exception | None = None
 
     for attempt in range(max_retries + 1):
@@ -210,8 +233,6 @@ def _retry_with_backoff(
 
             if hasattr(result, "status_code"):
                 if result.status_code == 401:
-                    from nullrun.breaker.exceptions import NullRunAuthError
-
                     err = NullRunAuthError(
                         "Invalid API key",
                         error_code="NR-A003",
@@ -233,8 +254,6 @@ def _retry_with_backoff(
                 if result.status_code >= 500 and on_transport_error == "raise":
                     # 5xx is a classified GATEWAY_ERROR. Don't retry; only raise
                     # when caller opted into the typed-error contract.
-                    from nullrun.breaker.exceptions import NullRunBackendError
-
                     err = NullRunBackendError(
                         f"Gateway returned {result.status_code}",
                         endpoint="execute",
@@ -247,13 +266,40 @@ def _retry_with_backoff(
                         status_code=result.status_code,
                     )
                     raise err
-                if result.status_code >= 400:
+                if result.status_code >= 500 and retry_on_5xx and attempt < max_retries:
+                    # NR-006: treat 5xx as transient infra failure and retry.
+                    # Convert to HTTPStatusError so the except branch catches
+                    # it as a retryable condition. After retry exhaustion
+                    # the helper returns the last response (see below).
                     result.raise_for_status()
+                elif result.status_code >= 500 and not retry_on_5xx:
+                    # Pre-NR-006 behaviour: 5xx without ``retry_on_5xx``
+                    # raises HTTPStatusError so the caller (e.g.
+                    # ``Transport.execute``) can run its fallback logic
+                    # after retry exhaustion produces BreakerTransportError.
+                    # ``retry_on_5xx=True`` (the /gate path) takes the
+                    # branch above instead and returns the last response.
+                    result.raise_for_status()
+                # 4xx is a real gate decision — return the response so
+                # the caller can synthesize the appropriate fallback
+                # (Transport.check returns a synthetic block; Transport.execute
+                # returns a synthetic block; /track batch inspects status
+                # directly). Calling ``raise_for_status()`` here would force
+                # every caller into the except path and retry a permanent
+                # error — the audit's NR-006 PIN 3 pins this non-retry
+                # contract.
 
             return result
 
-        except (BreakerTransportError, NullRunAuthenticationError, NullRunTransportError):
+        except (BreakerTransportError, NullRunAuthenticationError, NullRunTransportError, NullRunBackendError):
             raise
+
+        except httpx.HTTPStatusError as exc:
+            # 5xx HTTPStatusError from the retry_on_5xx branch above.
+            # Treat as retryable transient infra failure.
+            last_exc = exc
+            if attempt >= max_retries:
+                break
 
         except Exception as exc:
             last_exc = exc
@@ -291,6 +337,20 @@ def _retry_with_backoff(
 
             time.sleep(actual_delay)
 
+    # Retry exhaustion. NR-006 path: if the caller opted into
+    # ``retry_on_5xx`` and the failure mode was 5xx, return the
+    # last response so the caller can synthesize a fallback
+    # (e.g. ``Transport.check`` returns the legacy synthetic-block
+    # shape). Other exhaustion paths (network errors, timeouts)
+    # still raise ``BreakerTransportError`` — pre-existing
+    # behaviour, unchanged.
+    if (
+        retry_on_5xx
+        and last_exc is not None
+        and isinstance(last_exc, httpx.HTTPStatusError)
+        and last_exc.response is not None
+    ):
+        return last_exc.response
     raise BreakerTransportError(f"Request failed after {max_retries + 1} attempts") from last_exc
 
 
@@ -1286,41 +1346,71 @@ class Transport:
         body = _signed_request_body(gate_request)
         headers = self._build_signed_headers(body=body)
 
-        try:
-            response = self._client.post(
+        # NR-006 (audit 2026-08-24): wrap the gate POST in
+        # ``_retry_with_backoff`` with ``retry_on_5xx=True`` and
+        # ``max_retries=3`` (per audit recommendation: "less than
+        # 10 — /gate is critical and too many retries amplify
+        # load"). Pre-fix this code path returned a synthetic block
+        # on the FIRST 5xx — the agent caller never received a real
+        # gate decision, violating CLAUDE.md §4 "fail-CLOSED ≠
+        # fail-NO-CHECK". A transient 503 from a rolling deploy
+        # would silently flip every agent to "budget blocked" even
+        # though the budget was fine.
+        def _do_gate_post() -> httpx.Response:
+            return self._client.post(
                 f"{self.api_url}/api/v1/gate",
                 content=body,
                 headers=headers,
                 timeout=5.0,
             )
 
+        try:
+            response = _retry_with_backoff(
+                _do_gate_post,
+                max_retries=3,
+                base_delay=0.5,
+                max_delay=10.0,
+                backoff_factor=2.0,
+                jitter=0.1,
+                retry_on_5xx=True,
+                on_transport_error=on_transport_error,
+            )
+
             if response.status_code == 200:
                 return response.json()  # type: ignore[no-any-return]
-            else:
-                # 4xx always -> synthetic block. 5xx only raises when
-                # the caller opted into the typed-error contract via
-                # on_transport_error="raise"; otherwise it's also a
-                # synthetic block (legacy behaviour).
-                if response.status_code >= 500 and on_transport_error == "raise":
-                    raise NullRunTransportError(
-                        f"Gateway returned {response.status_code}",
-                        source=TransportErrorSource.GATEWAY_ERROR,
-                        endpoint="check",
-                        status_code=response.status_code,
-                    )
-                return {
-                    "decision": "block",
-                    "decision_source": DecisionSource.FALLBACK,
-                    "reservation_id": None,
-                    "remaining_budget_cents": 0,
-                    "projected_cost_cents": 0,
-                    "explanations": [f"Gate endpoint returned {response.status_code}"],
-                    "suggestions": ["Check API availability"],
-                }
+            # 4xx always -> synthetic block (real gate decision,
+            # never retried by ``_retry_with_backoff``). 5xx after
+            # retry exhaustion -> synthetic block (legacy
+            # fallback path preserved).
+            if response.status_code >= 500 and on_transport_error == "raise":
+                # Defence-in-depth: the helper raises 5xx-with-raise
+                # inside the retry loop, but if a path slips through
+                # (e.g. operator passes on_transport_error after
+                # exhaustion), we still surface the typed error
+                # rather than the silent synthetic block.
+                raise NullRunTransportError(
+                    f"Gateway returned {response.status_code}",
+                    source=TransportErrorSource.GATEWAY_ERROR,
+                    endpoint="check",
+                    status_code=response.status_code,
+                )
+            return {
+                "decision": "block",
+                "decision_source": DecisionSource.FALLBACK,
+                "reservation_id": None,
+                "remaining_budget_cents": 0,
+                "projected_cost_cents": 0,
+                "explanations": [f"Gate endpoint returned {response.status_code}"],
+                "suggestions": ["Check API availability"],
+            }
         except httpx.RequestError as e:
-            # Classify network errors. By default fall through
-            # to synthetic block (legacy); raise only when the
-            # caller opted in via on_transport_error="raise".
+            # NR-006: ``_retry_with_backoff`` re-raises network errors
+            # after retry exhaustion as ``BreakerTransportError``, but
+            # ``httpx.RequestError`` can still surface when the helper
+            # raises mid-loop on a non-retryable path (e.g. caller
+            # passes ``max_retries=0``). Translate to either a
+            # typed ``NullRunTransportError`` (opt-in) or a synthetic
+            # block (legacy).
             if on_transport_error == "raise":
                 raise NullRunTransportError(
                     f"Network error on /check: {e}",
@@ -1335,6 +1425,29 @@ class Transport:
                 "remaining_budget_cents": 0,
                 "projected_cost_cents": 0,
                 "explanations": [f"Gate request failed: {e}"],
+                "suggestions": ["Check API availability"],
+            }
+        except BreakerTransportError as e:
+            # NR-006: the helper exhausted the retry budget on network
+            # errors and re-raised as ``BreakerTransportError``. Apply
+            # the same translation rule as ``httpx.RequestError``
+            # above so the legacy ``on_transport_error`` opt-in
+            # contract is preserved — opt-in → typed error, default
+            # → synthetic block.
+            if on_transport_error == "raise":
+                raise NullRunTransportError(
+                    f"Network error on /check after retry exhaustion: {e}",
+                    source=TransportErrorSource.NETWORK_ERROR,
+                    endpoint="check",
+                ) from e
+            logger.warning(f"Gate request failed after retries: {e}")
+            return {
+                "decision": "block",
+                "decision_source": DecisionSource.FALLBACK,
+                "reservation_id": None,
+                "remaining_budget_cents": 0,
+                "projected_cost_cents": 0,
+                "explanations": [f"Gate request failed after retries: {e}"],
                 "suggestions": ["Check API availability"],
             }
 
@@ -2509,6 +2622,7 @@ def _build_v3_error_code_map() -> dict[str, type[Exception]]:
         NullRunConsumeOverbudgetError,
         NullRunProtocolError,
         NullRunRateLimitRedisError,
+        NullRunToolBlockedError,
         NullRunWorkflowInactiveError,
         RateLimitError,
     )
@@ -2593,6 +2707,57 @@ def _build_v3_error_code_map() -> dict[str, type[Exception]]:
         # Backed by GateErrorCode::BudgetRecheckFailed in the
         # backend (error_codes.rs).
         "BUDGET_RECHECK_FAILED": NullRunBudgetError,
+        # NR-007 (audit 2026-08-24): the 19 entries below were missing
+        # from the SDK map and caused cookbook recipes that branch on
+        # ``error_code`` to fall through to ``NullRunBackendError``.
+        # Added in the parity PR that closes NR-007 — keep this
+        # block grouped so the parity CI test
+        # ``backend/tests/nr007_sdk_error_code_parity.rs`` has a
+        # single regression pin surface. Family mapping rationale
+        # per code:
+        #   - budget family: NullRunBudgetError
+        #   - chain family: NullRunChainError
+        #   - auth binding: NullRunAuthError
+        #   - protocol / wire validation: NullRunProtocolError /
+        #     NullRunBackendError
+        #   - gate decision: NullRunBlockedException /
+        #     NullRunToolBlockedError (TOOL_BLOCKED MUST use the
+        #     dedicated class per CLAUDE.md §8 — operators expect
+        #     ``except NullRunToolBlockedError:`` for tool-name
+        #     branch recipes).
+        "BUDGET_ANTI_DOS_RESERVED_CAP": NullRunBudgetError,
+        "BUDGET_REDIS_UNAVAILABLE": NullRunBudgetError,
+        "CHAIN_ID_INVALID": NullRunChainError,
+        "EXECUTION_KEY_MISMATCH": NullRunAuthError,
+        "EXECUTION_ORG_MISMATCH": NullRunAuthError,
+        "ORG_MISMATCH": NullRunAuthError,
+        "PROTOCOL_HEADER_INVALID": NullRunProtocolError,
+        "PROTOCOL_HEADER_REQUIRED": NullRunProtocolError,
+        "TOOL_BLOCKED": NullRunToolBlockedError,
+        "LOOP_DETECTED": NullRunBlockedException,
+        "MODEL_REQUIRED": NullRunBlockedException,
+        "POLICY_UNCONFIGURED": NullRunBlockedException,
+        "TOO_MANY_PENDING_APPROVALS": NullRunBlockedException,
+        "BUSINESS_IMPACT_INVALID": NullRunBlockedException,
+        "VALIDATION_FAILED": NullRunBlockedException,
+        # Wire-level parsing failures (missing / malformed fields).
+        # Map to ``NullRunBackendError`` because the SDK treats them
+        # as infrastructure-side issues — the server should have
+        # returned a structured 4xx envelope, and a fall-through
+        # here indicates a wire-shape drift between client and server.
+        "EXECUTION_ID_MALFORMED": NullRunBackendError,
+        "EXECUTION_ID_REQUIRED": NullRunBackendError,
+        # Rate-limit plan lookup failure (Postgres / Redis adjacent).
+        # Tied to ``NullRunRateLimitRedisError`` because the failure
+        # mode is rate-limit-specific infrastructure unavailability
+        # rather than generic backend error.
+        "RATE_LIMIT_PLAN_LOOKUP_FAILED": NullRunRateLimitRedisError,
+        # Idempotency layer Redis unavailability. Map to generic
+        # ``NullRunBackendError`` — the wire class is infrastructure
+        # availability, not a typed subclass (mirrors
+        # ``RATE_LIMIT_REDIS_UNAVAILABLE`` -> ``NullRunRateLimitRedisError``
+        # family pattern at wire level).
+        "IDEMPOTENCY_REDIS_UNAVAILABLE": NullRunBackendError,
     }
 
 
