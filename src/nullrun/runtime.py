@@ -3453,11 +3453,91 @@ def _capture_server_minted_execution_id(response: dict[str, Any]) -> str | None:
     op_id = response.get("operation_id") if isinstance(response, dict) else None
     if isinstance(op_id, str) and op_id:
         set_server_minted_idempotency_key(op_id)
+    # ADR-037 Slice B (2026-08-31, protocol v4): capture the
+    # wire-evidence echo on the same /check as the execution_id so
+    # the two values always refer to the same gate decision. Wire-
+    # additive: pre-v4 backends omit both keys (skip_serializing_if)
+    # and the captures degrade to None — no false positive.
+    _capture_wire_evidence(response)
     logger.debug(
         "_capture_server_minted_execution_id: captured %s",
         raw,
     )
     return raw
+
+
+# ADR-037 Slice B (2026-08-31, protocol v4): wire-evidence echo
+# capture helper. Extracted from `_capture_server_minted_execution_id`
+# so the two captures share a call site but have distinct log lines
+# (debugging: a missing execution_id should not mask a successful
+# wire-evidence capture).
+#
+# Wire contract: backend's /gate response now carries `action_digest`
+# (SDK-supplied SHA-256 of canonical business_impact, re-verified
+# server-side, echoed back) and `policy_hash` (slot reserved for
+# future Slice D wiring — today always None because the gate doesn't
+# compute per-request hashes). Both are `skip_serializing_if = "..."`
+# on the backend, so v3 SDKs see JSON without the keys.
+#
+# Capture is fail-OPEN: a malformed value is logged at WARNING and
+# dropped (the contextvar stays at None) — a single /check must
+# never break the runtime on a bad wire echo.
+def _capture_wire_evidence(response: dict[str, Any]) -> tuple[str | None, str | None]:
+    """Capture `action_digest` + `policy_hash` from the /gate response.
+
+    Returns ``(action_digest, policy_hash)`` for the caller's log
+    paths; the contextvar side-effect is authoritative.
+
+    Both fields default to None on legacy backends (no keys in
+    the JSON) and on pre-Phase-1 SDKs that never sent
+    `action_digest` (legacy grant path is fail-CLOSED at v3+
+    anyway — the backend sets the field to None on those rows).
+    """
+    from nullrun.context import (
+        set_last_gate_action_digest,
+        set_last_gate_policy_hash,
+    )
+
+    if not isinstance(response, dict):
+        # Defensive — runtime never passes a non-dict, but a bad
+        # transport layer might. Reset to None so the previous
+        # scope's value can't leak.
+        set_last_gate_action_digest(None)
+        set_last_gate_policy_hash(None)
+        return None, None
+
+    # Defensive string validation — backend emits lowercase hex
+    # of length 64 for action_digest (SHA-256 hex). A buggy proxy
+    # could echo garbage; drop without raising so /check still
+    # proceeds (the backend has already validated the value during
+    # /gate processing — this is a post-hoc audit capture, not a
+    # gate).
+    def _safe_str(key: str) -> str | None:
+        v = response.get(key)
+        if v is None:
+            return None
+        if not isinstance(v, str):
+            logger.warning(
+                "_capture_wire_evidence: response.%s is %s, "
+                "expected str — dropping",
+                key,
+                type(v).__name__,
+            )
+            return None
+        return v
+
+    action_digest = _safe_str("action_digest")
+    policy_hash = _safe_str("policy_hash")
+
+    set_last_gate_action_digest(action_digest)
+    set_last_gate_policy_hash(policy_hash)
+
+    logger.debug(
+        "_capture_wire_evidence: action_digest=%s policy_hash=%s",
+        "set" if action_digest else "None",
+        "set" if policy_hash else "None",
+    )
+    return action_digest, policy_hash
 
 
 # 2026-07-04 (v0.12.0 wiring fix — ): build the

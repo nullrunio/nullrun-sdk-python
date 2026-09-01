@@ -28,7 +28,7 @@ LlamaIndex, and your own stack.
 
 <!-- BADGES: capability markers -->
 <div align="center">
-  <img src="https://img.shields.io/badge/protocol-v3.31-success?style=flat-square" alt="protocol v3.31" />
+  <img src="https://img.shields.io/badge/protocol-v4-success?style=flat-square" alt="protocol v4" />
   <img src="https://img.shields.io/badge/zero--code-instrumentation-22C55E?style=flat-square" alt="Zero-code instrumentation" />
   <img src="https://img.shields.io/badge/server--authoritative-cost-F59E0B?style=flat-square" alt="Server-authoritative cost" />
 </div>
@@ -37,7 +37,7 @@ LlamaIndex, and your own stack.
 
 ---
 
-> ⚠️ **Status: alpha (v0.15.0).** The public API may shift between minor versions.
+> ⚠️ **Status: alpha (v0.16.4).** The public API may shift between minor versions.
 > Pin your dependency and read the [CHANGELOG](https://github.com/nullrunio/nullrun-sdk-python/blob/master/CHANGELOG.md) before upgrading.
 
 ---
@@ -293,8 +293,9 @@ Runnable, copy-pastable examples live in a separate repo so you can adapt withou
 | Version | Status | Highlights |
 |---|---|---|
 | **v0.14.x** | ✅ alpha | Wire protocol v3.31, server-minted execution IDs, MCP, anti-OOM streaming cap |
-| **v0.15** (current) | ✅ alpha | ADR-009 governance audit surface, typed `runtime.audit.*`, capability probes for `/audit-log/verify` |
-| **v0.16** | 📋 planned | OpenTelemetry exporter, Redis-backed offline queue, hardened init contract |
+| **v0.15.x** | ✅ alpha | ADR-009 governance audit surface, typed `runtime.audit.*`, capability probes for `/audit-log/verify`, fail-OPEN observability closure |
+| **v0.16.x** (current) | ✅ alpha | Phase-1+ `action_digest` on `/gate`, `/execute` `tools` propagation, transient-5xx retry on gate (NR-006), error-code parity (NR-007, 41→56 entries) |
+| **v0.17** | 📋 planned | OpenTelemetry exporter, Redis-backed offline queue, hardened init contract |
 | **v1.0** | 🎯 beta target | Stable wire contract, full async support, type-safe decisions |
 
 [Full roadmap & RFCs →](https://nullrun.io/roadmap)

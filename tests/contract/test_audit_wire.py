@@ -30,7 +30,7 @@ from nullrun.audit import (
 )
 from nullrun.breaker.exceptions import NullRunAuthenticationError
 from nullrun.runtime import NullRunRuntime
-from nullrun.transport import HEADER_PROTOCOL
+from nullrun.transport import HEADER_PROTOCOL, NULLRUN_PROTOCOL_VERSION
 
 BASE = "https://api.test.nullrun.io"
 ORG = "00000000-0000-0000-0000-0000000000aa"
@@ -127,7 +127,7 @@ class TestAuditLogWire:
         )
         transport.audit_log(organization_id=ORG)
         request = route.calls.last.request
-        assert request.headers[HEADER_PROTOCOL] == "3"
+        assert request.headers[HEADER_PROTOCOL] == str(NULLRUN_PROTOCOL_VERSION)
         assert request.headers.get("X-API-Key") == "test-key-12345678"
         assert request.headers.get("Authorization") == "Bearer test-key-12345678"
 
@@ -296,7 +296,7 @@ class TestAuditCreateExportWire:
         # Signed POST — HMAC + protocol header present.
         assert request.headers.get("X-Signature")
         assert request.headers.get("X-Signature-Timestamp")
-        assert request.headers[HEADER_PROTOCOL] == "3"
+        assert request.headers[HEADER_PROTOCOL] == str(NULLRUN_PROTOCOL_VERSION)
         assert request.headers.get("Content-Type") == "application/json"
 
 

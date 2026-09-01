@@ -1,3 +1,37 @@
+## [0.16.4] - 2026-08-31
+
+Patch release — ADR-037 Slice B. The wire protocol bumps from 3 → 4 additively: `/gate` response now echoes the SDK-supplied `action_digest` and a `policy_hash` slot (always `None` today; Slice D wires per-request computation). `min_protocol_version` stays at 2 so v3 SDKs are unaffected. Wire-format additive only — no new hashing/computation introduced on either side (both fields echo already-computed values).
+
+### Added
+
+- **`NULLRUN_PROTOCOL_VERSION = 4`** (`src/nullrun/transport.py`). `X-NULLRUN-PROTOCOL` header on every signed POST now serialises the bumped value via the single source of truth `NULLRUN_PROTOCOL_VERSION`; tests are pinned to `str(NULLRUN_PROTOCOL_VERSION)` so a future bump doesn't sweep this file again. `NullRunProtocolError.user_action` and `docs/errors/NR-P001.md` updated to point operators at `X-NULLRUN-PROTOCOL: 4`.
+- **`/gate` response wire-evidence echo capture** — `runtime._capture_wire_evidence` (called from `_capture_server_minted_execution_id` on the same `/check` lifetime so the two values always refer to the same gate decision) reads `action_digest` + `policy_hash` off the response and stores them in two new contextvars: `_last_gate_action_digest_var`, `_last_gate_policy_hash_var`. Public accessors `get_last_gate_action_digest()` / `get_last_gate_policy_hash()`; setters `set_last_gate_action_digest()` / `set_last_gate_policy_hash()`. Capture is fail-OPEN: a malformed value (non-str type) is logged at WARNING and dropped — the contextvar stays at `None`. `clear_server_minted_execution_id` (and the underlying direct `set(...=None)` paths) also drop the v4 slots so a `/check` in one block never leaks a stale echo into a `/track` in a sibling block.
+- **`ServerCapabilities.wire_evidence_echo`** — informational capability flag surfaced by `/api/v1/capabilities`. Tells the SDK the backend echoes `action_digest` on `/gate` response. NOT included in `is_v3_ready()` (informational, not a hard gate). Defaults to `False` on pre-v4 backends; the canonical shape is `capabilities.wire_evidence_echo: true` at the top level, with the nested `capabilities.*` form also accepted.
+- **New test file `tests/test_slice_b_wire_evidence.py`** (10 tests). Pins the SDK-side of the v3→v4 additive bump: protocol-constant value, header serialisation, capture from `/gate` response (happy path + `policy_hash`-when-present + both-set), tolerance of pre-v4 backends (no keys → both `None`), tolerance of malformed wire values (non-str → drop, do not raise), tolerance of `None`-typed responses (defensive — runtime never passes a non-dict, but a bad transport layer might), `clear_server_minted_execution_id` resets the v4 slots, and the protocol-constant + capability-flag source-of-truth wiring.
+- **`tests/test_capabilities.py`** — two new assertions: `test_parse_capabilities_wire_evidence_echo_v4_backend` (top-level + nested + missing-key), `test_parse_capabilities_v4_protocol_range` (min=2 stays, max moves to 4).
+- **README alpha-status line + roadmap table** — `v0.15` → `v0.15.x` (so the v0.15.x fail-OPEN observability closure isn't squashed); `v0.16` → `v0.16.x` with the new highlights (Phase-1+ `action_digest` on `/gate`, `/execute` `tools` propagation, NR-006 transient-5xx retry, NR-007 error-code parity 41→56 entries, Slice B wire-evidence echo); `v0.17` for the OpenTelemetry exporter / Redis-backed offline queue / hardened init contract that previously sat under `v0.16`.
+
+### Changed
+
+- **`/gate` response handler now reads two more keys.** `action_digest` (SDK-supplied SHA-256 hex of canonical `business_impact`, re-verified server-side by `payload_binding::server_derive_action_digest`, echoed back so the SDK can confirm what the gate saw matches what it intended) and `policy_hash` (slot reserved for future Slice D wiring — today always `None` because the gate doesn't compute per-request hashes; the audit row stores `policy_hash = None` for the same reason at `audit_drain.rs:301`). Pre-v4 backends omit both keys entirely via `skip_serializing_if = "Option::is_none"` — a v4 SDK connecting to a v3 backend reads `None` on both fields and logs "no wire evidence echo" — no false positive.
+- **`tests/contract/test_audit_wire.py` + `tests/test_v3_wire_contract.py`** — header assertions now source `str(NULLRUN_PROTOCOL_VERSION)` instead of the literal `"3"` so a future bump doesn't require sweeping either file. Class names kept (`TestSignedPostIncludesProtocolHeader`) for git-blame continuity.
+
+### Compatibility
+
+Wire-format additive — pre-v4 SDKs parsing the response simply ignore the new fields; v4 SDKs parsing a v3 backend response see `None` on both fields (skip_serializing_if on the backend means the JSON keys are absent, not `null`). `min_protocol_version` stays at 2, so v3 SDKs continue to work against a v4 backend. The architectural invariant `GateResponse.action_digest == AuditEvent.action_digest` holds trivially because both sides flow from the SDK's input. No new hashing/computation introduced on either side — both fields echo already-computed values.
+
+### Verification
+
+- Targeted suite: `tests/test_slice_b_wire_evidence.py` — 10/10 pass.
+- Capabilities: `tests/test_capabilities.py::test_parse_capabilities_wire_evidence_echo_v4_backend`, `test_parse_capabilities_v4_protocol_range` — pass.
+- Wire contract: `tests/test_v3_wire_contract.py` — pass (header assertions now source the constant).
+- Audit wire: `tests/contract/test_audit_wire.py` — pass.
+- Broader regression suite: `pytest -q` 1613 passed / 4 skipped (12 more than 0.16.3, accounting for the 10 new Slice B pins + 2 new capabilities assertions); `ruff check src tests` all checks pass; `mypy src/nullrun` no issues reported in 37 source files.
+
+### Why this is needed
+
+ADR-037 Slice B closes the SDK/backend wire-trust gap: pre-Slice-B the SDK had no way to verify the gate saw the same `action_digest` it intended — a misconfigured proxy or a future Slice A regression could swallow or rewrite the digest without any SDK-side signal. The echo slot on `/gate` response + the two contextvars give operators a clean diagnostic ("the gate echoed digest X — that's what I sent") and pin the architectural invariant `GateResponse.action_digest == AuditEvent.action_digest` at the SDK layer. `policy_hash` is forward-compat for Slice D; the slot is wired now so Slice D doesn't require another SDK release.
+
 ## [0.16.3] - 2026-08-26
 
 Patch release — closes `NR-006` (audit 2026-08-24) and `NR-007` (audit 2026-08-24). No wire-format change. Pure reliability + SDK/backend parity hardening on top of 0.16.2.

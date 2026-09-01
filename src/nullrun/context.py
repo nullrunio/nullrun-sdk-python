@@ -328,6 +328,35 @@ _server_minted_reservation_at_var: ContextVar[float] = ContextVar(
 _server_minted_idempotency_key_var: ContextVar[str | None] = ContextVar(
     "server_minted_idempotency_key", default=None
 )
+# ADR-037 Slice B (2026-08-31, protocol v4): wire-evidence echo
+# from /gate response. Both fields are ADR-009 governance columns
+# that the backend now echoes on the /gate response (additive —
+# pre-v4 backends omit the keys entirely via skip_serializing_if).
+#
+# `action_digest` is the SDK-supplied SHA-256 hex of the canonical
+# `business_impact` payload, re-verified server-side by
+# `payload_binding::server_derive_action_digest` and echoed back
+# on the wire so the SDK can confirm what the gate saw matches
+# what it intended. The architectural invariant
+# `GateResponse.action_digest == AuditEvent.action_digest` holds
+# trivially because both sides flow from the SDK's input.
+#
+# `policy_hash` is reserved for future Slice D wiring (per
+# ADR-037 §3 deferral — gate doesn't compute per-request hash
+# today; in-memory KeyPolicy cache carries no hash and the hot
+# path cannot load PolicyRow). Today this field is always None
+# on the wire; the audit row stores `policy_hash = None` for the
+# same reason (audit_drain.rs:301), so the invariant
+# `GateResponse.policy_hash == AuditEvent.policy_hash` holds
+# trivially.
+#
+# Both default to None; clear_ functions reset to None.
+_last_gate_action_digest_var: ContextVar[str | None] = ContextVar(
+    "last_gate_action_digest", default=None
+)
+_last_gate_policy_hash_var: ContextVar[str | None] = ContextVar(
+    "last_gate_policy_hash", default=None
+)
 
 
 def get_server_minted_execution_id() -> str | None:
@@ -449,6 +478,10 @@ def clear_server_minted_execution_id() -> None:
         _server_minted_execution_id_var.set(None)
         _server_minted_reservation_at_var.set(0.0)
         _server_minted_idempotency_key_var.set(None)
+        # Also drops the v4 wire-evidence echo slots so the next
+        # /check in scope doesn't read a stale echo from a prior block.
+        _last_gate_action_digest_var.set(None)
+        _last_gate_policy_hash_var.set(None)
 
     Use:func:`reset_server_minted_execution_id` instead when you
     have a Token to consume — that path restores the previous
@@ -457,11 +490,79 @@ def clear_server_minted_execution_id() -> None:
     _server_minted_execution_id_var.set(None)
     _server_minted_reservation_at_var.set(0.0)
     _server_minted_idempotency_key_var.set(None)
+    # ADR-037 Slice B (2026-08-31, protocol v4): also drop the
+    # wire-evidence echo slots so a /check in one block never leaks
+    # a stale echo into a /track in a sibling block.
+    _last_gate_action_digest_var.set(None)
+    _last_gate_policy_hash_var.set(None)
 
 
 def set_attempt_index(index: int) -> None:
     """Set current attempt index for retry correlation."""
     _attempt_index_var.set(index)
+
+
+# ---------------------------------------------------------------------------
+# ADR-037 Slice B (2026-08-31, protocol v4): wire-evidence echo
+# ---------------------------------------------------------------------------
+# Read by tests + operators to confirm the gate saw the same
+# `action_digest` the SDK sent (and to surface the architectural
+# invariant `GateResponse.action_digest == AuditEvent.action_digest`
+# from the SDK side). `policy_hash` is informational only today;
+# Slice D will populate it per-request.
+
+
+def get_last_gate_action_digest() -> str | None:
+    """Return the `action_digest` echoed by the last /gate response, or
+    ``None`` if no echo captured in scope (legacy backend, or a /check
+    that didn't carry a typed business impact).
+
+    Wire-additive — pre-v4 backends omit the field entirely
+    (``skip_serializing_if = "Option::is_none"`` on the backend); a
+    v4 SDK connecting to a v3 backend reads None and behaves like
+    pre-Slice-B. No false positive.
+
+    See ADR-037 Slice B (2026-08-31) for the wire contract.
+    """
+    return _last_gate_action_digest_var.get()
+
+
+def get_last_gate_policy_hash() -> str | None:
+    """Return the `policy_hash` echoed by the last /gate response, or
+    ``None`` if no echo captured in scope.
+
+    Slot reserved for future Slice D wiring (per ADR-037 §3
+    deferral — gate doesn't compute per-request hash today; the
+    audit row stores `policy_hash = None` for the same reason at
+    `audit_drain.rs:301`). Today this field is always None on the
+    wire, so this getter is informational only.
+
+    See ADR-037 Slice B (2026-08-31) for the wire contract.
+    """
+    return _last_gate_policy_hash_var.get()
+
+
+def set_last_gate_action_digest(value: str | None) -> None:
+    """Capture the `action_digest` echoed by a /gate response.
+
+    Called by ``runtime._capture_wire_evidence`` immediately after
+    ``_capture_server_minted_execution_id`` — the two captures share
+    the same lifetime (one /check → one execution_id + one
+    action_digest). See ADR-037 Slice B (2026-08-31).
+    """
+    _last_gate_action_digest_var.set(value)
+
+
+def set_last_gate_policy_hash(value: str | None) -> None:
+    """Capture the `policy_hash` echoed by a /gate response.
+
+    Slot reserved for Slice D (per ADR-037 §3 deferral). Today
+    this is always set to None on the wire; this setter is the
+    forward-compatible hook for Slice D.
+
+    See ADR-037 Slice B (2026-08-31).
+    """
+    _last_gate_policy_hash_var.set(value)
 
 
 # ---------------------------------------------------------------------------

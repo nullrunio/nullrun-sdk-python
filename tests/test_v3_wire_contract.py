@@ -67,7 +67,7 @@ class TestProtocolHeaderConstant:
     def test_version_is_three(self):
         # Bumping this requires a coordinated backend release —
         # see (semver: major = breaking wire change).
-        assert NULLRUN_PROTOCOL_VERSION == 3
+        assert NULLRUN_PROTOCOL_VERSION == 4  # v4 = Slice B additive (action_digest, policy_hash on /gate wire)
 
     def test_header_name_is_dashed(self):
         # Match the backend's HeaderName parsing (axum 0.7 normalises
@@ -79,12 +79,21 @@ class TestProtocolHeaderConstant:
         from nullrun.transport import _protocol_header_value
 
         # Stored as u32 on the wire — serialise the integer directly
-        # (``"3"``, not ``"v3"``).
-        assert _protocol_header_value() == "3"
+        # (``"4"`` after the Slice B bump, not ``"v3"``). The value
+        # is sourced from `NULLRUN_PROTOCOL_VERSION` as the single
+        # source of truth so future bumps don't sweep this test.
+        assert _protocol_header_value() == str(NULLRUN_PROTOCOL_VERSION)
 
 
 class TestSignedPostIncludesProtocolHeader:
-    """Every signed POST must include ``X-NULLRUN-PROTOCOL: 3``."""
+    """Every signed POST must include ``X-NULLRUN-PROTOCOL: <NULLRUN_PROTOCOL_VERSION>``.
+
+    v4 (2026-08-31, ADR-037 Slice B): protocol bumped 3→4 additively.
+    The class name is kept (``TestSignedPostIncludesProtocolHeader``)
+    for git-blame continuity; the header value is sourced from
+    ``NULLRUN_PROTOCOL_VERSION`` as the single source of truth so
+    future bumps don't require sweeping this file again.
+    """
 
     @respx.mock
     def test_track_batch_includes_protocol_header(self):
@@ -95,7 +104,7 @@ class TestSignedPostIncludesProtocolHeader:
             )
             t._send_batch_with_retry_info([{"event": "test"}])
             sent = route.calls.last.request
-            assert sent.headers["X-NULLRUN-PROTOCOL"] == "3"
+            assert sent.headers["X-NULLRUN-PROTOCOL"] == str(NULLRUN_PROTOCOL_VERSION)
         finally:
             t.stop()
 
@@ -111,7 +120,7 @@ class TestSignedPostIncludesProtocolHeader:
             )
             t.check({"check_type": "llm", "estimated_tokens": 1})
             sent = route.calls.last.request
-            assert sent.headers["X-NULLRUN-PROTOCOL"] == "3"
+            assert sent.headers["X-NULLRUN-PROTOCOL"] == str(NULLRUN_PROTOCOL_VERSION)
         finally:
             t.stop()
 
@@ -135,7 +144,7 @@ class TestSignedPostIncludesProtocolHeader:
             )
             t.check_v3({"check_type": "llm", "estimated_tokens": 1})
             sent = route.calls.last.request
-            assert sent.headers["X-NULLRUN-PROTOCOL"] == "3"
+            assert sent.headers["X-NULLRUN-PROTOCOL"] == str(NULLRUN_PROTOCOL_VERSION)
         finally:
             t.stop()
 
@@ -164,7 +173,7 @@ class TestSignedPostIncludesProtocolHeader:
                 }
             )
             sent = route.calls.last.request
-            assert sent.headers["X-NULLRUN-PROTOCOL"] == "3"
+            assert sent.headers["X-NULLRUN-PROTOCOL"] == str(NULLRUN_PROTOCOL_VERSION)
         finally:
             t.stop()
 
@@ -177,7 +186,7 @@ class TestSignedPostIncludesProtocolHeader:
             )
             t.cancel("exec-1")
             sent = route.calls.last.request
-            assert sent.headers["X-NULLRUN-PROTOCOL"] == "3"
+            assert sent.headers["X-NULLRUN-PROTOCOL"] == str(NULLRUN_PROTOCOL_VERSION)
         finally:
             t.stop()
 
@@ -190,7 +199,7 @@ class TestSignedPostIncludesProtocolHeader:
             )
             t.heartbeat("chain-abc")
             sent = route.calls.last.request
-            assert sent.headers["X-NULLRUN-PROTOCOL"] == "3"
+            assert sent.headers["X-NULLRUN-PROTOCOL"] == str(NULLRUN_PROTOCOL_VERSION)
         finally:
             t.stop()
 
@@ -206,7 +215,7 @@ class TestSignedPostIncludesProtocolHeader:
             )
             t.chain_end("chain-abc")
             sent = route.calls.last.request
-            assert sent.headers["X-NULLRUN-PROTOCOL"] == "3"
+            assert sent.headers["X-NULLRUN-PROTOCOL"] == str(NULLRUN_PROTOCOL_VERSION)
             body = sent.content.decode("utf-8")
             assert '"chain_id":"chain-abc"' in body
             assert '"chain_op":"end"' in body
@@ -231,7 +240,7 @@ class TestSignedPostIncludesProtocolHeader:
             )
             t.approximate_budget(organization_id="org-1")
             sent = route.calls.last.request
-            assert sent.headers["X-NULLRUN-PROTOCOL"] == "3"
+            assert sent.headers["X-NULLRUN-PROTOCOL"] == str(NULLRUN_PROTOCOL_VERSION)
         finally:
             t.stop()
 
@@ -253,7 +262,7 @@ class TestSignedPostIncludesProtocolHeader:
                 input_data={"command": "ls"},
             )
             sent = route.calls.last.request
-            assert sent.headers["X-NULLRUN-PROTOCOL"] == "3"
+            assert sent.headers["X-NULLRUN-PROTOCOL"] == str(NULLRUN_PROTOCOL_VERSION)
         finally:
             t.stop()
 
@@ -269,7 +278,7 @@ class TestSignedPostIncludesProtocolHeader:
             )
             asyncio.run(t._refetch_credentials())
             sent = route.calls.last.request
-            assert sent.headers["X-NULLRUN-PROTOCOL"] == "3"
+            assert sent.headers["X-NULLRUN-PROTOCOL"] == str(NULLRUN_PROTOCOL_VERSION)
         finally:
             t.stop()
 

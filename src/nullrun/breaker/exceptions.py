@@ -378,7 +378,7 @@ class NullRunProtocolError(NullRunInfrastructureError):
     user_action = (
         "The NullRun backend rejected the SDK's wire-protocol version. "
         "Upgrade the SDK to a version that supports protocol "
-        "X-NULLRUN-PROTOCOL: 3 — see "
+        "X-NULLRUN-PROTOCOL: 4 — see "
         "https://docs.nullrun.io/reference/wire-protocol for the "
         "current compatibility matrix."
     )
