@@ -57,7 +57,16 @@ __api_version__ = "1.0"
 # Wire-protocol version handshake. Backend rejects signed POSTs without
 # `X-NULLRUN-PROTOCOL: <n>` with 400. Bump must be coordinated with backend
 # `proxy::http::gate::protocol` and `/api/v1/capabilities`.
-NULLRUN_PROTOCOL_VERSION: int = 3
+#
+# v4 (2026-08-31, ADR-037 Slice B): ADDITIVE — /gate response now echoes
+# the SDK-supplied `action_digest` and a `policy_hash` slot (always None
+# today; Slice D wires per-request computation). Wire-additive: v3 SDKs
+# parsing the response simply ignore the new fields; v4 SDKs parsing a
+# v3 backend response see `None` on both (skip_serializing_if on the
+# backend means the JSON keys are absent, not `null`). No new
+# hashing/computation introduced on either side — both fields echo
+# already-computed values.
+NULLRUN_PROTOCOL_VERSION: int = 4
 HEADER_PROTOCOL: str = "X-NULLRUN-PROTOCOL"
 
 

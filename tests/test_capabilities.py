@@ -190,6 +190,59 @@ def test_probe_capabilities_returns_caps_on_2xx():
     assert caps.min_protocol_version == 3
 
 
+def test_parse_capabilities_wire_evidence_echo_v4_backend():
+    """ADR-037 Slice B (2026-08-31, protocol v4): a v4 backend
+    surfaces `wire_evidence_echo` capability flag. Defaults to
+    False on pre-v4 backends (which omit the field entirely) so
+    the SDK falls back to a no-echo view without raising.
+
+    NOT included in `is_v3_ready()` — it's informational, not a
+    hard gate. Operators can read `caps.wire_evidence_echo` to
+    surface a clean diagnostic at `init()` ("server echoes
+    action_digest on /gate response — you can verify the gate
+    saw the same digest you sent").
+    """
+    # v4 backend: flag present at top level
+    caps_v4 = parse_capabilities(
+        {
+            "min_protocol_version": 2,
+            "max_protocol_version": 4,
+            "wire_evidence_echo": True,
+        }
+    )
+    assert caps_v4.wire_evidence_echo is True
+
+    # v4 backend: flag nested under capabilities.* (canonical shape)
+    caps_v4_nested = parse_capabilities(
+        {
+            "min_protocol_version": 2,
+            "max_protocol_version": 4,
+            "capabilities": {"wire_evidence_echo": True},
+        }
+    )
+    assert caps_v4_nested.wire_evidence_echo is True
+
+    # Pre-v4 backend: flag missing entirely → False (fail-closed)
+    caps_legacy = parse_capabilities(
+        {"min_protocol_version": 3, "max_protocol_version": 3}
+    )
+    assert caps_legacy.wire_evidence_echo is False
+
+
+def test_parse_capabilities_v4_protocol_range():
+    """ADR-037 Slice B (2026-08-31, protocol v4): the protocol
+    version is bumped 3→4 additively. `min_protocol_version` stays
+    at 2 (so v3 SDKs are unaffected); `max_protocol_version` moves
+    to 4. The SDK reads both via the capabilities probe and the
+    parse tolerates missing keys.
+    """
+    caps = parse_capabilities(
+        {"min_protocol_version": 2, "max_protocol_version": 4}
+    )
+    assert caps.min_protocol_version == 2
+    assert caps.max_protocol_version == 4
+
+
 def test_probe_capabilities_returns_none_on_non_2xx():
     """A non-2xx /api/v1/capabilities response returns None (advisory, not fatal).
 

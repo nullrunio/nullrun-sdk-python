@@ -142,6 +142,16 @@ class ServerCapabilities:
     # included in `is_v3_ready()` -- it's informational, not a
     # hard gate.
     execution_graph: bool = False
+    # ADR-037 Slice B (2026-08-31, protocol v4): /gate response
+    # echoes the SDK-supplied `action_digest` and a `policy_hash`
+    # slot (None today; Slice D wires per-request computation).
+    # Backend always sends the fields (skip_serializing_if elides
+    # only when None); the flag is informational so SDKs can
+    # surface a clean diagnostic at `init()` ("server echoes
+    # action_digest on /gate response — you can verify the gate
+    # saw the same digest you sent"). NOT included in
+    # `is_v3_ready()` — it's informational, not a hard gate.
+    wire_evidence_echo: bool = False
     rate_limit_fail_scope: RateLimitFailScope = field(
         default_factory=lambda: RateLimitFailScope()
     )
@@ -183,6 +193,7 @@ class ServerCapabilities:
                 "outbox_async_drain": self.outbox_async_drain,
                 "idempotency_keys": self.idempotency_keys,
                 "execution_graph": self.execution_graph,
+                "wire_evidence_echo": self.wire_evidence_echo,
                 "rate_limit_fail_scope": {
                     "aggregate": self.rate_limit_fail_scope.aggregate,
                     "per_key": self.rate_limit_fail_scope.per_key,
@@ -345,6 +356,15 @@ def parse_capabilities(payload: dict[str, Any]) -> ServerCapabilities:
         # the field entirely) yield a fail-closed view where the
         # SDK does NOT send `parent_execution_id`.
         execution_graph=_v3_flag("execution_graph"),
+        # ADR-037 Slice B (2026-08-31, protocol v4): additive
+        # flag — defaults to False so pre-Slice-B backends yield
+        # a fail-closed view where the SDK does NOT log the
+        # wire-evidence echo as "server confirmed". Pre-v4
+        # backends return the JSON without `action_digest` /
+        # `policy_hash` keys at all (skip_serializing_if on the
+        # backend), so a v4 SDK sees None on both fields and
+        # logs "no wire evidence echo" — no false positive.
+        wire_evidence_echo=_v3_flag("wire_evidence_echo"),
         rate_limit_fail_scope=_parse_rate_limit_scope(caps.get("rate_limit_fail_scope")),
     )
 
