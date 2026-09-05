@@ -1849,6 +1849,33 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # always-skipped).
         metrics.inc_runtime("check_calls")
 
+        # AUDIT P0-27 (2026-09-05): hoist the operation_id mint.
+        # Pre-fix, /check minted its own UUID v4 here AND /execute
+        # minted a separate UUID v4 — same logical action produced
+        # two unrelated backend bindings. The mint now lives in a
+        # single contextvar (``_operation_id_var``) so /check,
+        # /execute, and /track all share the SAME value for one
+        # logical action. /track consumes this value via the
+        # ``server_minted_idempotency_key`` contextvar, which the
+        # /check capture path (see ``_capture_server_minted_...``)
+        # sets from ``get_operation_id()`` rather than from the
+        # response-echo (P0-26 — the echo could silently overwrite
+        # with whatever the server returned, even on a different
+        # execution's response).
+        from nullrun.context import (
+            get_operation_id as _get_op_id_for_check,
+            set_operation_id as _set_op_id_for_check,
+        )
+
+        op_id = _get_op_id_for_check()
+        if op_id is None:
+            # First wire call for this scope — mint once and stash
+            # in the contextvar. /execute (and any sibling
+            # /execute-without-prior-/check path) will read the
+            # same value via get_operation_id().
+            op_id = str(uuid.uuid4())
+            _set_op_id_for_check(op_id)
+
         from nullrun.business_impact import (
             BusinessImpact as _BusinessImpact,
         )
@@ -1910,7 +1937,13 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             "organization_id": self.organization_id or "local",
             # 2026-07-04 (BUG #4): requires server-minted
             "execution_id": uuid7_str(),
-            "operation_id": str(uuid.uuid4()),
+            # AUDIT P0-27 (2026-09-05): operation_id comes from the
+            # contextvar minted at the top of this method (and shared
+            # with /execute). The pre-fix `str(uuid.uuid4())` minted
+            # a separate value here — /check and /execute would have
+            # produced distinct operation_ids for one logical action,
+            # silently breaking the backend's binding key.
+            "operation_id": op_id,
             "check_type": "llm",
             "model": call_model,  # may be None if user didn't set it
             "estimated_tokens": 1,
@@ -2746,7 +2779,24 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # Keep one operation_id across the initial request and the
         # post-approval re-check so the backend can bind both requests
         # to the same logical action.
-        operation_id = str(uuid.uuid4())
+        #
+        # AUDIT P0-27 (2026-09-05): read from the same contextvar
+        # /check uses (`_operation_id_var`) instead of minting an
+        # independent UUID v4. The pre-fix `str(uuid.uuid4())`
+        # produced a different value than the one /check used,
+        # silently breaking the backend's operation_id-keyed binding.
+        # If /execute is the FIRST wire call (no prior /check in
+        # scope), mint here and stash in the contextvar; otherwise
+        # reuse whatever /check minted.
+        from nullrun.context import (
+            get_operation_id as _get_op_id_for_execute,
+            set_operation_id as _set_op_id_for_execute,
+        )
+
+        operation_id = _get_op_id_for_execute()
+        if operation_id is None:
+            operation_id = str(uuid.uuid4())
+            _set_op_id_for_execute(operation_id)
         # Populate the per-call `tools` array so the backend's Step 3
         # tool_block check (`backend/src/proxy/http/gate/orchestrator.rs:1847-1893`)
         # can match each tool against the workflow's effective
@@ -3449,10 +3499,46 @@ def _capture_server_minted_execution_id(response: dict[str, Any]) -> str | None:
 
     set_server_minted_execution_id(raw)
     set_server_minted_reservation_at(_time.monotonic())
-    # 2026-07-04: capture the /check
-    op_id = response.get("operation_id") if isinstance(response, dict) else None
-    if isinstance(op_id, str) and op_id:
-        set_server_minted_idempotency_key(op_id)
+    # AUDIT P0-26 (2026-09-05): derive the idempotency_key from the
+    # SDK-minted operation_id (the value /check just sent on the
+    # wire) rather than from the server's response-echo. Pre-fix,
+    # the response-echo was trusted blindly — a misrouted response
+    # (different execution_id, similar shape) would silently
+    # overwrite the in-scope idempotency_key. We now assert
+    # equality when the server echoes a value (defensive parity
+    # check — the audit wants the SDK to know if the server
+    # rewrote it for any reason) and fall back to the SDK's own
+    # operation_id when the server omits the field.
+    from nullrun.context import get_operation_id as _get_op_id_for_capture
+
+    sdk_op_id = _get_op_id_for_capture()
+    server_op_id = (
+        response.get("operation_id")
+        if isinstance(response, dict)
+        else None
+    )
+    if isinstance(server_op_id, str) and server_op_id:
+        # Defensive parity assertion: server MUST echo the same
+        # operation_id the SDK sent. A mismatch indicates either
+        # a backend bug (the gate rewrote the field) or a
+        # misrouted response (the SDK is matching against a
+        # different execution's reply). Log loud; keep the SDK's
+        # value (the wire contract is "operation_id is SDK-owned"
+        # per ADR-016 §2.6).
+        if sdk_op_id is not None and server_op_id != sdk_op_id:
+            logger.error(
+                "AUDIT P0-26 parity check: server echoed operation_id=%s "
+                "but SDK sent operation_id=%s. Keeping the SDK value "
+                "(operation_id is SDK-owned per ADR-016 §2.6). If this "
+                "fires consistently, the backend is rewriting the field "
+                "or the response was misrouted.",
+                server_op_id,
+                sdk_op_id,
+            )
+        set_server_minted_idempotency_key(sdk_op_id or server_op_id)
+    elif isinstance(sdk_op_id, str) and sdk_op_id:
+        # Server omitted the echo (pre-v4 backend); trust the SDK.
+        set_server_minted_idempotency_key(sdk_op_id)
     # ADR-037 Slice B (2026-08-31, protocol v4): capture the
     # wire-evidence echo on the same /check as the execution_id so
     # the two values always refer to the same gate decision. Wire-

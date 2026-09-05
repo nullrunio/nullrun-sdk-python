@@ -328,6 +328,25 @@ _server_minted_reservation_at_var: ContextVar[float] = ContextVar(
 _server_minted_idempotency_key_var: ContextVar[str | None] = ContextVar(
     "server_minted_idempotency_key", default=None
 )
+# AUDIT P0-27 (2026-09-05): operation_id hoist.
+#
+# Pre-fix, runtime.py minted operation_id independently at the
+# /check site (line 1913) and the /execute site (line 2749).
+# A single logical action therefore produced two distinct
+# operation_ids — the backend's binding (which keys on
+# operation_id) saw them as two unrelated reservations, and the
+# P0-26 response-echo capture (`response.get("operation_id")`)
+# silently recorded whichever value the server echoed last.
+#
+# Fix: hoist the mint into a single contextvar owned by the
+# runtime's lifecycle. ``set_operation_id`` is called once at
+# the top of the public gate/enforce entry point; both /check
+# and /execute then ``get_operation_id()`` instead of minting
+# their own. The result is the SAME operation_id flows across
+# /check → /execute → /track for a single logical action.
+_operation_id_var: ContextVar[str | None] = ContextVar(
+    "operation_id", default=None
+)
 # ADR-037 Slice B (2026-08-31, protocol v4): wire-evidence echo
 # from /gate response. Both fields are ADR-009 governance columns
 # that the backend now echoes on the /gate response (additive —
@@ -500,6 +519,75 @@ def clear_server_minted_execution_id() -> None:
 def set_attempt_index(index: int) -> None:
     """Set current attempt index for retry correlation."""
     _attempt_index_var.set(index)
+
+
+# ---------------------------------------------------------------------------
+# AUDIT P0-27 (2026-09-05) — operation_id lifecycle helpers.
+#
+# The runtime mints the operation_id once at the top of the
+# public gate/enforce entry point (``NullRunRuntime.execute``
+# or ``NullRunRuntime.check_workflow_budget``) and threads it
+# through every wire call that needs an ``operation_id``
+# (currently /check and /execute; /track consumes the same
+# value via ``get_server_minted_idempotency_key``, which is
+# set from ``get_operation_id()`` on the /check side).
+#
+# The Token-returning setter mirrors the
+# ``set_server_minted_execution_id`` / ``reset_`` pattern
+# already used elsewhere so the runtime can scope the var
+# inside ``with workflow(...)`` / ``with chain(...)`` blocks
+# without leaking into sibling blocks.
+# ---------------------------------------------------------------------------
+
+
+def get_operation_id() -> str | None:
+    """Return the SDK-minted operation_id for the in-scope gate call.
+
+    Returns ``None`` if the runtime has not yet minted an
+    operation_id for this scope — call sites must handle the
+    None case (typically by minting a one-shot UUID v4 as a
+    fallback so the wire contract is preserved). The audit's
+    hoist design assumes the runtime ALWAYS sets this var
+    before any wire call; ``None`` indicates a context-leak
+    bug or an out-of-order call (e.g. /execute called without
+    a prior /check in the same scope).
+    """
+    return _operation_id_var.get()
+
+
+def set_operation_id(value: str) -> Token[str | None]:
+    """Mint/set the SDK-side operation_id.
+
+    Returns the ``Token`` so the caller can restore the
+    previous scope's value via :func:`reset_operation_id`.
+    Used by the runtime at the top of ``check_workflow_budget``
+    and ``execute`` to ensure a single logical action produces
+    exactly one operation_id across /check → /execute → /track.
+    """
+    return _operation_id_var.set(value)
+
+
+def reset_operation_id(token: Token[str | None]) -> None:
+    """Restore the previous operation_id value (Token-based API).
+
+    Pair with :func:`set_operation_id`. The runtime drives the
+    capture/reset cycle inside ``with workflow(...)`` /
+    ``with chain(...)`` blocks so a sibling block never sees a
+    stale value.
+    """
+    _operation_id_var.reset(token)
+
+
+def clear_operation_id() -> None:
+    """Hard-reset the operation_id to None (no-token convenience).
+
+    Use this when the surrounding scope cannot supply a Token
+    (e.g. exception paths, ``finally`` blocks after a Token
+    was already consumed). For symmetric capture/reset, prefer
+    :func:`reset_operation_id` with the Token returned from
+    :func:`set_operation_id`.
+    """
+    _operation_id_var.set(None)
 
 
 # ---------------------------------------------------------------------------
