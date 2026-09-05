@@ -52,6 +52,7 @@ from nullrun.breaker.exceptions import (
 from nullrun.context import (
     _call_tools_var,
     get_call_tools,
+    get_server_minted_execution_id,  # for cancel-on-exception helper
     get_workflow_id,
     reset_span_id,
     reset_trace_id,
@@ -383,6 +384,42 @@ def _emit_span_end(
         logger.debug(f"span_end emission failed: {exc}")
 
 
+def _safe_cancel_active_execution(reason: str | None = None) -> None:
+    """Best-effort cancel of any in-flight reservation captured by /gate.
+
+    Used by @protect's exception path: when the wrapped function or any
+    pre-execution gate raises after /gate has succeeded, the budget
+    reservation is still open in Redis and will leak via TTL expiry
+    unless closed. This helper makes the cancel call that closes it.
+
+    Behavior:
+      - No-op if no execution_id was captured (failure happened
+        pre-/gate — e.g., control_plane KILL).
+      - Never raises: catches everything including NullRunTransportError
+        and NullRunBackendError. Masking the original exception with
+        a cancel-failure would defeat observability.
+      - Synchronous, blocking HTTP. Caller is the @protect context
+        manager; HTTP I/O is the same channel used by
+        check_workflow_budget, so it does not change timeout posture.
+    """
+    try:
+        execution_id = get_server_minted_execution_id()
+    except Exception:
+        return
+    if not execution_id:
+        return
+    try:
+        runtime = get_runtime()
+    except Exception:
+        return
+    try:
+        runtime.cancel_execution(execution_id, reason=reason)
+    except Exception:
+        # An orphan from cancellation failure is preferred over
+        # masking the original exception with a transport error.
+        return
+
+
 def protect(fn: F | None = None) -> F | Callable[[F], F]:
     """
         Decorator that wraps a function in a NullRun span.
@@ -557,25 +594,57 @@ def protect(fn: F | None = None) -> F | Callable[[F], F]:
 
         @functools.wraps(fn)
         async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
-            with _protect_body(args, kwargs, unify_block=False) as runtime:
-                result = await fn(*args, **kwargs)
-                runtime.track_tool(
-                    fn.__name__,
-                    metadata={"arguments": _safe_kwargs(kwargs)},
-                )
-                return result
+            fn_completed = False
+            try:
+                with _protect_body(args, kwargs, unify_block=False) as runtime:
+                    result = await fn(*args, **kwargs)
+                    fn_completed = True
+                    runtime.track_tool(
+                        fn.__name__,
+                        metadata={"arguments": _safe_kwargs(kwargs)},
+                    )
+                    return result
+            except Exception:
+                # Close the in-flight reservation unless fn() actually
+                # completed — in which case track_tool failure means
+                # side effects already happened and only
+                # retry/consume semantics apply, not cancel.
+                #
+                # NB: we intentionally catch Exception, not
+                # BaseException. asyncio.CancelledError /
+                # KeyboardInterrupt / SystemExit propagate without
+                # blocking I/O — synchronous HTTP in a cancellation
+                # handler delays shutdown and triggers "Task was
+                # destroyed but pending" warnings. Orphan from a
+                # cancelled task is left to TTL/reconciliation, which
+                # is what the safety net is for.
+                if not fn_completed:
+                    _safe_cancel_active_execution(reason="tool_exception")
+                raise
 
         return async_wrapper  # type: ignore[return-value]
 
     @functools.wraps(fn)
     def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
-        with _protect_body(args, kwargs, unify_block=True) as runtime:
-            result = fn(*args, **kwargs)
-            runtime.track_tool(
-                fn.__name__,
-                metadata={"arguments": _safe_kwargs(kwargs)},
-            )
-            return result
+        fn_completed = False
+        try:
+            with _protect_body(args, kwargs, unify_block=True) as runtime:
+                result = fn(*args, **kwargs)
+                fn_completed = True
+                runtime.track_tool(
+                    fn.__name__,
+                    metadata={"arguments": _safe_kwargs(kwargs)},
+                )
+                return result
+        except BaseException:
+            # Sync path: BaseException is fine to catch and run
+            # cleanup in. No event loop to delay; KeyboardInterrupt
+            # on Ctrl+C just gets a few seconds of cancel I/O before
+            # exit. Matches existing _protect_body unify_block
+            # semantics.
+            if not fn_completed:
+                _safe_cancel_active_execution(reason="tool_exception")
+            raise
 
     return sync_wrapper  # type: ignore[return-value]
 
