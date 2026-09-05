@@ -1,3 +1,49 @@
+## [0.16.5] - 2026-09-05
+
+Patch release — two independent reliability fixes: (1) `@protect` cancel-on-exception orphan leak (Redis reservation leak on tool exceptions), (2) P0-26+P0-27 `operation_id` hoist (single-source mint, server-vs-SDK divergence detection). No wire-format change on either fix.
+
+### Fixed
+
+- **`@protect` cancel-on-exception orphan leak** (`src/nullrun/decorators.py`). Both `async_wrapper` and `sync_wrapper` now wrap the with-block in a try/except; on failure, `_safe_cancel_active_execution(reason="tool_exception")` closes the in-flight `/gate` reservation so the budget envelope is released immediately rather than waiting on TTL expiry. Three invariant pins:
+    - **Asymmetry on exception scope.** `async_wrapper` catches `Exception`, NOT `BaseException` — `asyncio.CancelledError`, `KeyboardInterrupt`, and `SystemExit` propagate without doing a synchronous blocking HTTP call inside a cancellation handler. That call has a 5s timeout; inside a cancellation handler it would (a) delay task cancellation by up to 5s on network errors, (b) make `Task was destroyed but it is pending` warnings more frequent and harder to diagnose, and (c) in some shutdown paths get cancelled itself, leaving cleanup incomplete (the server's `/cancel` is idempotent so this is acceptable — orphan via TTL/reconciliation instead). `sync_wrapper` catches `BaseException` to match existing `_protect_body` unify_block semantics; sync code has no event loop to delay and a Ctrl+C during a long sync agent gets a few seconds of cancel I/O before exit.
+    - **`fn_completed` sentinel.** After `fn(...)` returns, `fn_completed = True`. If `track_tool(...)` then fails (rare `/track` batch-sender network error), the wrapper's `except` runs but `fn_completed` is True so cancel does NOT fire — side effects already happened and the right move is to retry `track_tool`, not cancel (which would tell the server "no side effects" — a lie that produces a phantom budget refund and breaks audit).
+    - **Helper is fail-OPEN.** `_safe_cancel_active_execution` swallows everything (`NullRunTransportError`, `NullRunBackendError`, `get_runtime()` failures) so a cancel I/O failure never masks the original exception. An orphan from cancel failure is preferred over masking a `ValueError` from `fn()`.
+- **P0-26 — `operation_id` server-vs-SDK divergence detection** (`src/nullrun/runtime.py`, `src/nullrun/context.py`). `_capture_server_minted_execution_id` previously read `response.get('operation_id')` directly; if a proxy or a backend bug echoed back a different `operation_id` than the SDK minted, the SDK had no signal — audit row stored one id, downstream `/track` used another. Now reads via `_get_op_id_for_capture()` (the SDK-minted contextvar value) and asserts `server_op_id != sdk_op_id` with ERROR log on disagreement. `idempotency_key` is derived from the SDK-minted value, not the server echo, so a divergent server response cannot break idempotency.
+- **P0-27 — `operation_id` hoisted to contextvar; triple-mint collapsed to one** (`src/nullrun/context.py`, `src/nullrun/runtime.py`). New `_operation_id_var` contextvar (name `operation_id`) in `context.py`. `check_workflow_budget` mints ONCE via `_get_op_id_for_check()` / `_set_op_id_for_check()`; `execute` reads via `_get_op_id_for_execute()` with a single fallback mint+stash branch (only runs if `/check` did not run — pre-execution paths that bypass `/check`). The previous code minted at three sites independently, which meant a divergence between `/check` mint and `/execute` mint produced an audit-row-vs-/execute id mismatch.
+
+### Added
+
+- **`tests/test_protect_cancel_on_exception.py`** (7 tests). Pins both halves of the asymmetry and the helper's behavior:
+    - `test_1_async_cancelled_error_does_not_trigger_cancel` — the regression guard. If a future refactor reverts `except Exception` to `except BaseException` in `async_wrapper`, this test fails. `set_server_minted_execution_id(...)` is set so the helper WOULD have run if the except had caught BaseException; `cancel_calls` must be empty.
+    - `test_2_track_tool_failure_after_fn_completion_does_not_trigger_cancel` — the second regression guard. If someone removes the `fn_completed` sentinel, this test fails (cancel would run on a successfully-completed tool, producing a phantom refund).
+    - `test_3_async_fn_raises_value_error_triggers_cancel` — happy-path cancel. `cancel_calls == [("exec-test-123", "tool_exception")]`.
+    - `test_4_async_no_execution_id_skips_cancel` — control_plane reject happens pre-`/gate`, ContextVar stays None, no cancel.
+    - `test_5_sync_fn_raises_value_error_triggers_cancel` — sync ValueError path mirrors async.
+    - `test_6_sync_baseexception_also_triggers_cancel` — sync `KeyboardInterrupt` cancels (sync has no event loop to delay).
+    - `test_happy_path_no_cancel_called` — sanity: success path produces no cancel and gate order stays `control_plane, budget, track_tool`.
+- **`tests/test_audit_p0_27_operation_id_hoist.py`** (8 tests). Pins the single-source-mint + server-vs-SDK divergence detection:
+    - contextvar name `operation_id` (forbids any other name; would silently disable mint if renamed without a corresponding accessor change).
+    - mint-site shapes in `check_workflow_budget` and `execute` (forbids pre-fix `str(uuid.uuid4())` mints outside the fallback branch).
+    - parity assertion in `_capture_server_minted_execution_id` (server_op_id vs sdk_op_id equality required for the no-warn path).
+    - fallback mint+stash in `execute` only fires when `/check` did not mint (idempotency: one operation_id per call site, never two).
+
+### Compatibility
+
+Pure reliability fixes — no wire-format change on either fix. Cancel-on-exception: existing exception paths unchanged; the cancel I/O is purely additive cleanup. Operation-id hoist: wire field `operation_id` is unchanged; the SDK now uses a single mint source and adds a server-divergence warning, both invisible to the wire contract.
+
+### Verification
+
+- Targeted suite: `tests/test_protect_cancel_on_exception.py` — 7/7 pass.
+- Targeted suite: `tests/test_audit_p0_27_operation_id_hoist.py` — 8/8 pass.
+- Broader regression suite: `pytest -q` clean (prior 1613 + 7 + 8 = 1628); `ruff check src tests` clean on the WIP files (decorators.py + test_protect_cancel_on_exception.py); `mypy src/nullrun` no issues reported in 37 source files.
+- Wire-format: zero changes on both fixes. Same `/gate`, `/track`, `/execute`, `/cancel` payloads. The `/cancel` endpoint was already used by `runtime.cancel_execution(...)` from control-plane kill paths, just now also from the exception-cleanup helper. `operation_id` field on the wire was already a single string; this release only changes where the SDK mints/reads it locally.
+
+### Why this is needed
+
+**Cancel-on-exception** — at anti-DoS scale, every orphaned reservation is a permanent slot in `reserved_total` until TTL expiry. A noisy control-plane kill switch OR a single bad batch of tool exceptions could leak thousands of reservations per hour, gradually starving legitimate traffic out of the budget envelope. The fix collapses the leak window from "TTL expiry" (~minutes) to "synchronous cancel I/O on exception" (~ms), with the fail-OPEN helper guaranteeing we never trade an orphan for a swallowed exception.
+
+**Operation-id hoist** — pre-fix, three independent mints meant a race between `/check` and `/execute` could produce two different ids for the same logical call. The audit row stored one, `/execute` sent another, downstream `/track` chained off yet another. Server-vs-SDK divergence had no detection. P0-27 collapses to a single SDK-minted value; P0-26 adds the parity assertion so a divergent server echo is logged at ERROR before it propagates into audit/retry logic.
+
 ## [0.16.4] - 2026-08-31
 
 Patch release — ADR-037 Slice B. The wire protocol bumps from 3 → 4 additively: `/gate` response now echoes the SDK-supplied `action_digest` and a `policy_hash` slot (always `None` today; Slice D wires per-request computation). `min_protocol_version` stays at 2 so v3 SDKs are unaffected. Wire-format additive only — no new hashing/computation introduced on either side (both fields echo already-computed values).
