@@ -1864,6 +1864,8 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # execution's response).
         from nullrun.context import (
             get_operation_id as _get_op_id_for_check,
+        )
+        from nullrun.context import (
             set_operation_id as _set_op_id_for_check,
         )
 
@@ -2790,6 +2792,8 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # reuse whatever /check minted.
         from nullrun.context import (
             get_operation_id as _get_op_id_for_execute,
+        )
+        from nullrun.context import (
             set_operation_id as _set_op_id_for_execute,
         )
 

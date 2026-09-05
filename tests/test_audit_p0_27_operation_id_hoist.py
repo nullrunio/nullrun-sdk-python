@@ -47,7 +47,6 @@ from nullrun.context import (
     set_operation_id,
 )
 
-
 SDK_ROOT = Path(__file__).resolve().parent.parent
 RUNTIME_PY = SDK_ROOT / "src" / "nullrun" / "runtime.py"
 CONTEXT_PY = SDK_ROOT / "src" / "nullrun" / "context.py"
