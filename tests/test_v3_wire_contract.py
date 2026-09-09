@@ -609,10 +609,57 @@ class TestV3ErrorMapCatalog:
             "RATE_LIMIT_EXCEEDED",
             "RATE_LIMIT_REDIS_UNAVAILABLE",
             "BUDGET_DATA_UNAVAILABLE",
+            # NR-007 SDK↔backend parity audit (2026-09-08). The 8
+            # codes below were unmapped in `_V3_ERROR_CODE_MAP` and
+            # silently degraded to the generic NullRunBackendError
+            # — cookbook code that branches on the typed exception
+            # class would never catch them. Added per
+            # `nullrun-examples/SDK_BACKEND_PARITY_MATRIX.md` §5.
+            "WORKFLOW_CYCLE_DETECTED",
+            "WORKFLOW_DEPTH_EXCEEDED",
+            "WORKFLOW_PARENT_BINDING_EXPIRED",
+            "WORKFLOW_DEPTH_LOOKUP_FAILED",
+            "INVOKE_PERSIST_FAILED",
+            "SUBWORKFLOW_INVOKE_DISABLED",
+            "APPROVAL_ALREADY_DECIDED",
+            "LEGACY_GRANT_REJECTED",
         }
         actual = set(_V3_ERROR_CODE_MAP.keys())
         missing = expected - actual
         assert not missing, f"Missing v3 error_code mappings: {missing}"
+
+        # Defensive: each newly-added code must map to the
+        # exception class documented in the parity matrix (NOT
+        # the generic NullRunBackendError — that would defeat the
+        # purpose of the typed mapping). The test catches a
+        # future maintainer who "simplifies" the map by falling
+        # everything back to NullRunBackendError.
+        from nullrun.breaker.exceptions import (
+            NullRunApprovalReplayRejectedError,
+            NullRunBackendError,
+            NullRunBlockedException,
+            NullRunChainError,
+        )
+
+        typed_required = {
+            "WORKFLOW_CYCLE_DETECTED": NullRunChainError,
+            "WORKFLOW_DEPTH_EXCEEDED": NullRunChainError,
+            "WORKFLOW_PARENT_BINDING_EXPIRED": NullRunChainError,
+            "WORKFLOW_DEPTH_LOOKUP_FAILED": NullRunChainError,
+            "INVOKE_PERSIST_FAILED": NullRunBackendError,
+            "SUBWORKFLOW_INVOKE_DISABLED": NullRunChainError,
+            "APPROVAL_ALREADY_DECIDED": NullRunApprovalReplayRejectedError,
+            "LEGACY_GRANT_REJECTED": NullRunBlockedException,
+        }
+        for code, expected_cls in typed_required.items():
+            actual_cls = _V3_ERROR_CODE_MAP[code]
+            assert actual_cls is expected_cls, (
+                f"{code} maps to {actual_cls.__name__}, expected "
+                f"{expected_cls.__name__}. Cookbook recipes branch "
+                f"on the typed exception class, so a generic "
+                f"fallback (NullRunBackendError for non-infra "
+                f"codes) silently breaks recipe dispatch."
+            )
 
 
 # ─────────────────────────────────────────────────────────────────────

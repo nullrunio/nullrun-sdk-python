@@ -82,11 +82,16 @@ def _read_token_attrs(obj: Any) -> tuple[int, int, int, dict[str, Any]] | None:
         total_t = getattr(obj, "total_tokens", 0) or 0
         if not (in_t or out_t or total_t):
             return None
-        return int(in_t), int(out_t), int(total_t), {
-            "input_tokens": in_t,
-            "output_tokens": out_t,
-            "total_tokens": total_t,
-        }
+        return (
+            int(in_t),
+            int(out_t),
+            int(total_t),
+            {
+                "input_tokens": in_t,
+                "output_tokens": out_t,
+                "total_tokens": total_t,
+            },
+        )
     return None
 
 
@@ -191,6 +196,7 @@ def _get_finish_reason(response: Any) -> str | None:
 # Usage Normalization (SDK extracts, backend computes)
 # =============================================================================
 
+
 def extract_usage_from_response(response: Any, provider: str, model: str) -> dict[str, Any]:
     """
     Extract usage data from LLM response.
@@ -258,7 +264,7 @@ def extract_usage_from_response(response: Any, provider: str, model: str) -> dic
 
     # Check for streaming chunks that accumulated usage
     # (streaming responses may not have usage until final chunk)
-    if not usage["has_usage"] and hasattr(response, '__iter__'):
+    if not usage["has_usage"] and hasattr(response, "__iter__"):
         # For streaming, we can't get accurate usage in middle of stream
         # Final response should have usage_metadata
         pass
@@ -273,29 +279,19 @@ def extract_usage_from_response(response: Any, provider: str, model: str) -> dic
     # OpenAI exposes cached_tokens on a nested prompt_tokens_details.
     raw = usage.get("raw_usage") or {}
     if isinstance(raw, dict):
-        cache_read = raw.get("cache_read_input_tokens") or raw.get(
-            "cacheReadInputTokenCount"
-        )
+        cache_read = raw.get("cache_read_input_tokens") or raw.get("cacheReadInputTokenCount")
         if cache_read:
             usage["cache_read_tokens"] = int(cache_read) or 0
-        cache_write = raw.get("cache_creation_input_tokens") or raw.get(
-            "cacheWriteInputTokenCount"
-        )
+        cache_write = raw.get("cache_creation_input_tokens") or raw.get("cacheWriteInputTokenCount")
         if cache_write:
             usage["cache_write_tokens"] = int(cache_write) or 0
         prompt_details = raw.get("prompt_tokens_details") or {}
         if isinstance(prompt_details, dict) and prompt_details.get("cached_tokens"):
             # OpenAI's prefix-cached prompt hits — best-effort merge.
-            usage["cache_read_tokens"] = int(
-                prompt_details.get("cached_tokens") or 0
-            )
+            usage["cache_read_tokens"] = int(prompt_details.get("cached_tokens") or 0)
         completion_details = raw.get("completion_tokens_details") or {}
-        if isinstance(completion_details, dict) and completion_details.get(
-            "reasoning_tokens"
-        ):
-            usage["reasoning_tokens"] = int(
-                completion_details.get("reasoning_tokens") or 0
-            )
+        if isinstance(completion_details, dict) and completion_details.get("reasoning_tokens"):
+            usage["reasoning_tokens"] = int(completion_details.get("reasoning_tokens") or 0)
 
     # Finish reason — read from every known source independently of the
     # token branch. The `elif`-chain above means only one branch fills
@@ -370,9 +366,7 @@ def extract_usage_from_response(response: Any, provider: str, model: str) -> dic
 
     # Determine if we got real usage data
     usage["has_usage"] = (
-        usage["total_tokens"] > 0 or
-        usage["input_tokens"] > 0 or
-        usage["output_tokens"] > 0
+        usage["total_tokens"] > 0 or usage["input_tokens"] > 0 or usage["output_tokens"] > 0
     )
 
     return usage
@@ -518,6 +512,50 @@ class NullRunCallback(BaseCallbackHandler):
         else:
             ctx = create_root_span()
         self._register_active_run(str(run_id), ctx)
+
+        # DEFS-SDKEXEC-LLM-RESERVATION (2026-09-08): pair the LLM
+        # span with a server-minted reservation so the matching
+        # llm_call cost event emitted by ``on_llm_end`` lands on
+        # ``/track_single`` instead of being dropped by
+        # ``runtime._route_track`` (which returns silently when
+        # ``_server_minted_execution_id_var`` is unset — see
+        # ``runtime.py:3167`` and the WARNING log at line 3198).
+        #
+        # Pattern: ``check_workflow_budget`` fails OPEN on transport
+        # error (CLAUDE.md §4 / ADR-008 / ``runtime.py:2022-2037``)
+        # — a backend outage silently returns without raising AND
+        # without capturing a reservation. The downstream
+        # ``_route_track`` will then drop the matching llm_call
+        # cost event (v3.66.2 alignment — backend rejects batched
+        # llm_call events without a reservation with 503
+        # BUDGET_RECHECK_FAILED). This matches the pre-fix
+        # behaviour because pre-fix the SDK also had no reservation
+        # at this site (no /check round-trip happened on the LLM
+        # span) and the llm_call cost event was dropped the same
+        # way. We swallow ``WorkflowKilledInterrupt`` /
+        # ``WorkflowPausedException`` because the LangChain
+        # callback contract is "never raise" (the framework breaks
+        # if a callback raises); the kill/pause signal still
+        # propagates because the next @protect on a sensitive tool
+        # re-runs ``check_control_plane``.
+        #
+        # Cost: one extra /gate round-trip per LLM span (~5 ms in
+        # the hot path). The /track emitted by ``on_llm_end``
+        # consumes the matching reservation, so the budget ledger
+        # stays balanced (1 reserve + 1 consume per LLM call).
+        # Inside an existing ``@protect`` block the contextvar is
+        # already populated; ``check_workflow_budget`` short-circuits
+        # early via the chain-mode cache when an active chain is in
+        # scope, so the wire-call cost is amortised across the chain.
+        try:
+            self.runtime.check_workflow_budget()
+        except BaseException as exc:  # noqa: BLE001 — never raise out of callback
+            logger.debug(
+                "NullRunCallback.on_llm_start: check_workflow_budget "
+                "raised %s — proceeding without reservation (llm_call "
+                "cost event will be dropped by runtime._route_track)",
+                type(exc).__name__,
+            )
         try:
             self.runtime.track_event(
                 event_type="span_start",
@@ -570,23 +608,25 @@ class NullRunCallback(BaseCallbackHandler):
             # fall back to the response object. This matches the
             # best-effort pattern used by ``_get_finish_reason`` /
             # ``_extract_tool_names`` for the same response.
-            invocation_params = kwargs.get('invocation_params') or {}
+            invocation_params = kwargs.get("invocation_params") or {}
             model = (
-                invocation_params.get('model_name')
+                invocation_params.get("model_name")
                 or _extract_model_from_response(response)
-                or 'unknown'
+                or "unknown"
             )
             provider = (
-                invocation_params.get('model_provider')
+                invocation_params.get("model_provider")
                 or _extract_provider_from_response(response)
-                or 'openai'
+                or "openai"
             )
 
             # Extract usage (normalized format)
             usage = extract_usage_from_response(response, provider, model)
 
-            logger.info(f"NullRun callback: model={model}, provider={provider}, "
-                      f"usage={usage}, has_usage={usage['has_usage']}")
+            logger.info(
+                f"NullRun callback: model={model}, provider={provider}, "
+                f"usage={usage}, has_usage={usage['has_usage']}"
+            )
 
             # Audit 2026-06-29 (unified fingerprint): derive the same
             # fingerprint the httpx transport computes for the same
@@ -719,9 +759,7 @@ class NullRunCallback(BaseCallbackHandler):
             # orphan-span finding (parent_span_id points at a run_id
             # that no longer exists in ``_active_runs``).
             with self._lock:
-                llm_ctx = (
-                    self._active_runs.get(str(llm_run_id)) if llm_run_id else None
-                )
+                llm_ctx = self._active_runs.get(str(llm_run_id)) if llm_run_id else None
             if llm_ctx is not None:
                 event["trace_id"] = llm_ctx.trace_id
                 event["span_id"] = llm_ctx.span_id
@@ -778,8 +816,9 @@ class NullRunCallback(BaseCallbackHandler):
             logger.debug("on_chain_start without run_id — skipping span emission")
             return
         name = _extract_node_name(serialized, "chain")
-        self._begin_run(str(run_id), str(parent_run_id) if parent_run_id else None,
-                        name, kind="chain")
+        self._begin_run(
+            str(run_id), str(parent_run_id) if parent_run_id else None, name, kind="chain"
+        )
 
     def on_chain_end(self, outputs: Any, *, run_id: Any = None, **kwargs: Any) -> None:
         self._end_run(run_id)
@@ -801,8 +840,9 @@ class NullRunCallback(BaseCallbackHandler):
             logger.debug("on_tool_start without run_id — skipping span emission")
             return
         name = _extract_node_name(serialized, "tool")
-        self._begin_run(str(run_id), str(parent_run_id) if parent_run_id else None,
-                        name, kind="tool")
+        self._begin_run(
+            str(run_id), str(parent_run_id) if parent_run_id else None, name, kind="tool"
+        )
 
     def on_tool_end(self, output: Any, *, run_id: Any = None, **kwargs: Any) -> None:
         self._end_run(run_id)
@@ -822,8 +862,12 @@ class NullRunCallback(BaseCallbackHandler):
         if run_id is None:
             return
         tool = getattr(action, "tool", None) or "agent"
-        self._begin_run(str(run_id), str(parent_run_id) if parent_run_id else None,
-                        f"agent_action:{tool}", kind="agent")
+        self._begin_run(
+            str(run_id),
+            str(parent_run_id) if parent_run_id else None,
+            f"agent_action:{tool}",
+            kind="agent",
+        )
 
     def on_agent_finish(self, finish: Any, *, run_id: Any = None, **kwargs: Any) -> None:
         self._end_run(run_id)
@@ -943,6 +987,7 @@ def _extract_node_name(serialized: Any, default: str) -> str:
 # uses, so we have a single pattern for "best-effort read from the
 # response object" across both helpers.
 
+
 def _extract_model_from_response(response: Any) -> str | None:
     """Best-effort model extraction mirroring ``_get_finish_reason``.
 
@@ -1003,12 +1048,7 @@ def _extract_model_from_response(response: Any) -> str | None:
         # less canonical keys (``"model_id"``, ``"modelName"``
         # ``"resolved_model"``).
         for key, val in llm_out.items():
-            if (
-                isinstance(key, str)
-                and "model" in key.lower()
-                and isinstance(val, str)
-                and val
-            ):
+            if isinstance(key, str) and "model" in key.lower() and isinstance(val, str) and val:
                 return val
 
     # 2. response_metadata on the response (langchain 0.x AIMessage
@@ -1133,4 +1173,3 @@ def _extract_provider_from_response(response: Any) -> str | None:
                 return str(val)
 
     return None
-

@@ -22,9 +22,10 @@ This file asserts the fixed behaviour:
   4. SDK does NOT send `model="budget-precheck"` anywhere.
   5. The runtime's pre-flight (`check_workflow_budget`) does NOT
      raise on a real `decision="allow"` response.
-  6. The runtime's pre-flight DOES raise `WorkflowKilledInterrupt`
-     on a real `decision="block"` response (so the fix didn't
-     accidentally remove the real-block path).
+  6. The runtime's pre-flight DOES raise a typed block exception
+     (NullRunBudgetError, NR-B004 — was WorkflowKilledInterrupt
+     pre-2026-09-08) on a real `decision="block"` response (so
+     the fix didn't accidentally remove the real-block path).
 """
 
 from __future__ import annotations
@@ -36,7 +37,7 @@ import pytest
 import respx
 
 import nullrun
-from nullrun.breaker.exceptions import WorkflowKilledInterrupt
+from nullrun.breaker.exceptions import NullRunBudgetError
 
 BASE_URL = "https://api.test.nullrun.io"
 GATE_URL = f"{BASE_URL}/api/v1/gate"
@@ -93,7 +94,9 @@ class TestGateRealPathRegression:
     def test_real_block_still_honored(self, make_runtime, mock_api):
         """T1 must NOT have accidentally removed the real-block path.
         Backend returning decision=block (with a real reason, NOT a
-        FALLBACK_* synthetic) must still raise WorkflowKilledInterrupt.
+        FALLBACK_* synthetic) must still raise a typed block
+        exception (NullRunBudgetError, NR-B004 — was
+        WorkflowKilledInterrupt pre-2026-09-08).
         """
         respx.post(GATE_URL).mock(
             return_value=httpx.Response(
@@ -108,7 +111,7 @@ class TestGateRealPathRegression:
             )
         )
         rt = make_runtime()
-        with pytest.raises(WorkflowKilledInterrupt) as exc_info:
+        with pytest.raises(NullRunBudgetError) as exc_info:
             rt.check_workflow_budget()
         assert "Budget exhausted" in exc_info.value.reason
 

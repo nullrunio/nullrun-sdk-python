@@ -842,6 +842,33 @@ class NullRunBudgetRecheckFailedError(NullRunBudgetError):
         self.recheck_retryable: bool = True
 
 
+class NullRunBudgetThrottleError(NullRunBudgetError):
+    """Backend returned ``decision == "throttle"`` — soft budget signal.
+
+    Distinct from :class:`NullRunBudgetError` (NR-B004, the hard-block
+    case raised when ``decision == "block"``). Throttle means
+    "rate-limit this workflow but don't fully block it" — a temporary
+    pacing signal that the SDK surfaces as a typed exception so
+    cookbook code can back off and retry, vs. the hard block where
+    the same parameters would fail again.
+
+    Added 2026-09-08 to retire the generic ``WorkflowKilledInterrupt``
+    raise on the throttle path. Cookbook pattern: catch this
+    specifically (``except NullRunBudgetThrottleError``), sleep for
+    the cooldown window, and retry — distinct from the hard block
+    where retrying with the same budget tier is futile.
+    """
+
+    error_code = "NR-B007"
+    user_action = (
+        "Backend throttled this workflow (soft budget signal). Wait "
+        "for the cooldown window shown in the response and retry — "
+        "do NOT request a budget increase for a throttle (that is "
+        "the wrong remediation; the issue is pacing, not cap)."
+    )
+    retryable = True
+
+
 class NullRunToolBlockedError(NullRunBlockedException):
     """The tool is in the workflow's block list.
 
@@ -887,6 +914,12 @@ class NullRunApprovalNotYetApprovedError(NullRunBlockedException):
     no — terminal) and from :class:`NullRunApprovalExpiredError`
     (operator said yes but grant TTL elapsed). All three share the
     HTTP 403 envelope; the wire code is the discriminator.
+
+    Also raised client-side (NOT just wire path) on the /execute
+    "approval_id missing in response" malformed-payload case — see
+    ``NullRunApprovalResponseMissingError`` for the precise semantic
+    distinction (NR-A004 is the wire-bug code, NR-A010 is "operator
+    has not decided yet").
     """
 
     error_code = "NR-A010"
@@ -897,6 +930,55 @@ class NullRunApprovalNotYetApprovedError(NullRunBlockedException):
     )
     retryable = True
 
+    def __init__(
+        self,
+        workflow_id: str,
+        reason: str,
+        action: str = "block",
+        tool_name: str | None = None,
+        status_code: int | None = None,
+        *,
+        approval_id: str | None = None,
+        **details: Any,
+    ) -> None:
+        super().__init__(
+            workflow_id=workflow_id,
+            reason=reason,
+            action=action,
+            tool_name=tool_name,
+            status_code=status_code,
+            **details,
+        )
+        # First-class attribute so cookbook code can introspect the
+        # pending approval row without parsing the message string.
+        self.approval_id = approval_id
+
+
+class NullRunApprovalResponseMissingError(NullRunBlockedException):
+    """``/execute`` returned ``require_approval`` but the response body
+    did not include an ``approval_id`` — wire-bug / server drift.
+
+    Wire code ``NR-A004`` (was previously set inline on a generic
+    ``NullRunBlockedException`` at runtime.py:2888, 2914, 2929 — promoted
+    to a typed class for parity with the six approval exceptions above).
+    This is distinct from ``NullRunApprovalNotYetApprovedError`` (NR-A010)
+    which is "the operator has not yet decided". Here the operator never
+    had a chance — the wire envelope was incomplete.
+
+    Cookbook pattern: do NOT retry the same execution_id; the backend
+    needs a fix or the wire-shape contract needs re-reading. Log the
+    full response body and report to NULLRUN support.
+    """
+
+    error_code = "NR-A004"
+    user_action = (
+        "Server returned require_approval without an approval_id — "
+        "this is a wire-contract bug, NOT a transient failure. Inspect "
+        "the full response body and report to NullRun support; do not "
+        "retry the same execution_id."
+    )
+    retryable = False
+
 
 class NullRunApprovalDeniedError(NullRunBlockedException):
     """Operator explicitly denied the approval.
@@ -905,6 +987,10 @@ class NullRunApprovalDeniedError(NullRunBlockedException):
     with the same approval_id will keep failing. Cookbook pattern:
     surface denial to the user and request a fresh approval row
     (different parameters / intent).
+
+    Now raised client-side (NOT just wire path) on the WS push "denied"
+    outcome at ``check_workflow_budget`` and on the /execute "outcome
+    != approved" branch.
     """
 
     error_code = "NR-A011"
@@ -915,23 +1001,135 @@ class NullRunApprovalDeniedError(NullRunBlockedException):
     )
     retryable = False
 
+    def __init__(
+        self,
+        workflow_id: str,
+        reason: str,
+        action: str = "block",
+        tool_name: str | None = None,
+        status_code: int | None = None,
+        *,
+        approval_id: str | None = None,
+        denial_note: str | None = None,
+        **details: Any,
+    ) -> None:
+        super().__init__(
+            workflow_id=workflow_id,
+            reason=reason,
+            action=action,
+            tool_name=tool_name,
+            status_code=status_code,
+            **details,
+        )
+        self.approval_id = approval_id
+        self.denial_note = denial_note
+
 
 class NullRunApprovalExpiredError(NullRunBlockedException):
     """Approval grant aged out — operator said yes but ``expires_at`` is past.
 
-    Wire code ``APPROVAL_EXPIRED`` (HTTP 403). The original grant was
-    approved but the operator's approval window elapsed before
-    ``/execute`` consumed it. Cookbook pattern: request a fresh
-    approval row (do not retry the same one).
+    Wire code ``APPROVAL_EXPIRED`` (HTTP 403). Two raise paths:
+
+    1. **Wire path** — backend returns APPROVAL_EXPIRED on /execute
+       because the operator's grant TTL elapsed between /gate and
+       /execute.
+    2. **Client-side timeout path** (added 2026-09-08, the trigger for
+       this typed exception migration) — WS push went silent for
+       ``approval_timeout_seconds`` (default 300s) without an operator
+       decision. The SDK raises this exception instead of the generic
+       ``WorkflowKilledInterrupt`` so cookbook code can catch it
+       (`except NullRunApprovalExpiredError`) and react with a fresh
+       approval request.
+
+    Cookbook pattern: do NOT retry the same approval_id — request a
+    fresh row and re-/gate.
     """
 
     error_code = "NR-A012"
     user_action = (
-        "Approval grant has expired — the operator approved, but "
-        "the grant's expires_at is past. Request a fresh approval "
-        "row and retry /execute with the new approval_id."
+        "Approval expired — no operator decision within the configured "
+        "timeout window (WS push silent past approval_timeout_seconds). "
+        "Request a fresh approval row and retry /gate; the previous "
+        "approval_id cannot be revived."
     )
     retryable = False
+
+    def __init__(
+        self,
+        workflow_id: str,
+        reason: str,
+        action: str = "block",
+        tool_name: str | None = None,
+        status_code: int | None = None,
+        *,
+        approval_id: str | None = None,
+        timeout_seconds: float | None = None,
+        local_timeout: bool = False,
+        **details: Any,
+    ) -> None:
+        super().__init__(
+            workflow_id=workflow_id,
+            reason=reason,
+            action=action,
+            tool_name=tool_name,
+            status_code=status_code,
+            **details,
+        )
+        self.approval_id = approval_id
+        # Server-authoritative timeout the SDK waited for. ``None`` when
+        # the exception came from the wire path (where the backend
+        # already closed the grant; the SDK never started a wait).
+        self.timeout_seconds = timeout_seconds
+        # True when raised by the SDK on local WS-silent timeout (path 2
+        # above); False when raised by the wire path (path 1). Lets
+        # cookbook code distinguish "operator never saw the request"
+        # (local timeout — maybe the request never propagated) from
+        # "operator approved but grant TTL elapsed" (wire path).
+        self.local_timeout = local_timeout
+
+
+class NullRunApprovalReplayRejectedError(NullRunBlockedException):
+    """Approval grant was already consumed by a prior /execute call.
+
+    Wire code ``APPROVAL_REPLAY_REJECTED`` (HTTP 403). Each grant
+    is single-use per ``consume_approved`` atomic check-and-set.
+    Cookbook pattern: do NOT retry the same approval_id; treat as
+    idempotency violation (likely a client retry loop).
+
+    Also raised client-side on the /execute "post-approval re-check
+    returned require_approval again" race (the operator approved but
+    the same approval_id was already consumed by a concurrent /execute).
+    """
+
+    error_code = "NR-A015"
+    user_action = (
+        "Approval grant was already consumed by a prior /execute "
+        "call — this is a replay/retry-loop signal, NOT a transient "
+        "failure. Inspect your retry logic; the same approval_id "
+        "will never succeed twice."
+    )
+    retryable = False
+
+    def __init__(
+        self,
+        workflow_id: str,
+        reason: str,
+        action: str = "block",
+        tool_name: str | None = None,
+        status_code: int | None = None,
+        *,
+        approval_id: str | None = None,
+        **details: Any,
+    ) -> None:
+        super().__init__(
+            workflow_id=workflow_id,
+            reason=reason,
+            action=action,
+            tool_name=tool_name,
+            status_code=status_code,
+            **details,
+        )
+        self.approval_id = approval_id
 
 
 class NullRunApprovalDigestMismatchError(NullRunBlockedException):
@@ -975,23 +1173,13 @@ class NullRunApprovalToolDigestMismatchError(NullRunBlockedException):
     retryable = False
 
 
-class NullRunApprovalReplayRejectedError(NullRunBlockedException):
-    """Approval grant was already consumed by a prior /execute call.
-
-    Wire code ``APPROVAL_REPLAY_REJECTED`` (HTTP 403). Each grant
-    is single-use per ``consume_approved`` atomic check-and-set.
-    Cookbook pattern: do NOT retry the same approval_id; treat as
-    idempotency violation (likely a client retry loop).
-    """
-
-    error_code = "NR-A015"
-    user_action = (
-        "Approval grant was already consumed by a prior /execute "
-        "call — this is a replay/retry-loop signal, NOT a transient "
-        "failure. Inspect your retry logic; the same approval_id "
-        "will never succeed twice."
-    )
-    retryable = False
+# NOTE: NullRunApprovalReplayRejectedError was moved earlier in this
+# module (alongside the other five approval exceptions) so all six
+# typed approval exceptions are co-located. The earlier definition
+# also adds an explicit ``__init__`` accepting ``approval_id`` as a
+# first-class attribute. See the block just below the
+# ``NullRunApprovalNotYetApprovedError`` docstring for the canonical
+# definition.
 
 
 # NOTE: the following six exception classes were removed in 0.4.0
@@ -1095,27 +1283,35 @@ class WorkflowKilledException(BaseException):
         super().__init__(f"Workflow {workflow_id} killed: {reason}")
 
 
-class WorkflowKilledInterrupt(WorkflowKilledException):
+class WorkflowKilledInterrupt(NullRunError):
     """
     Raised when a workflow is killed by the NullRun control plane.
 
-    Inherits from the deprecated:class:`WorkflowKilledException`
-    (which is itself a ``BaseException`` subclass, not ``Exception``)
-    so that:
+    **2026-09-08 migration**: this class is now an ``Exception``
+    subclass (``NullRunError`` parent) — formerly ``BaseException``.
+    The user override: agent recovery code needs to catch the kill
+    signal via ``except WorkflowKilledInterrupt`` or
+    ``except NullRunWorkflowKilledError`` to surface a structured
+    error to the user with ``error_code=NR-W002`` and ``user_action``.
 
-      * ``except WorkflowKilledInterrupt`` (new code) catches new raises
-        and only new raises.
-      * ``except WorkflowKilledException`` (legacy user code) still
-        catches new raises — back-compat.
-      * ``except Exception`` does **not** catch this signal — kill is
-        not a recoverable error. Mirrors the ``KeyboardInterrupt`` /
-        ``SystemExit`` pattern from the standard library: user code
-        that catches ``except Exception`` and re-runs the work will
-        silently bypass the kill.
-      * ``except BaseException`` catches it, like the stdlib interrupts.
+    Migration back-compat guarantees (all three hold):
 
-    See ``docs/kill-contract.md` for the full rationale, including
-    the four-level coverage model and the decision tree for users.
+      * ``except WorkflowKilledInterrupt`` (new code) — still matches,
+        including legacy raises that haven't been updated.
+      * ``except NullRunError`` — now matches (was NO match before
+        migration; this is the new ability the user wanted).
+      * ``except NullRunWorkflowKilledError`` — matches (preferred
+        typed name for new cookbook code).
+
+    Migration BREAK (acceptable, documented in CHANGELOG):
+
+      * ``except WorkflowKilledException`` (the deprecated parent
+        class) — no longer matches. The parent class remains
+        BaseException and emits DeprecationWarning on construction,
+        but is no longer in the ``WorkflowKilledInterrupt`` MRO. Code
+        that catches the deprecated name must migrate to either
+        ``WorkflowKilledInterrupt`` (keep current name) or
+        ``NullRunWorkflowKilledError`` (preferred typed name).
 
     Fields:
         workflow_id: The workflow that was killed.
@@ -1124,31 +1320,99 @@ class WorkflowKilledInterrupt(WorkflowKilledException):
 
     Catching in production
     ----------------------
-    ``WorkflowKilledInterrupt`` is a ``BaseException`` subclass
-    (NOT ``Exception``), so a user-agent ``try / except Exception``
-    will not catch it. This is intentional — the kill signal
-    must reach the top of the loop. It does mean, however, that
-    Sentry / OpenTelemetry default error handlers (which filter
-    on ``Exception``) will not record the kill event unless the
-    user's code re-raises it under an ``except BaseException``:
+    ``WorkflowKilledInterrupt`` is now an ``Exception`` subclass.
+    Cookbook code can do::
 
-        from sentry_sdk import capture_exception
         try:
-            agent.run 
-        except BaseException:
-            capture_exception # records kill, ctrl-c, system-exit
+            agent.run()
+        except NullRunWorkflowKilledError as exc:
+            surface_to_user(
+                f"Workflow {exc.workflow_id} was killed: {exc.reason}. "
+                f"{exc.user_action}"
+            )
+
+    or for broader catch::
+
+        try:
+            agent.run()
+        except Exception as exc:
+            # Now catches kill signals too (the new contract).
+            sentry_sdk.capture_exception(exc)
             raise
 
-    ``except Exception`` will swallow non-kill errors but let the
-    kill through. ``except BaseException`` captures everything
-    including the kill — recommended for the top of an agent loop.
+    Sentry / OpenTelemetry handlers that filter on ``Exception`` will
+    now record kill events — this is the intended new behavior. Code
+    that relies on kill being un-catchable by ``except Exception`` is
+    a regression candidate; see ``docs/kill-contract-migration-2026-09-08.md``.
     """
 
-    def __init__(self, workflow_id: str, reason: str) -> None:
-        # Bypass the parent's __init__ so constructing the canonical
-        # class does NOT trigger the parent's DeprecationWarning. The
-        # deprecation is about using the old *name* — not the
-        # BaseException-based hierarchy.
+    error_code = "NR-W002"
+    user_action = (
+        "The workflow was killed by the NullRun control plane. The "
+        "body did not run. Inspect the reason (killed via dashboard, "
+        "killed via API, circuit-breaker tripped, etc.) and, if "
+        "appropriate, resume the workflow at "
+        "https://app.nullrun.io/workflows/<workflow_id>."
+    )
+    retryable = False
+
+    def __init__(
+        self,
+        workflow_id: str,
+        reason: str,
+        *,
+        kill_source: str | None = None,
+        **details: Any,
+    ) -> None:
+        # Skip NullRunError.__init__'s kwargs-by-key path — we want
+        # the structured fields attached as instance attrs (matches
+        # the pre-migration shape) AND surfaced through the NullRunError
+        # fields too, so cookbook introspection works either way.
         self.workflow_id = workflow_id
         self.reason = reason
-        BaseException.__init__(self, f"Workflow {workflow_id} killed: {reason}")
+        # First-class attribute distinguishing operator kill from
+        # circuit-breaker kill, etc. None when the source is ambiguous.
+        self.kill_source = kill_source
+        NullRunError.__init__(
+            self,
+            f"Workflow {workflow_id} killed: {reason}",
+            error_code=self.error_code,
+            user_action=self.user_action,
+            **details,
+        )
+
+
+class NullRunWorkflowKilledError(WorkflowKilledInterrupt):
+    """Typed public name for the kill signal.
+
+    Subclass of :class:`WorkflowKilledInterrupt` (which remains the
+    legacy canonical name) so ``except WorkflowKilledInterrupt``
+    clauses continue to match. New cookbook code should prefer this
+    name (``except NullRunWorkflowKilledError``) for typed dispatch.
+
+    Wire code ``NR-W002`` (same as parent). Distinct from
+    :class:`NullRunBlockedException` family — kill is a control-plane
+    signal (operator or circuit-breaker), not a gate-decision block.
+
+    Cookbook pattern (2026-09-08 migration):
+
+        try:
+            agent.run()
+        except NullRunWorkflowKilledError as exc:
+            # Structured fields ready for the LLM:
+            # exc.workflow_id, exc.reason, exc.kill_source,
+            # exc.error_code ("NR-W002"), exc.user_action
+            surface_to_user(
+                f"Workflow {exc.workflow_id} was killed "
+                f"(source={exc.kill_source}): {exc.user_action}"
+            )
+    """
+
+    error_code = "NR-W002"
+    user_action = (
+        "Workflow was killed by the NullRun control plane (operator "
+        "action or circuit-breaker). The body did not run. Resume "
+        "the workflow at https://app.nullrun.io/workflows/<workflow_id> "
+        "or inspect the reason before retrying."
+    )
+    retryable = False

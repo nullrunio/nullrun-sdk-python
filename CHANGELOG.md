@@ -1,3 +1,35 @@
+## [0.16.6] - 2026-09-08
+
+Patch release — closes the SDK↔backend drift introduced by backend `DEF-SDKK-022-EXEC-BYPASS` (2026-09-04, RUN_ID=20260904T1500). After that backend fix, `/api/v1/execute` runs an `execution:{id}` ownership-binding existence check and returns 404 EXECUTION_NOT_FOUND for any execution_id that was not minted by a prior `/api/v1/gate`. The SDK's `runtime.execute()` had been minting a fresh `uuid7_str()` regardless of prior `/gate`, so every `@protect @sensitive` call returned 404 ("Gateway returned 404") and the displayed workflow_id was the misleading `__nullrun_unknown__` sentinel. LangGraph's `NullRunCallback.on_llm_start` had the symmetric problem on the LLM span side: it fired `llm_call` cost events with no paired `/gate` reservation, so the runtime's `_route_track` silently dropped them. This release closes all three holes. No wire-format change.
+
+### Fixed
+
+- **DEFS-SDKEXEC-GATE-FIRST** — `runtime.execute()` reuses the server-minted execution_id from `_server_minted_execution_id_var` when a prior `/gate` minted it (`src/nullrun/runtime.py:2820+`). Pre-fix minted `uuid7_str()` unconditionally; post-fix reads the contextvar (set by `check_workflow_budget`'s `_capture_server_minted_execution_id` from the `/gate` response's `reservation_id` field) and only mints fresh when the contextvar is empty (direct callers without a prior `/gate`, which is a wire-contract violation the backend's 404 handles correctly). Comment block at the fix site names both DEFS-SDKEXEC-GATE-FIRST and DEF-SDKK-022-EXEC-BYPASS so future readers see the round-trip contract without searching.
+- **DEFS-SDKEXEC-WORKFLOW-LABEL** — `_enforce_sensitive_tool` displays the API key's bound workflow via `runtime._resolve_workflow_id(get_workflow_id())` instead of the literal `__nullrun_unknown__` sentinel (`src/nullrun/decorators.py`). The wire still carries the same workflow_id (server-side binding); only the displayed label changes. Two sites updated (extract failure path + main path).
+- **DEFS-SDKEXEC-LLM-RESERVATION** — `NullRunCallback.on_llm_start` (`src/nullrun/instrumentation/langgraph.py`) fires `runtime.check_workflow_budget()` (fail-OPEN) so the matching `on_llm_end` `llm_call` cost event has a server-minted reservation_id and routes via `/track_single` instead of being dropped by `runtime._route_track` (the WARNING log "dropping llm_call event — no server-minted reservation_id in scope"). The call is wrapped in `except BaseException` so a backend outage or `WorkflowKilledInterrupt` / `WorkflowPausedException` never breaks the LangChain callback contract.
+- **`Transport.execute` docstring** (`src/nullrun/transport.py`) — rewrites the misleading pre-2026-09-04 claim ("/execute MUST be called rather than /gate") to reflect the post-DEF-SDKK-022-EXEC-BYPASS contract ("/execute MUST be preceded by /gate for the same execution_id"). Names both fix tags so the contract is grep-able.
+
+### Added
+
+- **`tests/test_2026_09_08_gate_first_execute.py`** (9 tests). Source-pin regression for all three fixes:
+    - `runtime.execute()` reads `get_server_minted_execution_id()` and reuses it when present (forbids re-introducing an unconditional `uuid7_str()` mint outside the fallback arm).
+    - `_enforce_sensitive_tool` displays via `runtime._resolve_workflow_id(...)` (forbids the pre-fix contextvar-only fallback).
+    - `Transport.execute` docstring references the post-fix contract (forbids the legacy misleading claim).
+    - `NullRunCallback.on_llm_start` calls `check_workflow_budget()` with a never-raise guard.
+    - Contextvar round-trip sanity (`set_server_minted_execution_id` / `get_server_minted_execution_id`).
+
+### Compatibility
+
+Pure reliability fixes — no wire-format change. `/gate`, `/execute`, `/track`, `/cancel` payloads are byte-identical to 0.16.5. The drift existed only on the SDK side; this release brings the SDK in line with the backend's 2026-09-04 contract without rolling back any backend-side hardening.
+
+### Why this is needed
+
+**Gate-first** — the user-facing symptom was that `langgraph_openai_approval_demo.py` (and any `@protect @sensitive` decorator that was actually wired through `runtime.execute()`) returned `Workflow __nullrun_unknown__ blocked: Gateway returned 404` for every call, with `action=block, status_code=None`. The approval rule never had a chance to fire because the 404 was raised on the existence-of-binding check before the policy engine ran. The 0.12.0 SDK had been silently broken against post-2026-09-04 backends for the entire /execute path; this release closes the four-day window of broken `/execute` behaviour.
+
+**Workflow label** — `__nullrun_unknown__` was misleading because the SDK did know the workflow (the API key's binding) but only read the contextvar (which was unset on bare `@protect` calls). The displayed label was wrong; the wire was right. Operators reading traces had no signal that the gate had, in fact, scoped the call to a real workflow.
+
+**LLM reservation** — LangGraph's `NullRunCallback` emits LLM cost events from the LangChain callback hooks. These have no `@protect` scope and therefore no paired `/gate`. The runtime's `_route_track` (which since v0.16.0 / 2026-08-20 backend v3.66.2 alignment refuses to fall back to `/track/batch` for `llm_call` events without a reservation) dropped them with a WARNING log. Cost attribution for agentic LLM loops was silently incomplete. The fix fires `/gate` once per LLM span (fail-OPEN; same wire-call shape as `@protect`), so cost attribution completes via the v3 `/track_single` path.
+
 ## [0.16.5] - 2026-09-05
 
 Patch release — two independent reliability fixes: (1) `@protect` cancel-on-exception orphan leak (Redis reservation leak on tool exceptions), (2) P0-26+P0-27 `operation_id` hoist (single-source mint, server-vs-SDK divergence detection). No wire-format change on either fix.

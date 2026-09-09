@@ -72,14 +72,30 @@ def test_decision_and_infrastructure_are_disjoint():
 
 
 def test_workflow_killed_interrupt_is_neither_decision_nor_infrastructure():
-    """The kill signal is a BaseException — it deliberately bypasses
-    ``except Exception:`` so careless handlers can't swallow operator
-    kills. It must NOT inherit from NullRunDecision (which would make
-    it catchable by `except Exception:` via the NullRunError branch)."""
-    assert not issubclass(exc.WorkflowKilledInterrupt, exc.NullRunError)
+    """2026-09-08 migration reversal: WorkflowKilledInterrupt IS now a
+    NullRunError subclass (Exception subclass, NR-W002) — formerly
+    a BaseException subclass that bypassed ``except Exception:``.
+    The user override: agent recovery needs catchable kill signals
+    to surface the structured error_code + user_action.
+
+    Hierarchy after migration:
+      WorkflowKilledInterrupt → NullRunError → BreakerError → Exception → BaseException
+
+    Kill is intentionally NOT a NullRunDecision (the structured-
+    decision branch is reserved for gate-decision failures:
+    budget/tool/approval). Kill is a control-plane signal (operator
+    or circuit-breaker), semantically distinct from a decision —
+    the new MRO reflects this.
+    """
+    assert issubclass(exc.WorkflowKilledInterrupt, exc.NullRunError)
+    # Kill is NOT a NullRunDecision (decision failures are budget/
+    # tool/approval; kill is a control-plane signal).
     assert not issubclass(exc.WorkflowKilledInterrupt, exc.NullRunDecision)
+    # And NOT a NullRunInfrastructureError (operator action is not
+    # a transport failure).
     assert not issubclass(exc.WorkflowKilledInterrupt, exc.NullRunInfrastructureError)
-    # But it IS a BaseException, which is the whole point.
+    # And it's still a BaseException (transitively, since it is now
+    # an Exception subclass which is-a BaseException).
     assert issubclass(exc.WorkflowKilledInterrupt, BaseException)
 
 
