@@ -740,7 +740,10 @@ def _check_kill_before_send(runtime: Any, request: httpx.Request) -> None:
     has a remote control plane to consult.
 
     Raises:
-        WorkflowKilledInterrupt: state == "Killed"
+        NullRunWorkflowKilledError: state == "Killed" (2026-09-08:
+            typed signal with error_code=NR-W002 + user_action;
+            subclass of WorkflowKilledInterrupt which remains as a
+            back-compat name.)
         WorkflowPausedException: state == "Paused"
     """
     if runtime is None:
@@ -761,10 +764,14 @@ def _check_kill_before_send(runtime: Any, request: httpx.Request) -> None:
     state = runtime._remote_state_for(workflow_id) if hasattr(runtime, "_remote_state_for") else getattr(runtime, "_remote_states", {}).get(workflow_id, {})
     state_name = state.get("state", "Normal")
     if state_name == "Killed":
-        from nullrun.breaker.exceptions import WorkflowKilledInterrupt
-        raise WorkflowKilledInterrupt(
+        # 2026-09-08: typed kill signal (NR-W002). Cookbook
+        # code can `except NullRunWorkflowKilledError`; legacy
+        # `except WorkflowKilledInterrupt` still matches (subclass).
+        from nullrun.breaker.exceptions import NullRunWorkflowKilledError
+        raise NullRunWorkflowKilledError(
             workflow_id=workflow_id,
             reason=state.get("reason", "remote kill"),
+            kill_source="auto_instrumentation",
         )
     if state_name == "Paused":
         from nullrun.breaker.exceptions import WorkflowPausedException

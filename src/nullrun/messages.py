@@ -89,6 +89,16 @@ DEFAULT_MESSAGES: dict[str, str] = {
     "NR-C000": "There's a configuration issue. Please contact support.",
     "NR-C001": "There's a configuration issue. Please contact support.",
     "NR-C004": "There's a configuration issue. Please contact support.",
+    # ---- Integration errors (programmer misuse, expected to be caught) ----
+    # NR-EX01: /execute (or /cancel) was called without a prior /gate
+    # that minted this execution_id, or the binding TTL expired. This
+    # is a programmer-facing flow — the host code is responsible for
+    # re-issuing /api/v1/gate. The user-facing message is a polite
+    # catch-all that signals "this should not normally reach the end
+    # user" without leaking wire-shape details. Wording mirrors the
+    # configuration-issue cluster above; end users who ever see this
+    # are downstream of a host-code bug.
+    "NR-EX01": "There's a configuration issue. Please contact support.",
     # ---- Base ---------------------------------------------------------------
     "NR-0000": "Something went wrong. Please try again.",
 }

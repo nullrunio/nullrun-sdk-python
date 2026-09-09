@@ -841,18 +841,42 @@ def test_workflow_killed_interrupt_does_not_emit_warning():
     assert not any(issubclass(item.category, DeprecationWarning) for item in w)
 
 
-def test_workflow_killed_interrupt_is_base_exception():
-    """``except Exception`` does NOT catch the kill signal."""
-    with pytest.raises(WorkflowKilledInterrupt):
-        try:
-            raise WorkflowKilledInterrupt(workflow_id="wf-1", reason="x")
-        except Exception:
-            pytest.fail("Exception should not catch WorkflowKilledInterrupt")
-
-
-def test_workflow_killed_exception_is_caught_by_except_killed_exception():
-    """Legacy ``except WorkflowKilledException`` still catches the new
-    interrupt (back-compat contract).
+def test_workflow_killed_interrupt_is_catchable_by_exception():
+    """2026-09-08 migration reversal: ``except Exception`` DOES catch
+    the kill signal — cookbook code can react with typed error_code
+    + user_action. The pre-migration contract (BaseException bypass)
+    is intentionally broken because agent recovery requires
+    catchable kill signals.
     """
-    with pytest.raises(WorkflowKilledException):
+    caught: list[Exception] = []
+
+    try:
         raise WorkflowKilledInterrupt(workflow_id="wf-1", reason="x")
+    except Exception as exc:
+        caught.append(exc)
+
+    assert len(caught) == 1, "Exception should catch WorkflowKilledInterrupt (post-migration)"
+    assert isinstance(caught[0], WorkflowKilledInterrupt)
+    assert caught[0].error_code == "NR-W002"
+
+
+def test_workflow_killed_interrupt_not_caught_by_except_killed_exception():
+    """2026-09-08 BREAK: legacy ``except WorkflowKilledException``
+    no longer catches the new interrupt (WorkflowKilledInterrupt is
+    no longer a BaseException subclass). Cookbook code must migrate
+    to ``except WorkflowKilledInterrupt`` (canonical) or
+    ``except NullRunWorkflowKilledError`` (preferred typed name).
+    """
+    raised = False
+    try:
+        raise WorkflowKilledInterrupt(workflow_id="wf-1", reason="x")
+    except WorkflowKilledException:
+        pytest.fail(
+            "except WorkflowKilledException should NOT catch the new "
+            "interrupt (2026-09-08 BREAK — migrate to except "
+            "WorkflowKilledInterrupt or except NullRunWorkflowKilledError)"
+        )
+    except WorkflowKilledInterrupt:
+        raised = True
+
+    assert raised, "the new interrupt should propagate through except WorkflowKilledException"

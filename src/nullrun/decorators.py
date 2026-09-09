@@ -742,7 +742,13 @@ def _enforce_sensitive_tool(
                 TransportErrorSource,
             )
 
-            workflow_id = get_workflow_id() or UNKNOWN_WORKFLOW_ID
+            # DEFS-SDKEXEC-WORKFLOW-LABEL (2026-09-08): prefer the
+            # runtime's bound workflow (from _authenticate) over the
+            # sentinel so the displayed label matches what the SDK
+            # actually sends to /gate / /execute. See the matching
+            # note in `_enforce_sensitive_tool` below for the full
+            # rationale.
+            workflow_id = runtime._resolve_workflow_id(get_workflow_id()) or UNKNOWN_WORKFLOW_ID
             # The user-facing hint depends on which extractor fired.
             # Money extractor wants the bound arg name; ToolParams
             # extractor wants the rule-param -> arg-name mapping
@@ -807,7 +813,19 @@ def _enforce_sensitive_tool(
     )
 
     fail_open = os.environ.get("NULLRUN_SENSITIVE_FAIL_OPEN", "").strip() == "1"
-    workflow_id = get_workflow_id() or UNKNOWN_WORKFLOW_ID
+    # DEFS-SDKEXEC-WORKFLOW-LABEL (2026-09-08): resolve the
+    # *display* workflow_id via the runtime's precedence chain
+    # (contextvar → self.workflow_id → None) so the label reflects
+    # what the SDK actually sends on the wire (the API key's bound
+    # workflow, when the user hasn't explicitly opened a
+    # ``with workflow(...)`` block). Pre-fix this read only the
+    # contextvar; on every API-key-bound key without an explicit
+    # workflow block the displayed label was the literal sentinel
+    # ``"__nullrun_unknown__"``, which misleads operators reading
+    # the trace and the block message into thinking the gate was
+    # unable to identify the workflow. Sentinel stays as the last
+    # resort for legacy / never-bound keys.
+    workflow_id = runtime._resolve_workflow_id(get_workflow_id()) or UNKNOWN_WORKFLOW_ID
 
     try:
         # Pass on_transport_error="raise" so the transport raises

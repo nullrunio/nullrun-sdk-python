@@ -22,6 +22,7 @@ except ImportError:
 
 from nullrun.breaker.exceptions import (
     NullRunBlockedException,
+    NullRunWorkflowKilledError,
     WorkflowKilledInterrupt,
     WorkflowPausedException,
 )
@@ -69,7 +70,7 @@ class ActionHandler:
     Handler for NullRun circuit breaker actions.
 
     This executes protective actions when triggered:
-    - KILL: Immediately stops the workflow (raises WorkflowKilledInterrupt)
+    - KILL: Immediately stops the workflow (raises NullRunWorkflowKilledError, NR-W002)
     - PAUSE: Temporarily halts the workflow (raises WorkflowPausedException)
     - ALERT: Sends notification (can be customized)
     - SNAPSHOT: Captures workflow state for debugging
@@ -179,7 +180,10 @@ class ActionHandler:
             **details: Additional details about the action
 
         Raises:
-            WorkflowKilledInterrupt: If action is "kill"
+            NullRunWorkflowKilledError: If action is "kill"
+                (2026-09-08 typed signal, NR-W002; subclass of
+                WorkflowKilledInterrupt which remains as the
+                back-compat name.)
             WorkflowPausedException: If action is "pause"
             NullRunBlockedException: If action is "block"
         """
@@ -230,12 +234,11 @@ class ActionHandler:
         except BaseException as e:
             # Don't let handler exceptions propagate. We catch
             # `BaseException` (not just `Exception`) because
-            # `WorkflowKilledInterrupt` is intentionally a
-            # `BaseException` subclass — it's a non-recoverable
-            # control signal, but inside the ActionHandler dispatch
-            # loop we want the kill to be recorded in history
-            # (already done above) and swallowed, NOT re-raised into
-            # the caller's frame.
+            # kill signals (NullRunWorkflowKilledError, the
+            # 2026-09-08-migrated Exception subclass) and any
+            # third-party kill-shaped signals must be recorded
+            # in history (already done above) and swallowed,
+            # NOT re-raised into the caller's frame.
             logger.error(f"Action handler error: {e}")
 
     def _default_kill(
@@ -244,9 +247,21 @@ class ActionHandler:
         reason: str,
         **details: Any,
     ) -> None:
-        """Default kill handler - raises WorkflowKilledInterrupt."""
+        """Default kill handler - raises NullRunWorkflowKilledError.
+
+        2026-09-08: typed kill signal (NR-W002). Cookbook code
+        can `except NullRunWorkflowKilledError` to react to
+        operator-initiated kills with structured error_code +
+        user_action. Legacy `except WorkflowKilledInterrupt`
+        still matches because NullRunWorkflowKilledError is a
+        subclass.
+        """
         logger.warning(f"KILL action for workflow {workflow_id}: {reason}")
-        raise WorkflowKilledInterrupt(workflow_id=workflow_id, reason=reason)
+        raise NullRunWorkflowKilledError(
+            workflow_id=workflow_id,
+            reason=reason,
+            kill_source="action_handler",
+        )
 
     def _default_pause(
         self,

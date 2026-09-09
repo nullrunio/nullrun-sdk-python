@@ -29,6 +29,7 @@ from nullrun.breaker.exceptions import (
     BreakerTransportError,
     InsecureTransportError,
     NullRunAuthenticationError,
+    NullRunExecutionNotFoundError,
     NullRunTransportError,
     RateLimitError,
     TransportErrorSource,
@@ -300,7 +301,12 @@ def _retry_with_backoff(
 
             return result
 
-        except (BreakerTransportError, NullRunAuthenticationError, NullRunTransportError, NullRunBackendError):
+        except (
+            BreakerTransportError,
+            NullRunAuthenticationError,
+            NullRunTransportError,
+            NullRunBackendError,
+        ):
             raise
 
         except httpx.HTTPStatusError as exc:
@@ -1119,9 +1125,27 @@ class Transport:
     ) -> dict[str, Any]:
         """Pre-execution policy evaluation via /api/v1/execute (PRIMARY enforcement point).
 
-        The SDK MUST call /api/v1/execute (which checks the ``execute`` scope on
-        the API key) rather than /api/v1/gate (advisory, no scope check).
-        /api/v1/gate is reserved for budget pre-flight via ``Transport.check``.
+        Wire contract (revised 2026-09-08, DEFS-SDKEXEC-GATE-FIRST):
+        /execute REQUIRES a prior /gate call that minted the same
+        ``execution_id`` and registered the ``execution:{id}`` binding
+        in Redis. Backend enforcement:
+        ``backend/src/proxy/http/gate/execute.rs:46-208``
+        (DEF-SDKK-022-EXEC-BYPASS, 2026-09-04, RUN_ID=20260904T1500)
+        runs ``HGET execution:{id} ORG_FIELD`` on entry; a miss
+        returns 404 EXECUTION_NOT_FOUND (fail-CLOSED). The SDK
+        therefore MUST thread the execution_id captured by
+        ``runtime.check_workflow_budget`` (which calls ``Transport.check``,
+        i.e. /gate) into the body of this /execute call. See
+        ``runtime.execute()`` (line ~2820) for the reuse path; this
+        method's caller is the single source of truth for
+        ``execution_id`` selection.
+
+        Prior to DEF-SDKK-022 the comment here claimed "/execute MUST
+        be called rather than /gate" — that contract was the legacy
+        pre-2026-09-04 shape. The post-fix shape is "/execute MUST be
+        preceded by /gate for the same execution_id" — the budget
+        pre-flight (Transport.check, /api/v1/gate) is the binding
+        registrar; /execute is the policy decision that re-uses it.
 
         Args:
             organization_id: Organization identifier
@@ -1143,7 +1167,12 @@ class Transport:
                 - decision: "allow" | "block" | "flag" | "pause" | "require_approval"
                 - decision_source: "gateway" | "cached" | "fallback"
                 - explanation: Human-readable explanation
-                - policy_version: Policy version used
+                - policy_hash: Server-side SHA-256 of the policy applied
+                  (v4 wire field; null on pre-v4 backends). NOT a
+                  sequential `policy_version` number — wire v3/v4 backends
+                  emit only `policy_hash`. Synthetic fallback dicts ship
+                  `policy_version: 0` for legacy compatibility; real
+                  responses populate `policy_hash` only.
                 - decision_context: Context for replay (if available)
         """
         gate_request = {
@@ -1198,7 +1227,7 @@ class Transport:
                     "decision": "block",
                     "decision_source": DecisionSource.FALLBACK,
                     "explanation": f"Gateway returned {response.status_code}",
-                    "policy_version": 0,
+                    "policy_hash": None,
                 }
 
         except BreakerTransportError as exc:
@@ -1216,14 +1245,14 @@ class Transport:
                     "decision": "allow",
                     "decision_source": TransportErrorSource.NETWORK_ERROR,
                     "explanation": f"Gateway unreachable: {exc}",
-                    "policy_version": 0,
+                    "policy_hash": None,
                 }
             if on_transport_error == "closed":
                 return {
                     "decision": "block",
                     "decision_source": TransportErrorSource.NETWORK_ERROR,
                     "explanation": f"Gateway unreachable: {exc}",
-                    "policy_version": 0,
+                    "policy_hash": None,
                 }
             pass  # fall through to fallback mode
         except NullRunTransportError:
@@ -1693,8 +1722,17 @@ class Transport:
                         ``idempotency_key``.
 
                 Returns:
-                    Parsed JSON dict with at least
-                    ``{"status": "ok"|"idempotent_replay",...}``.
+                    Parsed JSON dict from the backend's TrackResponse.
+                    NOTE: there is NO top-level ``status`` field on the
+                    wire — the legacy pre-v3 docstring claimed one, but
+                    v3/v4 backends emit
+                    ``{snapshot, actions_taken, processing_mode,
+                    cost_source, confidence, event_id,
+                    idempotent_replay, stored_response?}``. SDK callers
+                    branch on the HTTP status (200 vs 4xx/5xx) and on
+                    ``idempotent_replay`` (bool) for replay detection —
+                    do NOT read ``data["status"]`` (KeyError on every
+                    backend >= 3.66.2).
 
                 Raises:
                     NullRunConsumeOverbudgetError: 422 CONSUME_OVERBUDGET —
@@ -1760,8 +1798,14 @@ class Transport:
                         cancellation (audit trail).
 
                 Returns:
-                    Parsed JSON dict (typically ``{"status": "ok"
-                    "execution_id":..., "cancelled_at": ts}``).
+                    Parsed JSON dict from the backend's CancelResponse.
+                    NOTE: there is NO top-level ``status`` field on the
+                    wire — the legacy pre-v3 docstring claimed one.
+                    v3/v4 backends emit
+                    ``{execution_id, canceled_at, reservation_released_cents,
+                    already_canceled}``. SDK callers branch on the HTTP
+                    status only — do NOT read ``data["status"]``
+                    (KeyError on every backend >= 3.66.2).
         """
         request: dict[str, Any] = {"execution_id": execution_id}
         if reason:
@@ -2151,10 +2195,7 @@ class Transport:
         Raises:
             NullRunBackendError / NullRunAuthenticationError.
         """
-        url = (
-            f"{self.api_url}/api/v1/orgs/{organization_id}"
-            f"/audit-log/export/{job_id}/status"
-        )
+        url = f"{self.api_url}/api/v1/orgs/{organization_id}/audit-log/export/{job_id}/status"
         headers = self._auth_headers_for_get()
         try:
             response = self._client.get(url, headers=headers, timeout=10.0)
@@ -2515,6 +2556,22 @@ def _parse_v3_error_envelope(
                 endpoint=endpoint,
                 status_code=status,
             )
+        if catalog is NullRunExecutionNotFoundError:
+            # 2026-09-09 audit: dedicated dispatch so callers can
+            # read ``execution_id`` / ``endpoint`` / ``regate_required``
+            # off the exception without indexing into ``details``.
+            # Mirrors the ``NullRunBackendError`` branch above (the
+            # parent class) but also forwards ``execution_id`` from
+            # the wire envelope. Without this branch the generic
+            # catalog fallback at line ~2615 would discard the
+            # ``execution_id`` field (it filters ``**details`` to
+            # the base NullRunError kwargs only).
+            return NullRunExecutionNotFoundError(
+                full_message,
+                execution_id=details.get("execution_id"),
+                endpoint=details.get("endpoint") or endpoint,
+                status_code=status,  # 404 per backend mapping
+            )
         if catalog is NullRunBudgetError:
             # NullRunBudgetError → NullRunBlockedException → requires
             return NullRunBudgetError(
@@ -2627,8 +2684,10 @@ def _build_v3_error_code_map() -> dict[str, type[Exception]]:
         NullRunBackendError,
         NullRunBlockedException,
         NullRunBudgetError,
+        NullRunBudgetRecheckFailedError,
         NullRunChainError,
         NullRunConsumeOverbudgetError,
+        NullRunExecutionNotFoundError,
         NullRunProtocolError,
         NullRunRateLimitRedisError,
         NullRunToolBlockedError,
@@ -2715,7 +2774,12 @@ def _build_v3_error_code_map() -> dict[str, type[Exception]]:
         # refresh the reservation envelope and retry /execute.
         # Backed by GateErrorCode::BudgetRecheckFailed in the
         # backend (error_codes.rs).
-        "BUDGET_RECHECK_FAILED": NullRunBudgetError,
+        # 2026-09-09 audit: the per-class dispatcher in
+        # ``_v3_error_dispatch`` (line ~2477) already routes this to
+        # ``NullRunBudgetRecheckFailedError`` (NR-B006) before the
+        # catalog fallback — defense-in-depth, this catalog entry
+        # now matches the dispatcher.
+        "BUDGET_RECHECK_FAILED": NullRunBudgetRecheckFailedError,
         # NR-007 (audit 2026-08-24): the 19 entries below were missing
         # from the SDK map and caused cookbook recipes that branch on
         # ``error_code`` to fall through to ``NullRunBackendError``.
@@ -2756,6 +2820,25 @@ def _build_v3_error_code_map() -> dict[str, type[Exception]]:
         # here indicates a wire-shape drift between client and server.
         "EXECUTION_ID_MALFORMED": NullRunBackendError,
         "EXECUTION_ID_REQUIRED": NullRunBackendError,
+        # 2026-09-09 SDK-drift audit: ``INVALID_EXECUTION_ID`` is
+        # emitted by the backend as a typed envelope at
+        # ``cancel.rs:142-149`` and ``orchestrator.rs:1327-1334`` —
+        # round-trips through the canonical ``v3_error_envelope``
+        # helper, so the wire string is canonical. Map to
+        # ``NullRunBackendError`` (sibling to the EXECUTION_ID_*
+        # siblings above) — wire-shape drift guard.
+        "INVALID_EXECUTION_ID": NullRunBackendError,
+        # 2026-09-09 SDK-drift audit: ``EXECUTION_NOT_FOUND`` is
+        # emitted by the backend as a typed envelope at
+        # ``execute.rs:194`` and ``cancel.rs:303`` (post-DEF-SDKK-022
+        # routing through ``v3_error_envelope`` + the new
+        # ``GateErrorCode::ExecutionNotFound`` variant). Map to the
+        # dedicated ``NullRunExecutionNotFoundError`` (NR-EX01) so
+        # cookbook code can ``except
+        # NullRunExecutionNotFoundError`` to distinguish a missed
+        # /gate (re-issue /gate then retry /execute) from generic
+        # wire-shape drift.
+        "EXECUTION_NOT_FOUND": NullRunExecutionNotFoundError,
         # Rate-limit plan lookup failure (Postgres / Redis adjacent).
         # Tied to ``NullRunRateLimitRedisError`` because the failure
         # mode is rate-limit-specific infrastructure unavailability
@@ -2767,6 +2850,35 @@ def _build_v3_error_code_map() -> dict[str, type[Exception]]:
         # ``RATE_LIMIT_REDIS_UNAVAILABLE`` -> ``NullRunRateLimitRedisError``
         # family pattern at wire level).
         "IDEMPOTENCY_REDIS_UNAVAILABLE": NullRunBackendError,
+        # Execution Graph / ADR-036 (sub-agent spawn topology). Backend
+        # error_codes.rs:107-382 covers six codes in this family — three
+        # 422 semantic rejects (cycle / depth / parent-binding) and three
+        # 503 infrastructure failures (depth lookup / invoke persist /
+        # subworkflow disabled). Map to ``NullRunChainError`` because
+        # the existing class already carries `parent_execution_id` per
+        # Execution Graph v0 docstring at `exceptions.py:388-410`. Adding
+        # them under a fresh ``NullRunSubworkflowError`` would force
+        # cookbook code to import a new exception class for the same
+        # lineage concept; consolidate under ChainError instead.
+        "WORKFLOW_CYCLE_DETECTED": NullRunChainError,
+        "WORKFLOW_DEPTH_EXCEEDED": NullRunChainError,
+        "WORKFLOW_PARENT_BINDING_EXPIRED": NullRunChainError,
+        "WORKFLOW_DEPTH_LOOKUP_FAILED": NullRunChainError,
+        "INVOKE_PERSIST_FAILED": NullRunBackendError,
+        "SUBWORKFLOW_INVOKE_DISABLED": NullRunChainError,
+        # ADR-023 (post-approval re-check race): a second operator
+        # already decided on the same approval row before this call's
+        # re-check landed. Map to ``NullRunApprovalReplayRejectedError``
+        # because semantically the agent caller has the same retry-loop
+        # concern as a replay-rejected approval (CLAUDE.md §34c).
+        "APPROVAL_ALREADY_DECIDED": NullRunApprovalReplayRejectedError,
+        # ADR-023 (Phase-1+ wire-shape fail-CLOSED): a v3+ SDK hit /gate
+        # without ``action_digest`` (legacy anchor attempt). Map to
+        # ``NullRunBlockedException`` because the wire shape is a true
+        # block decision, not an infrastructure error — cookbook code
+        # branches on the action_digest missing path with the same
+        # `except NullRunBlockedException:` flow as TOOL_BLOCKED.
+        "LEGACY_GRANT_REJECTED": NullRunBlockedException,
     }
 
 

@@ -83,12 +83,18 @@ from nullrun.audit import (  # ADR-009 P1 — governance audit surface
 )
 from nullrun.breaker.exceptions import (
     BreakerError,
+    NullRunApprovalDeniedError,
+    NullRunApprovalExpiredError,
+    NullRunApprovalReplayRejectedError,
+    NullRunApprovalResponseMissingError,
     NullRunAuthenticationError,
     NullRunBackendError,
     NullRunBlockedException,
+    NullRunBudgetError,
     NullRunError,
     NullRunInfrastructureError,
     NullRunTransportError,
+    NullRunWorkflowKilledError,
     WorkflowKilledInterrupt,
     WorkflowPausedException,
 )
@@ -176,9 +182,7 @@ def _is_production_environment(api_url: str | None = None) -> bool:
     """
     from urllib.parse import urlparse
 
-    effective_url = api_url or os.getenv(
-        "NULLRUN_API_URL", "https://api.nullrun.io"
-    )
+    effective_url = api_url or os.getenv("NULLRUN_API_URL", "https://api.nullrun.io")
     # Strip any trailing slash before parsing for consistent
     # ``hostname`` extraction.
     effective_url = effective_url.rstrip("/")
@@ -647,7 +651,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         self._debug = debug
         self._transport: Transport | None = None
 
-# Local enforcement state
+        # Local enforcement state
         # The BoundedDict-based per-workflow cost / loop / retry
         # counters have been removed alongside ``_check_local_limits``.
         # As of 0.7.0 ALL local enforcement (LoopTracker / RateTracker
@@ -693,7 +697,8 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         #   - the WS push arrives with outcome="approved" (release
         #     the gate, resume from the same execution_id), or
         #   - the WS push arrives with outcome="denied" (surface
-        #     WorkflowKilledInterrupt), or
+        #     NullRunApprovalDeniedError / NullRunWorkflowKilledError),
+        #     or
         #   - the per-approval timeout elapses (fall back to the
         #     /status poll path; emit a warning so the operator
         #     knows WS push is silent).
@@ -1524,9 +1529,10 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
 
     def _handle_approval_resolved(self, payload: dict[str, Any]) -> None:
         """WS push handler for an approval resolution. Releases
-        the matching gate reservation (approved) or raises
-        WorkflowKilledInterrupt (denied) so the agent can resume
-        from the same execution_id.
+        the matching gate reservation (approved) or surfaces the
+        typed denial/timeout (NullRunApprovalDeniedError on denied,
+        NullRunApprovalExpiredError on timeout, NR-A011/NR-A012)
+        so the agent can resume from the same execution_id.
 
         Args:
             payload: The WsMessage::ApprovalResolved dict from the
@@ -1593,16 +1599,20 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             a sentinel ``{"outcome": "timeout", "timed_out": True}``.
 
             **The caller is expected to fail-CLOSED on timeout** —
-            raise ``WorkflowKilledInterrupt``. The contract
-            deliberately rejects a `/status` poll fallback here:
-            a silent timeout must not silently approve a
-            privileged action.
+            raise :class:`NullRunApprovalExpiredError` (typed
+            exception, NR-A012). The contract deliberately rejects
+            a `/status` poll fallback here: a silent timeout must
+            not silently approve a privileged action.
 
         Raises:
             Nothing. Approval timeouts are returned, not raised,
             so the caller can choose the right recovery action
-            (raise WorkflowKilledInterrupt on denied OR on
-            timeout, resume on approved).
+            (raise NullRunApprovalDeniedError on denied, raise
+            NullRunApprovalExpiredError on timeout, resume on
+            approved). 2026-09-08: typed approval exceptions
+            (NR-A011, NR-A012) replaced the generic
+            ``WorkflowKilledInterrupt`` here so cookbook code can
+            catch by wire-code.
         """
         # Per-approval timeout resolution: prefer the
         # server-authoritative value from the /gate response so
@@ -1705,7 +1715,10 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
 
         Raises:
             WorkflowPausedException: If workflow is paused on server
-            WorkflowKilledInterrupt: If workflow is killed on server
+            NullRunWorkflowKilledError: If workflow is killed on
+                server (2026-09-08 typed signal, NR-W002; subclass
+                of WorkflowKilledInterrupt which remains as the
+                back-compat name.)
         """
         # Prefer the explicit arg (contextvar-supplied), fall back
         # to the API key's bound workflow. None on legacy keys --
@@ -1744,9 +1757,14 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             )
         elif state_normalized == "killed":
             reason = remote_state.get("reason", "remote kill")
-            raise WorkflowKilledInterrupt(
+            # 2026-09-08: typed kill signal (NR-W002). Cookbook code
+            # can `except NullRunWorkflowKilledError` to surface the
+            # structured error_code + user_action. Legacy
+            # `except WorkflowKilledInterrupt` still matches (subclass).
+            raise NullRunWorkflowKilledError(
                 workflow_id=workflow_id,
                 reason=reason,
+                kill_source="remote_state",
             )
 
     def check_workflow_budget(self) -> None:
@@ -1756,7 +1774,8 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         budget never gets to spend tokens.
 
         Decision → exception mapping:
-            "block" → WorkflowKilledInterrupt (hard policy / reservation error)
+            "block" → NullRunBudgetError (NR-B004, hard policy /
+                reservation error; 2026-09-08 typed signal)
             "throttle"→ WorkflowPausedException (insufficient budget, can resume)
             "allow" → return
 
@@ -1798,12 +1817,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             # pre-v3.53 the SDK silently honored it in any env
             # which made accidental prod misuse a silent fail-OPEN.
             if _is_production_environment(self.api_url):
-                allow_ack = (
-                    os.environ.get(
-                        "NULLRUN_ALLOW_SKIP_BUDGET_CHECK", ""
-                    ).strip()
-                    == "1"
-                )
+                allow_ack = os.environ.get("NULLRUN_ALLOW_SKIP_BUDGET_CHECK", "").strip() == "1"
                 if not allow_ack:
                     logger.error(
                         "check_workflow_budget: NULLRUN_SKIP_BUDGET_CHECK=1 "
@@ -1838,9 +1852,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 except Exception:  # noqa: BLE001
                     pass
                 return
-            logger.debug(
-                "check_workflow_budget: skipped via NULLRUN_SKIP_BUDGET_CHECK=1"
-            )
+            logger.debug("check_workflow_budget: skipped via NULLRUN_SKIP_BUDGET_CHECK=1")
             return
 
         # Bump the ``check_calls`` counter so the dashboard can show
@@ -1963,9 +1975,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # `transport.py::execute`) and do not pass through this
         # pre-flight gate. Computing once per call (not cached) is
         # fine: compute_action_digest is ~5µs of pure stdlib.
-        check_req["action_digest"] = _compute_action_digest(
-            _BusinessImpact.no_impact()
-        )
+        check_req["action_digest"] = _compute_action_digest(_BusinessImpact.no_impact())
 
         # Forward the tool list so backend (T3) can match each tool
         # against the workflow's effective `blocked_tools` aggregate.
@@ -2087,9 +2097,17 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             # distinct from loop / retry / rate which have their
             # own counters.
             metrics.inc_runtime("cost_limit_exceeded")
-            raise WorkflowKilledInterrupt(
+            # 2026-09-08: typed hard-block (NR-B004 budget cap).
+            # ``NullRunBudgetError`` carries structured
+            # ``error_code``, ``user_action``, ``retryable`` so the
+            # LLM gets an actionable hint instead of "Something went
+            # wrong". ``reasons`` preserved in details for telemetry.
+            raise NullRunBudgetError(
                 workflow_id=workflow_id,
                 reason="; ".join(reasons),
+                action="block",
+                decision_source=response.get("decision_source"),
+                reasons="; ".join(reasons),
             )
         if decision == "throttle":
             reasons = response.get("explanations") or (
@@ -2128,8 +2146,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             # alongside "hard cap hits" via the same dashboard panel.
             metrics.inc_runtime("soft_overdraft_used")
             logger.warning(
-                "check_workflow_budget: soft_pass -- %s "
-                "(overdraft_used=%s, max=%s, remaining=%s)",
+                "check_workflow_budget: soft_pass -- %s (overdraft_used=%s, max=%s, remaining=%s)",
                 explanation,
                 overdraft_used,
                 max_overdraft,
@@ -2161,9 +2178,16 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 logger.warning(
                     "check_workflow_budget: require_approval decision but no approval_id in response"
                 )
-                raise WorkflowKilledInterrupt(
+                # 2026-09-08: typed backend error (NR-B002, retryable).
+                # The server returned require_approval without an
+                # approval_id -- this is a wire-bug / drift, not a
+                # budget block. Surface as retryable backend error
+                # so cookbook code can decide whether to fall back
+                # to polling /status.
+                raise NullRunBackendError(
+                    message="approval_id missing in require_approval response",
+                    endpoint="/api/v1/gate",
                     workflow_id=workflow_id,
-                    reason="approval_id missing in require_approval response",
                 )
             # Read the per-approval timeout from the response. Both
             # `approval_timeout_seconds` (i64) and
@@ -2198,17 +2222,28 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 logger.info(f"check_workflow_budget: approval {approval_id} approved -- resuming")
                 return
             if outcome == "denied":
-                raise WorkflowKilledInterrupt(
+                # 2026-09-08: typed approval-denied (NR-A011). Cookbook
+                # code can `except NullRunApprovalDeniedError` to
+                # surface the denial note + user_action to the LLM.
+                raise NullRunApprovalDeniedError(
                     workflow_id=workflow_id,
                     reason=f"approval denied: {result.get('note') or 'operator denied'}",
+                    approval_id=approval_id,
+                    denial_note=result.get("note"),
                 )
             # timeout: fail-CLOSED -- do not run the call.
-            raise WorkflowKilledInterrupt(
+            # 2026-09-08: typed approval-expired (NR-A012) -- THE TRIGGER
+            # FIX. The LLM now sees "Approval expired after 300s of
+            # WS push silence" instead of "Something went wrong".
+            raise NullRunApprovalExpiredError(
                 workflow_id=workflow_id,
                 reason=(
                     f"approval {approval_id} timeout: WS push silent for "
                     f"{self._approval_timeout_seconds:.0f}s"
                 ),
+                approval_id=approval_id,
+                timeout_seconds=self._approval_timeout_seconds,
+                local_timeout=True,
             )
 
     # =============================================================================
@@ -2729,7 +2764,14 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 - decision: "allow" | "block" | "flag" | "pause" | "require_approval"
                 - decision_source: "gateway" | "cached" | "fallback"
                 - explanation: Human-readable explanation
-                - policy_version: Policy version used
+                - policy_hash: Server-side SHA-256 of the policy applied
+                  to this gate decision (v4 wire field; null on pre-v4
+                  backends). Captured via `_capture_wire_evidence` →
+                  `set_last_gate_policy_hash` for downstream audit linkage.
+                  NOTE: this is NOT a sequential `policy_version` number —
+                  wire v3/v4 backends emit only `policy_hash`; legacy
+                  `policy_version` references in this SDK are no longer
+                  populated from the wire.
                 - decision_context: Context used for the decision
 
             Mode values:
@@ -2772,7 +2814,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 "decision": "allow",
                 "decision_source": DecisionSource.LOCAL,
                 "explanation": "Inline mode: local enforcement only",
-                "policy_version": 0,
+                "policy_hash": None,
                 "allow_execution": True,
             }
 
@@ -2820,10 +2862,46 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # decorator call site).
         if tools is None:
             from nullrun.context import get_call_tools as _get_call_tools_for_execute
+
             tools = _get_call_tools_for_execute()
+
+        # DEFS-SDKEXEC-GATE-FIRST (2026-09-08): hoist the execution_id
+        # mint to REUSE the server-minted id from a prior /gate call
+        # (set via `_capture_server_minted_execution_id` from the
+        # `reservation_id` field of the /gate response).
+        #
+        # Why this matters: backend `/api/v1/execute` (the wire
+        # contract enforced by `backend/src/proxy/http/gate/execute.rs`
+        # since DEF-SDKK-022-EXEC-BYPASS, 2026-09-04, RUN_ID=20260904T1500)
+        # runs an existence check on `execution:{id}` in Redis at
+        # `execute.rs:180-208` and returns 404 EXECUTION_NOT_FOUND when
+        # no prior /gate minted the binding. Pre-fix this method minted
+        # a fresh `uuid7_str()` here — the freshly-minted id was never
+        # registered by /gate, so /execute fail-CLOSED with 404 on
+        # EVERY call and the SDK translated the 404 into a synthetic
+        # block ("Gateway returned 404") in
+        # ``transport.py::execute`` (line ~1195).
+        #
+        # Resolution: when a prior /gate captured a server-minted
+        # execution_id into ``_server_minted_execution_id_var``, reuse
+        # it. The decorator-driven ``@protect @sensitive`` path always
+        # runs ``check_workflow_budget()`` BEFORE ``runtime.execute()``
+        # (decorators.py:538 vs :824), so the contextvar is populated
+        # in the common path. Direct callers of ``runtime.execute()``
+        # without a prior /gate will fall through to the fresh-mint
+        # branch below — that's a wire-contract violation and the
+        # backend's 404 is the correct fail-CLOSED response.
+        from nullrun.context import get_server_minted_execution_id
+
+        prior_execution_id = get_server_minted_execution_id()
+        if prior_execution_id is not None:
+            execution_id = prior_execution_id
+        else:
+            execution_id = uuid7_str()
+
         execute_kwargs: dict[str, Any] = {
             "organization_id": organization_id,
-            "execution_id": uuid7_str(),
+            "execution_id": execution_id,
             "trace_id": trace_id,
             "tool": tool_name,
             "input_data": input_data,
@@ -2854,11 +2932,15 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             approval_id = result.get("approval_id") or ""
             if not approval_id:
                 metrics.inc_runtime("execute_blocked")
-                raise NullRunBlockedException(
+                # 2026-09-08: typed wire-bug (NR-A004). The server
+                # returned require_approval without an approval_id —
+                # this is a wire-contract bug, NOT a transient failure.
+                # Cookbook code catches this and reports to NULLRUN
+                # support; do NOT retry.
+                raise NullRunApprovalResponseMissingError(
                     workflow_id=workflow_id or UNKNOWN_WORKFLOW_ID,
                     reason="approval_id missing in require_approval response",
                     tool_name=tool_name,
-                    error_code="NR-A004",
                 )
 
             server_timeout = _validate_approval_timeout(
@@ -2875,16 +2957,38 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             outcome = str(approval_result.get("outcome") or "").lower()
             if outcome != "approved":
                 metrics.inc_runtime("execute_blocked")
-                reason = (
-                    f"approval denied: {approval_result.get('note') or 'operator denied'}"
-                    if outcome == "denied"
-                    else f"approval {approval_id} timeout"
-                )
+                # 2026-09-08: dispatch typed approval exception by
+                # outcome so cookbook code can react per wire-code:
+                #   denied  → NR-A011 (NullRunApprovalDeniedError)
+                #   timeout → NR-A012 (NullRunApprovalExpiredError)
+                #   other   → NR-X001 (NullRunBlockedException, generic)
+                if outcome == "denied":
+                    raise NullRunApprovalDeniedError(
+                        workflow_id=workflow_id or UNKNOWN_WORKFLOW_ID,
+                        reason=(
+                            f"approval denied: "
+                            f"{approval_result.get('note') or 'operator denied'}"
+                        ),
+                        tool_name=tool_name,
+                        approval_id=approval_id,
+                        denial_note=approval_result.get("note"),
+                    )
+                if outcome == "timeout":
+                    raise NullRunApprovalExpiredError(
+                        workflow_id=workflow_id or UNKNOWN_WORKFLOW_ID,
+                        reason=f"approval {approval_id} timeout",
+                        tool_name=tool_name,
+                        approval_id=approval_id,
+                        timeout_seconds=server_timeout,
+                        local_timeout=True,
+                    )
+                # Unknown outcome (cancelled / superseded / wire drift):
+                # fall back to generic block so the LLM still sees a
+                # typed exception with error_code, never a bare string.
                 raise NullRunBlockedException(
                     workflow_id=workflow_id or UNKNOWN_WORKFLOW_ID,
-                    reason=reason,
+                    reason=f"approval {approval_id} unresolved: outcome={outcome!r}",
                     tool_name=tool_name,
-                    error_code="NR-A004",
                 )
 
             # Re-check the same action. The backend must verify that
@@ -2895,11 +2999,17 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             result = self._transport.execute(**execute_kwargs)
             if result.get("decision") == "require_approval":
                 metrics.inc_runtime("execute_blocked")
-                raise NullRunBlockedException(
+                # 2026-09-08: typed replay-rejection (NR-A015). The
+                # operator approved but the same approval_id was
+                # already consumed by a concurrent /execute (race).
+                # Cookbook pattern: do NOT retry the same approval_id;
+                # treat as idempotency violation (likely a client
+                # retry loop).
+                raise NullRunApprovalReplayRejectedError(
                     workflow_id=workflow_id or UNKNOWN_WORKFLOW_ID,
                     reason="approved action was not accepted on re-check",
                     tool_name=tool_name,
-                    error_code="NR-A004",
+                    approval_id=approval_id,
                 )
 
         # Check if execution is allowed
@@ -3066,9 +3176,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 # 2026-08-06 (DEF-SDKWRAP-CHAIN-SOFT-EXECUTION-ID-REUSE-01,
                 span_id = enriched.get("span_id")
                 if span_id and ":" not in idem_key:
-                    enriched["idempotency_key"] = (
-                        f"{idem_key}:{str(span_id)[:16]}"
-                    )
+                    enriched["idempotency_key"] = f"{idem_key}:{str(span_id)[:16]}"
                 else:
                     enriched["idempotency_key"] = idem_key
 
@@ -3516,11 +3624,7 @@ def _capture_server_minted_execution_id(response: dict[str, Any]) -> str | None:
     from nullrun.context import get_operation_id as _get_op_id_for_capture
 
     sdk_op_id = _get_op_id_for_capture()
-    server_op_id = (
-        response.get("operation_id")
-        if isinstance(response, dict)
-        else None
-    )
+    server_op_id = response.get("operation_id") if isinstance(response, dict) else None
     if isinstance(server_op_id, str) and server_op_id:
         # Defensive parity assertion: server MUST echo the same
         # operation_id the SDK sent. A mismatch indicates either
@@ -3608,8 +3712,7 @@ def _capture_wire_evidence(response: dict[str, Any]) -> tuple[str | None, str | 
             return None
         if not isinstance(v, str):
             logger.warning(
-                "_capture_wire_evidence: response.%s is %s, "
-                "expected str — dropping",
+                "_capture_wire_evidence: response.%s is %s, expected str — dropping",
                 key,
                 type(v).__name__,
             )

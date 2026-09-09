@@ -149,10 +149,12 @@ class TestCheckWorkflowBudgetFailOpen:
         rt = make_runtime()
         rt.check_workflow_budget()
 
-    def test_real_block_raises_workflow_killed(self, make_runtime, mock_api):
-        """Real `decision=block` from gateway still raises
-        WorkflowKilledInterrupt. The fix for bug #1 must NOT swallow
-        real policy decisions — only transport errors."""
+    def test_real_block_raises_budget_error(self, make_runtime, mock_api):
+        """Real `decision=block` from gateway raises ``NullRunBudgetError``
+        (a ``NullRunBlockedException`` subclass). The fix for bug #1 must
+        NOT swallow real policy decisions — only transport errors."""
+        from nullrun.breaker.exceptions import NullRunBudgetError
+
         respx.post(f"{BASE_URL}/api/v1/gate").mock(
             return_value=httpx.Response(
                 200,
@@ -163,7 +165,7 @@ class TestCheckWorkflowBudgetFailOpen:
             )
         )
         rt = make_runtime()
-        with pytest.raises(WorkflowKilledInterrupt):
+        with pytest.raises(NullRunBudgetError):
             rt.check_workflow_budget()
 
     def test_real_throttle_raises_paused(self, make_runtime, mock_api):
@@ -321,6 +323,7 @@ class TestCheckWorkflowBudgetObservability:
         refactor that mistakenly moves the metric emit above the
         decision-parse stage.
         """
+        from nullrun.breaker.exceptions import NullRunBudgetError
         from nullrun.observability import metrics
 
         before = metrics.runtime.gate_fail_open_total
@@ -335,7 +338,7 @@ class TestCheckWorkflowBudgetObservability:
             )
         )
         rt = make_runtime()
-        with pytest.raises(WorkflowKilledInterrupt):
+        with pytest.raises(NullRunBudgetError):
             rt.check_workflow_budget()
         assert metrics.runtime.gate_fail_open_total == before, (
             "real policy block must not increment the fail-OPEN metric"

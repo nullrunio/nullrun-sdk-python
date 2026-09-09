@@ -76,16 +76,24 @@ class TestHierarchyRoots:
             )
 
     def test_killed_interrupt_does_not_inherit_from_exception(self):
-        # WorkflowKilledInterrupt is a BaseException subclass by design
-        # (docs/kill-contract.md). It MUST NOT inherit from
-        # NullRunError (which is an Exception subclass), so that
-        # `except Exception` does not catch the kill signal.
-        assert not issubclass(WorkflowKilledInterrupt, Exception)
-        assert not issubclass(WorkflowKilledInterrupt, NullRunError)
-        # But it MUST inherit from WorkflowKilledException (legacy
-        # back-compat shim) so old `except WorkflowKilledException`
-        # clauses still match.
-        assert issubclass(WorkflowKilledInterrupt, WorkflowKilledException)
+        # 2026-09-08 migration: WorkflowKilledInterrupt is now an
+        # Exception subclass (``NullRunError`` parent) — formerly a
+        # BaseException subclass. The user override: agent recovery
+        # code needs to catch the kill signal via ``except
+        # WorkflowKilledInterrupt`` / ``except NullRunWorkflowKilledError``
+        # and surface the structured error_code + user_action.
+        #
+        # Pinning this in test is a regression guard: a future
+        # maintainer reverting to BaseException to "preserve the
+        # kill contract" would break cookbook recovery and this
+        # test would fail loudly, forcing them to either keep the
+        # migration or justify the revert in a comment.
+        assert issubclass(WorkflowKilledInterrupt, Exception)
+        assert issubclass(WorkflowKilledInterrupt, NullRunError)
+        # Back-compat: legacy `except WorkflowKilledException` no
+        # longer matches (WorkflowKilledInterrupt is no longer a
+        # BaseException subclass). This is the documented BREAK.
+        assert not issubclass(WorkflowKilledInterrupt, WorkflowKilledException)
 
 
 # ---------------------------------------------------------------------------
@@ -152,18 +160,29 @@ class TestBackCompat:
             raise NullRunBackendError("5xx", endpoint="/api/v1/check", status_code=503)
 
     def test_killed_interrupt_caught_by_killed_exception(self):
-        # Back-compat shim — legacy `except WorkflowKilledException`
-        # must still match the new interrupt subclass.
+        # 2026-09-08 migration: WorkflowKilledException (the
+        # deprecated BaseException parent) no longer matches the
+        # new Exception subclass. This is the documented BREAK —
+        # cookbook code must migrate to `except
+        # WorkflowKilledInterrupt` (canonical) or
+        # `except NullRunWorkflowKilledError` (preferred typed name).
         with pytest.raises(WorkflowKilledException):
-            raise WorkflowKilledInterrupt("wf-1", reason="killed via API")
+            # WorkflowKilledException is itself a BaseException
+            # subclass, so this raises WorkflowKilledException
+            # directly (which is still BaseException). The
+            # WorkflowKilledInterrupt (Exception subclass) is NOT
+            # caught by this — that's the new contract.
+            raise WorkflowKilledException("wf-1", reason="killed via API")
 
     def test_killed_interrupt_not_caught_by_exception(self):
-        # The whole point of BaseException inheritance: kill must
-        # not be swallowable by `except Exception`.
-        with pytest.raises(BaseException) as exc_info:
+        # 2026-09-08 migration REVERSAL: WorkflowKilledInterrupt is
+        # now an Exception subclass — it IS catchable by
+        # `except Exception`. This is the new contract (cookbook
+        # recovery needs typed error_code + user_action).
+        with pytest.raises(Exception) as exc_info:
             raise WorkflowKilledInterrupt("wf-1", reason="killed")
         assert isinstance(exc_info.value, WorkflowKilledInterrupt)
-        assert not isinstance(exc_info.value, Exception)
+        assert isinstance(exc_info.value, Exception)
 
 
 # ---------------------------------------------------------------------------
