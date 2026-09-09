@@ -6,8 +6,11 @@ Contract:
 * Both translate any:class:`nullrun.NullRunError` into a single
   ``print(format_user_message(exc), file=sys.stderr)`` and then
   ``sys.exit(1)``.
-*:class:`nullrun.WorkflowKilledInterrupt` (BaseException) propagates
-  unchanged — kill must not be swallowed into a graceful exit.
+*:class:`nullrun.WorkflowKilledInterrupt` propagates unchanged — kill
+  must not be swallowed into a graceful exit. (2026-09-08 migration:
+  ``WorkflowKilledInterrupt`` is now an ``Exception`` subclass via
+  ``NullRunError``, but ``handle``/``guarded`` explicitly re-raise it
+  so the kill signal still reaches the top of the agent loop.)
 * Non-NullRun exceptions also propagate unchanged so the user's own
   bugs surface as honest tracebacks.
 * No runtime is required — these helpers work without
@@ -48,7 +51,7 @@ def test_handle_catches_nullrun_error_and_exits(monkeypatch, capsys):
 
 
 def test_handle_propagates_workflow_killed(monkeypatch):
-    """``WorkflowKilledInterrupt`` is BaseException — must NOT be caught."""
+    """``WorkflowKilledInterrupt`` must NOT be swallowed into sys.exit."""
     monkeypatch.setattr("sys.exit", lambda c: pytest.fail("sys.exit was called"))
 
     with pytest.raises(WorkflowKilledInterrupt):

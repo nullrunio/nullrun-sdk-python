@@ -1912,7 +1912,7 @@ class TestEndToEndCaptureFlow:
             return_value=Response(200, json={"ok": True, "accepted": 1})
         )
 
-        from nullrun.breaker.exceptions import WorkflowKilledInterrupt
+        from nullrun.breaker.exceptions import NullRunBudgetError
         from nullrun.context import workflow
         from nullrun.observability import metrics
 
@@ -1922,13 +1922,13 @@ class TestEndToEndCaptureFlow:
         before = metrics.runtime.dropped_llm_call_no_reservation
 
         with workflow("wf-1"):
-            # Block path raises — WorkflowKilledInterrupt is a
-            # BaseException (carries the kill signal
-            # must propagate honestly). Catch it explicitly for
-            # this test which only wants to verify contextvar hygiene.
+            # Block path raises — NullRunBudgetError is a
+            # NullRunBlockedException (carries the policy decision
+            # upstream). Catch it explicitly for this test which only
+            # wants to verify contextvar hygiene after a block.
             try:
                 rt.check_workflow_budget()
-            except WorkflowKilledInterrupt:
+            except NullRunBudgetError:
                 pass
 
             rt.track_llm(

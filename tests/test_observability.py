@@ -319,7 +319,7 @@ class TestAllMetricsWired:
 
     def test_cost_limit_exceeded_incremented_on_block(self):
         """A pre-flight decision=block must bump ``cost_limit_exceeded``."""
-        from nullrun.breaker.exceptions import WorkflowKilledInterrupt
+        from nullrun.breaker.exceptions import NullRunBudgetError
         from nullrun.observability import metrics
         from nullrun.runtime import NullRunRuntime
 
@@ -353,7 +353,7 @@ class TestAllMetricsWired:
             # it per runtime.py:996).
             rt.workflow_id = "wf-cost-test"
             try:
-                with pytest.raises(WorkflowKilledInterrupt):
+                with pytest.raises(NullRunBudgetError):
                     rt.check_workflow_budget()
             finally:
                 rt.shutdown()

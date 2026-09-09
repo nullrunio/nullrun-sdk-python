@@ -5,7 +5,8 @@ The push contract: when the server pushes a `state_change` message with
 `state: "Killed"`, the runtime's `on_state_change` callback writes the
 state into `runtime._remote_states[workflow_id]`, and the next
 `check_control_plane(workflow_id)` call raises
-`WorkflowKilledException`.
+`NullRunWorkflowKilledError` (the typed public name for the kill
+signal post the 2026-09-08 migration).
 
 We cover the contract at two levels:
 
@@ -33,7 +34,10 @@ from typing import Any
 import pytest
 import websockets
 
-from nullrun.breaker.exceptions import WorkflowKilledException
+from nullrun.breaker.exceptions import (
+    NullRunWorkflowKilledError,
+    WorkflowPausedException,
+)
 from nullrun.runtime import NullRunRuntime
 from nullrun.transport_websocket import WebSocketConnection
 
@@ -61,7 +65,9 @@ def _make_runtime(workflow_id: str = "wf-1") -> NullRunRuntime:
 
 def test_kill_state_surfaces_as_workflow_killed_exception():
     """If the WS push writes a Killed state, the next
-    check_control_plane raises WorkflowKilledException."""
+    check_control_plane raises NullRunWorkflowKilledError (the typed
+    public name for the kill signal; subclass of WorkflowKilledInterrupt
+    after the 2026-09-08 migration)."""
     rt = _make_runtime("wf-kill")
 
     # Simulate the WS push: on_state_change writes to _remote_states.
@@ -79,16 +85,14 @@ def test_kill_state_surfaces_as_workflow_killed_exception():
         "updated_at": state_msg["updated_at"],
     }
 
-    with pytest.raises(WorkflowKilledException) as exc_info:
+    with pytest.raises(NullRunWorkflowKilledError) as exc_info:
         rt.check_control_plane("wf-kill")
     assert "policy_violation" in str(exc_info.value)
 
 
 def test_paused_state_surfaces_as_workflow_paused_exception():
     """Same contract for Paused — the gate should raise
-    WorkflowPausedException, NOT WorkflowKilledException."""
-    from nullrun.breaker.exceptions import WorkflowPausedException
-
+    WorkflowPausedException, NOT NullRunWorkflowKilledError."""
     rt = _make_runtime("wf-pause")
     rt._remote_states["wf-pause"] = {
         "state": "Paused",

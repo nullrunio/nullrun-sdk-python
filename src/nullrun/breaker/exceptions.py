@@ -932,7 +932,13 @@ class NullRunExecutionNotFoundError(NullRunBackendError):
         # which execution_id and which endpoint surfaced the 404
         # without indexing into ``details``.
         self.execution_id: str | None = execution_id
-        self.endpoint: str | None = endpoint
+        # ``endpoint`` is always set after ``super().__init__`` (the
+        # parent constructor receives ``endpoint or "/api/v1/execute"``,
+        # never None). Override the inherited ``str`` annotation with the
+        # same type so mypy is happy — we are narrowing the parent's
+        # declared type by subclass attribute re-assignment here, not
+        # widening it.
+        self.endpoint: str = endpoint or "/api/v1/execute"
         # Re-issue /gate is the only path forward.
         self.regate_required: bool = True
 

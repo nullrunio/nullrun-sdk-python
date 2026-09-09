@@ -18,10 +18,13 @@ message on failure" case, this module provides three one-liners:
 
 All three translate any:class:`nullrun.NullRunError` into a single
 ``print(format_user_message(exc), file=sys.stderr)`` followed by
-``sys.exit(1)``.:class:`nullrun.WorkflowKilledInterrupt` is a
-``BaseException`` subclass and therefore propagates through all three
-— the kill signal is never silently swallowed. Non-NullRun exceptions
-also propagate unchanged.
+``sys.exit(1)``.:class:`nullrun.WorkflowKilledInterrupt` now inherits
+from :class:`nullrun.NullRunError` (the 2026-09-08 migration; see the
+class docstring), so a bare ``except NullRunError`` would otherwise
+swallow the kill signal. ``handle``/``guarded`` explicitly re-raise it
+— the kill is a control-plane action, not an SDK failure, and must
+reach the top of the agent loop. Non-NullRun exceptions also propagate
+unchanged.
 
 ``init_or_die`` exists because:func:`nullrun.init` is typically
 called at module top-level — before any ``with handle: `` block or
@@ -56,7 +59,7 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from typing import TypeVar
 
-from nullrun.breaker.exceptions import NullRunError
+from nullrun.breaker.exceptions import NullRunError, WorkflowKilledInterrupt
 from nullrun.messages import format_user_message
 
 T = TypeVar("T")
@@ -75,11 +78,16 @@ def handle(*, exit_code: int = 1):
 
     Exceptions that propagate unchanged:
 
-    *:class:`nullrun.WorkflowKilledInterrupt` (``BaseException``) — kill
-      signals must reach the top of the agent loop, not be swallowed
-      into a graceful exit.
+    *:class:`nullrun.WorkflowKilledInterrupt` — kill signals must reach
+      the top of the agent loop, not be swallowed into a graceful exit.
+      Re-raised explicitly inside the ``except NullRunError`` branch
+      because the 2026-09-08 migration moved ``WorkflowKilledInterrupt``
+      onto the ``NullRunError`` MRO (Sentry/OTel ``except Exception``
+      handlers should now record kill events; this ``handle`` /
+      ``guarded`` wrapper opts OUT of that recording on purpose).
     *:class:`KeyboardInterrupt` /:class:`SystemExit` (``BaseException``) —
-      same reason as the kill signal.
+      same reason as the kill signal — never reach the
+      ``except NullRunError`` branch anyway.
     * Any non-NullRun exception — the user's own bugs are not handled
       here; let them propagate for an honest traceback.
 
@@ -101,6 +109,15 @@ def handle(*, exit_code: int = 1):
     try:
         yield
     except NullRunError as exc:
+        # 2026-09-08 migration: WorkflowKilledInterrupt moved onto
+        # the NullRunError MRO so Sentry/OTel `except Exception`
+        # handlers record kill events. ``handle``/``guarded`` are the
+        # friendly-exit pattern, NOT the user-callback pattern — kill
+        # is a control-plane action and must propagate so the agent
+        # loop / dashboard resume path can see it. Re-raise explicitly
+        # before the catalog print + sys.exit.
+        if isinstance(exc, WorkflowKilledInterrupt):
+            raise
         print(format_user_message(exc), file=sys.stderr)
         sys.exit(exit_code)
 
@@ -111,7 +128,8 @@ def guarded(fn: Callable[..., T]) -> Callable[..., T]:
     Wrap a function so any:class:`nullrun.NullRunError` raised inside
     it is caught, rendered as a user-facing message, and the process
     exits with code ``1``. ``WorkflowKilledInterrupt`` and other
-    ``BaseException`` subclasses propagate.
+    ``BaseException`` subclasses propagate (``handle`` re-raises kill
+    explicitly, see the 2026-09-08 migration note).
 
     Pair with:func:`nullrun.protect` for the standard agent loop::
 
