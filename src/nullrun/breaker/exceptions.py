@@ -869,6 +869,74 @@ class NullRunBudgetThrottleError(NullRunBudgetError):
     retryable = True
 
 
+class NullRunExecutionNotFoundError(NullRunBackendError):
+    """``/execute`` or ``/cancel`` was called with an ``execution_id`` that
+    has no live server-side binding.
+
+    Wire code ``EXECUTION_NOT_FOUND`` (HTTP 404) from backend
+    `GateErrorCode::ExecutionNotFound` (`error_codes.rs`). Two emission
+    sites:
+      - ``backend/src/proxy/http/gate/execute.rs:194`` — when /execute
+        fires before /gate (or after the binding TTL expired)
+      - ``backend/src/proxy/http/cancel.rs:303`` — same condition on
+        the cancel path
+
+    Cookbook pattern: do NOT retry the same ``execution_id``; the
+    server never minted it (or its binding has expired and the
+    reservation has been released). Re-issue ``/api/v1/gate`` to mint
+    a fresh ``execution_id``, then retry /execute.
+
+    Subclass of :class:`NullRunBackendError` (NR-GEN) so the existing
+    ``except NullRunBackendError:`` cookbook pattern keeps matching;
+    callers that want to handle this specific case can ``except
+    NullRunExecutionNotFoundError`` for a clearer intent.
+
+    Audit: 2026-09-09 SDK-drift audit — pre-fix SDK 0.15.x collapsed
+    this code into a generic ``NullRunBackendError("Execution binding
+    not found")`` with no introspection on whether /gate was missed.
+    """
+
+    error_code = "NR-EX01"
+    user_action = (
+        "/execute (or /cancel) was called without a prior /gate that "
+        "minted this execution_id — or the binding TTL expired. "
+        "Re-issue /api/v1/gate to get a fresh execution_id, then retry."
+    )
+    retryable = False
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        execution_id: str | None = None,
+        endpoint: str | None = None,
+        status_code: int | None = None,
+    ) -> None:
+        # Wire detail envelope carries execution_id + endpoint;
+        # promote them to first-class kwargs on the exception so
+        # cookbook code can introspect without indexing into
+        # ``details``. The parent (NullRunBackendError) accepts
+        # ``endpoint`` as a named param and ``**details`` for
+        # everything else, so we route execution_id through
+        # details to avoid colliding with the parent's signature.
+        details: dict[str, Any] = {}
+        if execution_id is not None:
+            details["execution_id"] = execution_id
+        super().__init__(
+            message=message,
+            endpoint=endpoint or "/api/v1/execute",
+            status_code=status_code,
+            **details,
+        )
+        # First-class attributes so cookbook code can introspect
+        # which execution_id and which endpoint surfaced the 404
+        # without indexing into ``details``.
+        self.execution_id: str | None = execution_id
+        self.endpoint: str | None = endpoint
+        # Re-issue /gate is the only path forward.
+        self.regate_required: bool = True
+
+
 class NullRunToolBlockedError(NullRunBlockedException):
     """The tool is in the workflow's block list.
 

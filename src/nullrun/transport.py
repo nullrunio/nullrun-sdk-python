@@ -29,6 +29,7 @@ from nullrun.breaker.exceptions import (
     BreakerTransportError,
     InsecureTransportError,
     NullRunAuthenticationError,
+    NullRunExecutionNotFoundError,
     NullRunTransportError,
     RateLimitError,
     TransportErrorSource,
@@ -2555,6 +2556,22 @@ def _parse_v3_error_envelope(
                 endpoint=endpoint,
                 status_code=status,
             )
+        if catalog is NullRunExecutionNotFoundError:
+            # 2026-09-09 audit: dedicated dispatch so callers can
+            # read ``execution_id`` / ``endpoint`` / ``regate_required``
+            # off the exception without indexing into ``details``.
+            # Mirrors the ``NullRunBackendError`` branch above (the
+            # parent class) but also forwards ``execution_id`` from
+            # the wire envelope. Without this branch the generic
+            # catalog fallback at line ~2615 would discard the
+            # ``execution_id`` field (it filters ``**details`` to
+            # the base NullRunError kwargs only).
+            return NullRunExecutionNotFoundError(
+                full_message,
+                execution_id=details.get("execution_id"),
+                endpoint=details.get("endpoint") or endpoint,
+                status_code=status,  # 404 per backend mapping
+            )
         if catalog is NullRunBudgetError:
             # NullRunBudgetError → NullRunBlockedException → requires
             return NullRunBudgetError(
@@ -2667,8 +2684,10 @@ def _build_v3_error_code_map() -> dict[str, type[Exception]]:
         NullRunBackendError,
         NullRunBlockedException,
         NullRunBudgetError,
+        NullRunBudgetRecheckFailedError,
         NullRunChainError,
         NullRunConsumeOverbudgetError,
+        NullRunExecutionNotFoundError,
         NullRunProtocolError,
         NullRunRateLimitRedisError,
         NullRunToolBlockedError,
@@ -2755,7 +2774,12 @@ def _build_v3_error_code_map() -> dict[str, type[Exception]]:
         # refresh the reservation envelope and retry /execute.
         # Backed by GateErrorCode::BudgetRecheckFailed in the
         # backend (error_codes.rs).
-        "BUDGET_RECHECK_FAILED": NullRunBudgetError,
+        # 2026-09-09 audit: the per-class dispatcher in
+        # ``_v3_error_dispatch`` (line ~2477) already routes this to
+        # ``NullRunBudgetRecheckFailedError`` (NR-B006) before the
+        # catalog fallback — defense-in-depth, this catalog entry
+        # now matches the dispatcher.
+        "BUDGET_RECHECK_FAILED": NullRunBudgetRecheckFailedError,
         # NR-007 (audit 2026-08-24): the 19 entries below were missing
         # from the SDK map and caused cookbook recipes that branch on
         # ``error_code`` to fall through to ``NullRunBackendError``.
@@ -2796,6 +2820,25 @@ def _build_v3_error_code_map() -> dict[str, type[Exception]]:
         # here indicates a wire-shape drift between client and server.
         "EXECUTION_ID_MALFORMED": NullRunBackendError,
         "EXECUTION_ID_REQUIRED": NullRunBackendError,
+        # 2026-09-09 SDK-drift audit: ``INVALID_EXECUTION_ID`` is
+        # emitted by the backend as a typed envelope at
+        # ``cancel.rs:142-149`` and ``orchestrator.rs:1327-1334`` —
+        # round-trips through the canonical ``v3_error_envelope``
+        # helper, so the wire string is canonical. Map to
+        # ``NullRunBackendError`` (sibling to the EXECUTION_ID_*
+        # siblings above) — wire-shape drift guard.
+        "INVALID_EXECUTION_ID": NullRunBackendError,
+        # 2026-09-09 SDK-drift audit: ``EXECUTION_NOT_FOUND`` is
+        # emitted by the backend as a typed envelope at
+        # ``execute.rs:194`` and ``cancel.rs:303`` (post-DEF-SDKK-022
+        # routing through ``v3_error_envelope`` + the new
+        # ``GateErrorCode::ExecutionNotFound`` variant). Map to the
+        # dedicated ``NullRunExecutionNotFoundError`` (NR-EX01) so
+        # cookbook code can ``except
+        # NullRunExecutionNotFoundError`` to distinguish a missed
+        # /gate (re-issue /gate then retry /execute) from generic
+        # wire-shape drift.
+        "EXECUTION_NOT_FOUND": NullRunExecutionNotFoundError,
         # Rate-limit plan lookup failure (Postgres / Redis adjacent).
         # Tied to ``NullRunRateLimitRedisError`` because the failure
         # mode is rate-limit-specific infrastructure unavailability
