@@ -86,6 +86,24 @@ DEFAULT_MESSAGES: dict[str, str] = {
     # defence for the case where the host code catches too broadly.
     "NR-A001": "There's a configuration issue. Please contact support.",
     "NR-A003": "There's a configuration issue. Please contact support.",
+    # ---- Approval lifecycle (operator decision flow) -------------------------
+    # NR-A012: approval grant expired. Two raise paths (see
+    # ``NullRunApprovalExpiredError`` docstring):
+    #   1. Wire path — backend closed the grant because operator's
+    #      ``expires_at`` elapsed between /gate and /execute.
+    #   2. Client-side timeout path — WS push went silent for
+    #      ``approval_timeout_seconds`` without an operator decision.
+    # Cookbook pattern: do NOT retry the same approval_id; request a
+    # fresh row and re-/gate. Pre-fix (2026-09-08), the catalog was
+    # missing NR-A012 entirely, so ``format_user_message`` fell
+    # through to ``FALLBACK_MESSAGE = "Something went wrong. Please
+    # try again."`` — exactly what
+    # ``langgraph_openai_approval_demo.py`` printed, hiding the
+    # actionable detail. The wording below mirrors the tone rules
+    # (imperative when there's something to do) and tells the user
+    # *what to do next* (try again with a fresh approval), not just
+    # *what happened*.
+    "NR-A012": "This request was not approved in time and has expired. Please try again — the operator will be notified.",
     "NR-C000": "There's a configuration issue. Please contact support.",
     "NR-C001": "There's a configuration issue. Please contact support.",
     "NR-C004": "There's a configuration issue. Please contact support.",

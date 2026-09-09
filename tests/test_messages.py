@@ -31,6 +31,7 @@ _EXPECTED_CODES = {
     "NR-0000",
     "NR-A001",
     "NR-A003",
+    "NR-A012",
     "NR-B001",
     "NR-B002",
     "NR-B005",
@@ -157,6 +158,56 @@ def test_format_user_message_handles_workflow_paused():
     paused = exc.WorkflowPausedException(workflow_id="wf-1", reason="cooldown")
     out = messages.format_user_message(paused)
     assert out == messages.DEFAULT_MESSAGES["NR-W003"]
+
+
+def test_format_user_message_handles_approval_expired():
+    """NR-A012 catalog entry (added 2026-09-08 to close the silent
+    state-flip audit gap). Pre-fix, ``NullRunApprovalExpiredError``
+    raised but the catalog was missing NR-A012, so
+    ``format_user_message`` fell through to
+    ``FALLBACK_MESSAGE = "Something went wrong. Please try again."`` —
+    exactly what ``langgraph_openai_approval_demo.py`` printed.
+
+    This test pins the catalog entry so a future refactor that
+    removes NR-A012 from ``DEFAULT_MESSAGES`` re-introduces the
+    demo's user-visible bug.
+    """
+    expired = exc.NullRunApprovalExpiredError(
+        workflow_id="wf-1",
+        reason="WS push silent past approval_timeout_seconds",
+        approval_id="appr-1",
+        timeout_seconds=5.0,
+        local_timeout=True,
+    )
+    assert expired.error_code == "NR-A012"
+    out = messages.format_user_message(expired)
+    assert out == messages.DEFAULT_MESSAGES["NR-A012"]
+    assert out != messages.FALLBACK_MESSAGE
+    # Tone rule: imperative when there's something to do.
+    assert "try again" in out.lower()
+
+
+def test_format_user_message_handles_approval_expired_local_timeout_path():
+    """Both raise paths for ``NullRunApprovalExpiredError`` (wire path
+    + local-timeout path) must resolve to NR-A012. Cookbook code that
+    catches the exception regardless of origin needs a consistent
+    user-facing message."""
+    wire = exc.NullRunApprovalExpiredError(
+        workflow_id="wf-1",
+        reason="APPROVAL_EXPIRED",
+        approval_id="appr-1",
+        timeout_seconds=None,
+        local_timeout=False,
+    )
+    local = exc.NullRunApprovalExpiredError(
+        workflow_id="wf-1",
+        reason="WS push silent past approval_timeout_seconds",
+        approval_id="appr-1",
+        timeout_seconds=5.0,
+        local_timeout=True,
+    )
+    assert messages.format_user_message(wire) == messages.DEFAULT_MESSAGES["NR-A012"]
+    assert messages.format_user_message(local) == messages.DEFAULT_MESSAGES["NR-A012"]
 
 
 def test_format_user_message_handles_workflow_killed_baseexception():
