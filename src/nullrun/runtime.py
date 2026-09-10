@@ -3057,73 +3057,15 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             #
             # The backend stamps a structured ``details.error_code``
             # on every block response, alongside the existing
-            # BUDGET_* / RATE_LIMIT_* family. When the backend
-            # provides one, we use it verbatim -- no string
-            # parsing, no false positives. Falls back to the
-            # legacy keyword-on-explanation mapping for older
-            # backends that pre-date the structured code (the
-            # keyword path stays for back-compat -- an older
-            # SDK still classifies budget/loop/rate/tool blocks
-            # correctly).
-            explanation = result.get("explanation", "policy violation")
-            wire_details = result.get("details") or {}
-            if not isinstance(wire_details, dict):
-                wire_details = {}
-            wire_error_code = wire_details.get("error_code")
-            if wire_error_code and isinstance(wire_error_code, str):
-                # Backend-supplied structured code wins. The
-                # catalogue exception class is mapped via
-                # ``_V3_ERROR_CODE_MAP`` on the transport path; on
-                # this /execute path we only have the SCREAMING_SNAKE
-                # backend code, so we surface it as-is in the
-                # ``error_code`` slot and let the caller branch on
-                # the catalog subclass if it has imported one. The
-                # block_code -> SDK exception-class mapping is done
-                # via the catalogue in nullrun.breaker.exceptions.
-                block_code, block_action = wire_error_code, "block"
-                block_cls = "NullRunBlockedException"
-            else:
-                explanation_lower = explanation.lower()
-                if "budget" in explanation_lower or "exhausted" in explanation_lower:
-                    block_code, block_action = "NR-B004", "block"
-                    block_cls = "NullRunBudgetError"
-                elif "loop" in explanation_lower or "repetition" in explanation_lower:
-                    block_code, block_action = "NR-L001", "block"
-                    block_cls = "NullRunBlockedException"
-                elif "rate" in explanation_lower or "too many" in explanation_lower:
-                    block_code, block_action = "NR-R001", "block"
-                    block_cls = "NullRunBlockedException"
-                elif "tool" in explanation_lower and "block" in explanation_lower:
-                    block_code, block_action = "NR-T001", "block"
-                    block_cls = "NullRunToolBlockedError"
-                else:
-                    block_code, block_action = "NR-X001", "block"
-                    block_cls = "NullRunBlockedException"
-            # Note: we still raise the base ``NullRunBlockedException``
-            # for non-budget/tool cases to keep the construction
-            # shape simple — the catalogue code is what the user
-            # reads, and they can branch on it via ``except
-            # NullRunBudgetError:`` for the budget case if they need
-            # to handle it specifically. We could instantiate the
-            # subclass per branch above; keeping one raise here is
-            # easier to reason about and matches the way the rest of
-            # the codebase handles backend blocks.
-            #
-            # ``details`` carries the wire ``details`` payload so the
-            # caller can introspect ``exc.details["error_code"]`` and
-            # ``exc.details["decision_source"]`` for diagnostic
-            # routing. ``mapped_class`` is preserved as a backwards-
-            # compat shim for callers that branched on the keyword
-            # path; new code should branch on ``exc.error_code``.
-            merged_details = dict(wire_details)
-            merged_details["mapped_class"] = block_cls
-            err = NullRunBlockedException(
+            # BUDGET_* / RATE_LIMIT_* family. Layer-1 dispatch is
+            # factored into ``_build_block_exception`` so the
+            # dispatch logic is unit-testable without standing up a
+            # full ``Runtime.execute()`` pipeline (see
+            # tests/test_2026_09_10_runtime_block_typed_dispatch.py).
+            err = self._build_block_exception(
+                result=result,
                 workflow_id=workflow_id or UNKNOWN_WORKFLOW_ID,
-                reason=explanation,
-                action=block_action,
                 tool_name=tool_name,
-                error_code=block_code,
-                details=merged_details,
             )
             # Layer 2: fire the on_error hook. The hook sees the
             # same exception the caller will catch plus the
@@ -3141,6 +3083,203 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
 
         metrics.inc_runtime("execute_allowed")
         return result
+
+    @staticmethod
+    def _build_block_exception(
+        *,
+        result: dict[str, Any],
+        workflow_id: str,
+        tool_name: str | None,
+    ) -> Exception:
+        """Build the typed catalog exception for a /execute block
+        decision. Factored out of ``Runtime.execute`` so the dispatch
+        logic is unit-testable without a full transport pipeline
+        (see tests/test_2026_09_10_runtime_block_typed_dispatch.py).
+
+        Dispatch priority:
+
+        1. ``result["details"]["error_code"]`` is in
+           ``_V3_ERROR_CODE_MAP`` → instantiate the typed catalog
+           class (e.g. ``NullRunApprovalReplayRejectedError`` for
+           ``APPROVAL_REPLAY_REJECTED``). This is the common path
+           and is what cookbook recipes branch on
+           (``except NullRunApprovalReplayRejectedError:`` for
+           NR-A015, etc.).
+
+        2. Wire code present but NOT in the catalog (backend / SDK
+           drift) → ``NullRunBlockedException`` with
+           ``error_code=<wire_code>`` so the caller still has
+           something to branch on via ``exc.error_code``.
+
+        3. No structured wire code (legacy backends) → keyword-on-
+           ``explanation`` mapping for BUDGET / LOOP / RATE / TOOL
+           families. Each branch sets a synthetic
+           ``NR-B004 / NR-L001 / NR-R001 / NR-T001`` catalog code
+           on ``NullRunBlockedException`` (kept for backward
+           compat — old code branched on
+           ``exc.error_code == "NR-B004"``).
+
+        The class attribute ``error_code`` on the typed class
+        (e.g. ``NullRunApprovalReplayRejectedError.error_code ==
+        "NR-A015"``) is the canonical ``format_user_message``
+        lookup key — we NEVER pass ``error_code=wire_code`` to the
+        typed class because that would override the catalog code
+        and defeat ``format_user_message``.
+
+        Returns a ``NullRunBlockedException`` (or subclass) —
+        caller is responsible for raising / ``on_error`` hook /
+        metric increment.
+        """
+        from nullrun.transport import _V3_ERROR_CODE_MAP
+
+        explanation = result.get("explanation", "policy violation")
+        wire_details = result.get("details") or {}
+        if not isinstance(wire_details, dict):
+            wire_details = {}
+        wire_error_code = wire_details.get("error_code")
+
+        # Catalog classes with a custom ``__init__`` that promotes
+        # a wire field to a first-class attribute (e.g.
+        # ``exc.approval_id`` on ``NullRunApprovalReplayRejectedError``,
+        # ``exc.current_spend_cents`` on
+        # ``NullRunBudgetRecheckFailedError``). Mirrors the
+        # keyword-only params declared on those classes in
+        # ``breaker/exceptions.py``. The value is a frozenset of
+        # wire-field names that must be passed as named kwargs to
+        # the constructor (NOT nested under ``details=``) so they
+        # land on the typed exception as first-class attrs.
+        #
+        # Classes that map to ``NullRunBlockedException`` (the base
+        # class — e.g. ``NullRunBudgetError``,
+        # ``NullRunToolBlockedError``) do NOT appear here because
+        # they have no custom ``__init__`` that promotes fields; all
+        # wire fields stay in the ``details=`` payload.
+        _TYPED_KWARGS_BY_CLASS: dict[str, frozenset[str]] = {
+            "NullRunBudgetRecheckFailedError": frozenset(
+                {"current_spend_cents", "budget_cents", "epsilon_cents"}
+            ),
+            "NullRunApprovalNotYetApprovedError": frozenset({"approval_id"}),
+            "NullRunApprovalDeniedError": frozenset(
+                {"approval_id", "denial_note"}
+            ),
+            "NullRunApprovalExpiredError": frozenset(
+                {"approval_id", "timeout_seconds"}
+            ),
+            "NullRunApprovalReplayRejectedError": frozenset({"approval_id"}),
+            "NullRunApprovalDigestMismatchError": frozenset({"approval_id"}),
+            "NullRunApprovalToolDigestMismatchError": frozenset({"approval_id"}),
+        }
+
+        def _build_payload(
+            src: dict[str, Any], mapped_name: str
+        ) -> dict[str, Any]:
+            """Build the ``details=...`` payload dict that the
+            constructor captures as ``self.details["details"]``.
+
+            Carries the full wire payload verbatim (including
+            ``error_code``) so callers can introspect the wire
+            shape for routing/alerting (e.g.
+            ``exc.details["details"]["decision_source"]``). The
+            ``mapped_class`` shim is appended for back-compat with
+            callers that branched on the legacy keyword path.
+            """
+            payload = dict(src)
+            payload["mapped_class"] = mapped_name
+            return payload
+
+        # Priority 1: typed catalog dispatch via _V3_ERROR_CODE_MAP.
+        if wire_error_code and isinstance(wire_error_code, str):
+            typed_cls = _V3_ERROR_CODE_MAP.get(wire_error_code)
+            if typed_cls is not None:
+                # 1a: typed SUBCLASS (e.g.
+                # NullRunApprovalReplayRejectedError for
+                # APPROVAL_REPLAY_REJECTED). The class's class
+                # attribute owns error_code (NR-A015), so we MUST
+                # NOT pass error_code=... — that would override
+                # NR-A015 with the wire code and defeat
+                # format_user_message's catalog lookup.
+                if typed_cls is not NullRunBlockedException:
+                    payload = _build_payload(
+                        wire_details, typed_cls.__name__
+                    )
+                    typed_kwarg_names = _TYPED_KWARGS_BY_CLASS.get(
+                        typed_cls.__name__, frozenset()
+                    )
+                    typed_kwargs = {
+                        k: wire_details[k]
+                        for k in typed_kwarg_names
+                        if k in wire_details
+                    }
+                    return typed_cls(
+                        workflow_id=workflow_id,
+                        reason=explanation,
+                        action="block",
+                        tool_name=tool_name,
+                        details=payload,
+                        **typed_kwargs,
+                    )
+                # 1b: catalog maps to base NullRunBlockedException
+                # (e.g. APPROVAL_VALIDATION_FAILED). There is no
+                # catalog error_code class attr to protect — we
+                # pass the wire code explicitly so self.error_code
+                # reflects the wire code (back-compat callers
+                # branch on exc.error_code == "APPROVAL_*").
+                payload = _build_payload(
+                    wire_details, "NullRunBlockedException"
+                )
+                return NullRunBlockedException(
+                    workflow_id=workflow_id,
+                    reason=explanation,
+                    action="block",
+                    tool_name=tool_name,
+                    error_code=wire_error_code,
+                    details=payload,
+                )
+            # Priority 2: wire code NOT in catalog (drift).
+            # Base class — wire code IS self.error_code (no catalog
+            # entry to dispatch to, so no class attr to protect).
+            payload = _build_payload(
+                wire_details, "NullRunBlockedException"
+            )
+            return NullRunBlockedException(
+                workflow_id=workflow_id,
+                reason=explanation,
+                action="block",
+                tool_name=tool_name,
+                error_code=wire_error_code,
+                details=payload,
+            )
+
+        # Priority 3: legacy keyword-on-explanation mapping for
+        # backends that pre-date the structured wire code. Each
+        # branch picks a synthetic catalog code so legacy
+        # ``exc.error_code == "NR-B004"``-style branching still
+        # works for back-compat callers.
+        explanation_lower = explanation.lower()
+        if "budget" in explanation_lower or "exhausted" in explanation_lower:
+            block_code = "NR-B004"
+            mapped = "NullRunBudgetError"
+        elif "loop" in explanation_lower or "repetition" in explanation_lower:
+            block_code = "NR-L001"
+            mapped = "NullRunBlockedException"
+        elif "rate" in explanation_lower or "too many" in explanation_lower:
+            block_code = "NR-R001"
+            mapped = "NullRunBlockedException"
+        elif "tool" in explanation_lower and "block" in explanation_lower:
+            block_code = "NR-T001"
+            mapped = "NullRunToolBlockedError"
+        else:
+            block_code = "NR-X001"
+            mapped = "NullRunBlockedException"
+        payload = _build_payload(wire_details, mapped)
+        return NullRunBlockedException(
+            workflow_id=workflow_id,
+            reason=explanation,
+            action="block",
+            tool_name=tool_name,
+            error_code=block_code,
+            details=payload,
+        )
 
     def _enrich_event(self, event: dict[str, Any]) -> dict[str, Any]:
         """Add context fields to event."""
