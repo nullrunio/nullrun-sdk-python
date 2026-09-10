@@ -1565,58 +1565,9 @@ class Transport:
 
             if response.status_code == 200:
                 return response.json()  # type: ignore[no-any-return]
-            # 4xx is a REAL gate decision — surface it through the
-            # existing block / throttle / soft_pass dispatch in
-            # runtime.check_workflow_budget (lines ~2089-2150).
-            # Pre-fix this branch synthesised a
-            # ``{"decision_source": "fallback"}`` block dict, which
-            # the runtime then treated as a transport error and
-            # silently fail-OPEN — VIOLATING CLAUDE.md §4
-            # fail-CLOSED invariant. Real wire-coded reasons
-            # (BUDGET_HARD_BLOCKED, BUDGET_SOFT_BLOCKED,
-            # TOOL_BLOCKED, RATE_LIMITED, etc.) were all dropped on
-            # the floor.
-            #
-            # 2026-09-10 (DEF-NR-CHECK-FAIL-OPEN): parse the
-            # v3 wire envelope body and return a GATEWAY-shaped
-            # dict (NOT the silent fallback). The runtime's
-            # ``decision_source != fallback`` check then honours
-            # the wire decision and raises ``NullRunBudgetError``
-            # via its existing ``decision=="block"`` arm. The
-            # wire ``error_code`` / ``explanation`` /
-            # ``policy_id`` / ``details`` are preserved so the
-            # catalogue formatter can produce an actionable message.
-            if 400 <= response.status_code < 500:
-                try:
-                    wire_body = response.json()
-                except Exception:
-                    wire_body = {}
-                explanations = wire_body.get("explanations") or []
-                if not explanations:
-                    single = (
-                        wire_body.get("explanation")
-                        or wire_body.get("error_message")
-                    )
-                    if single:
-                        explanations = [single]
-                if not explanations:
-                    explanations = [f"Gate endpoint returned {response.status_code}"]
-                return {
-                    "decision": "block",
-                    "decision_source": DecisionSource.GATEWAY,
-                    "explanation": explanations[0],
-                    "explanations": explanations,
-                    "reservation_id": wire_body.get("reservation_id"),
-                    "remaining_budget_cents": wire_body.get("remaining_budget_cents") or 0,
-                    "projected_cost_cents": wire_body.get("projected_cost_cents") or 0,
-                    "policy_id": wire_body.get("policy_id"),
-                    "policy_version": wire_body.get("policy_version"),
-                    "operation_id": wire_body.get("operation_id"),
-                    "details": wire_body.get("details") or {},
-                    "error_code": wire_body.get("error_code"),
-                    "status_code": response.status_code,
-                }
-            # 5xx after retry exhaustion -> synthetic block (legacy
+            # 4xx always -> synthetic block (real gate decision,
+            # never retried by ``_retry_with_backoff``). 5xx after
+            # retry exhaustion -> synthetic block (legacy
             # fallback path preserved).
             if response.status_code >= 500 and on_transport_error == "raise":
                 # Defence-in-depth: the helper raises 5xx-with-raise
