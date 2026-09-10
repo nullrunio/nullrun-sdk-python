@@ -808,6 +808,7 @@ def _enforce_sensitive_tool(
     # ADR-008: prefer `on_transport_error` (raise classified
     from nullrun.breaker.exceptions import (
         NullRunBlockedException,
+        NullRunExecutionNotFoundError,  # DEF-NR-EX01-REWRAP-LOSS (2026-09-10): pass-through arm
         NullRunTransportError,
         TransportErrorSource,
     )
@@ -847,6 +848,19 @@ def _enforce_sensitive_tool(
             action_digest=action_digest_hex,
             tools=get_call_tools(),
         )
+    except NullRunExecutionNotFoundError:
+        # DEF-NR-EX01-REWRAP-LOSS (2026-09-10): pass-through arm.
+        # NullRunExecutionNotFoundError IS a NullRunTransportError
+        # (via NullRunBackendError -> NullRunTransportError), so the
+        # generic arm below would rewrap it as
+        # NullRunBlockedException(NR-B00X) and destroy the typed
+        # class + NR-EX01 catalog line. Cookbook code (and
+        # langgraph_openai_approval_demo.py) must be able to
+        # ``except NullRunExecutionNotFoundError`` for the
+        # documented regate_required=True recovery path. Re-raise
+        # BEFORE the NullRunBlockedException arm so the typed
+        # exception propagates unchanged.
+        raise
     except NullRunBlockedException:
         # Real policy-block decision from the gateway — propagate as-is.
         raise
