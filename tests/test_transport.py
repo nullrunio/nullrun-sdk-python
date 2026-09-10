@@ -1079,6 +1079,7 @@ import pytest
 
 from nullrun.breaker.exceptions import (
     NullRunAuthenticationError,
+    NullRunBackendError,
     NullRunTransportError,
     RateLimitError,
     TransportErrorSource,
@@ -1216,22 +1217,28 @@ def test_execute_200_with_cache_write():
 
 
 def test_execute_4xx_returns_block():
-    """4xx (no special handling) → block-dict, decision_source FALLBACK."""
+    """4xx (no special handling) → raises NullRunBackendError after
+    wire-envelope parse (def-nr-transport-catchfanin-gap closed the
+    pre-fix silent-fallback path that synthesised decision_source=
+    FALLBACK dicts and swallowed real wire-coded reasons).
+
+    The fake response body uses the legacy `{"error": ...}` slug
+    shape, which the parser treats as unrecognised envelope and
+    surfaces as NullRunBackendError."""
     t = _build_transport()
     fake_response = MagicMock()
     fake_response.status_code = 400
     fake_response.json.return_value = {"error": "bad_request"}
     t._client.post = MagicMock(return_value=fake_response)
 
-    result = t.execute(
-        organization_id="org-1",
-        execution_id="wf-1",
-        trace_id="t-1",
-        tool="safe.tool",
-        input_data={},
-    )
-    assert result["decision"] == "block"
-    assert "400" in result["explanation"]
+    with pytest.raises(NullRunBackendError):
+        t.execute(
+            organization_id="org-1",
+            execution_id="wf-1",
+            trace_id="t-1",
+            tool="safe.tool",
+            input_data={},
+        )
 
 
 def test_execute_breaker_error_with_raise():

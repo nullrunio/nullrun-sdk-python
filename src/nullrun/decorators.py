@@ -808,7 +808,11 @@ def _enforce_sensitive_tool(
     # ADR-008: prefer `on_transport_error` (raise classified
     from nullrun.breaker.exceptions import (
         NullRunBlockedException,
+        NullRunDecision,  # DEF-NR-TRANSPORT-CATCHFANIN-GAP (2026-09-10): umbrella arm
+        NullRunExecutionNotFoundError,  # DEF-NR-EX01-REWRAP-LOSS (2026-09-10): pass-through arm
+        NullRunInfrastructureError,  # DEF-NR-TRANSPORT-CATCHFANIN-GAP (2026-09-10): umbrella arm
         NullRunTransportError,
+        RateLimitError,  # DEF-NR-R001-REWRAP-LOSS (2026-09-10): pass-through arm
         TransportErrorSource,
     )
 
@@ -847,6 +851,43 @@ def _enforce_sensitive_tool(
             action_digest=action_digest_hex,
             tools=get_call_tools(),
         )
+    except NullRunExecutionNotFoundError:
+        # DEF-NR-EX01-REWRAP-LOSS (2026-09-10): pass-through arm.
+        # NullRunExecutionNotFoundError IS a NullRunTransportError
+        # (via NullRunBackendError -> NullRunTransportError), so the
+        # generic arm below would rewrap it as
+        # NullRunBlockedException(NR-B00X) and destroy the typed
+        # class + NR-EX01 catalog line. Cookbook code (and
+        # langgraph_openai_approval_demo.py) must be able to
+        # ``except NullRunExecutionNotFoundError`` for the
+        # documented regate_required=True recovery path. Re-raise
+        # BEFORE the NullRunBlockedException arm so the typed
+        # exception propagates unchanged.
+        raise
+    except RateLimitError:
+        # DEF-NR-R001-REWRAP-LOSS (2026-09-10): pass-through arm.
+        # RateLimitError IS a NullRunTransportError (its parent
+        # class) raised with source=GATEWAY_ERROR on a 429 wire
+        # response (RATE_LIMIT_EXCEEDED). Pre-fix the generic
+        # ``except NullRunTransportError as exc:`` arm below
+        # rewrote every TransportError as
+        # ``NullRunBlockedException(error_code="NR-B002",
+        # reason="policy engine unavailable: GATEWAY_ERROR")`` —
+        # losing ``exc.retry_after`` (gateway's Retry-After /
+        # ``retry_after_ms`` body field converted to seconds),
+        # ``exc.upgrade_url`` (plan-upgrade URL from 429 body),
+        # and ``exc.body`` (parsed 429 envelope). Cookbook code
+        # ``except RateLimitError`` would never match because the
+        # rewrap stripped the typed class. The user-facing
+        # catalog line also lost: NR-B002 says "Our service is
+        # temporarily unavailable. Please try again shortly."
+        # when the correct NR-R001 says "The NullRun backend
+        # rate-limited this API key. Wait ``retry_after`` seconds
+        # (or upgrade the plan) before retrying." Re-raise BEFORE
+        # the NullRunBlockedException arm so the typed exception
+        # propagates with error_code=NR-R001, retry_after,
+        # upgrade_url, and body intact.
+        raise
     except NullRunBlockedException:
         # Real policy-block decision from the gateway — propagate as-is.
         raise
@@ -894,6 +935,64 @@ def _enforce_sensitive_tool(
             extra={"transport_source": exc.source.value},
         )
         raise err from exc
+    except NullRunDecision:
+        # DEF-NR-A003-REWRAP-LOSS (2026-09-10, broader scope):
+        # umbrella pass-through for typed Decision subclasses that
+        # reach here without hitting NullRunBlockedException (this
+        # decorator's natural block path) or NullRunTransportError
+        # (the generic rewrap above). Specifically:
+        #   - NullRunChainError (NR-CH001) — chain lifetime /
+        #     cross-org / Execution Graph parent-lineage
+        #     rejections. Needs exc.chain_id,
+        #     exc.parent_execution_id, exc.backend_code preserved.
+        #   - NullRunWorkflowInactiveError (NR-W004) — soft-deleted
+        #     workflow. Needs exc.workflow_id preserved.
+        #   - NullRunConsumeOverbudgetError (NR-O001) — invariant
+        #     violation. Needs exc.execution_id,
+        #     exc.reserved_cents, exc.max_allowed_cents,
+        #     exc.actual_cost_cents preserved.
+        #   - WorkflowPausedException (NR-W003) — needs
+        #     exc.workflow_id, exc.reason, exc.resume_after.
+        # Pre-fix the catch-all rewrap below stamped error_code
+        # NR-B001 on these and discarded every first-class
+        # attribute, blocking the cookbook recovery path for
+        # each. Re-raise BEFORE the catch-all to preserve the
+        # typed instance.
+        raise
+    except NullRunInfrastructureError:
+        # DEF-NR-A003-REWRAP-LOSS (2026-09-10, broader scope):
+        # umbrella pass-through for typed Infrastructure
+        # subclasses that don't match NullRunBackendError,
+        # NullRunAuthenticationError, or NullRunTransportError
+        # above. Specifically:
+        #   - NullRunAuthError (NR-A003) — typed 401 envelope.
+        #     Needs exc.wire_code (API_KEY_REVOKED /
+        #     API_KEY_EXPIRED / API_KEY_DISABLED /
+        #     API_KEY_INVALID / API_KEY_MISSING /
+        #     API_KEY_MALFORMED per v3.38) preserved so ops
+        #     can branch on granular lifecycle state. The
+        #     transport fan-in (transport.py:1294) already
+        #     preserves this via NullRunAuthenticationError
+        #     pass-through, but a refactor that reorders the
+        #     transport arms would surface this here.
+        #   - NullRunProtocolError (NR-P001) — wire-protocol
+        #     mismatch. Needs the catalog line "Upgrade the SDK
+        #     to a version that supports protocol
+        #     X-NULLRUN-PROTOCOL: 4" to reach the cookbook.
+        #   - NullRunRateLimitRedisError (NR-R002) — Redis
+        #     outage for aggregate rate limit (fail-CLOSED).
+        #     Needs the catalog line that distinguishes "Redis
+        #     is down" from generic NR-B002.
+        #   - NullRunConfigError (NR-Cxxx) — malformed config,
+        #     typically surfaced by runtime.execute with bad
+        #     env. Never rewrap a config error as a transient
+        #     transport block — that's misleading.
+        # Pre-fix the catch-all stamped error_code NR-B001 on
+        # these and discarded wire_code (AuthError),
+        # protocol-version info (ProtocolError), and Redis
+        # source-of-failure (RateLimitRedisError). Re-raise
+        # BEFORE the catch-all.
+        raise
     except Exception as exc:  # noqa: BLE001
         # Any other exception is a transport / network / backend
         # failure. Re-raise as NullRunBlockedException so the caller

@@ -430,14 +430,14 @@ class TestV3ErrorEnvelopeMapping:
         exc = _parse_v3_error_envelope(resp, "check")
         assert isinstance(exc, NullRunBudgetError)
 
-    def test_redis_unavailable_maps_to_budget_error(self):
-        #: REDIS_UNAVAILABLE is fail-CLOSED → 402
-        resp = self._make_response(
-            402,
-            {"error_code": "REDIS_UNAVAILABLE", "error_message": "Redis down"},
-        )
-        exc = _parse_v3_error_envelope(resp, "check")
-        assert isinstance(exc, NullRunBudgetError)
+    # REMOVED 2026-09-10: ``test_redis_unavailable_maps_to_budget_error``
+    # — the legacy v2 ``REDIS_UNAVAILABLE`` slug is absent from the
+    # backend ``GateErrorCode::all()`` set and is never emitted on the
+    # wire. The corresponding SDK map entry in transport.py
+    # (``_V3_ERROR_CODE_MAP``) was removed in lockstep so cookbook
+    # mapping tables stay in sync with what the backend can actually
+    # send. BUDGET_REDIS_UNAVAILABLE / RATE_LIMIT_REDIS_UNAVAILABLE
+    # below are the post-v3.36 canonical codes and remain mapped.
 
     def test_chain_max_duration_maps_to_chain_error(self):
         resp = self._make_response(
@@ -599,7 +599,10 @@ class TestV3ErrorMapCatalog:
             "BUDGET_SOFT_BLOCKED",
             "BUDGET_OVERDRAFT_EXCEEDED",
             "BUDGET_PERIOD_NOT_STARTED",
-            "REDIS_UNAVAILABLE",
+            # REDIS_UNAVAILABLE removed 2026-09-10 — never emitted
+            # by the backend (absent from GateErrorCode::all()).
+            # Use BUDGET_REDIS_UNAVAILABLE / RATE_LIMIT_REDIS_UNAVAILABLE
+            # (canonical post-v3.36) instead.
             "CHAIN_MAX_DURATION_EXCEEDED",
             "CHAIN_CROSS_ORG",
             "CHAIN_ORG_MISMATCH",

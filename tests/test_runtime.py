@@ -193,6 +193,18 @@ class TestNullRunRuntimeExecute:
         # "Approval infrastructure unavailable: validation error during
         # approval row creation" as the generic NR-X001 — the very
         # bug the journal test surfaced).
+        #
+        # Post-fix (2026-09-10 batch, ``_V3_ERROR_CODE_MAP`` dispatch):
+        # ``APPROVAL_VALIDATION_FAILED`` is now in the typed catalog
+        # map (transport.py:2996) and resolves to
+        # ``NullRunApprovalDbUnavailableError`` (catalog code NR-A016).
+        # The catalog code (NOT the wire SCREAMING_SNAKE string) is
+        # the canonical ``format_user_message`` lookup key — see
+        # ``runtime._build_block_exception`` docstring. The wire code
+        # is preserved verbatim on ``exc.details["details"]["error_code"]``
+        # for routing/alerting.
+        from nullrun.breaker.exceptions import NullRunApprovalDbUnavailableError
+
         respx.post(f"{BASE_URL}/api/v1/execute").mock(
             return_value=httpx.Response(
                 200,
@@ -215,8 +227,11 @@ class TestNullRunRuntimeExecute:
         rt = make_runtime()
         with pytest.raises(NullRunBlockedException) as exc_info:
             rt.execute(tool_name="refund_customer", input_data={}, mode="strict")
-        # The wire code wins — no keyword guessing.
-        assert exc_info.value.error_code == "APPROVAL_VALIDATION_FAILED"
+        # Catalog typed class wins — not the keyword-guessing fallback.
+        assert isinstance(exc_info.value, NullRunApprovalDbUnavailableError)
+        # The catalog error_code (NR-A016) is canonical for
+        # format_user_message; the wire code stays in details.
+        assert exc_info.value.error_code == "NR-A016"
         # The structured payload is preserved on details so a caller
         # can introspect ``decision_source`` for routing/alerting.
         # ``NullRunBlockedException.__init__`` wraps ``**details`` so
@@ -224,9 +239,10 @@ class TestNullRunRuntimeExecute:
         wire_details = exc_info.value.details.get("details") or {}
         assert wire_details.get("error_code") == "APPROVAL_VALIDATION_FAILED"
         assert wire_details.get("decision_source") == "approval_create_failed"
-        # Back-compat shim: the legacy ``mapped_class`` field is still
-        # populated so any caller that branched on it pre-fix keeps working.
-        assert wire_details.get("mapped_class") == "NullRunBlockedException"
+        # Back-compat shim: the legacy ``mapped_class`` field exposes
+        # the typed catalog class name (NR-A016 / NullRunApprovalDbUnavailableError)
+        # so any caller that branched on it pre-fix keeps working.
+        assert wire_details.get("mapped_class") == "NullRunApprovalDbUnavailableError"
 
     @pytest.mark.skip(
         reason=(
@@ -703,17 +719,33 @@ def test_execute_auto_sensitive_routes_to_strict():
     assert call_args.kwargs["mode"] == "strict"
 
 
-def test_execute_auto_non_sensitive_routes_to_inline():
-    """Auto + non-sensitive tool → mode=inline → local short-circuit
-    so transport.execute is NOT called. Verify via the LOCAL decision_source.
+def test_execute_auto_non_sensitive_routes_to_strict():
+    """DEF-TS12-01 (2026-09-10): ``mode="auto"`` with a non-sensitive
+    tool now ALWAYS resolves to ``mode="strict"`` and contacts the
+    gateway.
+
+    Pre-fix this was a CRITICAL fail-OPEN: ``mode="auto"`` with a
+    non-sensitive tool silently switched to ``mode="inline"`` which
+    returned a synthetic local allow WITHOUT contacting the gateway.
+    Every operator-configured budget, rate-limit, and tool-block
+    policy was silently bypassed for non-sensitive tools. The
+    dashboard showed policies in effect; the SDK ignored them.
+
+    Post-fix the cloud-only invariant from CLAUDE.md §17 and
+    memory `cloud-only-invariant-sdk` holds: every call routes
+    through /execute when ``mode="auto"`` (the default). The
+    ``mode="inline"`` opt-in is preserved for callers who
+    explicitly want to skip /execute — see
+    ``test_execute_inline_mode_short_circuits_local`` below for
+    the explicit opt-in pin.
     """
     rt = _make_test_runtime()
     rt._transport.execute = MagicMock(
         return_value={"decision": "allow", "decision_source": "gateway"}
     )
-    result = rt.execute("safe.tool", {"x": 1})
-    assert result["decision_source"] == "local"
-    rt._transport.execute.assert_not_called()
+    rt.execute("safe.tool", {"x": 1})
+    rt._transport.execute.assert_called_once()
+    assert rt._transport.execute.call_args.kwargs["mode"] == "strict"
 
 
 def test_execute_auto_sensitive_calls_transport():

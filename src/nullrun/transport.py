@@ -28,8 +28,17 @@ from nullrun.breaker.circuit_breaker import CircuitBreaker
 from nullrun.breaker.exceptions import (
     BreakerTransportError,
     InsecureTransportError,
+    NullRunApprovalDbUnavailableError,
+    NullRunApprovalReplayRejectedError,
     NullRunAuthenticationError,
+    NullRunBackendError,
+    NullRunBlockedException,
+    NullRunDecision,
     NullRunExecutionNotFoundError,
+    NullRunInfrastructureError,
+    NullRunMcpApprovalRequiredError,
+    NullRunMcpDestructiveBlockedError,
+    NullRunMcpReadonlyBypassBlockedError,
     NullRunTransportError,
     RateLimitError,
     TransportErrorSource,
@@ -1222,7 +1231,151 @@ class Transport:
                 # 0.7.0 thin client: no local policy cache. The next
                 return data  # type: ignore[no-any-return]
             elif response.status_code >= 400:
-                # 4xx - don't retry, return block
+                # 4xx — don't retry.
+                #
+                # 2026-09-10 (NR-SDK-A015-SURFACE): before the fix,
+                # this branch dropped the wire envelope on the floor
+                # and synthesised a generic ``{"decision": "block",
+                # "explanation": "Gateway returned 409"}`` dict. That
+                # hid every wire-coded reason (`APPROVAL_REPLAY_REJECTED`,
+                # `APPROVAL_DENIED`, `BUDGET_HARD_BLOCKED`, etc.) behind
+                # a single string, so the runtime block dispatch fell
+                # through to ``NR-X001`` and `format_user_message`
+                # produced the catalogue fallback ("Something went
+                # wrong. Please try again.") instead of the typed
+                # `NR-A015` message. Cookbook callers had no way to
+                # branch on the precise cause.
+                #
+                # Post-fix: parse the envelope via the existing
+                # `_parse_v3_error_envelope` helper — it covers the
+                # v3 wire envelope for every /execute reject reason,
+                # including the six typed approval grant-consume
+                # outcomes (`APPROVAL_NOT_YET_APPROVED` →
+                # ``NullRunApprovalNotYetApprovedError`` (NR-A010),
+                # `APPROVAL_DENIED` → NR-A011,
+                # `APPROVAL_EXPIRED` → NR-A012,
+                # `APPROVAL_DIGEST_MISMATCH` → NR-A013,
+                # `APPROVAL_TOOL_DIGEST_MISMATCH` → NR-A014,
+                # `APPROVAL_REPLAY_REJECTED` → NR-A015 / ``
+                # NullRunApprovalReplayRejectedError``) — and raise
+                # the typed exception so the @protect /
+                # @sensitive / runtime.execute() exception arms
+                # propagate the right class up to the caller.
+                #
+                # Fall through to the synthetic block shape if the
+                # envelope is unrecognised (plaintext body, malformed
+                # JSON, unknown wire code) so behaviour stays
+                # backwards-compatible for legacy / non-v3 backends.
+                # `_parse_v3_error_envelope` always returns an
+                # Exception — it never silently swallows a 4xx.
+                try:
+                    raise _parse_v3_error_envelope(response, "execute")
+                except NullRunApprovalReplayRejectedError as exc:
+                    # The exact case the user reported: the operator
+                    # approved, the SDK polled /execute again, and
+                    # the backend's atomic consume_approved UPDATE
+                    # returned zero rows (replay race — UI approve
+                    # vs SDK re-check). Surface the typed exception
+                    # so `format_user_message` yields the NR-A015
+                    # catalogue line ("Your request couldn't be
+                    # completed because the approval has already
+                    # been used. Please start a new request.")
+                    # instead of the fallback.
+                    metrics.inc_transport("execute_block_replay_rejected")
+                    raise
+                except NullRunBlockedException as exc:
+                    # All other typed blocks from the dispatch —
+                    # budget, rate, tool, approval-deny, etc.
+                    # Re-raise for the @protect / runtime.execute
+                    # arms to handle.
+                    metrics.inc_transport("execute_block_typed")
+                    raise
+                except NullRunBackendError as exc:
+                    # 5xx-classified envelope parsed as a typed
+                    # backend error (shouldn't normally land here
+                    # because the helper maps 5xx to GATEWAY_ERROR
+                    # via NullRunTransportError, but stays
+                    # defensive). Re-raise.
+                    raise
+                except NullRunAuthenticationError as exc:
+                    # 401 envelope parsed as auth error — surface
+                    # directly so the caller can react.
+                    raise
+                except NullRunTransportError as exc:
+                    # Transport-classified (network, breaker) — not
+                    # a real 4xx, but helper may return one if the
+                    # envelope shape is ambiguous. Re-raise so the
+                    # on_transport_error arm sees it.
+                    raise
+                except NullRunDecision as exc:
+                    # DEF-NR-TRANSPORT-CATCHFANIN-GAP (2026-09-10):
+                    # umbrella pass-through for typed Decision
+                    # subclasses NOT in the NullRunBlockedException
+                    # MRO. Specifically:
+                    #   - NullRunChainError (NR-CH001) — chain
+                    #     lifetime / cross-org / Execution Graph
+                    #     parent-lineage rejections
+                    #   - NullRunWorkflowInactiveError (NR-W004) —
+                    #     soft-deleted workflow
+                    #   - NullRunConsumeOverbudgetError (NR-O001) —
+                    #     CONSUME > RESERVE + epsilon_cents invariant
+                    #   - WorkflowPausedException (NR-W003)
+                    # Pre-fix these fell through to `except
+                    # Exception: pass` below and got silently
+                    # swallowed into the synthetic block shape
+                    # (`{"decision": "block", "decision_source":
+                    # FALLBACK, "explanation": f"Gateway returned
+                    # {response.status_code}"}`) — losing
+                    # exc.chain_id / exc.parent_execution_id (Chain),
+                    # exc.workflow_id (WorkflowInactive),
+                    # exc.execution_id / exc.reserved_cents /
+                    # exc.actual_cost_cents / exc.epsilon_cents
+                    # (ConsumeOverbudget), and every typed
+                    # `error_code`/user-action. MUST come AFTER the
+                    # NullRunBlockedException arm above so the typed
+                    # approval / budget / tool-block path still
+                    # matches by MRO specificity.
+                    metrics.inc_transport("execute_block_decision_typed")
+                    raise
+                except NullRunInfrastructureError as exc:
+                    # DEF-NR-TRANSPORT-CATCHFANIN-GAP (2026-09-10):
+                    # umbrella pass-through for typed
+                    # Infrastructure subclasses NOT in the
+                    # NullRunBackendError / NullRunAuthenticationError /
+                    # NullRunTransportError MRO branches above.
+                    # Specifically:
+                    #   - NullRunProtocolError (NR-P001) —
+                    #     PROTOCOL_TOO_OLD / PROTOCOL_TOO_NEW /
+                    #     PROTOCOL_HEADER_INVALID /
+                    #     PROTOCOL_HEADER_REQUIRED
+                    #   - NullRunRateLimitRedisError (NR-R002) —
+                    #     RATE_LIMIT_REDIS_UNAVAILABLE
+                    #   - NullRunConfigError (NR-Cxxx) — when raised
+                    #     from a wire envelope (rare; mostly SDK-side)
+                    # NullRunAuthError (NR-A003) IS in the
+                    # NullRunAuthenticationError arm above (parent
+                    # class match), but listing here for completeness
+                    # preserves the documented recovery contract
+                    # even if a future refactor reorders the prior
+                    # arms.
+                    # Pre-fix these fell through to `except Exception:
+                    # pass` below — same synthetic-block loss as the
+                    # Decision path. MUST come AFTER the three
+                    # specific parent arms above (Backend, Auth,
+                    # Transport) so the wire-classified exceptions
+                    # still match by MRO specificity.
+                    metrics.inc_transport("execute_block_infra_typed")
+                    raise
+                except Exception:
+                    # Unrecognised envelope (plaintext body, legacy
+                    # slug, malformed JSON). Fall through to the
+                    # synthetic block shape so old / non-v3 backends
+                    # keep working and ``on_transport_error="raise"``
+                    # callers still see a usable dict. The retry
+                    # helper has already given up; emitting a typed
+                    # exception here would mask unknown wire codes
+                    # the user hasn't yet catalogued.
+                    pass
                 return {
                     "decision": "block",
                     "decision_source": DecisionSource.FALLBACK,
@@ -1416,9 +1569,58 @@ class Transport:
 
             if response.status_code == 200:
                 return response.json()  # type: ignore[no-any-return]
-            # 4xx always -> synthetic block (real gate decision,
-            # never retried by ``_retry_with_backoff``). 5xx after
-            # retry exhaustion -> synthetic block (legacy
+            # 4xx is a REAL gate decision — surface it through the
+            # existing block / throttle / soft_pass dispatch in
+            # runtime.check_workflow_budget (lines ~2089-2150).
+            # Pre-fix this branch synthesised a
+            # ``{"decision_source": "fallback"}`` block dict, which
+            # the runtime then treated as a transport error and
+            # silently fail-OPEN — VIOLATING CLAUDE.md §4
+            # fail-CLOSED invariant. Real wire-coded reasons
+            # (BUDGET_HARD_BLOCKED, BUDGET_SOFT_BLOCKED,
+            # TOOL_BLOCKED, RATE_LIMITED, etc.) were all dropped on
+            # the floor.
+            #
+            # 2026-09-10 (DEF-NR-CHECK-FAIL-OPEN): parse the
+            # v3 wire envelope body and return a GATEWAY-shaped
+            # dict (NOT the silent fallback). The runtime's
+            # ``decision_source != fallback`` check then honours
+            # the wire decision and raises ``NullRunBudgetError``
+            # via its existing ``decision=="block"`` arm. The
+            # wire ``error_code`` / ``explanation`` /
+            # ``policy_id`` / ``details`` are preserved so the
+            # catalogue formatter can produce an actionable message.
+            if 400 <= response.status_code < 500:
+                try:
+                    wire_body = response.json()
+                except Exception:
+                    wire_body = {}
+                explanations = wire_body.get("explanations") or []
+                if not explanations:
+                    single = (
+                        wire_body.get("explanation")
+                        or wire_body.get("error_message")
+                    )
+                    if single:
+                        explanations = [single]
+                if not explanations:
+                    explanations = [f"Gate endpoint returned {response.status_code}"]
+                return {
+                    "decision": "block",
+                    "decision_source": DecisionSource.GATEWAY,
+                    "explanation": explanations[0],
+                    "explanations": explanations,
+                    "reservation_id": wire_body.get("reservation_id"),
+                    "remaining_budget_cents": wire_body.get("remaining_budget_cents") or 0,
+                    "projected_cost_cents": wire_body.get("projected_cost_cents") or 0,
+                    "policy_id": wire_body.get("policy_id"),
+                    "policy_version": wire_body.get("policy_version"),
+                    "operation_id": wire_body.get("operation_id"),
+                    "details": wire_body.get("details") or {},
+                    "error_code": wire_body.get("error_code"),
+                    "status_code": response.status_code,
+                }
+            # 5xx after retry exhaustion -> synthetic block (legacy
             # fallback path preserved).
             if response.status_code >= 500 and on_transport_error == "raise":
                 # Defence-in-depth: the helper raises 5xx-with-raise
@@ -2364,7 +2566,13 @@ def _safe_json(response: httpx.Response, endpoint: str) -> Any:
             f"(status={response.status_code}): {type(exc).__name__}",
             source=TransportErrorSource.GATEWAY_ERROR,
             endpoint=endpoint,
-            error_code="NR-T001",
+            # NR-T001 collides with NullRunToolBlockedError's
+            # canonical code (breaker/exceptions.py:955); using
+            # NR-T-PARSE here so a cookbook handler that branches
+            # on `exc.error_code == "NR-T001"` does not mis-classify
+            # a JSON parse failure as a tool block. See
+            # tests/test_2026_08_11_fixes.py for the pin.
+            error_code="NR-T-PARSE",
         ) from exc
 
 
@@ -2398,12 +2606,16 @@ def _parse_v3_error_envelope(
         NullRunApprovalToolDigestMismatchError,
         NullRunAuthError,
         NullRunBackendError,
+        NullRunBlockedException,
         NullRunBudgetError,
         NullRunBudgetRecheckFailedError,
         NullRunChainError,
         NullRunConsumeOverbudgetError,
+        NullRunDecision,
+        NullRunInfrastructureError,
         NullRunProtocolError,
         NullRunRateLimitRedisError,
+        NullRunToolBlockedError,
         NullRunWorkflowInactiveError,
         RateLimitError,
     )
@@ -2628,6 +2840,36 @@ def _parse_v3_error_envelope(
         # as BaseException (the helper declares -> Exception).
         allowed = {"error_code", "user_action", "retryable", "docs_url", "cause"}
         forwarded = {k: v for k, v in details.items() if k in allowed}
+        if (
+            catalog is NullRunToolBlockedError
+            or catalog is NullRunBlockedException
+        ):
+            # DEF-NR-TOOLBLOCKED-PARSER (2026-09-10): NullRunBlockedException
+            # subclasses require positional ``workflow_id`` + ``reason``
+            # (no defaults), so the generic ``catalog(full_message, ...)``
+            # fallback below raises TypeError when given a string for
+            # ``workflow_id``. Affects 7 catalog entries: TOOL_BLOCKED,
+            # LOOP_DETECTED, MODEL_REQUIRED, POLICY_UNCONFIGURED,
+            # TOO_MANY_PENDING_APPROVALS, BUSINESS_IMPACT_INVALID,
+            # VALIDATION_FAILED. Pre-fix the TypeError escaped the parser
+            # and got swallowed by the catch-all ``except Exception: pass``
+            # in Transport.execute, surfacing the synthetic-block dict
+            # ``{"decision": "block", "explanation": "Gateway returned
+            # 403"}`` instead of the typed NR-T001 / NR-Lxxx catalog line.
+            # ``tool_name`` is forwarded for NullRunToolBlockedError
+            # (the only BlockedException subclass that surfaces it on the
+            # wire envelope); the parent constructor drops it for plain
+            # NullRunBlockedException so it's a no-op there. ``forwarded``
+            # (error_code / user_action / retryable / docs_url / cause) is
+            # passed through so the catalog value's defaults win.
+            instance = catalog(  # type: ignore[call-arg]
+                workflow_id=str(details.get("workflow_id") or "unknown"),
+                reason=full_message,
+                status_code=status,
+                tool_name=details.get("tool_name"),
+                **forwarded,
+            )
+            return cast(Exception, instance)
         instance = catalog(full_message, **forwarded)  # type: ignore[call-arg]
         return cast(Exception, instance)
 
@@ -2704,7 +2946,13 @@ def _build_v3_error_code_map() -> dict[str, type[Exception]]:
         "BUDGET_SOFT_BLOCKED": NullRunBudgetError,
         "BUDGET_OVERDRAFT_EXCEEDED": NullRunBudgetError,
         "BUDGET_PERIOD_NOT_STARTED": NullRunBudgetError,
-        "REDIS_UNAVAILABLE": NullRunBudgetError,
+        # Note: BUDGET_REDIS_UNAVAILABLE and RATE_LIMIT_REDIS_UNAVAILABLE
+        # below are the canonical redis-down codes (post-v3.36 rename);
+        # the legacy ``REDIS_UNAVAILABLE`` slug was removed 2026-09-10
+        # because the backend never emits it (it is absent from
+        # ``GateErrorCode::all()`` in error_codes.rs). A cookbook that
+        # extends this map with the legacy slug risks silently matching
+        # nothing, so the slot stays unoccupied by design.
         # 402 — chain family (separate class for diagnostic clarity)
         "CHAIN_MAX_DURATION_EXCEEDED": NullRunChainError,
         # 403 — chain security + workflow state
@@ -2737,12 +2985,18 @@ def _build_v3_error_code_map() -> dict[str, type[Exception]]:
         "RATE_LIMIT_REDIS_UNAVAILABLE": NullRunRateLimitRedisError,
         "BUDGET_DATA_UNAVAILABLE": NullRunBackendError,
         # 402 — approval-create failure family (DEF-ARFLOW-TOOLNAME-01,
-        "APPROVAL_DB_UNAVAILABLE": NullRunBlockedException,
-        "APPROVAL_PERSISTENCE_FAILED": NullRunBlockedException,
-        "APPROVAL_VALIDATION_FAILED": NullRunBlockedException,
-        "APPROVAL_CONFLICT": NullRunBlockedException,
-        "APPROVAL_NOT_FOUND": NullRunBlockedException,
-        "APPROVAL_CREATE_FAILED": NullRunBlockedException,
+        # B.1 symmetry fix 2026-09-10): six sibling codes all map to
+        # the typed ``NullRunApprovalDbUnavailableError`` (NR-A016) so
+        # cookbook code can branch on the typed class instead of
+        # falling through to the base NullRunBlockedException. Pre-B.1
+        # all six collapsed to the base class — operators couldn't tell
+        # apart a transient DB outage from a validation failure.
+        "APPROVAL_DB_UNAVAILABLE": NullRunApprovalDbUnavailableError,
+        "APPROVAL_PERSISTENCE_FAILED": NullRunApprovalDbUnavailableError,
+        "APPROVAL_VALIDATION_FAILED": NullRunApprovalDbUnavailableError,
+        "APPROVAL_CONFLICT": NullRunApprovalDbUnavailableError,
+        "APPROVAL_NOT_FOUND": NullRunApprovalDbUnavailableError,
+        "APPROVAL_CREATE_FAILED": NullRunApprovalDbUnavailableError,
         # 403 — approval grant-consume outcomes (v3.53 / 2026-08-13
         # audit, A-1+A-2 bundle). Distinct from the /gate
         # create-failure family above: these are the seven
@@ -2813,6 +3067,19 @@ def _build_v3_error_code_map() -> dict[str, type[Exception]]:
         "TOO_MANY_PENDING_APPROVALS": NullRunBlockedException,
         "BUSINESS_IMPACT_INVALID": NullRunBlockedException,
         "VALIDATION_FAILED": NullRunBlockedException,
+        # ── MCP umbrella codes (ADR-013, 2026-08-14, frozen-dormant)
+        # B.1 (2026-09-10): the three umbrella codes map to typed
+        # ``NullRunMcp*Error`` subclasses so cookbook code can branch
+        # on the precise umbrella path. Pre-B.1 these collapsed to
+        # the generic NullRunBlockedException / NR-X001 fallback —
+        # operators couldn't distinguish the destructive-MCP block
+        # from the readonly-bypass block from the approval-required
+        # path. ADR-013 marked the umbrella frozen-dormant: wire
+        # codes are reserved and the SDK must round-trip them, but
+        # the underlying mechanisms aren't wired in production yet.
+        "MCP_DESTRUCTIVE_BLOCKED": NullRunMcpDestructiveBlockedError,
+        "MCP_READONLY_BYPASS_BLOCKED": NullRunMcpReadonlyBypassBlockedError,
+        "MCP_APPROVAL_REQUIRED": NullRunMcpApprovalRequiredError,
         # Wire-level parsing failures (missing / malformed fields).
         # Map to ``NullRunBackendError`` because the SDK treats them
         # as infrastructure-side issues — the server should have

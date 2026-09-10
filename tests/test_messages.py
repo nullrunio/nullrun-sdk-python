@@ -31,16 +31,39 @@ _EXPECTED_CODES = {
     "NR-0000",
     "NR-A001",
     "NR-A003",
+    "NR-A010",
+    "NR-A011",
+    "NR-A012",
+    "NR-A013",
+    "NR-A014",
+    "NR-A015",
+    "NR-A016",  # B.1 (2026-09-10): APPROVAL_DB_* sibling family
     "NR-B001",
     "NR-B002",
-    "NR-B005",
-    "NR-R001",
-    "NR-C000",
-    "NR-X001",
     "NR-B004",
+    "NR-B005",
+    "NR-B006",
+    # NR-B007 removed 2026-09-10: NullRunBudgetThrottleError was a
+    # zombie class never raised on a wire or runtime path
+    # (runtime.py:2116 raises WorkflowPausedException on
+    # decision=="throttle"). Catalog entry + exception class removed
+    # to keep messages in sync with the exception module.
+    "NR-CH001",
+    "NR-C000",
+    "NR-EX01",
+    "NR-L001",
+    "NR-MCP01",  # B.1 (2026-09-10): MCP umbrella destructive
+    "NR-MCP02",  # B.1 (2026-09-10): MCP umbrella readonly bypass
+    "NR-MCP03",  # B.1 (2026-09-10): MCP umbrella approval required
+    "NR-O001",
+    "NR-P001",
+    "NR-R001",
+    "NR-R002",
     "NR-T001",
     "NR-W002",
     "NR-W003",
+    "NR-W004",
+    "NR-X001",
 }
 
 
@@ -159,6 +182,56 @@ def test_format_user_message_handles_workflow_paused():
     assert out == messages.DEFAULT_MESSAGES["NR-W003"]
 
 
+def test_format_user_message_handles_approval_expired():
+    """NR-A012 catalog entry (added 2026-09-08 to close the silent
+    state-flip audit gap). Pre-fix, ``NullRunApprovalExpiredError``
+    raised but the catalog was missing NR-A012, so
+    ``format_user_message`` fell through to
+    ``FALLBACK_MESSAGE = "Something went wrong. Please try again."`` —
+    exactly what ``langgraph_openai_approval_demo.py`` printed.
+
+    This test pins the catalog entry so a future refactor that
+    removes NR-A012 from ``DEFAULT_MESSAGES`` re-introduces the
+    demo's user-visible bug.
+    """
+    expired = exc.NullRunApprovalExpiredError(
+        workflow_id="wf-1",
+        reason="WS push silent past approval_timeout_seconds",
+        approval_id="appr-1",
+        timeout_seconds=5.0,
+        local_timeout=True,
+    )
+    assert expired.error_code == "NR-A012"
+    out = messages.format_user_message(expired)
+    assert out == messages.DEFAULT_MESSAGES["NR-A012"]
+    assert out != messages.FALLBACK_MESSAGE
+    # Tone rule: imperative when there's something to do.
+    assert "try again" in out.lower()
+
+
+def test_format_user_message_handles_approval_expired_local_timeout_path():
+    """Both raise paths for ``NullRunApprovalExpiredError`` (wire path
+    + local-timeout path) must resolve to NR-A012. Cookbook code that
+    catches the exception regardless of origin needs a consistent
+    user-facing message."""
+    wire = exc.NullRunApprovalExpiredError(
+        workflow_id="wf-1",
+        reason="APPROVAL_EXPIRED",
+        approval_id="appr-1",
+        timeout_seconds=None,
+        local_timeout=False,
+    )
+    local = exc.NullRunApprovalExpiredError(
+        workflow_id="wf-1",
+        reason="WS push silent past approval_timeout_seconds",
+        approval_id="appr-1",
+        timeout_seconds=5.0,
+        local_timeout=True,
+    )
+    assert messages.format_user_message(wire) == messages.DEFAULT_MESSAGES["NR-A012"]
+    assert messages.format_user_message(local) == messages.DEFAULT_MESSAGES["NR-A012"]
+
+
 def test_format_user_message_handles_workflow_killed_baseexception():
     """``WorkflowKilledInterrupt`` is a BaseException subclass. The
     formatter must still resolve it via the inherited ``error_code``
@@ -168,6 +241,145 @@ def test_format_user_message_handles_workflow_killed_baseexception():
     # NB: the formatter does NOT catch BaseException — caller's job.
     out = messages.format_user_message(killed)
     assert out == messages.DEFAULT_MESSAGES["NR-W002"]
+
+
+# ---------------------------------------------------------------------------
+# Edge-case catalog coverage (added 2026-09-09 alongside NR-A012 fix)
+# ---------------------------------------------------------------------------
+# Each test below pins a specific NR-XXXX code so a future refactor that
+# silently removes the catalog entry re-introduces the user-visible
+# "Something went wrong. Please try again." fallback bug. Pre-fix these
+# exceptions raised but their codes had no DEFAULT_MESSAGES entry; the
+# formatter silently fell through to FALLBACK_MESSAGE.
+def test_format_user_message_handles_approval_pending():
+    """NR-A010: approval pending. Distinct from NR-A012 (expired); the
+    actionable verb is ``wait`` not ``try again``."""
+    pending = exc.NullRunApprovalNotYetApprovedError(
+        workflow_id="wf-1", reason="APPROVAL_NOT_YET_APPROVED", approval_id="appr-1"
+    )
+    assert pending.error_code == "NR-A010"
+    out = messages.format_user_message(pending)
+    assert out == messages.DEFAULT_MESSAGES["NR-A010"]
+    assert out != messages.FALLBACK_MESSAGE
+
+
+def test_format_user_message_handles_approval_denied():
+    """NR-A011: operator denied. Terminal — same approval_id cannot be
+    re-used. Wording must NOT say 'try again' alone (cookbook pattern
+    requires a fresh approval_id)."""
+    denied = exc.NullRunApprovalDeniedError(
+        workflow_id="wf-1", reason="APPROVAL_DENIED", approval_id="appr-1"
+    )
+    assert denied.error_code == "NR-A011"
+    out = messages.format_user_message(denied)
+    assert out == messages.DEFAULT_MESSAGES["NR-A011"]
+    assert out != messages.FALLBACK_MESSAGE
+
+
+def test_format_user_message_handles_approval_digest_mismatch_action():
+    """NR-A013: business-impact digest mismatch (different action
+    approved than the one bound to this execution)."""
+    mismatch = exc.NullRunApprovalDigestMismatchError(
+        workflow_id="wf-1", reason="APPROVAL_DIGEST_MISMATCH"
+    )
+    assert mismatch.error_code == "NR-A013"
+    out = messages.format_user_message(mismatch)
+    assert out == messages.DEFAULT_MESSAGES["NR-A013"]
+
+
+def test_format_user_message_handles_approval_digest_mismatch_tool():
+    """NR-A014: tool capability digest mismatch (MCP tools/list
+    refreshed between /gate and /execute)."""
+    mismatch = exc.NullRunApprovalToolDigestMismatchError(
+        workflow_id="wf-1", reason="APPROVAL_TOOL_DIGEST_MISMATCH"
+    )
+    assert mismatch.error_code == "NR-A014"
+    out = messages.format_user_message(mismatch)
+    assert out == messages.DEFAULT_MESSAGES["NR-A014"]
+
+
+def test_format_user_message_handles_approval_replay_rejected():
+    """NR-A015: approval grant already consumed. Replay/retry-loop
+    signal — NOT transient; the same approval_id will never succeed
+    twice."""
+    replay = exc.NullRunApprovalReplayRejectedError(
+        workflow_id="wf-1", reason="APPROVAL_REPLAY_REJECTED", approval_id="appr-1"
+    )
+    assert replay.error_code == "NR-A015"
+    out = messages.format_user_message(replay)
+    assert out == messages.DEFAULT_MESSAGES["NR-A015"]
+
+
+def test_format_user_message_handles_workflow_inactive():
+    """NR-W004: workflow soft-deleted / killed on the server. Distinct
+    from NR-W002 (BaseException kill path that bypasses handle()) and
+    NR-W003 (pause / cooldown). End-user copy is similar to NR-W002
+    because the user-visible outcome is the same."""
+    inactive = exc.NullRunWorkflowInactiveError(
+        "workflow soft-deleted", workflow_id="wf-1"
+    )
+    assert inactive.error_code == "NR-W004"
+    out = messages.format_user_message(inactive)
+    assert out == messages.DEFAULT_MESSAGES["NR-W004"]
+    assert out != messages.FALLBACK_MESSAGE
+
+
+def test_format_user_message_handles_budget_recheck_failed():
+    """NR-B006: post-approval budget re-check race — another execution
+    spent the budget between /gate and /execute. Retryable."""
+    race = exc.NullRunBudgetRecheckFailedError(
+        "BUDGET_RECHECK_FAILED",
+        current_spend_cents=500,
+        budget_cents=400,
+    )
+    assert race.error_code == "NR-B006"
+    out = messages.format_user_message(race)
+    assert out == messages.DEFAULT_MESSAGES["NR-B006"]
+
+
+def test_format_user_message_handles_consume_overbudget():
+    """NR-O001: consume > reserve + ε tolerance (ADR-005 invariant;
+    SDK rejects rather than silently re-reserving)."""
+    overbudget = exc.NullRunConsumeOverbudgetError(
+        "CONSUME_OVERBUDGET",
+        execution_id="exec-1",
+        reserved_cents=100,
+        max_allowed_cents=101,
+        actual_cost_cents=150,
+    )
+    assert overbudget.error_code == "NR-O001"
+    out = messages.format_user_message(overbudget)
+    assert out == messages.DEFAULT_MESSAGES["NR-O001"]
+
+
+def test_format_user_message_handles_protocol_error():
+    """NR-P001: wire-protocol version below backend minimum. End-user
+    action is 'contact support' (host code needs an SDK upgrade)."""
+    proto = exc.NullRunProtocolError("protocol mismatch")
+    assert proto.error_code == "NR-P001"
+    out = messages.format_user_message(proto)
+    assert out == messages.DEFAULT_MESSAGES["NR-P001"]
+
+
+def test_format_user_message_handles_chain_error():
+    """NR-CH001: chain context invalid (unknown chain_id, wrong org, or
+    exceeded max_duration). End-user must start a fresh conversation."""
+    chain = exc.NullRunChainError("CHAIN_NOT_FOUND", chain_id="chain-1")
+    assert chain.error_code == "NR-CH001"
+    out = messages.format_user_message(chain)
+    assert out == messages.DEFAULT_MESSAGES["NR-CH001"]
+
+
+def test_format_user_message_handles_rate_limit_redis_error():
+    """NR-R002: rate-limit Redis unreachable. Fail-CLOSED — distinct
+    from NR-R001 (per-workflow soft rate limit hit). User-facing copy
+    mirrors NR-B001 / NR-B002 because the operator-side fix is the
+    same (restore Redis) and the user-facing difference between 'rate
+    limit hit' and 'rate limit Redis down' is operator-internal."""
+    rl = exc.NullRunRateLimitRedisError("redis down")
+    assert rl.error_code == "NR-R002"
+    out = messages.format_user_message(rl)
+    assert out == messages.DEFAULT_MESSAGES["NR-R002"]
 
 
 def test_format_user_message_falls_back_for_object_without_error_code():

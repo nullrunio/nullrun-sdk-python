@@ -86,6 +86,108 @@ DEFAULT_MESSAGES: dict[str, str] = {
     # defence for the case where the host code catches too broadly.
     "NR-A001": "There's a configuration issue. Please contact support.",
     "NR-A003": "There's a configuration issue. Please contact support.",
+    # ---- Approval lifecycle (operator decision flow) -------------------------
+    # NR-A010: approval pending — operator has not yet decided. Cookbook
+    # contract: do NOT surface this as terminal. The ``@protect`` wrapper
+    # blocks via WS push until the operator resolves; if the wrapper
+    # surfaces it as an exception it means the host code chose to raise
+    # rather than wait. User-facing copy is "wait" (the only actionable
+    # verb) without leaking the WS / approval_id wire details.
+    "NR-A010": "Your request is awaiting approval. Please wait a moment while it's being reviewed.",
+    # NR-A011: operator denied. Terminal — re-running with the same
+    # approval_id fails again. Tell the user the request was not
+    # approved (without quoting operator-side rationale, which may
+    # include internal context) and invite them to submit a revised
+    # request.
+    "NR-A011": "Your request was not approved. Please review and submit a new request if you'd like to try again.",
+    # NR-A012: approval grant expired. Two raise paths (see
+    # ``NullRunApprovalExpiredError`` docstring):
+    #   1. Wire path — backend closed the grant because operator's
+    #      ``expires_at`` elapsed between /gate and /execute.
+    #   2. Client-side timeout path — WS push went silent for
+    #      ``approval_timeout_seconds`` without an operator decision.
+    # Cookbook pattern: do NOT retry the same approval_id; request a
+    # fresh row and re-/gate. Pre-fix (2026-09-08), the catalog was
+    # missing NR-A012 entirely, so ``format_user_message`` fell
+    # through to ``FALLBACK_MESSAGE = "Something went wrong. Please
+    # try again."`` — exactly what
+    # ``langgraph_openai_approval_demo.py`` printed, hiding the
+    # actionable detail. The wording below mirrors the tone rules
+    # (imperative when there's something to do) and tells the user
+    # *what to do next* (try again with a fresh approval), not just
+    # *what happened*.
+    "NR-A012": "This request was not approved in time and has expired. Please try again — the operator will be notified.",
+    # NR-A013: business-impact digest mismatch. The operator approved a
+    # different action (different amount, different target) than the one
+    # currently bound to the execution. User must re-request approval
+    # with the intended impact — the existing grant cannot be re-used.
+    "NR-A013": "Your request couldn't be completed because the approval was for a different action. Please request a new approval and try again.",
+    # NR-A014: tool capability digest mismatch. The operator approved a
+    # different tool capability surface than the one currently bound
+    # (e.g. MCP tools/list refreshed between /gate and /execute). User
+    # must re-/gate with the current capability surface.
+    "NR-A014": "Your request couldn't be completed because the available tools have changed. Please refresh and try again.",
+    # NR-A015: approval grant already consumed by a prior /execute
+    # call — replay / retry-loop signal. NOT a transient failure; the
+    # same approval_id will never succeed twice. Inspect retry logic.
+    "NR-A015": "Your request couldn't be completed because the approval has already been used. Please start a new request.",
+    # ---- Workflow lifecycle (server-side state) ------------------------------
+    # NR-W004: workflow soft-deleted or killed on the server. Distinct
+    # from NR-W002 (BaseException path that bypasses ``nullrun.handle``)
+    # and NR-W003 (pause / cooldown). End users see this only after an
+    # operator terminated their session from the dashboard; the wording
+    # is similar to NR-W002 because the user-visible outcome is the
+    # same ("this service is unavailable to you").
+    "NR-W004": "This service is no longer available. Please contact support if you believe this was a mistake.",
+    # ---- Budget sub-cases (NR-B004 is the parent hard block) -----------------
+    # NR-B006: post-approval budget re-check failed. Another execution
+    # spent the budget between /gate and /execute. User should retry —
+    # the next /gate will mint a fresh reservation against the current
+    # available budget.
+    "NR-B006": "Your request couldn't be completed because the available capacity changed. Please try again.",
+    # NR-B007: removed 2026-09-10. NullRunBudgetThrottleError was a
+    # zombie class — never raised on a wire or runtime path
+    # (runtime.py:2116 raises WorkflowPausedException on
+    # decision=="throttle"). Catalog entry removed to keep
+    # messages in sync with the exception module.
+    # "NR-B007": "...",
+    # NR-O001: consume > reserve + ε tolerance. ADR-005 invariant;
+    # the SDK rejects rather than silently re-reserving. User-facing
+    # copy is generic because the cause is operator-side accounting;
+    # user should retry (a fresh /gate will recompute the reservation).
+    "NR-O001": "Your request couldn't be completed due to a usage accounting discrepancy. Please try again.",
+    # ── B.1 (2026-09-10): MCP umbrella + APPROVAL_DB typed arms.
+    # Three MCP umbrella codes (ADR-013, frozen-dormant) and the
+    # single NR-A016 typed class for the six APPROVAL_DB_* sibling
+    # codes. NR-A016 wording is intentionally close to the generic
+    # "transient service outage" cluster — the cookbook recipe for
+    # the typed class branches on retryable vs terminal, not on
+    # the specific DB cause (operators don't care whether it was a
+    # validation failure or a Postgres connection drop; both are
+    # "retry shortly, contact support if persistent").
+    "NR-MCP01": "That action isn't available right now. Please contact support if you need it.",
+    "NR-MCP02": "That action isn't available right now. Please contact support if you need it.",
+    "NR-MCP03": "Your request is awaiting approval. Please wait a moment while it's being reviewed.",
+    "NR-A016": "Your request couldn't be completed. Please try again shortly.",
+    # ---- Wire / protocol ----------------------------------------------------
+    # NR-P001: SDK wire-protocol version is below the backend's
+    # ``X-NULLRUN-PROTOCOL:`` minimum. End-user action is "contact
+    # support" — the host code needs an SDK upgrade, which only the
+    # operator / developer can perform.
+    "NR-P001": "This service needs an update. Please contact support.",
+    # ---- Chain (multi-leg conversation state) -------------------------------
+    # NR-CH001: chain context invalid — chain_id is unknown, belongs to
+    # a different org, or exceeded max_duration. End-user outcome is
+    # "start a new conversation"; the chain handle cannot be revived.
+    "NR-CH001": "Your session was interrupted. Please start a new conversation.",
+    # ---- Rate limit (NR-R001 is the per-workflow soft limit) ---------------
+    # NR-R002: rate-limit Redis unreachable. Fail-CLOSED — the request
+    # is rejected because the rate limit is authoritative, not a soft
+    # advisory. End-user copy mirrors NR-B001 / NR-B002 (transient
+    # service outage) because the operator's fix is the same (restore
+    # Redis); the user-facing difference between "rate limit hit" and
+    # "rate limit Redis down" is operator-internal.
+    "NR-R002": "Our service is temporarily unavailable. Please try again shortly.",
     "NR-C000": "There's a configuration issue. Please contact support.",
     "NR-C001": "There's a configuration issue. Please contact support.",
     "NR-C004": "There's a configuration issue. Please contact support.",
