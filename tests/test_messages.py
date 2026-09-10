@@ -37,6 +37,7 @@ _EXPECTED_CODES = {
     "NR-A013",
     "NR-A014",
     "NR-A015",
+    "NR-A016",  # B.1 (2026-09-10): APPROVAL_DB_* sibling family
     "NR-B001",
     "NR-B002",
     "NR-B004",
@@ -51,6 +52,9 @@ _EXPECTED_CODES = {
     "NR-C000",
     "NR-EX01",
     "NR-L001",
+    "NR-MCP01",  # B.1 (2026-09-10): MCP umbrella destructive
+    "NR-MCP02",  # B.1 (2026-09-10): MCP umbrella readonly bypass
+    "NR-MCP03",  # B.1 (2026-09-10): MCP umbrella approval required
     "NR-O001",
     "NR-P001",
     "NR-R001",

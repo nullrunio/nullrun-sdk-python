@@ -500,6 +500,18 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     # base-interrupt form (mro-aware dispatch). The class lives at
     # breaker/exceptions.py:1459.
     "NullRunWorkflowKilledError": ("nullrun.breaker.exceptions", "NullRunWorkflowKilledError"),
+    # ── B.1 (2026-09-10): MCP umbrella + APPROVAL_DB symmetry.
+    # Four typed exception classes that round-trip the MCP umbrella
+    # codes (ADR-013, frozen-dormant) and the six APPROVAL_DB_*
+    # sibling codes (DEF-ARFLOW-TOOLNAME-01). Pre-B.1 these all
+    # collapsed to NullRunBlockedException + the generic NR-X001
+    # fallback — cookbook code couldn't branch on the typed arm.
+    # Post-B.1 each maps to its own typed class so
+    # ``except NullRunMcpDestructiveBlockedError:`` etc. work.
+    "NullRunMcpDestructiveBlockedError": ("nullrun.breaker.exceptions", "NullRunMcpDestructiveBlockedError"),
+    "NullRunMcpReadonlyBypassBlockedError": ("nullrun.breaker.exceptions", "NullRunMcpReadonlyBypassBlockedError"),
+    "NullRunMcpApprovalRequiredError": ("nullrun.breaker.exceptions", "NullRunMcpApprovalRequiredError"),
+    "NullRunApprovalDbUnavailableError": ("nullrun.breaker.exceptions", "NullRunApprovalDbUnavailableError"),
     # User-facing message catalog (NULLRUN owns the wording; see
     # nullrun/messages.py for the design rationale). Eager in
     # spirit — these are the "give the user a chance" surface that
@@ -613,6 +625,14 @@ __all__ = [
     "NullRunToolBlockedError",
     "WorkflowKilledInterrupt",
     "NullRunWorkflowKilledError",
+    # B.1 (2026-09-10): MCP umbrella + APPROVAL_DB symmetry. The
+    # four typed exception classes are part of the curated public
+    # surface — cookbook code branches on them by name, so they
+    # need to be visible in ``dir(nullrun)`` for tab-completion.
+    "NullRunMcpDestructiveBlockedError",
+    "NullRunMcpReadonlyBypassBlockedError",
+    "NullRunMcpApprovalRequiredError",
+    "NullRunApprovalDbUnavailableError",
     # User-facing message catalog — the single entry point for
     # turning an SDK exception into a string safe to display to
     # end users. ``set_user_message`` lets a deployment brand its

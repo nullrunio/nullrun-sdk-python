@@ -1220,6 +1220,107 @@ class NullRunApprovalToolDigestMismatchError(NullRunBlockedException):
     retryable = False
 
 
+# ────────────────────────────────────────────────────────────────────────
+# MCP umbrella codes (ADR-013, 2026-08-14, frozen-dormant per Phase B.1)
+#
+# Pre-B.1 these three wire codes (``MCP_DESTRUCTIVE_BLOCKED``,
+# ``MCP_READONLY_BYPASS_BLOCKED``, ``MCP_APPROVAL_REQUIRED``) all
+# mapped to the base ``NullRunBlockedException`` in
+# ``transport.py:_V3_ERROR_CODE_MAP`` — every cookbook handler that
+# tried to branch on the typed MCP outcome silently fell through to
+# the generic arm. The post-B.1 fix introduces three typed exception
+# subclasses so cookbook code can ``except NullRunMcpDestructiveBlockedError:``
+# (etc.) and surface the right user_action verb.
+#
+# ADR-013 (2026-08-14) marks the umbrella as **frozen-dormant** —
+# the underlying ``mcp_destructive_policy`` / ``mcp_readonly_bypass``
+# mechanisms are not currently wired in production but the wire codes
+# are reserved and the SDK must round-trip them so a future enablement
+# doesn't require SDK-side migration.
+# ────────────────────────────────────────────────────────────────────────
+
+
+class NullRunMcpDestructiveBlockedError(NullRunBlockedException):
+    """Destructive MCP tool blocked by the mcp_destructive_policy umbrella.
+
+    Wire code ``MCP_DESTRUCTIVE_BLOCKED`` (HTTP 403). ADR-013 — the
+    SDK maps it to a typed class so cookbook code can distinguish
+    destructive-MCP blocks from the generic block fallback (NR-X001)
+    or from the read-only bypass path (different operator-side
+    fix path).
+    """
+
+    error_code = "NR-MCP01"
+    user_action = (
+        "The MCP tool's destructive capability is blocked by the "
+        "mcp_destructive_policy umbrella. Either remove the "
+        "destructive flag from the tool declaration or update the "
+        "workflow's policy to allow this destructive capability."
+    )
+    retryable = False
+
+
+class NullRunMcpReadonlyBypassBlockedError(NullRunBlockedException):
+    """Read-only MCP tool blocked because the bypass path is closed.
+
+    Wire code ``MCP_READONLY_BYPASS_BLOCKED`` (HTTP 403). ADR-013 —
+    the SDK maps it to a typed class so cookbook code can distinguish
+    the readonly-bypass block (where the operator's intent was to
+    avoid destructive checks but the umbrella closed that path)
+    from the generic block fallback.
+    """
+
+    error_code = "NR-MCP02"
+    user_action = (
+        "The MCP tool's read-only bypass path is blocked by the "
+        "mcp_readonly_bypass policy umbrella. The tool must go "
+        "through full destructive-MCP evaluation."
+    )
+    retryable = False
+
+
+class NullRunMcpApprovalRequiredError(NullRunBlockedException):
+    """MCP tool requires operator approval (NR-A010 equivalent for MCP).
+
+    Wire code ``MCP_APPROVAL_REQUIRED`` (HTTP 403). Sibling to
+    :class:`NullRunApprovalNotYetApprovedError` but for the MCP
+    umbrella path — distinct so cookbook code can show a different
+    user_action hint (\"operator needs to approve the MCP tool's
+    capability\" vs \"operator has not yet decided on the workflow\").
+    """
+
+    error_code = "NR-MCP03"
+    user_action = (
+        "The MCP tool requires operator approval. Wait for the "
+        "operator to approve the tool's capability surface or use "
+        "a non-MCP equivalent."
+    )
+    retryable = True
+
+
+class NullRunApprovalDbUnavailableError(NullRunBlockedException):
+    """Approval database (Postgres) unavailable on the create-or-update path.
+
+    Wire codes ``APPROVAL_DB_UNAVAILABLE``, ``APPROVAL_PERSISTENCE_FAILED``,
+    ``APPROVAL_VALIDATION_FAILED``, ``APPROVAL_CONFLICT``,
+    ``APPROVAL_NOT_FOUND``, ``APPROVAL_CREATE_FAILED`` (HTTP 402/403/503).
+    Pre-B.1 these all mapped to the base ``NullRunBlockedException``
+    (transport.py:2984-2989) — operators couldn't tell apart a
+    transient DB outage (retryable) from a validation failure
+    (terminal). Post-B.1 they map to this single typed class so
+    cookbook code can ``except NullRunApprovalDbUnavailableError:``
+    and surface the right remediation hint.
+    """
+
+    error_code = "NR-A016"
+    user_action = (
+        "Approval database unavailable or rejected the request. "
+        "Retry shortly (transient DB outage) or contact support if "
+        "the failure persists (validation/conflict)."
+    )
+    retryable = True
+
+
 # NOTE: NullRunApprovalReplayRejectedError was moved earlier in this
 # module (alongside the other five approval exceptions) so all six
 # typed approval exceptions are co-located. The earlier definition

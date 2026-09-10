@@ -28,6 +28,7 @@ from nullrun.breaker.circuit_breaker import CircuitBreaker
 from nullrun.breaker.exceptions import (
     BreakerTransportError,
     InsecureTransportError,
+    NullRunApprovalDbUnavailableError,
     NullRunApprovalReplayRejectedError,
     NullRunAuthenticationError,
     NullRunBackendError,
@@ -35,6 +36,9 @@ from nullrun.breaker.exceptions import (
     NullRunDecision,
     NullRunExecutionNotFoundError,
     NullRunInfrastructureError,
+    NullRunMcpApprovalRequiredError,
+    NullRunMcpDestructiveBlockedError,
+    NullRunMcpReadonlyBypassBlockedError,
     NullRunTransportError,
     RateLimitError,
     TransportErrorSource,
@@ -2981,12 +2985,18 @@ def _build_v3_error_code_map() -> dict[str, type[Exception]]:
         "RATE_LIMIT_REDIS_UNAVAILABLE": NullRunRateLimitRedisError,
         "BUDGET_DATA_UNAVAILABLE": NullRunBackendError,
         # 402 — approval-create failure family (DEF-ARFLOW-TOOLNAME-01,
-        "APPROVAL_DB_UNAVAILABLE": NullRunBlockedException,
-        "APPROVAL_PERSISTENCE_FAILED": NullRunBlockedException,
-        "APPROVAL_VALIDATION_FAILED": NullRunBlockedException,
-        "APPROVAL_CONFLICT": NullRunBlockedException,
-        "APPROVAL_NOT_FOUND": NullRunBlockedException,
-        "APPROVAL_CREATE_FAILED": NullRunBlockedException,
+        # B.1 symmetry fix 2026-09-10): six sibling codes all map to
+        # the typed ``NullRunApprovalDbUnavailableError`` (NR-A016) so
+        # cookbook code can branch on the typed class instead of
+        # falling through to the base NullRunBlockedException. Pre-B.1
+        # all six collapsed to the base class — operators couldn't tell
+        # apart a transient DB outage from a validation failure.
+        "APPROVAL_DB_UNAVAILABLE": NullRunApprovalDbUnavailableError,
+        "APPROVAL_PERSISTENCE_FAILED": NullRunApprovalDbUnavailableError,
+        "APPROVAL_VALIDATION_FAILED": NullRunApprovalDbUnavailableError,
+        "APPROVAL_CONFLICT": NullRunApprovalDbUnavailableError,
+        "APPROVAL_NOT_FOUND": NullRunApprovalDbUnavailableError,
+        "APPROVAL_CREATE_FAILED": NullRunApprovalDbUnavailableError,
         # 403 — approval grant-consume outcomes (v3.53 / 2026-08-13
         # audit, A-1+A-2 bundle). Distinct from the /gate
         # create-failure family above: these are the seven
@@ -3057,6 +3067,19 @@ def _build_v3_error_code_map() -> dict[str, type[Exception]]:
         "TOO_MANY_PENDING_APPROVALS": NullRunBlockedException,
         "BUSINESS_IMPACT_INVALID": NullRunBlockedException,
         "VALIDATION_FAILED": NullRunBlockedException,
+        # ── MCP umbrella codes (ADR-013, 2026-08-14, frozen-dormant)
+        # B.1 (2026-09-10): the three umbrella codes map to typed
+        # ``NullRunMcp*Error`` subclasses so cookbook code can branch
+        # on the precise umbrella path. Pre-B.1 these collapsed to
+        # the generic NullRunBlockedException / NR-X001 fallback —
+        # operators couldn't distinguish the destructive-MCP block
+        # from the readonly-bypass block from the approval-required
+        # path. ADR-013 marked the umbrella frozen-dormant: wire
+        # codes are reserved and the SDK must round-trip them, but
+        # the underlying mechanisms aren't wired in production yet.
+        "MCP_DESTRUCTIVE_BLOCKED": NullRunMcpDestructiveBlockedError,
+        "MCP_READONLY_BYPASS_BLOCKED": NullRunMcpReadonlyBypassBlockedError,
+        "MCP_APPROVAL_REQUIRED": NullRunMcpApprovalRequiredError,
         # Wire-level parsing failures (missing / malformed fields).
         # Map to ``NullRunBackendError`` because the SDK treats them
         # as infrastructure-side issues — the server should have

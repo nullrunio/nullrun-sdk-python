@@ -156,6 +156,19 @@ DEFAULT_MESSAGES: dict[str, str] = {
     # copy is generic because the cause is operator-side accounting;
     # user should retry (a fresh /gate will recompute the reservation).
     "NR-O001": "Your request couldn't be completed due to a usage accounting discrepancy. Please try again.",
+    # ── B.1 (2026-09-10): MCP umbrella + APPROVAL_DB typed arms.
+    # Three MCP umbrella codes (ADR-013, frozen-dormant) and the
+    # single NR-A016 typed class for the six APPROVAL_DB_* sibling
+    # codes. NR-A016 wording is intentionally close to the generic
+    # "transient service outage" cluster — the cookbook recipe for
+    # the typed class branches on retryable vs terminal, not on
+    # the specific DB cause (operators don't care whether it was a
+    # validation failure or a Postgres connection drop; both are
+    # "retry shortly, contact support if persistent").
+    "NR-MCP01": "That action isn't available right now. Please contact support if you need it.",
+    "NR-MCP02": "That action isn't available right now. Please contact support if you need it.",
+    "NR-MCP03": "Your request is awaiting approval. Please wait a moment while it's being reviewed.",
+    "NR-A016": "Your request couldn't be completed. Please try again shortly.",
     # ---- Wire / protocol ----------------------------------------------------
     # NR-P001: SDK wire-protocol version is below the backend's
     # ``X-NULLRUN-PROTOCOL:`` minimum. End-user action is "contact
