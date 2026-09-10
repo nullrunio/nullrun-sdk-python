@@ -1,3 +1,41 @@
+## [0.16.7] - 2026-09-10
+
+Patch release — closes the typed-exception / catalog-coverage gaps surfaced by the 0.16.6 backend hardening. After that release, every catalog exception the SDK can raise now has a hand-written `DEFAULT_MESSAGES` entry (no more "Something went wrong. Please try again." fallback), and `@protect`-decorated sites surface the real exception type instead of rewriting it into a generic `NullRunBlockedException`. The `@protect` block path in `runtime.execute` now dispatches the actual catalog code through `format_user_message`, so wire-error codes (NR-A012, NR-A016, NR-EX01, …) reach users with actionable wording. No wire-format change.
+
+### Fixed
+
+- **DEFS-SDKEXEC-TYPED-DISPATCH** — `runtime.execute` block path raises the catalog exception itself (NR-A016 etc.) instead of the generic fallback (`src/nullrun/runtime.py`, `2e77902`). `exc.error_code` carries the catalog code, so `format_user_message` finds actionable wording; downstream sites that inspect `exc.details['details']['mapped_class']` see the typed class name (e.g. `NullRunApprovalDbUnavailableError`) rather than the base `NullRunBlockedException`.
+- **DEFS-SDKEXEC-BLOCK-PIN** — `tests/test_runtime.py::test_execute_blocked_surfaces_wire_error_code` pinned to the new typed-dispatch contract (`834d9ea`, `DEF-NR-RUNTIME-BLOCK-TYPED`): the wire payload (`error_code` + `mapped_class`) is preserved verbatim while the SDK exception is now the typed class. This was the last stale wire-code assertion in `test_runtime.py` blocking full SDK pass under the post-0.16.6 catalog contract.
+- **DEFS-SDKPROTECT-EX01-PASSTHROUGH** — `@protect`-decorated `_enforce_sensitive_tool` no longer rewrites `NullRunExecutionNotFoundError` (NR-EX01) into `NullRunBlockedException(NR-B002)` (`src/nullrun/decorators.py`, `257ab7f`). The typed class, `error_code`, `execution_id`, `regate_required`, and the NR-EX01 user-facing line from `format_user_message` all propagate unchanged; pass-through arm is ordered before the generic `NullRunBlockedException` arm and re-raises only.
+- **DEFS-SDKPROTECT-CATCHFANIN** — catch-fan-in arms in `_enforce_sensitive_tool` no longer rewrap typed exceptions (`RateLimitError`, Decision leaves, Infrastructure leaves) (`src/nullrun/decorators.py`, `2ad87dd`). Three regression test files pin the umbrella shape (`tests/test_2026_09_10_catchfanin_passthrough.py`, `tests/test_2026_09_10_decision_infra_passthrough.py`, `tests/test_2026_09_10_r001_passthrough.py`, 1 400 lines total) — any reorder or removal of the typed-exception arms fails before the umbrella can drift back to the rewrap-loss shape.
+- **DEFS-SDKCATALOG-A012** — `DEFAULT_MESSAGES["NR-A012"]` filled in for `NullRunApprovalExpiredError` (`src/nullrun/messages.py`, `a4c6019`); tests in `tests/test_typed_exceptions_full_audit.py` and `tests/test_messages.py` cover the new entry. Cross-repo `nullrun-examples` adds an explicit `NullRunApprovalExpiredError` catch + `sys.exit(2)` in `langgraph_openai_approval_demo.py` so CI can branch on "approval expired" (exit 2) vs "any other failure" (exit 1).
+- **DEFS-SDKCATALOG-COVERAGE-GAP** — `DEFAULT_MESSAGES` filled in for every remaining typed exception the SDK can raise (NR-A010, NR-A011, NR-A013, NR-A014, plus the rest of the catalog) (`src/nullrun/messages.py`, `a441558`, 68 lines added). 170 lines of regression coverage in `tests/test_messages.py`. Closes the catalog-coverage gap that 0.16.6's `test_typed_exceptions_full_audit.py` audit flagged as "fallback to FALLBACK_MESSAGE".
+- **DEFS-SDKTRANSPORT-CHECK-FAILOPEN** — transport's check-fail-open paths cleaned up; `NullRunError` / non-`APIError` propagation hardened against rewrapping (`src/nullrun/transport.py`, `25eb2c2`, `b7575ad`, `bb1066c`). New `tests/test_2026_09_10_check_failopen.py` (330 lines), `tests/test_2026_09_10_mcp_umbrella_symmetry.py` (364 lines), `tests/test_2026_09_10_sdk_cleanup.py` (311 lines) lock the new transport shape.
+
+### Added
+
+- **`tests/test_2026_09_10_runtime_block_typed_dispatch.py`** (356 lines, `2e77902`). 11 source-pin + behavioural tests asserting `runtime.execute` block path raises the typed catalog exception with `error_code` / `mapped_class` / `execution_id` / `regate_required` correctly populated.
+- **`tests/test_2026_09_10_nr_ex01_passthrough.py`** (312 lines, `257ab7f`). 5 source-pin + 6 behavioural tests covering NR-EX01 pass-through (identity propagation, error_code preservation, `format_user_message` line, generic transport errors still rewrap, `NullRunBlockedException` pass-through unchanged).
+- **`tests/test_2026_09_10_catchfanin_passthrough.py`** (561 lines, `2ad87dd`), **`tests/test_2026_09_10_decision_infra_passthrough.py`** (448 lines), **`tests/test_2026_09_10_r001_passthrough.py`** (391 lines). Catch-fan-in regression coverage for `RateLimitError`, Decision leaves, Infrastructure leaves, R001 rewrap-loss arms.
+- **`tests/test_2026_09_10_toolblocked_parser.py`** (399 lines, `2dfd208`). Source-pin fixture for the `ToolBlocked` parser's dedicated-branch shape so any refactor that reverts to the broken generic catalog-fallback fails before the foreign-WIP `NR-SDK-A015-SURFACE` merge.
+- **`tests/test_2026_09_10_check_failopen.py`** / **`tests/test_2026_09_10_mcp_umbrella_symmetry.py`** / **`tests/test_2026_09_10_sdk_cleanup.py`** (1 005 lines combined). Transport-cleanup regression coverage for `25eb2c2` / `b7575ad` / `bb1066c`.
+
+### Cleanup
+
+- **`dist_local/nullrun-0.16.7-py3-none-any.whl`** (305 KB pre-built wheel) and **`src/nullrun/transport.py.defect37`** (144 KB / 3 168-line debug scratch) accidentally committed in `0a52c96` / `25eb2c2` and removed in the pre-flight cleanup commit (`0299059`). `.gitignore` extended with `dist_local/` and `src/**/*.defect*` to prevent re-introduction.
+
+### Compatibility
+
+Pure reliability fixes — no wire-format change. `/gate`, `/execute`, `/track`, `/cancel` payloads are byte-identical to 0.16.6. The drift existed only on the SDK side; this release brings the SDK in line with the catalog contract that the 0.16.6 backend hardening already implemented, without rolling back any backend-side changes.
+
+### Why this is needed
+
+**Typed dispatch** — the user-facing symptom was that `@protect`-decorated sites saw `Workflow <id> blocked: Something went wrong. Please try again.` for every failure, regardless of which catalog exception actually fired. Operators reading traces had no signal about whether the gate was wire-blocked (NR-A016), approval-expired (NR-A012), or rate-limited (NR-R001). 0.16.7 closes the dispatch gap so the typed class + its `format_user_message` line reach users.
+
+**Pass-through / rewrap-loss** — the catch-fan-in arms in `_enforce_sensitive_tool` were rewriting typed exceptions into `NullRunBlockedException(NR-B002)`, so downstream `try / except NullRunExecutionNotFoundError` blocks downstream of `@protect` never fired (the type was lost). 0.16.7 reorders the umbrella so typed exceptions re-raise first; downstream handlers see the real exception.
+
+**Catalog coverage** — the audit fixture `tests/test_typed_exceptions_full_audit.py` (introduced 0.16.6) flagged 13 catalog codes that fell through to `FALLBACK_MESSAGE`. 0.16.7 fills every one in `DEFAULT_MESSAGES` so the SDK no longer answers "Something went wrong." to codes it knows about.
+
 ## [0.16.6] - 2026-09-08
 
 Patch release — closes the SDK↔backend drift introduced by backend `DEF-SDKK-022-EXEC-BYPASS` (2026-09-04, RUN_ID=20260904T1500). After that backend fix, `/api/v1/execute` runs an `execution:{id}` ownership-binding existence check and returns 404 EXECUTION_NOT_FOUND for any execution_id that was not minted by a prior `/api/v1/gate`. The SDK's `runtime.execute()` had been minting a fresh `uuid7_str()` regardless of prior `/gate`, so every `@protect @sensitive` call returned 404 ("Gateway returned 404") and the displayed workflow_id was the misleading `__nullrun_unknown__` sentinel. LangGraph's `NullRunCallback.on_llm_start` had the symmetric problem on the LLM span side: it fired `llm_call` cost events with no paired `/gate` reservation, so the runtime's `_route_track` silently dropped them. This release closes all three holes. No wire-format change.

@@ -64,7 +64,6 @@ from nullrun.breaker.exceptions import (
     NullRunProtocolError,
     NullRunRateLimitRedisError,
     NullRunWorkflowInactiveError,
-    NullRunWorkflowInactiveError as _NullRunWorkflowInactiveError,  # alias for clarity
 )
 from nullrun.transport import Transport
 

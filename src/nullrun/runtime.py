@@ -2775,8 +2775,23 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 - decision_context: Context used for the decision
 
             Mode values:
-                - "inline": force fast path (non-sensitive tools only)
-                - "strict": force gateway roundtrip
+                - "auto" (default): ALWAYS contacts the gateway. This
+                  is the cloud-only invariant — budget, rate-limit,
+                  and tool-block policies cannot be bypassed by
+                  omitting ``mode``. Pre-v0.x SDKs silently switched
+                  to "inline" for non-sensitive tools, which caused
+                  DEF-TS12-01 (cycle 20260910T0515).
+                - "inline": explicit opt-out of /execute. Skips ALL
+                  enforcement (budget / rate / tool-block); returns
+                  a synthetic local allow. Use only when the caller
+                  knows the tool is safe and wants to skip the
+                  gateway round-trip. Cannot be combined with
+                  sensitive tools — sensitive tools always go to
+                  /execute even when "inline" is requested.
+                - "strict": explicit gateway round-trip (same
+                  wire behaviour as "auto" post-DEF-TS12-01, but
+                  useful for audit clarity when the caller wants
+                  the intent on the wire).
 
         Raises:
             NullRunBlockedException: If decision is "block"
@@ -2787,33 +2802,56 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         workflow_id = get_workflow_id()
         trace_id = get_trace_id() or str(uuid.uuid4())
 
-        # Auto-select mode: sensitive tools always use strict
-        # mode so /execute is consulted. The two checks below
-        # gate the /execute round-trip:
-        #   1. ``self.is_sensitive_tool(tool_name)`` — the runtime
-        #      registry, populated by the ``@sensitive`` decorator
-        #      at decoration time.
-        #   2. ``is_strict_mode_forced(tool_name)`` — the static
-        #      ``@sensitive(impact=...)`` registered a per-tool
-        #      extract_on call site that requires strict mode
-        #      regardless of the runtime registry. This is the
-        #      second source of truth, populated at decoration
-        #      time and immune to ``init_or_die()`` reinit that
-        #      might lose the registry on a fresh runtime singleton.
+        # Auto-select mode: ``mode="auto"`` (the default) ALWAYS
+        # resolves to "strict" so the /execute endpoint is consulted
+        # for every tool call. This is the cloud-only invariant
+        # documented in CLAUDE.md §17 and memory `cloud-only-invariant-sdk`:
+        # budget enforcement, rate limiting, and tool_block policies
+        # cannot be silently bypassed because the SDK caller used the
+        # default ``mode="auto"``.
+        #
+        # Pre-fix (DEF-TS12-01, cycle 20260910T0515): ``mode="auto"``
+        # with a non-sensitive tool resolved to ``mode="inline"`` which
+        # returned a synthetic local allow WITHOUT contacting the
+        # gateway. Every operator-configured budget, rate-limit, and
+        # tool-block policy was silently bypassed for non-sensitive
+        # tools. The dashboard showed policies in effect; the SDK
+        # ignored them. This is now fixed: ``mode="auto"`` →
+        # ``"strict"`` unconditionally.
+        #
+        # Explicit opt-out paths (preserved unchanged):
+        #   1. ``mode="inline"`` (explicit opt-in by the caller) —
+        #      returns the local allow WITHOUT contacting the gateway.
+        #      Documented as the only way to skip /execute. Use
+        #      sparingly: skips ALL enforcement, not just budget.
+        #   2. ``mode="strict"`` (explicit opt-in by the caller) —
+        #      forces /execute round-trip regardless of tool
+        #      sensitivity. Identical wire behaviour to ``"auto"``
+        #      post-fix, but useful when the caller wants the
+        #      intent on the wire for audit clarity.
+        #
+        # The two sensitivity checks below still gate the inline
+        # fast-path — sensitive tools cannot be silently skipped
+        # even if the caller explicitly asks for ``mode="inline"``.
+        # They also gate the /execute round-trip when ``mode="auto"``
+        # resolved to ``"strict"`` (no behavioural change there).
         if mode == "auto":
-            if self.is_sensitive_tool(tool_name) or is_strict_mode_forced(tool_name):
-                mode = "strict"
-            else:
-                mode = "inline"
+            mode = "strict"
 
-        # For inline mode with non-sensitive tools, skip execute and use local enforcement
+        # For inline mode with non-sensitive tools, skip execute and use local enforcement.
+        # Sensitive tools always go through /execute even when the
+        # caller asked for ``mode="inline"`` — fail-CLOSED stance per
+        # memory `sensitive-tool-fail-closed`.
         if mode == "inline" and not (
             self.is_sensitive_tool(tool_name) or is_strict_mode_forced(tool_name)
         ):
             return {
                 "decision": "allow",
                 "decision_source": DecisionSource.LOCAL,
-                "explanation": "Inline mode: local enforcement only",
+                "explanation": (
+                    "Inline mode: local enforcement only. Caller explicitly opted "
+                    "out of /execute — budget / rate / tool-block policies bypassed."
+                ),
                 "policy_hash": None,
                 "allow_execution": True,
             }

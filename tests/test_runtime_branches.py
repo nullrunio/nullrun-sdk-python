@@ -258,17 +258,21 @@ def test_execute_auto_sensitive_routes_to_strict():
     assert call_args.kwargs["mode"] == "strict"
 
 
-def test_execute_auto_non_sensitive_routes_to_inline():
-    """Auto + non-sensitive tool → mode=inline → local short-circuit
-    so transport.execute is NOT called. Verify via the LOCAL decision_source.
+def test_execute_auto_non_sensitive_routes_to_strict():
+    """DEF-TS12-01 (2026-09-10): ``mode="auto"`` with a non-sensitive
+    tool now ALWAYS resolves to ``mode="strict"`` and contacts the
+    gateway. Pre-fix this routed to ``mode="inline"`` which bypassed
+    the gateway entirely — see ``test_runtime.py`` for the original
+    inline-bypass pin (now inverted). Cloud-only invariant from
+    CLAUDE.md §17.
     """
     rt = _make_test_runtime()
     rt._transport.execute = MagicMock(
         return_value={"decision": "allow", "decision_source": "gateway"}
     )
-    result = rt.execute("safe.tool", {"x": 1})
-    assert result["decision_source"] == "local"
-    rt._transport.execute.assert_not_called()
+    rt.execute("safe.tool", {"x": 1})
+    rt._transport.execute.assert_called_once()
+    assert rt._transport.execute.call_args.kwargs["mode"] == "strict"
 
 
 def test_execute_auto_sensitive_calls_transport():

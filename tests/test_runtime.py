@@ -703,17 +703,33 @@ def test_execute_auto_sensitive_routes_to_strict():
     assert call_args.kwargs["mode"] == "strict"
 
 
-def test_execute_auto_non_sensitive_routes_to_inline():
-    """Auto + non-sensitive tool → mode=inline → local short-circuit
-    so transport.execute is NOT called. Verify via the LOCAL decision_source.
+def test_execute_auto_non_sensitive_routes_to_strict():
+    """DEF-TS12-01 (2026-09-10): ``mode="auto"`` with a non-sensitive
+    tool now ALWAYS resolves to ``mode="strict"`` and contacts the
+    gateway.
+
+    Pre-fix this was a CRITICAL fail-OPEN: ``mode="auto"`` with a
+    non-sensitive tool silently switched to ``mode="inline"`` which
+    returned a synthetic local allow WITHOUT contacting the gateway.
+    Every operator-configured budget, rate-limit, and tool-block
+    policy was silently bypassed for non-sensitive tools. The
+    dashboard showed policies in effect; the SDK ignored them.
+
+    Post-fix the cloud-only invariant from CLAUDE.md §17 and
+    memory `cloud-only-invariant-sdk` holds: every call routes
+    through /execute when ``mode="auto"`` (the default). The
+    ``mode="inline"`` opt-in is preserved for callers who
+    explicitly want to skip /execute — see
+    ``test_execute_inline_mode_short_circuits_local`` below for
+    the explicit opt-in pin.
     """
     rt = _make_test_runtime()
     rt._transport.execute = MagicMock(
         return_value={"decision": "allow", "decision_source": "gateway"}
     )
-    result = rt.execute("safe.tool", {"x": 1})
-    assert result["decision_source"] == "local"
-    rt._transport.execute.assert_not_called()
+    rt.execute("safe.tool", {"x": 1})
+    rt._transport.execute.assert_called_once()
+    assert rt._transport.execute.call_args.kwargs["mode"] == "strict"
 
 
 def test_execute_auto_sensitive_calls_transport():

@@ -808,11 +808,11 @@ def _enforce_sensitive_tool(
     # ADR-008: prefer `on_transport_error` (raise classified
     from nullrun.breaker.exceptions import (
         NullRunBlockedException,
+        NullRunDecision,  # DEF-NR-TRANSPORT-CATCHFANIN-GAP (2026-09-10): umbrella arm
         NullRunExecutionNotFoundError,  # DEF-NR-EX01-REWRAP-LOSS (2026-09-10): pass-through arm
-        NullRunInfrastructureError,    # DEF-NR-TRANSPORT-CATCHFANIN-GAP (2026-09-10): umbrella arm
-        NullRunDecision,               # DEF-NR-TRANSPORT-CATCHFANIN-GAP (2026-09-10): umbrella arm
+        NullRunInfrastructureError,  # DEF-NR-TRANSPORT-CATCHFANIN-GAP (2026-09-10): umbrella arm
         NullRunTransportError,
-        RateLimitError,                # DEF-NR-R001-REWRAP-LOSS (2026-09-10): pass-through arm
+        RateLimitError,  # DEF-NR-R001-REWRAP-LOSS (2026-09-10): pass-through arm
         TransportErrorSource,
     )
 

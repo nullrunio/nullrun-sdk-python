@@ -28,8 +28,13 @@ from nullrun.breaker.circuit_breaker import CircuitBreaker
 from nullrun.breaker.exceptions import (
     BreakerTransportError,
     InsecureTransportError,
+    NullRunApprovalReplayRejectedError,
     NullRunAuthenticationError,
+    NullRunBackendError,
+    NullRunBlockedException,
+    NullRunDecision,
     NullRunExecutionNotFoundError,
+    NullRunInfrastructureError,
     NullRunTransportError,
     RateLimitError,
     TransportErrorSource,
@@ -1222,7 +1227,151 @@ class Transport:
                 # 0.7.0 thin client: no local policy cache. The next
                 return data  # type: ignore[no-any-return]
             elif response.status_code >= 400:
-                # 4xx - don't retry, return block
+                # 4xx — don't retry.
+                #
+                # 2026-09-10 (NR-SDK-A015-SURFACE): before the fix,
+                # this branch dropped the wire envelope on the floor
+                # and synthesised a generic ``{"decision": "block",
+                # "explanation": "Gateway returned 409"}`` dict. That
+                # hid every wire-coded reason (`APPROVAL_REPLAY_REJECTED`,
+                # `APPROVAL_DENIED`, `BUDGET_HARD_BLOCKED`, etc.) behind
+                # a single string, so the runtime block dispatch fell
+                # through to ``NR-X001`` and `format_user_message`
+                # produced the catalogue fallback ("Something went
+                # wrong. Please try again.") instead of the typed
+                # `NR-A015` message. Cookbook callers had no way to
+                # branch on the precise cause.
+                #
+                # Post-fix: parse the envelope via the existing
+                # `_parse_v3_error_envelope` helper — it covers the
+                # v3 wire envelope for every /execute reject reason,
+                # including the six typed approval grant-consume
+                # outcomes (`APPROVAL_NOT_YET_APPROVED` →
+                # ``NullRunApprovalNotYetApprovedError`` (NR-A010),
+                # `APPROVAL_DENIED` → NR-A011,
+                # `APPROVAL_EXPIRED` → NR-A012,
+                # `APPROVAL_DIGEST_MISMATCH` → NR-A013,
+                # `APPROVAL_TOOL_DIGEST_MISMATCH` → NR-A014,
+                # `APPROVAL_REPLAY_REJECTED` → NR-A015 / ``
+                # NullRunApprovalReplayRejectedError``) — and raise
+                # the typed exception so the @protect /
+                # @sensitive / runtime.execute() exception arms
+                # propagate the right class up to the caller.
+                #
+                # Fall through to the synthetic block shape if the
+                # envelope is unrecognised (plaintext body, malformed
+                # JSON, unknown wire code) so behaviour stays
+                # backwards-compatible for legacy / non-v3 backends.
+                # `_parse_v3_error_envelope` always returns an
+                # Exception — it never silently swallows a 4xx.
+                try:
+                    raise _parse_v3_error_envelope(response, "execute")
+                except NullRunApprovalReplayRejectedError as exc:
+                    # The exact case the user reported: the operator
+                    # approved, the SDK polled /execute again, and
+                    # the backend's atomic consume_approved UPDATE
+                    # returned zero rows (replay race — UI approve
+                    # vs SDK re-check). Surface the typed exception
+                    # so `format_user_message` yields the NR-A015
+                    # catalogue line ("Your request couldn't be
+                    # completed because the approval has already
+                    # been used. Please start a new request.")
+                    # instead of the fallback.
+                    metrics.inc_transport("execute_block_replay_rejected")
+                    raise
+                except NullRunBlockedException as exc:
+                    # All other typed blocks from the dispatch —
+                    # budget, rate, tool, approval-deny, etc.
+                    # Re-raise for the @protect / runtime.execute
+                    # arms to handle.
+                    metrics.inc_transport("execute_block_typed")
+                    raise
+                except NullRunBackendError as exc:
+                    # 5xx-classified envelope parsed as a typed
+                    # backend error (shouldn't normally land here
+                    # because the helper maps 5xx to GATEWAY_ERROR
+                    # via NullRunTransportError, but stays
+                    # defensive). Re-raise.
+                    raise
+                except NullRunAuthenticationError as exc:
+                    # 401 envelope parsed as auth error — surface
+                    # directly so the caller can react.
+                    raise
+                except NullRunTransportError as exc:
+                    # Transport-classified (network, breaker) — not
+                    # a real 4xx, but helper may return one if the
+                    # envelope shape is ambiguous. Re-raise so the
+                    # on_transport_error arm sees it.
+                    raise
+                except NullRunDecision as exc:
+                    # DEF-NR-TRANSPORT-CATCHFANIN-GAP (2026-09-10):
+                    # umbrella pass-through for typed Decision
+                    # subclasses NOT in the NullRunBlockedException
+                    # MRO. Specifically:
+                    #   - NullRunChainError (NR-CH001) — chain
+                    #     lifetime / cross-org / Execution Graph
+                    #     parent-lineage rejections
+                    #   - NullRunWorkflowInactiveError (NR-W004) —
+                    #     soft-deleted workflow
+                    #   - NullRunConsumeOverbudgetError (NR-O001) —
+                    #     CONSUME > RESERVE + epsilon_cents invariant
+                    #   - WorkflowPausedException (NR-W003)
+                    # Pre-fix these fell through to `except
+                    # Exception: pass` below and got silently
+                    # swallowed into the synthetic block shape
+                    # (`{"decision": "block", "decision_source":
+                    # FALLBACK, "explanation": f"Gateway returned
+                    # {response.status_code}"}`) — losing
+                    # exc.chain_id / exc.parent_execution_id (Chain),
+                    # exc.workflow_id (WorkflowInactive),
+                    # exc.execution_id / exc.reserved_cents /
+                    # exc.actual_cost_cents / exc.epsilon_cents
+                    # (ConsumeOverbudget), and every typed
+                    # `error_code`/user-action. MUST come AFTER the
+                    # NullRunBlockedException arm above so the typed
+                    # approval / budget / tool-block path still
+                    # matches by MRO specificity.
+                    metrics.inc_transport("execute_block_decision_typed")
+                    raise
+                except NullRunInfrastructureError as exc:
+                    # DEF-NR-TRANSPORT-CATCHFANIN-GAP (2026-09-10):
+                    # umbrella pass-through for typed
+                    # Infrastructure subclasses NOT in the
+                    # NullRunBackendError / NullRunAuthenticationError /
+                    # NullRunTransportError MRO branches above.
+                    # Specifically:
+                    #   - NullRunProtocolError (NR-P001) —
+                    #     PROTOCOL_TOO_OLD / PROTOCOL_TOO_NEW /
+                    #     PROTOCOL_HEADER_INVALID /
+                    #     PROTOCOL_HEADER_REQUIRED
+                    #   - NullRunRateLimitRedisError (NR-R002) —
+                    #     RATE_LIMIT_REDIS_UNAVAILABLE
+                    #   - NullRunConfigError (NR-Cxxx) — when raised
+                    #     from a wire envelope (rare; mostly SDK-side)
+                    # NullRunAuthError (NR-A003) IS in the
+                    # NullRunAuthenticationError arm above (parent
+                    # class match), but listing here for completeness
+                    # preserves the documented recovery contract
+                    # even if a future refactor reorders the prior
+                    # arms.
+                    # Pre-fix these fell through to `except Exception:
+                    # pass` below — same synthetic-block loss as the
+                    # Decision path. MUST come AFTER the three
+                    # specific parent arms above (Backend, Auth,
+                    # Transport) so the wire-classified exceptions
+                    # still match by MRO specificity.
+                    metrics.inc_transport("execute_block_infra_typed")
+                    raise
+                except Exception:
+                    # Unrecognised envelope (plaintext body, legacy
+                    # slug, malformed JSON). Fall through to the
+                    # synthetic block shape so old / non-v3 backends
+                    # keep working and ``on_transport_error="raise"``
+                    # callers still see a usable dict. The retry
+                    # helper has already given up; emitting a typed
+                    # exception here would mask unknown wire codes
+                    # the user hasn't yet catalogued.
+                    pass
                 return {
                     "decision": "block",
                     "decision_source": DecisionSource.FALLBACK,
@@ -2398,12 +2547,16 @@ def _parse_v3_error_envelope(
         NullRunApprovalToolDigestMismatchError,
         NullRunAuthError,
         NullRunBackendError,
+        NullRunBlockedException,
         NullRunBudgetError,
         NullRunBudgetRecheckFailedError,
         NullRunChainError,
         NullRunConsumeOverbudgetError,
+        NullRunDecision,
+        NullRunInfrastructureError,
         NullRunProtocolError,
         NullRunRateLimitRedisError,
+        NullRunToolBlockedError,
         NullRunWorkflowInactiveError,
         RateLimitError,
     )
@@ -2628,6 +2781,36 @@ def _parse_v3_error_envelope(
         # as BaseException (the helper declares -> Exception).
         allowed = {"error_code", "user_action", "retryable", "docs_url", "cause"}
         forwarded = {k: v for k, v in details.items() if k in allowed}
+        if (
+            catalog is NullRunToolBlockedError
+            or catalog is NullRunBlockedException
+        ):
+            # DEF-NR-TOOLBLOCKED-PARSER (2026-09-10): NullRunBlockedException
+            # subclasses require positional ``workflow_id`` + ``reason``
+            # (no defaults), so the generic ``catalog(full_message, ...)``
+            # fallback below raises TypeError when given a string for
+            # ``workflow_id``. Affects 7 catalog entries: TOOL_BLOCKED,
+            # LOOP_DETECTED, MODEL_REQUIRED, POLICY_UNCONFIGURED,
+            # TOO_MANY_PENDING_APPROVALS, BUSINESS_IMPACT_INVALID,
+            # VALIDATION_FAILED. Pre-fix the TypeError escaped the parser
+            # and got swallowed by the catch-all ``except Exception: pass``
+            # in Transport.execute, surfacing the synthetic-block dict
+            # ``{"decision": "block", "explanation": "Gateway returned
+            # 403"}`` instead of the typed NR-T001 / NR-Lxxx catalog line.
+            # ``tool_name`` is forwarded for NullRunToolBlockedError
+            # (the only BlockedException subclass that surfaces it on the
+            # wire envelope); the parent constructor drops it for plain
+            # NullRunBlockedException so it's a no-op there. ``forwarded``
+            # (error_code / user_action / retryable / docs_url / cause) is
+            # passed through so the catalog value's defaults win.
+            instance = catalog(  # type: ignore[call-arg]
+                workflow_id=str(details.get("workflow_id") or "unknown"),
+                reason=full_message,
+                status_code=status,
+                tool_name=details.get("tool_name"),
+                **forwarded,
+            )
+            return cast(Exception, instance)
         instance = catalog(full_message, **forwarded)  # type: ignore[call-arg]
         return cast(Exception, instance)
 
