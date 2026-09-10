@@ -9,6 +9,7 @@ __pycache__/
 build/
 develop-eggs/
 dist/
+dist_local/
 downloads/
 eggs/
 .eggs/
@@ -73,3 +74,8 @@ docs/integration-baseline-2026-06-19.md
 audit.md
 docs/postman/
 .hermes/
+
+# Debug scratch artefacts dropped by ad-hoc defect sessions
+# (mirrors the convention that `dist/` is ignored: built / scratch
+# outputs never belong in VCS regardless of where they were created).
+src/**/*.defect*
