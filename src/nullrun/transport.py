@@ -2562,7 +2562,13 @@ def _safe_json(response: httpx.Response, endpoint: str) -> Any:
             f"(status={response.status_code}): {type(exc).__name__}",
             source=TransportErrorSource.GATEWAY_ERROR,
             endpoint=endpoint,
-            error_code="NR-T001",
+            # NR-T001 collides with NullRunToolBlockedError's
+            # canonical code (breaker/exceptions.py:955); using
+            # NR-T-PARSE here so a cookbook handler that branches
+            # on `exc.error_code == "NR-T001"` does not mis-classify
+            # a JSON parse failure as a tool block. See
+            # tests/test_2026_08_11_fixes.py for the pin.
+            error_code="NR-T-PARSE",
         ) from exc
 
 
@@ -2936,7 +2942,13 @@ def _build_v3_error_code_map() -> dict[str, type[Exception]]:
         "BUDGET_SOFT_BLOCKED": NullRunBudgetError,
         "BUDGET_OVERDRAFT_EXCEEDED": NullRunBudgetError,
         "BUDGET_PERIOD_NOT_STARTED": NullRunBudgetError,
-        "REDIS_UNAVAILABLE": NullRunBudgetError,
+        # Note: BUDGET_REDIS_UNAVAILABLE and RATE_LIMIT_REDIS_UNAVAILABLE
+        # below are the canonical redis-down codes (post-v3.36 rename);
+        # the legacy ``REDIS_UNAVAILABLE`` slug was removed 2026-09-10
+        # because the backend never emits it (it is absent from
+        # ``GateErrorCode::all()`` in error_codes.rs). A cookbook that
+        # extends this map with the legacy slug risks silently matching
+        # nothing, so the slot stays unoccupied by design.
         # 402 — chain family (separate class for diagnostic clarity)
         "CHAIN_MAX_DURATION_EXCEEDED": NullRunChainError,
         # 403 — chain security + workflow state

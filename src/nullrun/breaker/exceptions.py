@@ -842,33 +842,6 @@ class NullRunBudgetRecheckFailedError(NullRunBudgetError):
         self.recheck_retryable: bool = True
 
 
-class NullRunBudgetThrottleError(NullRunBudgetError):
-    """Backend returned ``decision == "throttle"`` — soft budget signal.
-
-    Distinct from :class:`NullRunBudgetError` (NR-B004, the hard-block
-    case raised when ``decision == "block"``). Throttle means
-    "rate-limit this workflow but don't fully block it" — a temporary
-    pacing signal that the SDK surfaces as a typed exception so
-    cookbook code can back off and retry, vs. the hard block where
-    the same parameters would fail again.
-
-    Added 2026-09-08 to retire the generic ``WorkflowKilledInterrupt``
-    raise on the throttle path. Cookbook pattern: catch this
-    specifically (``except NullRunBudgetThrottleError``), sleep for
-    the cooldown window, and retry — distinct from the hard block
-    where retrying with the same budget tier is futile.
-    """
-
-    error_code = "NR-B007"
-    user_action = (
-        "Backend throttled this workflow (soft budget signal). Wait "
-        "for the cooldown window shown in the response and retry — "
-        "do NOT request a budget increase for a throttle (that is "
-        "the wrong remediation; the issue is pacing, not cap)."
-    )
-    retryable = True
-
-
 class NullRunExecutionNotFoundError(NullRunBackendError):
     """``/execute`` or ``/cancel`` was called with an ``execution_id`` that
     has no live server-side binding.

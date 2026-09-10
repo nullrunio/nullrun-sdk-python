@@ -135,11 +135,17 @@ def test_safe_json_helper_exists_and_wraps_json_errors():
         "transport.py must define _safe_json(response, endpoint) "
         "helper to wrap JSON parse failures"
     )
-    # The helper must raise NullRunTransportError with NR-T001
-    # (consistent with the rest of the SDK's error_code vocabulary)
-    assert 'error_code="NR-T001"' in src, (
+    # The helper must raise NullRunTransportError with NR-T-PARSE.
+    # NR-T001 (tool-block) was the historical literal here, but it
+    # collides with NullRunToolBlockedError.error_code
+    # (breaker/exceptions.py:955); cookbook handlers that branch on
+    # `exc.error_code == "NR-T001"` would mis-classify a JSON parse
+    # failure as a tool block. NR-T-PARSE is the new dedicated
+    # transport-class code; matches NR-T (transport) vocabulary.
+    assert 'error_code="NR-T-PARSE"' in src, (
         "_safe_json must raise NullRunTransportError with "
-        "error_code=NR-T001 (consistent with NR-A/NR-B vocabulary)"
+        "error_code=NR-T-PARSE (avoids collision with NR-T001 / "
+        "NullRunToolBlockedError)"
     )
     # body_preview truncation is part of the fix; the helper
     # must slice body to 200 chars max.

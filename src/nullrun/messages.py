@@ -145,9 +145,12 @@ DEFAULT_MESSAGES: dict[str, str] = {
     # the next /gate will mint a fresh reservation against the current
     # available budget.
     "NR-B006": "Your request couldn't be completed because the available capacity changed. Please try again.",
-    # NR-B007: workflow throttle (soft budget signal). Pacing issue, not
-    # cap; user should slow down and retry after the cooldown window.
-    "NR-B007": "You're sending requests too quickly. Please slow down and try again in a moment.",
+    # NR-B007: removed 2026-09-10. NullRunBudgetThrottleError was a
+    # zombie class — never raised on a wire or runtime path
+    # (runtime.py:2116 raises WorkflowPausedException on
+    # decision=="throttle"). Catalog entry removed to keep
+    # messages in sync with the exception module.
+    # "NR-B007": "...",
     # NR-O001: consume > reserve + ε tolerance. ADR-005 invariant;
     # the SDK rejects rather than silently re-reserving. User-facing
     # copy is generic because the cause is operator-side accounting;

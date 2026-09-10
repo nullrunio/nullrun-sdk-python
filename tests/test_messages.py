@@ -42,7 +42,11 @@ _EXPECTED_CODES = {
     "NR-B004",
     "NR-B005",
     "NR-B006",
-    "NR-B007",
+    # NR-B007 removed 2026-09-10: NullRunBudgetThrottleError was a
+    # zombie class never raised on a wire or runtime path
+    # (runtime.py:2116 raises WorkflowPausedException on
+    # decision=="throttle"). Catalog entry + exception class removed
+    # to keep messages in sync with the exception module.
     "NR-CH001",
     "NR-C000",
     "NR-EX01",
@@ -327,17 +331,6 @@ def test_format_user_message_handles_budget_recheck_failed():
     assert race.error_code == "NR-B006"
     out = messages.format_user_message(race)
     assert out == messages.DEFAULT_MESSAGES["NR-B006"]
-
-
-def test_format_user_message_handles_budget_throttle():
-    """NR-B007: workflow throttle (soft budget signal — pacing, not
-    cap). Distinct from NR-B004 (hard cap)."""
-    throttle = exc.NullRunBudgetThrottleError(
-        workflow_id="wf-1", reason="throttle"
-    )
-    assert throttle.error_code == "NR-B007"
-    out = messages.format_user_message(throttle)
-    assert out == messages.DEFAULT_MESSAGES["NR-B007"]
 
 
 def test_format_user_message_handles_consume_overbudget():

@@ -492,6 +492,14 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "WorkflowPausedException": ("nullrun.breaker.exceptions", "WorkflowPausedException"),
     "WorkflowKilledException": ("nullrun.breaker.exceptions", "WorkflowKilledException"),
     "WorkflowKilledInterrupt": ("nullrun.breaker.exceptions", "WorkflowKilledInterrupt"),
+    # Sibling typed name for the kill signal. Discovered via
+    # ``from nullrun import NullRunWorkflowKilledError``; matches
+    # `WorkflowKilledInterrupt` (BaseException) and the older
+    # `WorkflowKilledException` for back-compat. Cookbook code
+    # that wants a typed ``except`` clause prefers this over the
+    # base-interrupt form (mro-aware dispatch). The class lives at
+    # breaker/exceptions.py:1459.
+    "NullRunWorkflowKilledError": ("nullrun.breaker.exceptions", "NullRunWorkflowKilledError"),
     # User-facing message catalog (NULLRUN owns the wording; see
     # nullrun/messages.py for the design rationale). Eager in
     # spirit — these are the "give the user a chance" surface that
@@ -604,6 +612,7 @@ __all__ = [
     "NullRunBudgetError",
     "NullRunToolBlockedError",
     "WorkflowKilledInterrupt",
+    "NullRunWorkflowKilledError",
     # User-facing message catalog — the single entry point for
     # turning an SDK exception into a string safe to display to
     # end users. ``set_user_message`` lets a deployment brand its
