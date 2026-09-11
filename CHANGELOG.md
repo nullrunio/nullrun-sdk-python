@@ -1,3 +1,51 @@
+## [Unreleased]
+
+Patch release — closes the NR-A015 wire-shape gap on the SDK side. The
+`/execute` `require_approval` arm (backend v3.79+) mints a fresh
+server-side execution_id for the approval row and echoes it via
+`reservation_id`. Pre-fix `runtime.execute` captured that id into the
+contextvar AFTER `/gate` calls but not after `/execute`, so the post-
+approval `/execute` re-fire sent the stale pre-arm execution_id;
+`consume_approved`'s `WHERE execution_id = $3` predicate missed the
+freshly-stamped row and fell through to the terminal
+`APPROVAL_REPLAY_REJECTED` branch. This release wires the
+post-`/execute` capture and syncs the kwargs dict so the re-fire uses
+the freshly-minted id.
+
+### Fixed
+
+- **DEF-EXECUTE-CAPTURE-WIRING** — `runtime.execute` now calls
+  `_capture_server_minted_execution_id(result)` immediately after
+  `_transport.execute(...)` and syncs the re-fire kwargs dict to the
+  captured id (`src/nullrun/runtime.py`). The post-approval re-fire
+  now sends the freshly-minted execution_id stamped on the approval
+  row, so `consume_approved`'s `WHERE execution_id = $3` predicate
+  matches. Closes the SDK-side leg of NR-A015 on the `/execute`
+  require_approval arm.
+- **DEF-WAIT-FOR-APPROVAL-EXEC-ID** — both
+  `_wait_for_approval_resolution` call-sites (`check_workflow_budget`
+  + `runtime.execute`) now pass the captured server-minted
+  execution_id from the contextvar (with the prior
+  `org_id`/`workflow_id` sentinel as fallback) instead of the
+  `workflow_id` sentinel (`src/nullrun/runtime.py`). Diagnostic
+  improvement only — the WS handler matches on `approval_id` — but
+  log lines + entry metadata now reflect the server-minted id.
+
+### Added
+
+- **`tests/test_2026_09_11_execute_capture_wires_execution_id.py`** (220 lines). Two regression tests pinning the fix:
+  - `test_execute_captures_reservation_id_from_response` — verifies the contextvar updates from the `/execute` response and the re-fire uses the captured id (not the stale pre-call one).
+  - `test_execute_wait_for_approval_receives_captured_eid` — verifies the WS resolution handler receives the captured execution_id.
+
+### Compatibility
+
+Pure reliability fix — no wire-format change. `/gate`, `/execute`,
+`/track`, `/cancel` payloads are byte-identical to 0.16.7. Backend
+v3.79+ is required for the wire-shape contract (the `reservation_id`
+echo is the v3.79+ field that closes the gap); pre-v3.79 backends
+silently fall through the capture (helper is fail-OPEN on malformed
+values), preserving the pre-fix behaviour for un-deployed backends.
+
 ## [0.16.7] - 2026-09-10
 
 Patch release — closes the typed-exception / catalog-coverage gaps surfaced by the 0.16.6 backend hardening. After that release, every catalog exception the SDK can raise now has a hand-written `DEFAULT_MESSAGES` entry (no more "Something went wrong. Please try again." fallback), and `@protect`-decorated sites surface the real exception type instead of rewriting it into a generic `NullRunBlockedException`. The `@protect` block path in `runtime.execute` now dispatches the actual catalog code through `format_user_message`, so wire-error codes (NR-A012, NR-A016, NR-EX01, …) reach users with actionable wording. No wire-format change.

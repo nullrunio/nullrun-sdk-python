@@ -2207,10 +2207,26 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 f"check_workflow_budget: require_approval id={approval_id} -- "
                 f"waiting for WS push (timeout={server_timeout if server_timeout is not None else 'env-default'})"
             )
+            # 2026-09-11: pass the actual server-minted execution_id
+            # (captured above from the /gate response) into the WS
+            # wait so the entry's metadata + diagnostic log lines
+            # reflect the same id the server stamped on the
+            # approval row. Pre-fix this string fell back to
+            # ``str(self.organization_id)`` which made the
+            # ``__nullrun_unknown__`` sentinel leak into exception
+            # payloads (demo
+            # langgraph_openai_approval_demo.py prints
+            # ``execution_id=exc.workflow_id``). The handler matches
+            # purely on ``approval_id``, so this is diagnostic-only
+            # — captured on the consumer side.
+            from nullrun.context import get_server_minted_execution_id
+
+            _captured_eid = get_server_minted_execution_id()
             result = self._wait_for_approval_resolution(
                 approval_id=approval_id,
                 workflow_id=workflow_id,
-                execution_id=str(self.organization_id or "local"),
+                execution_id=_captured_eid
+                or str(self.organization_id or "local"),
                 timeout_seconds=server_timeout,
             )
             outcome = (result.get("outcome") or "").lower()
@@ -2963,6 +2979,34 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             execute_kwargs["action_digest"] = action_digest
         result = self._transport.execute(**execute_kwargs)
 
+        # 2026-09-11: DEF-EXECUTE-CAPTURE-WIRING. The /execute
+        # require_approval arm mints a FRESH execution_id (server-
+        # side) for the approval row + writes the binding, then
+        # echoes the new id back via ``reservation_id`` (mirrored by
+        # the backend's GateResponse::require_approval constructor —
+        # see backend/src/enforcement/gate_wire_adapter.rs v3.79+).
+        # Without this capture below, the contextvar stays at the
+        # /gate-minted value, and the post-approval /execute re-fire
+        # (line ~3037) sends the OLD execution_id back to the
+        # server. ``consume_approved``'s ``WHERE execution_id = $3``
+        # predicate then misses the row stamped with the freshly-
+        # minted one; the diagnostic SELECT walks all alternatives
+        # without match and falls through to the terminal
+        # replay-race branch (``APPROVAL_REPLAY_REJECTED``) — the
+        # SDK raises NR-A015. Capture here is fail-OPEN (drops
+        # malformed values silently via the helper's UUID parse),
+        # matching ``check_workflow_budget``'s behaviour.
+        _capture_server_minted_execution_id(result)
+
+        # Sync the kwargs dict to the captured id so the post-approval
+        # re-fire (line ~3083, ``self._transport.execute(**execute_kwargs)``)
+        # uses the freshly-minted execution_id. The contextvar update
+        # alone is not enough — the re-fire path does NOT re-read from
+        # the contextvar; it reuses the kwargs built before /execute.
+        _captured_after_execute = get_server_minted_execution_id()
+        if _captured_after_execute is not None:
+            execute_kwargs["execution_id"] = _captured_after_execute
+
         # Update metrics (thread-safe)
         metrics.inc_runtime("execute_calls")
 
@@ -2986,10 +3030,21 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 log_prefix="runtime.execute",
             )
 
+            # 2026-09-11: same rationale as in
+            # ``check_workflow_budget`` above — the entry's
+            # ``execution_id`` slot should reflect the server-minted
+            # id stamped on the approval row (captured via
+            # ``_capture_server_minted_execution_id(result)`` at line
+            # ~2968), not the workflow_id sentinel. The WS handler
+            # matches on approval_id only, so this is diagnostic.
+            from nullrun.context import get_server_minted_execution_id
+
+            _captured_eid = get_server_minted_execution_id()
             approval_result = self._wait_for_approval_resolution(
                 approval_id=str(approval_id),
                 workflow_id=workflow_id or UNKNOWN_WORKFLOW_ID,
-                execution_id=str(workflow_id or UNKNOWN_WORKFLOW_ID),
+                execution_id=_captured_eid
+                or str(workflow_id or UNKNOWN_WORKFLOW_ID),
                 timeout_seconds=server_timeout,
             )
             outcome = str(approval_result.get("outcome") or "").lower()
