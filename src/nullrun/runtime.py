@@ -95,7 +95,6 @@ from nullrun.breaker.exceptions import (
     NullRunInfrastructureError,
     NullRunTransportError,
     NullRunWorkflowKilledError,
-    TransportErrorSource,
     WorkflowKilledInterrupt,
     WorkflowPausedException,
 )

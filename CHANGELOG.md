@@ -1,4 +1,4 @@
-## [Unreleased]
+## [0.16.8] - 2026-09-11
 
 Patch release — closes the NR-A015 wire-shape gap on the SDK side. The
 `/execute` `require_approval` arm (backend v3.79+) mints a fresh
@@ -77,6 +77,41 @@ v3.79+ is required for the wire-shape contract (the `reservation_id`
 echo is the v3.79+ field that closes the gap); pre-v3.79 backends
 silently fall through the capture (helper is fail-OPEN on malformed
 values), preserving the pre-fix behaviour for un-deployed backends.
+
+### Why this is needed
+
+**NR-A015 (execute capture)** — the user-facing symptom was a
+post-approval `/execute` re-fire landing on `APPROVAL_REPLAY_REJECTED`
+because the SDK stamped the pre-arm `execution_id` into the
+re-fire's kwargs dict, but `consume_approved`'s `WHERE execution_id
+= $3` predicate had to match the freshly-minted id from the
+approval-row bind (backend v3.79+). The terminal error was a
+typed `NullRunApprovalReplayRejectedError(NR-A015)` — operators had
+no signal that the re-fire was sending a stale id rather than a
+truly-replayed call. 0.16.8 captures the `reservation_id` echo
+from `/execute`'s response into the same contextvar that `/gate`
+already uses, and re-emits the captured id on the re-fire kwargs
+dict.
+
+**AUTH-01 (transport reclassification)** — operators reading
+`NullRunAuthenticationError` from a failed `__init__` were led to
+rotate the API key because the class name suggested auth failure.
+Pre-fix, the duplicate arm in `NullRunRuntime.__init__` rewrapped
+`httpx.RequestError` as `NullRunAuthenticationError` (with the
+"this is a transport failure (not an auth failure)" wording in the
+message itself — a smoke signal the wrap was wrong). 0.16.8 raises
+`NullRunTransportError(source=NETWORK_ERROR, endpoint="auth")`
+matching the `Transport.heartbeat` convention. Catch-block semantics
+in cookbooks now need `except (NullRunAuthenticationError,
+NullRunTransportError):` for full coverage under
+`NullRunInfrastructureError`.
+
+**HEART-01 (public API)** — single-shot chain TTL extensions had to
+reach through `runtime._transport.heartbeat(...)` because
+`NullRunRuntime` exposed only the wall-clock `ping_chain()` scheduler.
+0.16.8 adds `NullRunRuntime.heartbeat(chain_id)` as a thin
+forwarder to `Transport.heartbeat`, matching the chain_end /
+cancel_execution pattern.
 
 ## [0.16.7] - 2026-09-10
 

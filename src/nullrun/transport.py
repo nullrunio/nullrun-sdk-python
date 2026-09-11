@@ -2158,6 +2158,8 @@ class Transport:
         # runtime.py:1978.
         from nullrun.business_impact import (
             BusinessImpact as _BusinessImpact,
+        )
+        from nullrun.business_impact import (
             compute_action_digest as _compute_action_digest,
         )
 

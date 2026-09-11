@@ -972,7 +972,11 @@ def test_authenticate_network_error_raises():
     """
     import httpx
 
-    from nullrun.breaker.exceptions import NullRunInfrastructureError, NullRunTransportError, TransportErrorSource
+    from nullrun.breaker.exceptions import (
+        NullRunInfrastructureError,
+        NullRunTransportError,
+        TransportErrorSource,
+    )
 
     rt = _make_runtime_with_mocked_auth()
     rt._transport._client.post.side_effect = httpx.ConnectError("nope")
