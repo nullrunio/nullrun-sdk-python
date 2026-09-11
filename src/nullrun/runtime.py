@@ -95,6 +95,7 @@ from nullrun.breaker.exceptions import (
     NullRunInfrastructureError,
     NullRunTransportError,
     NullRunWorkflowKilledError,
+    TransportErrorSource,
     WorkflowKilledInterrupt,
     WorkflowPausedException,
 )
@@ -767,15 +768,14 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             # Test mode: skip all network calls
             self._transport.start()
         else:
-            try:
-                self._authenticate()
-            except NullRunAuthenticationError:
-                raise  # Re-raise auth errors immediately - don't continue in unprotected mode
-            except httpx.RequestError as e:
-                raise NullRunAuthenticationError(
-                    f"Auth request failed: {e}. Cannot establish secure connection to NullRun. "
-                    f"Refusing to operate in unprotected mode."
-                ) from e
+            # AUTH-01 (2026-09-11): previously this arm caught ``httpx.RequestError``
+            # and re-raised ``NullRunAuthenticationError``, misclassifying network
+            # failures as auth failures. Arm B in ``_authenticate`` already catches
+            # the same condition with the correct class (``NullRunTransportError``);
+            # this defensive duplicate was a backstop for a code path that no longer
+            # exists between ``_authenticate()`` and ``self._transport.start()``.
+            # Remove: arm B is sufficient.
+            self._authenticate()
             self._transport.start()
             # Start remote polling unless disabled (internal `polling=False`
             # for tests/CI). Production always polls.
@@ -1252,19 +1252,22 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 )
                 raise err
         except httpx.RequestError as e:
-            # Network error - raise exception, do not fall back silently
-            err = NullRunAuthenticationError(
+            # AUTH-01 (2026-09-11): reclassify httpx.RequestError as
+            # ``NullRunTransportError`` instead of ``NullRunAuthenticationError``.
+            # The previous wrap misled operators — the same condition (DNS failure,
+            # connection refused, TLS handshake error, request timeout) is correctly
+            # classified as ``NullRunTransportError(NETWORK_ERROR, "auth")`` by
+            # ``Transport.heartbeat`` (transport.py:2077) and the rest of the SDK.
+            # The ``user_action`` previously embedded here noted "This is a
+            # transport failure (not an auth failure)" — the class should match
+            # the message. ``NullRunTransportError.__init__`` already sets
+            # ``error_code="NR-B001"`` (transport.py:233) and the standard
+            # retryable ``user_action`` (transport.py:234-237).
+            err = NullRunTransportError(
                 f"Auth request failed: {e}. Cannot establish secure connection to NullRun. "
                 f"Refusing to operate in unprotected mode.",
-                error_code="NR-B001",
-                user_action=(
-                    "Could not reach the NullRun backend at "
-                    f"{self.api_url}. Check network connectivity and the "
-                    "configured api_url. This is a transport failure (not "
-                    "an auth failure) — the API key may be valid, the "
-                    "backend is just unreachable."
-                ),
-                cause=e,
+                source=TransportErrorSource.NETWORK_ERROR,
+                endpoint="auth",
             )
             self._emit_sdk_error(err, stage="auth")
             raise err from e
@@ -2357,6 +2360,35 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             thread_done.wait(timeout=interval + 1.0)
 
         return stop
+
+    def heartbeat(self, chain_id: str) -> dict[str, Any]:
+        """POST /api/v1/heartbeat — extend a chain's idle TTL.
+
+        Single-shot wrapper around ``Transport.heartbeat`` matching the
+        ``chain_end`` / ``cancel_execution`` public-API pattern
+        (DEF-HEART-01, 2026-09-11). Use this for one-off TTL extensions;
+        use ``ping_chain`` when you want a wall-clock scheduler that calls
+        this method every N seconds.
+
+        The wire body is ``{"chain_id": chain_id}`` — HMAC headers carry
+        ``organization_id`` + ``trace_id`` automatically via
+        ``_build_signed_headers``, so no extra kwargs are needed at the
+        transport layer (mirrors the simpler heartbeat shape vs. chain_end's
+        ``organization_id``/``trace_id`` injection).
+
+        The transport layer already raises ``NullRunTransportError(
+        NETWORK_ERROR, "heartbeat")`` for network errors (transport.py:2077),
+        so no reclassification is needed at this layer.
+
+        Args:
+            chain_id: Active chain_id (UUID v4) registered via
+                ``with chain(chain_id, op="start")``.
+
+        Returns:
+            Parsed JSON dict (typically ``{"status": "ok", "chain_id": ...,
+            "last_active": ts}``).
+        """
+        return self._transport.heartbeat(chain_id)
 
     def cancel_execution(self, execution_id: str, reason: str | None = None) -> dict[str, Any]:
         """Cancel an in-flight execution via /api/v1/cancel

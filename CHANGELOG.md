@@ -12,6 +12,10 @@ freshly-stamped row and fell through to the terminal
 post-`/execute` capture and syncs the kwargs dict so the re-fire uses
 the freshly-minted id.
 
+Also includes the AUTH-01 / HEART-01 sweep from the 24-driver pass:
+reclassification of httpx transport errors on the auth path, plus a
+public `Runtime.heartbeat()` wrapper.
+
 ### Fixed
 
 - **DEF-EXECUTE-CAPTURE-WIRING** — `runtime.execute` now calls
@@ -30,12 +34,40 @@ the freshly-minted id.
   `workflow_id` sentinel (`src/nullrun/runtime.py`). Diagnostic
   improvement only — the WS handler matches on `approval_id` — but
   log lines + entry metadata now reflect the server-minted id.
+- **DEF-AUTH-01** — `NullRunRuntime.__init__` auth path no longer
+  reclassifies `httpx.RequestError` as `NullRunAuthenticationError`.
+  The defensive duplicate arm in `__init__` (backstop for a code path
+  that no longer exists) is removed; the real arm in `_authenticate`
+  now raises `NullRunTransportError(source=NETWORK_ERROR, endpoint="auth")`
+  — matching the convention used by `Transport.heartbeat` for the
+  same condition on `/heartbeat`. The previous wrap misled operators:
+  a network failure looked like an auth failure, even though the
+  message itself acknowledged "this is a transport failure (not an
+  auth failure)".
+
+  **Back-compat**: `NullRunTransportError` and `NullRunAuthenticationError`
+  are siblings under `NullRunInfrastructureError`, so the parent class
+  still catches both. Cookbook code that branches on
+  `except NullRunAuthenticationError:` for retry will need to also
+  catch `NullRunTransportError`. Two existing tests
+  (`test_authenticate_network_error_raises` in `test_runtime.py` and
+  `test_runtime_branches.py`) were locking in the old misclassification
+  and have been updated to assert the correct class.
 
 ### Added
+
+- **DEF-HEART-01** — `NullRunRuntime.heartbeat(chain_id)` public method
+  added (thin forwarder to `Transport.heartbeat`). Mirrors the
+  `chain_end` / `cancel_execution` pattern. Use for single-shot chain
+  TTL extensions; `Runtime.ping_chain()` remains the wall-clock
+  scheduler variant. Pure addition — no existing API surface changes.
 
 - **`tests/test_2026_09_11_execute_capture_wires_execution_id.py`** (220 lines). Two regression tests pinning the fix:
   - `test_execute_captures_reservation_id_from_response` — verifies the contextvar updates from the `/execute` response and the re-fire uses the captured id (not the stale pre-call one).
   - `test_execute_wait_for_approval_receives_captured_eid` — verifies the WS resolution handler receives the captured execution_id.
+- **`tests/test_2026_09_11_auth_heartbeat_sweep.py`** (~190 lines, 7 tests). Regression tests for AUTH-01 + HEART-01:
+  - AUTH-01: `test_auth_connect_error_raises_transport_error_not_auth`, `test_auth_timeout_raises_transport_error_not_auth`, `test_auth_error_class_no_longer_catches_network_error` (back-compat parent-class check).
+  - HEART-01: `test_heartbeat_method_exists_on_public_api`, `test_heartbeat_forwards_chain_id_to_transport`, `test_heartbeat_passes_through_transport_error`, `test_ping_chain_still_works_after_heartbeat_added`.
 
 ### Compatibility
 
