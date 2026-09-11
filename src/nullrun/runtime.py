@@ -2395,7 +2395,21 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 Returns:
                     Parsed JSON dict.
         """
-        return self._transport.chain_end(chain_id)
+        # DEF-CHAIN-END-ORG-ID (2026-09-11): ``Transport.chain_end`` pre-fix
+        # sent only ``{chain_id, chain_op, execution_id}`` to /gate and the
+        # backend rejected with 422 ``missing field 'organization_id'``.
+        # Fix: forward ``self.organization_id`` (set in ``_authenticate``)
+        # and the contextvar trace_id so the SDK builds a complete
+        # ``GateRequest`` body. ``trace_id`` is sourced from the contextvar
+        # to match the rest of the SDK's wire-shape policy (one trace id
+        # per logical chain).
+        from nullrun.context import get_trace_id
+
+        return self._transport.chain_end(
+            chain_id,
+            organization_id=self.organization_id,
+            trace_id=get_trace_id(),
+        )
 
     def approximate_budget(self) -> dict[str, Any]:
         """UI-only budget estimate via GET /api/v1/budget/approximate

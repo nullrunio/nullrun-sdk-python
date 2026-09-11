@@ -208,12 +208,14 @@ class TestSignedPostIncludesProtocolHeader:
         # 2026-07-04 (B3): ``chain_end`` now POSTs to
         # /api/v1/gate with ``chain_op: "end"``. The /api/v1/chain/end
         # endpoint was never registered on the backend.
+        # 2026-09-11 (DEF-CHAIN-END-ORG-ID): chain_end now requires
+        # organization_id (the backend's GateRequest rejects without it).
         t = Transport(api_url=BASE_URL, api_key="nr_live_abc123")
         try:
             route = respx.post(f"{BASE_URL}/api/v1/gate").mock(
                 return_value=Response(200, json={"decision": "allow"})
             )
-            t.chain_end("chain-abc")
+            t.chain_end("chain-abc", organization_id="org-1")
             sent = route.calls.last.request
             assert sent.headers["X-NULLRUN-PROTOCOL"] == str(NULLRUN_PROTOCOL_VERSION)
             body = sent.content.decode("utf-8")
@@ -913,11 +915,92 @@ class TestChainEndEndpoint:
             route = respx.post(f"{BASE_URL}/api/v1/gate").mock(
                 return_value=Response(200, json={"decision": "allow"})
             )
-            t.chain_end("chain-1")
+            t.chain_end("chain-1", organization_id="org-1")
             sent = route.calls.last.request
             body = sent.content.decode("utf-8")
             assert '"chain_id":"chain-1"' in body
             assert '"chain_op":"end"' in body
+        finally:
+            t.stop()
+
+    @respx.mock
+    def test_chain_end_sends_full_gate_request_body(self):
+        # DEF-CHAIN-END-ORG-ID (2026-09-11): pre-fix ``chain_end`` POSTed
+        # only ``{chain_id, chain_op, execution_id}`` to /gate. The
+        # backend's ``GateRequest`` struct (see
+        # backend/src/proxy/http/gate/internal.rs:156) marks
+        # ``organization_id``, ``execution_id``, ``trace_id``, ``mode``
+        # as REQUIRED — the deserializer rejects with 422
+        # ``missing field 'organization_id'`` BEFORE chain_op-specific
+        # dispatch runs. Live wire trace against api.nullrun.io
+        # (capture [009] in
+        # nullrun-examples/examples/_wire_trace_output.txt) confirms
+        # the 422.
+        #
+        # Fix: ``Transport.chain_end`` accepts ``organization_id`` (and
+        # optional ``trace_id``/``operation_id``) kwargs, builds a
+        # full GateRequest body (incl. action_digest so the
+        # Phase-1+ version-gate at backend::gate::gate.rs:148 passes),
+        # and raises ``NullRunConfigError`` if a direct caller
+        # forgets to pass organization_id.
+        t = Transport(api_url=BASE_URL, api_key="nr_live_abc123")
+        try:
+            route = respx.post(f"{BASE_URL}/api/v1/gate").mock(
+                return_value=Response(200, json={"decision": "allow"})
+            )
+            t.chain_end("chain-1", organization_id="org-1")
+            sent = route.calls.last.request
+            body = sent.content.decode("utf-8")
+            # All four GateRequest required fields must be on the wire.
+            assert '"organization_id":"org-1"' in body
+            assert '"execution_id":"' in body
+            assert '"trace_id":"' in body
+            assert '"mode":"auto"' in body
+            assert '"chain_id":"chain-1"' in body
+            assert '"chain_op":"end"' in body
+            assert '"operation_id":"' in body
+            # Phase-1+ version-gate rejects missing action_digest on
+            # proto>=3 — chain_end emits the NoImpact sentinel digest
+            # to match ``runtime.check_workflow_budget``.
+            assert '"action_digest":"' in body
+        finally:
+            t.stop()
+
+    @respx.mock
+    def test_chain_end_missing_organization_id_raises(self):
+        # DEF-CHAIN-END-ORG-ID: a direct Transport.chain_end call
+        # without organization_id MUST raise ``NullRunConfigError``
+        # before it hits the network — silent 422 from the backend
+        # would surface as a confusing transport error.
+        from nullrun.breaker.exceptions import NullRunConfigError
+
+        t = Transport(api_url=BASE_URL, api_key="nr_live_abc123")
+        try:
+            with pytest.raises(NullRunConfigError) as excinfo:
+                t.chain_end("chain-1")
+            assert "organization_id" in str(excinfo.value)
+        finally:
+            t.stop()
+
+    @respx.mock
+    def test_chain_end_forwards_trace_id_when_provided(self):
+        # When the caller (typically ``Runtime.chain_end``) supplies
+        # a trace_id, it MUST land on the wire unchanged so the
+        # chain-close event is correlated with the rest of the
+        # chain's spans.
+        t = Transport(api_url=BASE_URL, api_key="nr_live_abc123")
+        try:
+            route = respx.post(f"{BASE_URL}/api/v1/gate").mock(
+                return_value=Response(200, json={"decision": "allow"})
+            )
+            t.chain_end(
+                "chain-1",
+                organization_id="org-1",
+                trace_id="trace-abc",
+            )
+            sent = route.calls.last.request
+            body = sent.content.decode("utf-8")
+            assert '"trace_id":"trace-abc"' in body
         finally:
             t.stop()
 

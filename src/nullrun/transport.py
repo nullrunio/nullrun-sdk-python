@@ -33,6 +33,7 @@ from nullrun.breaker.exceptions import (
     NullRunAuthenticationError,
     NullRunBackendError,
     NullRunBlockedException,
+    NullRunConfigError,
     NullRunDecision,
     NullRunExecutionNotFoundError,
     NullRunInfrastructureError,
@@ -2088,6 +2089,10 @@ class Transport:
     def chain_end(
         self,
         chain_id: str,
+        *,
+        organization_id: str | None = None,
+        trace_id: str | None = None,
+        operation_id: str | None = None,
     ) -> dict[str, Any]:
         """Close a chain explicitly via /api/v1/gate with chain_op=end
         .
@@ -2105,20 +2110,76 @@ class Transport:
 
                 Args:
                     chain_id: Chain to close.
+                    organization_id: Organization identifier (REQUIRED on the
+                        wire — ``GateRequest`` deserialization fails with
+                        422 ``missing field 'organization_id'`` without it,
+                        see ``backend/src/proxy/http/gate/internal.rs:156``).
+                        ``Runtime.chain_end`` always passes
+                        ``self.organization_id`` from ``_authenticate``.
+                    trace_id: Distributed trace ID. Auto-generated UUIDv4 if
+                        not provided.
+                    operation_id: Idempotency key — set explicitly when the
+                        caller wants the backend's per-``operation_id``
+                        dedup (matches ``runtime.check_workflow_budget``
+                        behaviour). Auto-generated UUIDv4 if not provided.
 
                 Returns:
                     Parsed JSON dict (typically ``{"decision": "allow"
                     "chain_id":...}``).
         """
-        # 2026-07-04 (B3): POST /api/v1/gate with
+        # DEF-CHAIN-END-ORG-ID (2026-09-11): ``Transport.chain_end`` pre-fix
+        # POSTed only ``{chain_id, chain_op, execution_id}`` to /gate. The
+        # backend's ``GateRequest`` struct
+        # (backend/src/proxy/http/gate/internal.rs:156) marks
+        # ``organization_id``, ``execution_id``, ``trace_id``, ``mode`` as
+        # REQUIRED — the deserializer validates them BEFORE chain_op-specific
+        # dispatch, so even the ``chain_op=end`` control-plane path
+        # returns 422 ``missing field 'organization_id'`` on the old
+        # body. Live wire trace against api.nullrun.io confirms the
+        # 422. Fix: build the same full GateRequest body every other
+        # /gate caller builds (``check`` at transport.py:1481, the
+        # capture site at runtime.py:1953).
+        if organization_id is None:
+            raise NullRunConfigError(
+                "Transport.chain_end requires organization_id — "
+                "NullRunRuntime.chain_end always passes it from "
+                "_authenticate; a direct Transport.chain_end call must "
+                "pass organization_id explicitly. The backend's GateRequest "
+                "struct (backend/src/proxy/http/gate/internal.rs:156) "
+                "rejects requests without organization_id with 422 "
+                "VALIDATION_ERROR."
+            )
+        # v0.16.1 (Phase-1+ wire-shape): the backend's
+        # ``backend/src/proxy/http/gate/gate.rs:148`` version-gate
+        # fail-CLOSED-rejects any proto>=3 /gate call that omits
+        # ``action_digest``. ``chain_end`` is a control-plane op with
+        # no business_impact, so we emit the same NoImpact sentinel
+        # digest that ``runtime.check_workflow_budget`` produces at
+        # runtime.py:1978.
+        from nullrun.business_impact import (
+            BusinessImpact as _BusinessImpact,
+            compute_action_digest as _compute_action_digest,
+        )
+
         request = {
+            "organization_id": organization_id,
+            # Fresh UUIDv4 per call (canonical hyphenated form so it
+            # parses through the backend's ``Uuid::parse_str`` if it
+            # ever reads it on this path).
+            "execution_id": str(uuid.uuid4()),
+            "trace_id": trace_id or str(uuid.uuid4()),
+            "tool": None,
+            "input": None,
+            # ``mode="auto"`` — chain_end is a control-plane operation,
+            # not a budget-consuming call. The orchestrator's
+            # ``gate_reserve_v3`` Lua call receives ``chain_op=End``
+            # and skips the budget reserve path, so the mode string
+            # only needs to satisfy GateRequest's required-field check.
+            "mode": "auto",
+            "operation_id": operation_id or str(uuid.uuid4()),
             "chain_id": chain_id,
             "chain_op": "end",
-            # execution_id is required by the backend's gate handler
-            # even on chain_end — the handler reads it but does not
-            # mint a reservation for op=end. Use a fresh uuidv7
-            # call (the server ignores it on this path).
-            "execution_id": uuid.uuid4().hex,
+            "action_digest": _compute_action_digest(_BusinessImpact.no_impact()),
         }
         # 2026-07-06 (bug-fix): same body-before-headers reorder as
         body = _signed_request_body(request)
