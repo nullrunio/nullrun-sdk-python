@@ -1,3 +1,118 @@
+## [0.16.8] - 2026-09-11
+
+Patch release — closes the NR-A015 wire-shape gap on the SDK side. The
+`/execute` `require_approval` arm (backend v3.79+) mints a fresh
+server-side execution_id for the approval row and echoes it via
+`reservation_id`. Pre-fix `runtime.execute` captured that id into the
+contextvar AFTER `/gate` calls but not after `/execute`, so the post-
+approval `/execute` re-fire sent the stale pre-arm execution_id;
+`consume_approved`'s `WHERE execution_id = $3` predicate missed the
+freshly-stamped row and fell through to the terminal
+`APPROVAL_REPLAY_REJECTED` branch. This release wires the
+post-`/execute` capture and syncs the kwargs dict so the re-fire uses
+the freshly-minted id.
+
+Also includes the AUTH-01 / HEART-01 sweep from the 24-driver pass:
+reclassification of httpx transport errors on the auth path, plus a
+public `Runtime.heartbeat()` wrapper.
+
+### Fixed
+
+- **DEF-EXECUTE-CAPTURE-WIRING** — `runtime.execute` now calls
+  `_capture_server_minted_execution_id(result)` immediately after
+  `_transport.execute(...)` and syncs the re-fire kwargs dict to the
+  captured id (`src/nullrun/runtime.py`). The post-approval re-fire
+  now sends the freshly-minted execution_id stamped on the approval
+  row, so `consume_approved`'s `WHERE execution_id = $3` predicate
+  matches. Closes the SDK-side leg of NR-A015 on the `/execute`
+  require_approval arm.
+- **DEF-WAIT-FOR-APPROVAL-EXEC-ID** — both
+  `_wait_for_approval_resolution` call-sites (`check_workflow_budget`
+  + `runtime.execute`) now pass the captured server-minted
+  execution_id from the contextvar (with the prior
+  `org_id`/`workflow_id` sentinel as fallback) instead of the
+  `workflow_id` sentinel (`src/nullrun/runtime.py`). Diagnostic
+  improvement only — the WS handler matches on `approval_id` — but
+  log lines + entry metadata now reflect the server-minted id.
+- **DEF-AUTH-01** — `NullRunRuntime.__init__` auth path no longer
+  reclassifies `httpx.RequestError` as `NullRunAuthenticationError`.
+  The defensive duplicate arm in `__init__` (backstop for a code path
+  that no longer exists) is removed; the real arm in `_authenticate`
+  now raises `NullRunTransportError(source=NETWORK_ERROR, endpoint="auth")`
+  — matching the convention used by `Transport.heartbeat` for the
+  same condition on `/heartbeat`. The previous wrap misled operators:
+  a network failure looked like an auth failure, even though the
+  message itself acknowledged "this is a transport failure (not an
+  auth failure)".
+
+  **Back-compat**: `NullRunTransportError` and `NullRunAuthenticationError`
+  are siblings under `NullRunInfrastructureError`, so the parent class
+  still catches both. Cookbook code that branches on
+  `except NullRunAuthenticationError:` for retry will need to also
+  catch `NullRunTransportError`. Two existing tests
+  (`test_authenticate_network_error_raises` in `test_runtime.py` and
+  `test_runtime_branches.py`) were locking in the old misclassification
+  and have been updated to assert the correct class.
+
+### Added
+
+- **DEF-HEART-01** — `NullRunRuntime.heartbeat(chain_id)` public method
+  added (thin forwarder to `Transport.heartbeat`). Mirrors the
+  `chain_end` / `cancel_execution` pattern. Use for single-shot chain
+  TTL extensions; `Runtime.ping_chain()` remains the wall-clock
+  scheduler variant. Pure addition — no existing API surface changes.
+
+- **`tests/test_2026_09_11_execute_capture_wires_execution_id.py`** (220 lines). Two regression tests pinning the fix:
+  - `test_execute_captures_reservation_id_from_response` — verifies the contextvar updates from the `/execute` response and the re-fire uses the captured id (not the stale pre-call one).
+  - `test_execute_wait_for_approval_receives_captured_eid` — verifies the WS resolution handler receives the captured execution_id.
+- **`tests/test_2026_09_11_auth_heartbeat_sweep.py`** (~190 lines, 7 tests). Regression tests for AUTH-01 + HEART-01:
+  - AUTH-01: `test_auth_connect_error_raises_transport_error_not_auth`, `test_auth_timeout_raises_transport_error_not_auth`, `test_auth_error_class_no_longer_catches_network_error` (back-compat parent-class check).
+  - HEART-01: `test_heartbeat_method_exists_on_public_api`, `test_heartbeat_forwards_chain_id_to_transport`, `test_heartbeat_passes_through_transport_error`, `test_ping_chain_still_works_after_heartbeat_added`.
+
+### Compatibility
+
+Pure reliability fix — no wire-format change. `/gate`, `/execute`,
+`/track`, `/cancel` payloads are byte-identical to 0.16.7. Backend
+v3.79+ is required for the wire-shape contract (the `reservation_id`
+echo is the v3.79+ field that closes the gap); pre-v3.79 backends
+silently fall through the capture (helper is fail-OPEN on malformed
+values), preserving the pre-fix behaviour for un-deployed backends.
+
+### Why this is needed
+
+**NR-A015 (execute capture)** — the user-facing symptom was a
+post-approval `/execute` re-fire landing on `APPROVAL_REPLAY_REJECTED`
+because the SDK stamped the pre-arm `execution_id` into the
+re-fire's kwargs dict, but `consume_approved`'s `WHERE execution_id
+= $3` predicate had to match the freshly-minted id from the
+approval-row bind (backend v3.79+). The terminal error was a
+typed `NullRunApprovalReplayRejectedError(NR-A015)` — operators had
+no signal that the re-fire was sending a stale id rather than a
+truly-replayed call. 0.16.8 captures the `reservation_id` echo
+from `/execute`'s response into the same contextvar that `/gate`
+already uses, and re-emits the captured id on the re-fire kwargs
+dict.
+
+**AUTH-01 (transport reclassification)** — operators reading
+`NullRunAuthenticationError` from a failed `__init__` were led to
+rotate the API key because the class name suggested auth failure.
+Pre-fix, the duplicate arm in `NullRunRuntime.__init__` rewrapped
+`httpx.RequestError` as `NullRunAuthenticationError` (with the
+"this is a transport failure (not an auth failure)" wording in the
+message itself — a smoke signal the wrap was wrong). 0.16.8 raises
+`NullRunTransportError(source=NETWORK_ERROR, endpoint="auth")`
+matching the `Transport.heartbeat` convention. Catch-block semantics
+in cookbooks now need `except (NullRunAuthenticationError,
+NullRunTransportError):` for full coverage under
+`NullRunInfrastructureError`.
+
+**HEART-01 (public API)** — single-shot chain TTL extensions had to
+reach through `runtime._transport.heartbeat(...)` because
+`NullRunRuntime` exposed only the wall-clock `ping_chain()` scheduler.
+0.16.8 adds `NullRunRuntime.heartbeat(chain_id)` as a thin
+forwarder to `Transport.heartbeat`, matching the chain_end /
+cancel_execution pattern.
+
 ## [0.16.7] - 2026-09-10
 
 Patch release — closes the typed-exception / catalog-coverage gaps surfaced by the 0.16.6 backend hardening. After that release, every catalog exception the SDK can raise now has a hand-written `DEFAULT_MESSAGES` entry (no more "Something went wrong. Please try again." fallback), and `@protect`-decorated sites surface the real exception type instead of rewriting it into a generic `NullRunBlockedException`. The `@protect` block path in `runtime.execute` now dispatches the actual catalog code through `format_user_message`, so wire-error codes (NR-A012, NR-A016, NR-EX01, …) reach users with actionable wording. No wire-format change.

@@ -767,15 +767,14 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             # Test mode: skip all network calls
             self._transport.start()
         else:
-            try:
-                self._authenticate()
-            except NullRunAuthenticationError:
-                raise  # Re-raise auth errors immediately - don't continue in unprotected mode
-            except httpx.RequestError as e:
-                raise NullRunAuthenticationError(
-                    f"Auth request failed: {e}. Cannot establish secure connection to NullRun. "
-                    f"Refusing to operate in unprotected mode."
-                ) from e
+            # AUTH-01 (2026-09-11): previously this arm caught ``httpx.RequestError``
+            # and re-raised ``NullRunAuthenticationError``, misclassifying network
+            # failures as auth failures. Arm B in ``_authenticate`` already catches
+            # the same condition with the correct class (``NullRunTransportError``);
+            # this defensive duplicate was a backstop for a code path that no longer
+            # exists between ``_authenticate()`` and ``self._transport.start()``.
+            # Remove: arm B is sufficient.
+            self._authenticate()
             self._transport.start()
             # Start remote polling unless disabled (internal `polling=False`
             # for tests/CI). Production always polls.
@@ -1252,19 +1251,22 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 )
                 raise err
         except httpx.RequestError as e:
-            # Network error - raise exception, do not fall back silently
-            err = NullRunAuthenticationError(
+            # AUTH-01 (2026-09-11): reclassify httpx.RequestError as
+            # ``NullRunTransportError`` instead of ``NullRunAuthenticationError``.
+            # The previous wrap misled operators — the same condition (DNS failure,
+            # connection refused, TLS handshake error, request timeout) is correctly
+            # classified as ``NullRunTransportError(NETWORK_ERROR, "auth")`` by
+            # ``Transport.heartbeat`` (transport.py:2077) and the rest of the SDK.
+            # The ``user_action`` previously embedded here noted "This is a
+            # transport failure (not an auth failure)" — the class should match
+            # the message. ``NullRunTransportError.__init__`` already sets
+            # ``error_code="NR-B001"`` (transport.py:233) and the standard
+            # retryable ``user_action`` (transport.py:234-237).
+            err = NullRunTransportError(
                 f"Auth request failed: {e}. Cannot establish secure connection to NullRun. "
                 f"Refusing to operate in unprotected mode.",
-                error_code="NR-B001",
-                user_action=(
-                    "Could not reach the NullRun backend at "
-                    f"{self.api_url}. Check network connectivity and the "
-                    "configured api_url. This is a transport failure (not "
-                    "an auth failure) — the API key may be valid, the "
-                    "backend is just unreachable."
-                ),
-                cause=e,
+                source=TransportErrorSource.NETWORK_ERROR,
+                endpoint="auth",
             )
             self._emit_sdk_error(err, stage="auth")
             raise err from e
@@ -2207,10 +2209,26 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 f"check_workflow_budget: require_approval id={approval_id} -- "
                 f"waiting for WS push (timeout={server_timeout if server_timeout is not None else 'env-default'})"
             )
+            # 2026-09-11: pass the actual server-minted execution_id
+            # (captured above from the /gate response) into the WS
+            # wait so the entry's metadata + diagnostic log lines
+            # reflect the same id the server stamped on the
+            # approval row. Pre-fix this string fell back to
+            # ``str(self.organization_id)`` which made the
+            # ``__nullrun_unknown__`` sentinel leak into exception
+            # payloads (demo
+            # langgraph_openai_approval_demo.py prints
+            # ``execution_id=exc.workflow_id``). The handler matches
+            # purely on ``approval_id``, so this is diagnostic-only
+            # — captured on the consumer side.
+            from nullrun.context import get_server_minted_execution_id
+
+            _captured_eid = get_server_minted_execution_id()
             result = self._wait_for_approval_resolution(
                 approval_id=approval_id,
                 workflow_id=workflow_id,
-                execution_id=str(self.organization_id or "local"),
+                execution_id=_captured_eid
+                or str(self.organization_id or "local"),
                 timeout_seconds=server_timeout,
             )
             outcome = (result.get("outcome") or "").lower()
@@ -2342,6 +2360,35 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
 
         return stop
 
+    def heartbeat(self, chain_id: str) -> dict[str, Any]:
+        """POST /api/v1/heartbeat — extend a chain's idle TTL.
+
+        Single-shot wrapper around ``Transport.heartbeat`` matching the
+        ``chain_end`` / ``cancel_execution`` public-API pattern
+        (DEF-HEART-01, 2026-09-11). Use this for one-off TTL extensions;
+        use ``ping_chain`` when you want a wall-clock scheduler that calls
+        this method every N seconds.
+
+        The wire body is ``{"chain_id": chain_id}`` — HMAC headers carry
+        ``organization_id`` + ``trace_id`` automatically via
+        ``_build_signed_headers``, so no extra kwargs are needed at the
+        transport layer (mirrors the simpler heartbeat shape vs. chain_end's
+        ``organization_id``/``trace_id`` injection).
+
+        The transport layer already raises ``NullRunTransportError(
+        NETWORK_ERROR, "heartbeat")`` for network errors (transport.py:2077),
+        so no reclassification is needed at this layer.
+
+        Args:
+            chain_id: Active chain_id (UUID v4) registered via
+                ``with chain(chain_id, op="start")``.
+
+        Returns:
+            Parsed JSON dict (typically ``{"status": "ok", "chain_id": ...,
+            "last_active": ts}``).
+        """
+        return self._transport.heartbeat(chain_id)
+
     def cancel_execution(self, execution_id: str, reason: str | None = None) -> dict[str, Any]:
         """Cancel an in-flight execution via /api/v1/cancel
         .
@@ -2379,7 +2426,21 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 Returns:
                     Parsed JSON dict.
         """
-        return self._transport.chain_end(chain_id)
+        # DEF-CHAIN-END-ORG-ID (2026-09-11): ``Transport.chain_end`` pre-fix
+        # sent only ``{chain_id, chain_op, execution_id}`` to /gate and the
+        # backend rejected with 422 ``missing field 'organization_id'``.
+        # Fix: forward ``self.organization_id`` (set in ``_authenticate``)
+        # and the contextvar trace_id so the SDK builds a complete
+        # ``GateRequest`` body. ``trace_id`` is sourced from the contextvar
+        # to match the rest of the SDK's wire-shape policy (one trace id
+        # per logical chain).
+        from nullrun.context import get_trace_id
+
+        return self._transport.chain_end(
+            chain_id,
+            organization_id=self.organization_id,
+            trace_id=get_trace_id(),
+        )
 
     def approximate_budget(self) -> dict[str, Any]:
         """UI-only budget estimate via GET /api/v1/budget/approximate
@@ -2963,6 +3024,34 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             execute_kwargs["action_digest"] = action_digest
         result = self._transport.execute(**execute_kwargs)
 
+        # 2026-09-11: DEF-EXECUTE-CAPTURE-WIRING. The /execute
+        # require_approval arm mints a FRESH execution_id (server-
+        # side) for the approval row + writes the binding, then
+        # echoes the new id back via ``reservation_id`` (mirrored by
+        # the backend's GateResponse::require_approval constructor —
+        # see backend/src/enforcement/gate_wire_adapter.rs v3.79+).
+        # Without this capture below, the contextvar stays at the
+        # /gate-minted value, and the post-approval /execute re-fire
+        # (line ~3037) sends the OLD execution_id back to the
+        # server. ``consume_approved``'s ``WHERE execution_id = $3``
+        # predicate then misses the row stamped with the freshly-
+        # minted one; the diagnostic SELECT walks all alternatives
+        # without match and falls through to the terminal
+        # replay-race branch (``APPROVAL_REPLAY_REJECTED``) — the
+        # SDK raises NR-A015. Capture here is fail-OPEN (drops
+        # malformed values silently via the helper's UUID parse),
+        # matching ``check_workflow_budget``'s behaviour.
+        _capture_server_minted_execution_id(result)
+
+        # Sync the kwargs dict to the captured id so the post-approval
+        # re-fire (line ~3083, ``self._transport.execute(**execute_kwargs)``)
+        # uses the freshly-minted execution_id. The contextvar update
+        # alone is not enough — the re-fire path does NOT re-read from
+        # the contextvar; it reuses the kwargs built before /execute.
+        _captured_after_execute = get_server_minted_execution_id()
+        if _captured_after_execute is not None:
+            execute_kwargs["execution_id"] = _captured_after_execute
+
         # Update metrics (thread-safe)
         metrics.inc_runtime("execute_calls")
 
@@ -2986,10 +3075,21 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 log_prefix="runtime.execute",
             )
 
+            # 2026-09-11: same rationale as in
+            # ``check_workflow_budget`` above — the entry's
+            # ``execution_id`` slot should reflect the server-minted
+            # id stamped on the approval row (captured via
+            # ``_capture_server_minted_execution_id(result)`` at line
+            # ~2968), not the workflow_id sentinel. The WS handler
+            # matches on approval_id only, so this is diagnostic.
+            from nullrun.context import get_server_minted_execution_id
+
+            _captured_eid = get_server_minted_execution_id()
             approval_result = self._wait_for_approval_resolution(
                 approval_id=str(approval_id),
                 workflow_id=workflow_id or UNKNOWN_WORKFLOW_ID,
-                execution_id=str(workflow_id or UNKNOWN_WORKFLOW_ID),
+                execution_id=_captured_eid
+                or str(workflow_id or UNKNOWN_WORKFLOW_ID),
                 timeout_seconds=server_timeout,
             )
             outcome = str(approval_result.get("outcome") or "").lower()

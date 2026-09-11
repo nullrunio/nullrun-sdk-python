@@ -964,12 +964,29 @@ def test_authenticate_non_200_raises():
 
 
 def test_authenticate_network_error_raises():
+    """AUTH-01 (2026-09-11): httpx.RequestError on auth path now raises
+    ``NullRunTransportError(NETWORK_ERROR, "auth")`` instead of
+    ``NullRunAuthenticationError``. The previous test was locking in the
+    misclassified behavior — fix the test to assert the correct class.
+    ``NullRunInfrastructureError`` (parent) still catches it for back-compat.
+    """
     import httpx
 
-    from nullrun.breaker.exceptions import NullRunAuthenticationError
+    from nullrun.breaker.exceptions import (
+        NullRunInfrastructureError,
+        NullRunTransportError,
+        TransportErrorSource,
+    )
 
     rt = _make_runtime_with_mocked_auth()
     rt._transport._client.post.side_effect = httpx.ConnectError("nope")
 
-    with pytest.raises(NullRunAuthenticationError):
+    with pytest.raises(NullRunTransportError) as exc_info:
+        rt._authenticate()
+
+    assert exc_info.value.source == TransportErrorSource.NETWORK_ERROR
+    assert exc_info.value.endpoint == "auth"
+    # Parent-class catch still works for back-compat.
+    with pytest.raises(NullRunInfrastructureError):
+        rt._transport._client.post.side_effect = httpx.ConnectError("nope")
         rt._authenticate()
