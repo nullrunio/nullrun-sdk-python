@@ -476,6 +476,18 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     # `from nullrun.extractor import money_outflow` still works.
     "money_outflow": ("nullrun.extractor", "money_outflow"),
     "tool_params": ("nullrun.extractor", "tool_params"),
+    # Business impact module re-export. The docstrings at
+    # `extractor.py:18` and `extractor.py:799-801` reference
+    # `nullrun.business_impact.compute_action_digest` /
+    # `MoneyImpactExtractor` / `ToolParamsExtractor` as bare dotted
+    # paths. The module is real (`nullrun/business_impact.py`) and
+    # contains those symbols, but PEP 562 `__getattr__` masks
+    # submodule access unless we expose the module object itself.
+    # The `attr_name=None` sentinel below tells `__getattr__` to
+    # return the imported submodule verbatim rather than `getattr`
+    # on it — same shape as `from nullrun import business_impact`
+    # for the user, no manual `import nullrun.business_impact` first.
+    "business_impact": ("nullrun.business_impact", None),
     # Actions
     "ActionHandler": ("nullrun.actions", "ActionHandler"),
     "ActionType": ("nullrun.actions", "ActionType"),
@@ -569,7 +581,17 @@ def __getattr__(name: str):
     if name in _LAZY_EXPORTS:
         module_path, attr_name = _LAZY_EXPORTS[name]
         module = __import__(module_path, fromlist=[attr_name])
-        value = getattr(module, attr_name)
+        if attr_name is None:
+            # Sentinel: return the imported module itself (submodule
+            # re-export). Used for `nullrun.business_impact` so the
+            # docstring-referenced dotted paths
+            # (`nullrun.business_impact.compute_action_digest` etc.)
+            # resolve without an explicit `import
+            # nullrun.business_impact` first. See
+            # `_LAZY_EXPORTS['business_impact']` for the rationale.
+            value = module
+        else:
+            value = getattr(module, attr_name)
         # Cache on the module so subsequent lookups are O(1) and
         # dir(nullrun) still reports the curated public surface until
         # the legacy name is actually accessed.
