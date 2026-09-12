@@ -1,3 +1,52 @@
+## [0.17.0] - 2026-09-12
+
+Minor release — three correctness themes on the 0.16.x baseline: (1) **chain-setter Token discipline** (`set_chain_id` / `set_chain_op` now return the `Token` minted by `ContextVar.set()`, matching the rest of the manual-setter surface — silent audit-trail bleed across calls is closed), (2) **`_GATE_CACHE` staleness closure** (invalidate the gate cache on consume-side 402/422 + on `chain_end` so a stale "allow" cannot serve un-budgeted tool execution within the 5s cache window), and (3) **lazy-export repair** (`nullrun.money_outflow`, `nullrun.tool_params`, `nullrun.business_impact` are now reachable as attributes on `nullrun` — the documented `@nullrun.sensitive(impact=money_outflow(...))` pattern no longer crashes with `AttributeError`). **Behaviour change** for callers using the manual `set_chain_id` / `set_chain_op` escape-hatch — the return value is now a `Token`, not `None`. Wire-format unchanged. SDK_MIN_VERSION unchanged.
+
+### Fixed
+
+- **DEF-CHAIN-SETTER-NO-TOKEN** — `nullrun.set_chain_id(chain_id)` and `nullrun.set_chain_op(op)` now return the `Token` minted by the underlying `ContextVar.set()` call (`src/nullrun/__init__.py`, `src/nullrun/context.py`, `8e7e070`). Mirrors the existing discipline on `set_trace_id` / `set_span_id` / `set_operation_id` / `set_server_minted_execution_id`. Callers using the manual-setter API outside the `with chain(...)` contextmanager can now restore the prior value via `ctx.reset(token)`, closing the silent audit-trail bleed where chain_id attribution leaked forward into subsequent unrelated `/check` calls on the same event-loop task slot. Docstrings updated to call out the Token contract.
+
+  **Back-compat**: callers that ignored the previous `None` return continue to work; the only observable change is the new `Token` return value (assignable to a local variable). Recurring foot-gun, not an active bypass — CPython asyncio ContextVar is per-task, so cross-task leak requires unusual patterns (`asyncio.shield + manual context copy`); only the manual-setter escape-hatch path was affected. Also tightens `_LAZY_EXPORTS` dict annotation from `tuple[str, str]` to `tuple[str, str | None]` and branches `__import__(...)` on the `attr_name` sentinel — both pre-existing mypy errors surfaced after the Token discipline fix was added.
+
+- **DEF-CACHE-STALE-ALLOW-AFTER-OVERBUDGET** — `_route_track` now calls `_invalidate_gate_cache_for_chain(workflow_id, chain_id)` when `track_single` raises `HTTPStatusError(402)` or `HTTPStatusError(422)` (`src/nullrun/runtime.py`, `f40b5cf`). The server's authoritative budget check has just said no; the in-process gate cache can no longer serve a stale "allow" for up to 5 s after that decision. `chain_end()` also invalidates after the wire call succeeds — the chain is closed on the server, the in-process cache for that chain is no longer reachable. Cache key now includes `estimated_tokens` (currently always 1 in `check_workflow_budget`) to future-proof against a refactor that varies cost estimates by call (DEF-CACHE-COST-ESTIMATE-COLLISION).
+
+  **Failure scenario** (pre-fix): agent in a tight `for tool in chain` loop hammers `call_model="gpt-4"`; budget red-lines at `t=0`; the next `/gate` in the same chain within 5 s returns the cached allow without re-hitting the server; the tool executes un-budgeted; the consume on the next iteration hits `CONSUME_OVERBUDGET`. Post-fix the cache is invalidated on the 402/422, so the next `/gate` re-runs the budget check and gets the fresh rejection. Lua `reserve_v3.lua:306-333` already enforces chain state correctly (backend `fix-consume-binding-org-key-mismatch`); this commit is the SDK-side analog.
+
+- **DEF-CACHE-CHAIN-INVALIDATION-SCOPE** — correctness followup to `DEF-CACHE-STALE-ALLOW-AFTER-OVERBUDGET`: `_invalidate_gate_cache_for_chain` now reads `chain_id` from the contextvar (via `get_chain_id()`) rather than from `wire_event.get('chain_id')` (`src/nullrun/runtime.py`, `18f4bda`). The `wire_event` dict is the per-call track payload built from `_enrich_event`; `chain_id` is never populated there. Pre-fix the helper passed `chain_id=None` to the dict-iteration loop and dropped EVERY chain entry for the same `workflow_id` — safe in the sense that stale-allow wasn't served (the parent fix holds), but it leaked cache pressure onto unrelated chains under sustained traffic and made the cache effectively useless when multiple chains share a `workflow_id`. Post-fix mirrors the read pattern in `check_workflow_budget` (`runtime.py:2013`) and `chain_end` (`runtime.py:2507 via get_trace_id`).
+
+- **DEF-LAZYEXPORT-MONEY-TOOL-PARAMS** — `nullrun.money_outflow` and `nullrun.tool_params` are now reachable as top-level attributes on `nullrun` (`src/nullrun/__init__.py`, `b977537`). The documented `@nullrun.sensitive(impact=money_outflow(...))` pattern (referenced at `decorators.py:1113-1132`, `extractor.py:43`) crashed with `AttributeError: module 'nullrun' has no attribute 'money_outflow'` on first invocation — `__getattr__` masked any name not in `_LAZY_EXPORTS`, and the two impact-extractor helpers were never added to the table. Workaround `from nullrun.extractor import money_outflow` still works.
+
+- **DEF-LAZYEXPORT-BUSINESS-IMPACT** — `nullrun.business_impact` is now reachable as a submodule attribute on `nullrun` (`src/nullrun/__init__.py`, `6601208`). The docstrings at `extractor.py:18` and `extractor.py:799-801` reference `nullrun.business_impact.compute_action_digest` and `ToolCallParams` as bare dotted paths. The module is real (`nullrun/business_impact.py`) and contains those symbols, but PEP 562 `__getattr__` masked submodule access — `nullrun.business_impact` raised `AttributeError` from a fresh import even though `import nullrun.business_impact` worked. Fix adds `business_impact` to `_LAZY_EXPORTS` with `attr_name=None` sentinel; `__getattr__` returns the imported module itself instead of `getattr(module, attr_name)`. No-op for existing per-symbol re-exports (`money_outflow`, `tool_params`) — the sentinel branch only fires when `attr_name is None`.
+
+  **Post-fix probe**:
+  ```python
+  >>> nullrun.business_impact.compute_action_digest
+  <function compute_action_digest at 0x...>
+  ```
+
+### Added
+
+- **`tests/test_v3_wire_contract.py::TestGateCache::test_invalidate_drops_only_matching_chain`** (`18f4bda`). Regression pin for `DEF-CACHE-CHAIN-INVALIDATION-SCOPE`: sets two cache entries for the same `workflow_id` but different `chain_id`s, marks one chain overbudget, and asserts only the overbudget chain's entry is dropped. Forbids re-introducing the pre-fix `wire_event.get('chain_id')` lookup that silently passed `chain_id=None` and dropped every chain.
+- **`tests/test_v3_wire_contract.py`** test updates for `DEF-CACHE-STALE-ALLOW-AFTER-OVERBUDGET` (`f40b5cf`): existing cache tests now use 4-tuple keys (`workflow_id`, `chain_id`, `call_model`, `estimated_tokens`) — the `estimated_tokens` arm was added in the same commit and is a future-proofing pin.
+
+### Verification
+
+- `ruff check src tests` — all checks passed.
+- `mypy src/nullrun` — success: no issues found in 37 source files.
+- `pytest -q` — **1797 passed, 4 skipped** in 108.99s (1 new test from the `DEF-CACHE-CHAIN-INVALIDATION-SCOPE` regression pin).
+- `nullrun.__version__` — `0.17.0`.
+- Scratch diff — clean (no `dist_local/`, no `*.defect*`).
+
+### Why this is needed
+
+**Token discipline (DEF-CHAIN-SETTER-NO-TOKEN)** — pre-fix both setters did `return None` after calling the contextvar's `set()`, breaking the Token discipline every other setter in the module honours. Callers using the manual API outside the `with chain(...)` contextmanager could not restore the prior value via `ctx.reset(token)`, so the `chain_id` leaked forward into subsequent unrelated `/check` calls on the same event-loop task slot — silent audit-trail corruption (chain_id attribution bleeds across calls). The leak is a recurring foot-gun rather than an active bypass (CPython asyncio ContextVar is per-task), but the manual-setter escape hatch is documented and used; the fix brings the API surface in line with the rest of the setter family.
+
+**Cache staleness (DEF-CACHE-STALE-ALLOW-AFTER-OVERBUDGET)** — at anti-DoS scale, every cached "allow" served after the budget red-line is a tool execution that bypasses the gate. The 5-second cache TTL amplifies this: a single tight loop on `call_model="gpt-4"` can consume thousands of tool invocations against a budget the server already said no to. The fix collapses the cache-staleness window to "synchronous invalidation on 402/422" (~ms), matching the `reserve_v3.lua` defense-in-depth on the consume side.
+
+**Chain-scope invalidation (DEF-CACHE-CHAIN-INVALIDATION-SCOPE)** — pre-fix the helper matched on `chain_id=None` and dropped every chain entry for the workflow, making the cache effectively useless under multi-chain traffic. This wasn't an active bypass (the parent fix holds), but it meant operators under load saw cache eviction across unrelated chains whenever one chain hit 402/422. Surfaced 2026-09-12 by post-`DEF-CACHE-STALE-ALLOW-AFTER-OVERBUDGET` code review: the wire-event lookup was the kind of mistake that's invisible under single-chain testing but devastating in production.
+
+**Lazy exports (DEF-LAZYEXPORT-MONEY-TOOL-PARAMS + DEF-LAZYEXPORT-BUSINESS-IMPACT)** — the documented `@nullrun.sensitive(impact=money_outflow(...))` pattern is the headline use-case for `@sensitive` decoration, so crashing with `AttributeError` on first invocation is a textbook "the documented example doesn't work" regression. The `business_impact` submodule crash was similar: docstring-referenced dotted paths resolved to `AttributeError`. Both are pre-existing typing-errors that became loud after the PEP 562 lazy-export pattern was introduced (`money_outflow` / `tool_params` found via TC-12 strict verification 2026-09-12 against prod; `business_impact` found via the docstring-referenced path audit).
+
 ## [0.16.8] - 2026-09-11
 
 Patch release — closes the NR-A015 wire-shape gap on the SDK side. The
