@@ -78,19 +78,26 @@ class CircuitBreaker:
         self._half_open_calls = 0
         self._half_open_start: float | None = None  # Track half-open entry time
         self._lock = threading.Lock()
-        self._async_lock: asyncio.Lock | None = None  # Lazily created
+        # DEF-CB-LOCK-UNIFICATION-2026-09-12: removed `_async_lock`.
+        # Pre-fix the sync path held `self._lock` and the async path
+        # held a separate `asyncio.Lock`, so a sync thread and an
+        # async coroutine calling `breaker.call()` concurrently on
+        # the same instance could both write `self._state` without
+        # blocking each other. The async critical section
+        # (`_on_failure_async` lines 417-427, `_on_success_async`
+        # lines 400-405) contains NO `await` between attribute
+        # writes, so asyncio's single-threaded execution already
+        # serialises them — the async lock provided no additional
+        # exclusion beyond what the GIL + asyncio scheduler already
+        # give us. Using the single `self._lock` for both paths
+        # means a sync write and an async write serialise against
+        # each other.
 
         # Metrics
         self._metrics = CircuitBreakerMetrics()
         self.total_failures = 0
         self.total_opens = 0
         self.total_successes = 0
-
-    def _get_async_lock(self) -> asyncio.Lock:
-        """Get or create async lock. Must be called from async context."""
-        if self._async_lock is None:
-            self._async_lock = asyncio.Lock()
-        return self._async_lock
 
     # =============================================================================
     # Redis-based distributed state sharing
@@ -394,10 +401,20 @@ class CircuitBreaker:
             self._publish_open_state()
 
     async def _on_success_async(self) -> None:
-        """Async-safe success handler."""
+        """Async-safe success handler.
+
+        DEF-CB-LOCK-UNIFICATION-2026-09-12: switched from
+        `_async_lock` (asyncio.Lock) to the single `self._lock`
+        (threading.Lock). Python asyncio is single-threaded; an
+        `with threading.Lock()` inside an `async def` is safe as
+        long as the critical section has no `await`. This section
+        (below) has no `await`, so the sync lock blocks the event
+        loop for zero observable time on the happy path. The
+        trade-off (consistency under sync+async concurrency >
+        minor lock-hold latency) is the point of the fix.
+        """
         old_state = self._state
-        async_lock = self._get_async_lock()
-        async with async_lock:
+        with self._lock:
             self._state = CBState.CLOSED
             self._failure_count = 0
             self.total_successes += 1
@@ -411,10 +428,15 @@ class CircuitBreaker:
             self._clear_global_state()
 
     async def _on_failure_async(self) -> None:
-        """Async-safe failure handler."""
+        """Async-safe failure handler.
+
+        DEF-CB-LOCK-UNIFICATION-2026-09-12: see `_on_success_async`
+        docstring. Single `self._lock` covers both sync and async
+        write paths so a sync thread and an async coroutine cannot
+        both mutate `self._state` concurrently.
+        """
         old_state = self._state
-        async_lock = self._get_async_lock()
-        async with async_lock:
+        with self._lock:
             self._failure_count += 1
             self._last_failure_time = time.monotonic()
             self.total_failures += 1
