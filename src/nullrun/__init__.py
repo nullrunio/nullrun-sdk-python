@@ -404,7 +404,7 @@ def init(
 # in `globals ` so subsequent lookups are O(1) and not visible in
 # `vars(nullrun)` until then. This is the same pattern used by pandas /
 # sqlalchemy / etc. to keep the top-level namespace discoverable.
-_LAZY_EXPORTS: dict[str, tuple[str, str]] = {
+_LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     # Runtime + context (advanced)
     "NullRunRuntime": ("nullrun.runtime", "NullRunRuntime"),
     "get_runtime": ("nullrun.runtime", "get_runtime"),
@@ -580,7 +580,13 @@ def __getattr__(name: str):
     """PEP 562 — lazy attribute access for backward-compatible symbols."""
     if name in _LAZY_EXPORTS:
         module_path, attr_name = _LAZY_EXPORTS[name]
-        module = __import__(module_path, fromlist=[attr_name])
+        # ``attr_name`` is str | None: the sentinel ``None`` means
+        # "return the submodule itself" (see business_impact
+        # re-export at line 490). ``__import__`` with ``fromlist=[]``
+        # returns the top-level package, which is what we want in
+        # both cases.
+        fromlist: list[str] = [attr_name] if attr_name is not None else []
+        module = __import__(module_path, fromlist=fromlist)
         if attr_name is None:
             # Sentinel: return the imported module itself (submodule
             # re-export). Used for `nullrun.business_impact` so the
