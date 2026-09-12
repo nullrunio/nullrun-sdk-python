@@ -464,6 +464,18 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "reset_span": ("nullrun.tracing", "reset_span"),
     # Decorators
     "sensitive": ("nullrun.decorators", "sensitive"),
+    # Sensitive impact extractors. The documented decorator pattern
+    # `@nullrun.sensitive(impact=money_outflow(...))` lives in
+    # `decorators.py:1113-1132` and `extractor.py:43`. Both helpers
+    # live in `nullrun.extractor` but are not re-exported at the
+    # top level — `__getattr__` masks any name not in this table, so
+    # `nullrun.money_outflow(...)` previously raised AttributeError
+    # on the first invocation of the documented pattern. Adding the
+    # entries here matches the `NullRunApprovalDbUnavailableError`
+    # lazy-export pattern (see line 514). Workaround
+    # `from nullrun.extractor import money_outflow` still works.
+    "money_outflow": ("nullrun.extractor", "money_outflow"),
+    "tool_params": ("nullrun.extractor", "tool_params"),
     # Actions
     "ActionHandler": ("nullrun.actions", "ActionHandler"),
     "ActionType": ("nullrun.actions", "ActionType"),
