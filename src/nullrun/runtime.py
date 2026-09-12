@@ -3667,11 +3667,23 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             # the cache TTL over-reserves against a budget the
             # server has just rejected. Invalidate before logging
             # so the order in logs matches the order in code.
+            #
+            # chain_id lives in the contextvar (set by the
+            # ``with chain(...)`` contextmanager or
+            # ``set_chain_id(...)`` manual setter), NOT on the
+            # wire_event — wire_event is the per-call track dict
+            # and the chain_id is implicit (the backend re-derives
+            # it from the reservation binding on /track). Reading
+            # from ``get_chain_id()`` ensures we invalidate ONLY
+            # the failing chain's cache entries, not every chain
+            # for the same workflow.
+            from nullrun.context import get_chain_id
+
             status_code = getattr(exc, "status_code", None)
             if status_code in (402, 422):
                 _invalidate_gate_cache_for_chain(
                     wire_event.get("workflow_id"),
-                    wire_event.get("chain_id"),
+                    get_chain_id(),
                 )
             _emit_for_transport_error(
                 exc,

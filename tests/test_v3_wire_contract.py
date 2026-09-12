@@ -1159,6 +1159,31 @@ class TestGateCache:
         assert cache_enabled is False
         os.environ.pop("NULLRUN_GATE_CACHE_DISABLE", None)
 
+    def test_invalidate_drops_only_matching_chain(self):
+        # 2026-09-12 (DEF-CACHE-STALE-ALLOW-AFTER-OVERBUDGET): the
+        # invalidation must drop ONLY entries whose chain_id matches.
+        # Pre-fix the invalidation read chain_id from
+        # ``wire_event.get("chain_id")`` which is always None
+        # (chain_id lives in the contextvar, not on the per-call
+        # wire_event dict). That bug over-invalidated to all chains
+        # for the same workflow_id — safe but wasteful, and it
+        # leaked cache pressure onto unrelated chains. Pin that
+        # the helper accepts an explicit chain_id and only drops
+        # entries with that exact chain_id.
+        import time as _time
+
+        from nullrun import runtime
+
+        k_failing = ("wf-x", "chain-fail", "model-z", 1)
+        k_other = ("wf-x", "chain-other", "model-z", 1)
+        runtime._GATE_CACHE[k_failing] = (_time.monotonic(), {"decision": "allow"})
+        runtime._GATE_CACHE[k_other] = (_time.monotonic(), {"decision": "allow"})
+
+        dropped = runtime._invalidate_gate_cache_for_chain("wf-x", "chain-fail")
+        assert dropped == 1
+        assert k_failing not in runtime._GATE_CACHE
+        assert k_other in runtime._GATE_CACHE  # unrelated chain preserved
+
 
 # ─────────────────────────────────────────────────────────────────────
 # BUG #5 — chain-mode gate cache at the runtime level
