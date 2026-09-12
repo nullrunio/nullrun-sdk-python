@@ -17,6 +17,7 @@ Focuses on:
 from __future__ import annotations
 
 import asyncio
+import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -373,3 +374,113 @@ def test_call_after_open_raises_breaker_transport_error():
     # Now OPEN — next call raises BreakerTransportError before invoking func.
     with pytest.raises(BreakerTransportError, match="OPEN"):
         cb.call(lambda: "should not run")
+
+
+# ─── _lock unification: sync + async share a single lock ─────────────
+#
+# DEF-CB-LOCK-UNIFICATION-2026-09-12: pre-fix `_on_success_async` /
+# `_on_failure_async` held a separate `asyncio.Lock` from the sync
+# path's `threading.Lock`. A sync thread and an async coroutine on
+# the same breaker instance could both write `self._state` without
+# blocking each other — `_state` could flip OPEN→CLOSED→OPEN
+# underneath a reader.
+#
+# The fix unifies on `self._lock` for both paths. The async critical
+# section has no `await`, so `with self._lock` inside an `async def`
+# blocks the event loop for zero observable time on the happy path.
+# The trade-off (sync+async exclusion > minor lock-hold latency) is
+# the point of the fix.
+#
+# These tests pin:
+#   1. `_async_lock` no longer exists on the instance (the dead-weight
+#      lock is gone)
+#   2. `_get_async_lock` no longer exists (lazy-init helper removed)
+#   3. concurrent sync + async `_call_*` don't corrupt `self._state`:
+#      `_failure_count` and `total_failures` end equal (every increment
+#      is paired on the same lock acquisition), and `self._state` is
+#      consistent with `_failure_count` vs `failure_threshold`.
+
+
+def test_async_lock_attribute_removed() -> None:
+    """Pre-fix `_async_lock` was lazy-init asyncio.Lock. Post-fix it
+    is gone — single `self._lock` covers both paths."""
+    cb = CircuitBreaker(failure_threshold=5, recovery_timeout=30.0)
+    assert not hasattr(cb, "_async_lock"), (
+        "_async_lock should be removed; sync and async paths must "
+        "share a single self._lock"
+    )
+
+
+def test_no_get_async_lock_method() -> None:
+    """Pre-fix `_get_async_lock()` was the lazy-init helper. Post-fix
+    it should be gone — async handlers use `self._lock` directly."""
+    cb = CircuitBreaker(failure_threshold=5, recovery_timeout=30.0)
+    assert not hasattr(cb, "_get_async_lock"), (
+        "_get_async_lock should be removed; async handlers use "
+        "self._lock directly via `with self._lock:`"
+    )
+
+
+def test_concurrent_sync_async_state_not_corrupt() -> None:
+    """Spin a sync thread raising failures while the event loop
+    also raises async failures on the same instance. After both
+    finish, `_failure_count` MUST equal `total_failures` (every
+    increment is paired on the same lock acquisition) and
+    `self._state` MUST be consistent with that count vs
+    `failure_threshold`.
+
+    Pre-fix the two paths held separate locks so each could read
+    an inconsistent `_failure_count` and double-increment it. The
+    unified `self._lock` prevents that."""
+    threshold = 20
+    cb = CircuitBreaker(failure_threshold=threshold, recovery_timeout=30.0)
+
+    def sync_bad() -> None:
+        raise ValueError("sync boom")
+
+    async def async_bad() -> None:
+        raise ValueError("async boom")
+
+    sync_calls = 30
+    async_calls = 30
+
+    def sync_worker() -> None:
+        for _ in range(sync_calls):
+            try:
+                cb.call(sync_bad)
+            except BaseException:
+                # BreakerTransportError is fine too — once the
+                # circuit is OPEN, sync calls are rejected before
+                # invoking the func. That's still "an attempt".
+                pass
+
+    async def async_worker() -> None:
+        for _ in range(async_calls):
+            try:
+                await cb.call(async_bad)
+            except BaseException:
+                pass
+
+    t = threading.Thread(target=sync_worker)
+    t.start()
+    asyncio.run(async_worker())
+    t.join()
+
+    # `_failure_count` and `total_failures` are bumped on the SAME
+    # lock acquisition. Pre-fix the two paths held separate locks so
+    # the pairs could be written non-atomically and the assertion
+    # could fail. Post-fix both writes happen under `self._lock`.
+    assert cb._failure_count == cb.total_failures, (
+        f"_failure_count={cb._failure_count} != "
+        f"total_failures={cb.total_failures}; suggests two writers "
+        f"updated them on different locks"
+    )
+
+    # And state must be OPEN iff _failure_count >= threshold.
+    # Pre-fix state could end as CLOSED if an async write saw
+    # stale _failure_count below threshold and set CLOSED mid-flight.
+    if cb._failure_count >= threshold:
+        assert cb.state == CBState.OPEN, (
+            f"_failure_count={cb._failure_count} >= threshold={threshold} "
+            f"but state={cb.state}; suggests a writer clobbered state"
+        )
