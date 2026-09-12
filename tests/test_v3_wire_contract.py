@@ -1119,7 +1119,7 @@ class TestGateCache:
         import time as _time
 
         from nullrun import runtime
-        k = ("wf-x", "chain-y", "model-z")
+        k = ("wf-x", "chain-y", "model-z", 1)
         runtime._GATE_CACHE[k] = (_time.monotonic(), {"decision": "allow"})
         cached = runtime._GATE_CACHE.get(k)
         assert cached is not None
@@ -1129,8 +1129,8 @@ class TestGateCache:
         import time as _time
 
         from nullrun import runtime
-        k1 = ("wf-x", "chain-A", "model-z")
-        k2 = ("wf-x", "chain-B", "model-z")
+        k1 = ("wf-x", "chain-A", "model-z", 1)
+        k2 = ("wf-x", "chain-B", "model-z", 1)
         runtime._GATE_CACHE[k1] = (_time.monotonic(), {"decision": "allow"})
         runtime._GATE_CACHE[k2] = (_time.monotonic(), {"decision": "block"})
         assert runtime._GATE_CACHE.get(k1)[1]["decision"] == "allow"
