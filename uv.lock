@@ -2870,7 +2870,7 @@ wheels = [
 
 [[package]]
 name = "nullrun"
-version = "0.16.8"
+version = "0.17.0"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },

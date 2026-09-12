@@ -127,9 +127,73 @@ logger = logging.getLogger(__name__)
 # Sentinel used when a gate fires outside a ``with workflow(...)``
 UNKNOWN_WORKFLOW_ID: str = "__nullrun_unknown__"
 
-# 2026-07-04 (BUG #5): in-process gate cache for chain-mode
-_GATE_CACHE: dict[tuple[str, str | None, str | None], tuple[float, dict[str, Any]]] = {}
+# 2026-07-04 (BUG #5): in-process gate cache for chain-mode.
+# 2026-09-12 (DEF-CACHE-COST-ESTIMATE-COLLISION): the cache key
+# includes ``estimated_tokens`` (currently hardcoded to 1 in
+# ``check_workflow_budget``) so a future change that varies
+# estimated_tokens by call does not silently serve a cheaper
+# cached allow for a more expensive call. Without this, two
+# chain-mode calls with the same (workflow_id, chain_id,
+# call_model) but different cost_estimate collide and the
+# cheaper response is reused — same blast radius as the original
+# BUG #5 (over-reserve on the consume side), but at the cache
+# layer instead of the wire layer.
+# 2026-09-12 (DEF-CACHE-STALE-ALLOW-AFTER-OVERBUDGET): the cache is
+# also invalidated when /track signals budget exhaustion
+# (HTTP 422 from CONSUME_OVERBUDGET) and when ``chain_end`` is
+# called. Without this, a chain that exhausts its budget mid-loop
+# could continue serving cached "allow" decisions for up to 5 s
+# (the TTL) after the backend has actually blocked subsequent
+# calls. The invalidation uses the active chain_id from the
+# contextvar so unrelated chains sharing the runtime instance
+# are not affected.
+_GATE_CACHE: dict[tuple[str, str | None, str | None, int], tuple[float, dict[str, Any]]] = {}
 _GATE_CACHE_TTL_SECONDS: float = 5.0
+
+
+def _invalidate_gate_cache_for_chain(workflow_id: str | None, chain_id: str | None) -> int:
+    """Drop ``_GATE_CACHE`` entries whose ``(workflow_id, chain_id)``
+    match the supplied pair, regardless of ``call_model`` or
+    ``estimated_tokens``. Returns the number of entries removed.
+
+    Called from two sites:
+      1. ``_route_track`` after ``track_single`` raises HTTP 422
+         (CONSUME_OVERBUDGET) or HTTP 402 (REDIS_UNAVAILABLE for
+         consume-side authoritative check). The backend's
+         authoritative budget check has now said "no further
+         spend", so any cached "allow" for the same chain is stale
+         and must not be served until the chain ends or the
+         budget rolls over.
+      2. ``chain_end`` after the /gate body returns. The chain is
+         closed on the server; the SDK's in-process cache for that
+         chain is no longer reachable from subsequent calls, so
+         dropping it frees memory and prevents a hypothetical
+         re-use of the same (workflow_id, chain_id) UUID from
+         hitting the cached entry (UUID v4 collision risk is
+         negligible but the cleanup costs nothing).
+
+    Args:
+        workflow_id: The workflow whose entries should be dropped.
+            ``None`` matches every workflow with the same chain_id
+            (rare but defensive).
+        chain_id: The chain whose entries should be dropped.
+            ``None`` matches every chain with the same workflow_id.
+
+    Returns:
+        The number of cache entries removed. Useful for tests /
+        metric counters; not currently surfaced.
+    """
+    if not _GATE_CACHE:
+        return 0
+    keys_to_drop = [
+        k
+        for k in _GATE_CACHE
+        if (workflow_id is None or k[0] == workflow_id)
+        and (chain_id is None or k[1] == chain_id)
+    ]
+    for k in keys_to_drop:
+        _GATE_CACHE.pop(k, None)
+    return len(keys_to_drop)
 
 # 2026-07-24 (Root-cause fix for the ``@sensitive`` reinit gap):
 _STRICT_MODE_FORCED: set[str] = set()
@@ -2017,13 +2081,13 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # In-process gate cache for chain-mode invocations. See
         # module-top comment on _GATE_CACHE for full rationale.
         response: dict[str, Any]
-        cache_key: tuple[str, str | None, str | None] | None = None
+        cache_key: tuple[str, str | None, str | None, int] | None = None
         cache_enabled = (
             chain_id is not None
             and not os.environ.get("NULLRUN_GATE_CACHE_DISABLE", "").strip() == "1"
         )
         if cache_enabled:
-            cache_key = (str(workflow_id), chain_id, call_model)
+            cache_key = (str(workflow_id), chain_id, call_model, check_req.get("estimated_tokens", 1))
             cached = _GATE_CACHE.get(cache_key)
             if cached is not None and (time.monotonic() - cached[0]) < _GATE_CACHE_TTL_SECONDS:
                 # Cache hit within TTL — reuse the response without a
@@ -2045,6 +2109,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                     logger.warning(f"check_workflow_budget: /gate unavailable, failing open: {exc}")
                     metrics.inc_runtime("gate_fail_open_total")
                     return
+                assert cache_key is not None  # narrowed by cache_enabled above
                 _GATE_CACHE[cache_key] = (time.monotonic(), response)
         else:
             try:
@@ -2436,11 +2501,22 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # per logical chain).
         from nullrun.context import get_trace_id
 
-        return self._transport.chain_end(
+        result = self._transport.chain_end(
             chain_id,
             organization_id=self.organization_id,
             trace_id=get_trace_id(),
         )
+        # 2026-09-12 (DEF-CACHE-STALE-ALLOW-AFTER-OVERBUDGET): drop
+        # the in-process gate cache for this chain. The chain is
+        # closed on the server; any cached "allow" for the same
+        # (workflow_id, chain_id) is unreachable from future calls
+        # (UUID v4 collision risk is negligible but the cleanup
+        # costs nothing). Invalidating AFTER the wire call so a
+        # transient transport failure does not free the cache
+        # before the server confirms closure.
+        workflow_id_str = str(self.workflow_id) if self.workflow_id else None
+        _invalidate_gate_cache_for_chain(workflow_id_str, chain_id)
+        return result
 
     def approximate_budget(self) -> dict[str, Any]:
         """UI-only budget estimate via GET /api/v1/budget/approximate
@@ -3581,11 +3657,39 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             metrics.inc_runtime("v3_track_single_ok")
         except Exception as exc:  # noqa: BLE001 — transport-level
             metrics.inc_runtime("v3_track_single_failed")
+            # 2026-09-12 (DEF-CACHE-STALE-ALLOW-AFTER-OVERBUDGET):
+            # when the backend refuses the consume with HTTP 422
+            # (CONSUME_OVERBUDGET) or HTTP 402 (REDIS_UNAVAILABLE
+            # on the consume path) the chain has hit its budget
+            # ceiling. Any cached "allow" for the same
+            # (workflow_id, chain_id) must NOT be served for the
+            # next 0–5 s — otherwise a chain firing faster than
+            # the cache TTL over-reserves against a budget the
+            # server has just rejected. Invalidate before logging
+            # so the order in logs matches the order in code.
+            #
+            # chain_id lives in the contextvar (set by the
+            # ``with chain(...)`` contextmanager or
+            # ``set_chain_id(...)`` manual setter), NOT on the
+            # wire_event — wire_event is the per-call track dict
+            # and the chain_id is implicit (the backend re-derives
+            # it from the reservation binding on /track). Reading
+            # from ``get_chain_id()`` ensures we invalidate ONLY
+            # the failing chain's cache entries, not every chain
+            # for the same workflow.
+            from nullrun.context import get_chain_id
+
+            status_code = getattr(exc, "status_code", None)
+            if status_code in (402, 422):
+                _invalidate_gate_cache_for_chain(
+                    wire_event.get("workflow_id"),
+                    get_chain_id(),
+                )
             _emit_for_transport_error(
                 exc,
                 stage="track_v3_single",
                 correlation_id=smid,
-                status_code=getattr(exc, "status_code", None),
+                status_code=status_code,
             )
             logger.warning(
                 "_route_track: track_single failed for execution_id=%s (%s) — event dropped",

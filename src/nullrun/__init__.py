@@ -404,7 +404,7 @@ def init(
 # in `globals ` so subsequent lookups are O(1) and not visible in
 # `vars(nullrun)` until then. This is the same pattern used by pandas /
 # sqlalchemy / etc. to keep the top-level namespace discoverable.
-_LAZY_EXPORTS: dict[str, tuple[str, str]] = {
+_LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     # Runtime + context (advanced)
     "NullRunRuntime": ("nullrun.runtime", "NullRunRuntime"),
     "get_runtime": ("nullrun.runtime", "get_runtime"),
@@ -464,6 +464,30 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "reset_span": ("nullrun.tracing", "reset_span"),
     # Decorators
     "sensitive": ("nullrun.decorators", "sensitive"),
+    # Sensitive impact extractors. The documented decorator pattern
+    # `@nullrun.sensitive(impact=money_outflow(...))` lives in
+    # `decorators.py:1113-1132` and `extractor.py:43`. Both helpers
+    # live in `nullrun.extractor` but are not re-exported at the
+    # top level — `__getattr__` masks any name not in this table, so
+    # `nullrun.money_outflow(...)` previously raised AttributeError
+    # on the first invocation of the documented pattern. Adding the
+    # entries here matches the `NullRunApprovalDbUnavailableError`
+    # lazy-export pattern (see line 514). Workaround
+    # `from nullrun.extractor import money_outflow` still works.
+    "money_outflow": ("nullrun.extractor", "money_outflow"),
+    "tool_params": ("nullrun.extractor", "tool_params"),
+    # Business impact module re-export. The docstrings at
+    # `extractor.py:18` and `extractor.py:799-801` reference
+    # `nullrun.business_impact.compute_action_digest` /
+    # `MoneyImpactExtractor` / `ToolParamsExtractor` as bare dotted
+    # paths. The module is real (`nullrun/business_impact.py`) and
+    # contains those symbols, but PEP 562 `__getattr__` masks
+    # submodule access unless we expose the module object itself.
+    # The `attr_name=None` sentinel below tells `__getattr__` to
+    # return the imported submodule verbatim rather than `getattr`
+    # on it — same shape as `from nullrun import business_impact`
+    # for the user, no manual `import nullrun.business_impact` first.
+    "business_impact": ("nullrun.business_impact", None),
     # Actions
     "ActionHandler": ("nullrun.actions", "ActionHandler"),
     "ActionType": ("nullrun.actions", "ActionType"),
@@ -556,8 +580,24 @@ def __getattr__(name: str):
     """PEP 562 — lazy attribute access for backward-compatible symbols."""
     if name in _LAZY_EXPORTS:
         module_path, attr_name = _LAZY_EXPORTS[name]
-        module = __import__(module_path, fromlist=[attr_name])
-        value = getattr(module, attr_name)
+        # ``attr_name`` is str | None: the sentinel ``None`` means
+        # "return the submodule itself" (see business_impact
+        # re-export at line 490). ``__import__`` with ``fromlist=[]``
+        # returns the top-level package, which is what we want in
+        # both cases.
+        fromlist: list[str] = [attr_name] if attr_name is not None else []
+        module = __import__(module_path, fromlist=fromlist)
+        if attr_name is None:
+            # Sentinel: return the imported module itself (submodule
+            # re-export). Used for `nullrun.business_impact` so the
+            # docstring-referenced dotted paths
+            # (`nullrun.business_impact.compute_action_digest` etc.)
+            # resolve without an explicit `import
+            # nullrun.business_impact` first. See
+            # `_LAZY_EXPORTS['business_impact']` for the rationale.
+            value = module
+        else:
+            value = getattr(module, attr_name)
         # Cache on the module so subsequent lookups are O(1) and
         # dir(nullrun) still reports the curated public surface until
         # the legacy name is actually accessed.

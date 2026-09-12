@@ -187,7 +187,7 @@ def get_chain_op() -> str:
     return _chain_op_var.get()
 
 
-def set_chain_id(chain_id: str | None) -> None:
+def set_chain_id(chain_id: str | None) -> Token[str | None]:
     """Manually set the active chain_id (advanced; prefer ``with chain(...)``).
 
     Setting ``None`` clears the chain context — subsequent /check
@@ -199,10 +199,17 @@ def set_chain_id(chain_id: str | None) -> None:
     setter validates the format (length, canonical UUID
     structure, version=4) and raises ``ValueError`` on
     malformed input. ``None`` is accepted (clears the context).
+
+    Returns a ``Token`` so callers using the setter outside the
+    ``with chain(...)`` contextmanager can restore the prior value
+    via ``ctx.reset(token)`` in a ``finally`` block. Without this,
+    a manual set leaks the chain_id into subsequent unrelated
+    /check calls on the same event-loop task slot, corrupting the
+    audit trail (chain_id attribution bleeds across calls).
     """
     if chain_id is not None:
         _validate_chain_id(chain_id)
-    _chain_id_var.set(chain_id)
+    return _chain_id_var.set(chain_id)
 
 
 def _validate_chain_id(chain_id: str) -> None:
@@ -252,7 +259,7 @@ def _validate_chain_id(chain_id: str) -> None:
         )
 
 
-def set_chain_op(op: str) -> None:
+def set_chain_op(op: str) -> Token[str]:
     """Manually set the chain_op for the next /check call.
 
     Valid values: ``"auto"`` (default), ``"start"``, ``"continue"``
@@ -261,8 +268,13 @@ def set_chain_op(op: str) -> None:
     semantics on the next call (no auto-register); use ``"end"``
     on a /check to close the chain in the same atomic operation
     as the gate (avoids the extra round-trip).
+
+    Returns a ``Token`` so callers can restore the prior value via
+    ``ctx.reset(token)`` in a ``finally`` block. Symmetric with
+    ``set_chain_id``; without this the manual setter leaks the
+    chain_op into subsequent /check calls on the same task slot.
     """
-    _chain_op_var.set(op)
+    return _chain_op_var.set(op)
 
 
 # ---------------------------------------------------------------------------
