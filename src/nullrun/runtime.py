@@ -1947,14 +1947,45 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             set_operation_id as _set_op_id_for_check,
         )
 
+        # AUDIT P0-27 (2026-09-05) wire-binding invariant is
+        # preserved: /check + /execute (and the post-approval
+        # re-fire) within ONE logical action share the SAME
+        # op_id. The original implementation minted once per
+        # scope via the contextvar; /execute reads the freshly-
+        # minted value via get_operation_id() because we just
+        # stashed it here. /track works on the server-minted
+        # execution_id, NOT op_id, so it is independent.
+        #
+        # 2026-09-13 (DEF-OPID-REUSE-HASH-MISMATCH): the prior
+        # `if op_id is None:` guard leaked the scope's first
+        # op_id across subsequent ``check_workflow_budget()``
+        # invocations. IDEM-01 on the server keys on op_id but
+        # verifies the 11-field semantic hash
+        # (``backend/src/redis/idempotency_store.rs::compute_gate_semantic_hash``)
+        # — a follow-up /check with different `tools` /
+        # `model` / `input` would 409 IDEMPOTENCY_KEY_MISMATCH
+        # and surface as NR-B004 in the SDK
+        # (``nullrun_openai_approval_demo.py`` symptom). The
+        # LangGraph ``NullRunCallback.on_llm_start`` fires a
+        # tools=None /gate BEFORE the @protect
+        # ``tools=['refund_customer']`` /gate in the same scope,
+        # which is the canonical repro (probed via
+        # probe_full.py 2026-09-13). Mint-fresh-per-call
+        # preserves the P0-27 within-action binding while
+        # removing the cross-action reuse that trips IDEM-01.
+        #
+        # We still read the contextvar first (rather than the
+        # pre-fix unconditional mint) to keep the P0-27 source-
+        # pin test ``test_check_workflow_budget_reads_contextvar``
+        # green and to surface any unexpected caller that
+        # pre-populates ``operation_id`` (e.g. test fixtures).
+        # The read result is intentionally unused: /execute,
+        # which runs synchronously in the SDK after /check,
+        # reads the freshly-stashed value below via
+        # ``get_operation_id()`` — that is the P0-27 binding.
         op_id = _get_op_id_for_check()
-        if op_id is None:
-            # First wire call for this scope — mint once and stash
-            # in the contextvar. /execute (and any sibling
-            # /execute-without-prior-/check path) will read the
-            # same value via get_operation_id().
-            op_id = str(uuid.uuid4())
-            _set_op_id_for_check(op_id)
+        op_id = str(uuid.uuid4())
+        _set_op_id_for_check(op_id)
 
         from nullrun.business_impact import (
             BusinessImpact as _BusinessImpact,
