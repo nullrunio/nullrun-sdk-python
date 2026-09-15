@@ -37,7 +37,7 @@ LlamaIndex, and your own stack.
 
 ---
 
-> ⚠️ **Status: alpha (v0.16.4).** The public API may shift between minor versions.
+> ⚠️ **Status: alpha (v0.17.1).** The public API may shift between minor versions.
 > Pin your dependency and read the [CHANGELOG](https://github.com/nullrunio/nullrun-sdk-python/blob/master/CHANGELOG.md) before upgrading.
 
 ---
@@ -294,8 +294,9 @@ Runnable, copy-pastable examples live in a separate repo so you can adapt withou
 |---|---|---|
 | **v0.14.x** | ✅ alpha | Wire protocol v3.31, server-minted execution IDs, MCP, anti-OOM streaming cap |
 | **v0.15.x** | ✅ alpha | ADR-009 governance audit surface, typed `runtime.audit.*`, capability probes for `/audit-log/verify`, fail-OPEN observability closure |
-| **v0.16.x** (current) | ✅ alpha | Phase-1+ `action_digest` on `/gate`, `/execute` `tools` propagation, transient-5xx retry on gate (NR-006), error-code parity (NR-007, 41→56 entries) |
-| **v0.17** | 📋 planned | OpenTelemetry exporter, Redis-backed offline queue, hardened init contract |
+| **v0.16.x** | ✅ alpha | Phase-1+ `action_digest` on `/gate`, `/execute` `tools` propagation, transient-5xx retry on gate (NR-006), error-code parity (NR-007, 41→56 entries) |
+| **v0.17.x** (current) | ✅ alpha | Chain-setter Token discipline, `_GATE_CACHE` staleness closure, lazy-export repair, circuit-breaker lock unification (sync+async), op_id mint-fresh (DEF-OPID-REUSE-HASH-MISMATCH), error-code map closure (DEF-SDKT-004) |
+| **v0.18** | 📋 planned | OpenTelemetry exporter, Redis-backed offline queue, hardened init contract |
 | **v1.0** | 🎯 beta target | Stable wire contract, full async support, type-safe decisions |
 
 [Full roadmap & RFCs →](https://nullrun.io/roadmap)
