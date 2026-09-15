@@ -3169,6 +3169,30 @@ def _build_v3_error_code_map() -> dict[str, type[Exception]]:
         # /gate (re-issue /gate then retry /execute) from generic
         # wire-shape drift.
         "EXECUTION_NOT_FOUND": NullRunExecutionNotFoundError,
+        # 2026-09-13 (DEF-SDKT-004 / fix-wave-2): the backend
+        # ``From<JsonRejection> for ApiError`` impl routes the two
+        # parse-level rejections to distinct wire codes:
+        # - ``INVALID_FIELD`` (422 + ``invalid_field`` slug via
+        #   ``ErrorSlug::ValidationFailed``) for axum
+        #   ``JsonDataError`` — body parsed but a field failed
+        #   schema validation.
+        # - ``INVALID_JSON`` (400 + ``invalid_json`` slug via
+        #   ``ErrorSlug::InvalidJson``) for axum
+        #   ``JsonSyntaxError`` — the body isn't parseable as
+        #   JSON at all (truncated, malformed braces, unescaped
+        #   control chars).
+        # Both are emitted on /gate, /execute, and /track (the
+        # /track side has always used the typed 3-way split
+        # via ``TrackError::WithBody``). Both map to
+        # ``NullRunBackendError`` because the SDK treats
+        # parse-level rejections as "the server couldn't make
+        # sense of your body" infrastructure-side issues —
+        # cookbook recipes that branch on these codes (vs the
+        # generic ``VALIDATION_FAILED`` collapse) get the
+        # diagnostic class post-fix that they were missing
+        # pre-fix.
+        "INVALID_FIELD": NullRunBackendError,
+        "INVALID_JSON": NullRunBackendError,
         # Rate-limit plan lookup failure (Postgres / Redis adjacent).
         # Tied to ``NullRunRateLimitRedisError`` because the failure
         # mode is rate-limit-specific infrastructure unavailability
