@@ -773,6 +773,16 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # from a stale pending approval for a different execution
         # in the same workflow.
         self._approval_pending: dict[str, dict[str, Any]] = {}
+        # CLOSE-ORPHAN / ADR-047 (2026-09-21): reverse index
+        # keyed by execution_id → approval_id so the cancel /
+        # exception path can find the approval row that needs
+        # to be consumed. Lock-guarded by `_approval_lock` (same
+        # lock as `_approval_pending` — they must mutate
+        # together). Single-shot per approval_id: the entry is
+        # popped in `_handle_approval_resolved` and in
+        # `_safe_cancel_active_execution` after the consume call
+        # lands.
+        self._pending_approval_id_by_execution: dict[str, str] = {}
         self._approval_lock = threading.RLock()
         # Default timeout for WS approval push. Set to None to
         # block indefinitely (the legacy poll path is still
@@ -1621,6 +1631,16 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             )
             return
 
+        # CLOSE-ORPHAN / ADR-047 (2026-09-21): record the
+        # (execution_id → approval_id) mapping so the cancel /
+        # exception path can find the approval row that needs to
+        # be consumed. The entry is single-shot: it lives until
+        # the consume call lands in `_safe_cancel_active_execution`
+        # (exception path) or in `check_workflow_budget` (success
+        # path), whichever comes first.
+        if execution_id:
+            self._mark_approval_resolved_for_execution(execution_id, approval_id)
+
         # Release the threading.Event so the gate call wakes up.
         event = entry.get("event")
         if event is not None:
@@ -2329,10 +2349,26 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             )
             outcome = (result.get("outcome") or "").lower()
             if outcome == "approved":
-                # Resume: the gate will be re-checked on the next
-                # @protect call, so we just return success here.
-                # The caller proceeds with the original
-                # function body.
+                # CLOSE-ORPHAN / ADR-047 (2026-09-21): consume
+                # the approval row so it flips to CONSUMED
+                # before the operator sees it on the dashboard.
+                # Best-effort: the helper catches all exceptions
+                # and surfaces them at logger.debug, so a network
+                # blip here does NOT block the success path.
+                # The approval_expiry_sweeper will close
+                # APPROVED+stale rows eventually.
+                self.consume_approval(
+                    approval_id, execution_id=_captured_eid
+                )
+                # Pop the reverse index — the consume call landed.
+                # Future _safe_cancel_active_execution calls for
+                # this execution_id will see no approval_id and
+                # skip the consume (idempotent).
+                if _captured_eid:
+                    with self._approval_lock:
+                        self._pending_approval_id_by_execution.pop(
+                            _captured_eid, None
+                        )
                 logger.info(f"check_workflow_budget: approval {approval_id} approved -- resuming")
                 return
             if outcome == "denied":
@@ -2504,6 +2540,98 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                     Parsed JSON dict.
         """
         return self._transport.cancel(execution_id, reason=reason)
+
+    def consume_approval(
+        self,
+        approval_id: str,
+        execution_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Mark an approved approval as executed (CLOSE-ORPHAN).
+
+        ADR-047 (2026-09-21). Calls ``POST
+        /api/v1/approvals/{approval_id}/consume`` so the approval
+        row flips to ``CONSUMED`` before the operator sees it on
+        the dashboard. Closes the structural orphan where
+        ``mode="inline"`` non-sensitive tools or SDK crashes left
+        the row at APPROVED past ``expires_at``.
+
+        Idempotent on the server. Returns ``{"status": "consumed"}``
+        on first call, ``{"status": "already_consumed"}`` on a
+        retry (the SQL UPDATE matched zero rows; the diagnostic
+        SELECT recognised the row was already CONSUMED), or
+        ``{"status": "not_approved"}`` if the row was PENDING /
+        DENIED / EXPIRED. The SDK treats all three as success.
+
+        Best-effort: catches all exceptions (network blip,
+        5xx, etc.) and surfaces them at ``logger.debug``. The
+        ``approval_expiry_sweeper`` will close APPROVED+stale rows
+        eventually; a missed consume is preferable to raising on
+        the success path of ``check_workflow_budget``.
+
+        Args:
+            approval_id: Server-minted approval id from the WS
+                push payload.
+            execution_id: Optional server-minted execution_id
+                (forwarded as the body field for forensic
+                correlation; not validated by the server).
+
+        Returns:
+            Parsed JSON dict with ``{"status": ...,
+            "approval_id": ...}``. On error: ``{"status": "error",
+            "approval_id": approval_id}``.
+        """
+        try:
+            body: dict[str, Any] = {
+                "organization_id": str(self.organization_id),
+            }
+            if execution_id:
+                body["execution_id"] = execution_id
+            return self._transport.consume_approval(approval_id, body)
+        except Exception as exc:  # noqa: BLE001
+            # Best-effort — a missed consume is preferable to
+            # raising on the success path. The expiry sweeper
+            # will close APPROVED+stale rows eventually.
+            logger.debug(
+                f"consume_approval {approval_id} failed (non-blocking): {exc}"
+            )
+            return {"status": "error", "approval_id": approval_id}
+
+    def lookup_pending_approval_id_for_execution(
+        self, execution_id: str
+    ) -> str | None:
+        """Look up the approval_id captured for an in-flight execution.
+
+        ADR-047: the ``_safe_cancel_active_execution`` exception
+        path uses this to find the approval row that needs to be
+        consumed after the SDK crashed or raised mid-call.
+        Returns ``None`` if no approval was captured for the
+        given execution_id (typical when the call never required
+        approval, or already finished cleanly).
+        """
+        with self._approval_lock:
+            return self._pending_approval_id_by_execution.get(execution_id)
+
+    def _mark_approval_resolved_for_execution(
+        self,
+        execution_id: str | None,
+        approval_id: str,
+    ) -> None:
+        """Record (execution_id → approval_id) so the cancel path
+        can find the approval row.
+
+        ADR-047. Called from ``_handle_approval_resolved`` when
+        the WS push delivers an approval decision; the dict is
+        the reverse index that ``_safe_cancel_active_execution``
+        uses to consume the row on the exception path.
+
+        Single-shot: the entry is popped after the consume call
+        lands (in ``_safe_cancel_active_execution`` or in
+        ``check_workflow_budget``'s success branch).
+        """
+        if not execution_id:
+            return
+        with self._approval_lock:
+            self._pending_approval_id_by_execution[execution_id] = approval_id
 
     def chain_end(self, chain_id: str) -> dict[str, Any]:
         """Close a chain explicitly via /api/v1/chain/end

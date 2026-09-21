@@ -401,6 +401,10 @@ def _safe_cancel_active_execution(reason: str | None = None) -> None:
       - Synchronous, blocking HTTP. Caller is the @protect context
         manager; HTTP I/O is the same channel used by
         check_workflow_budget, so it does not change timeout posture.
+      - CLOSE-ORPHAN (ADR-047, 2026-09-21): after cancel_execution,
+        if a pending approval_id was captured for this execution_id,
+        ALSO call consume_approval so the row flips to CONSUMED.
+        Best-effort: a network blip here does NOT mask the cancel.
     """
     try:
         execution_id = get_server_minted_execution_id()
@@ -417,6 +421,20 @@ def _safe_cancel_active_execution(reason: str | None = None) -> None:
     except Exception:
         # An orphan from cancellation failure is preferred over
         # masking the original exception with a transport error.
+        pass
+    # CLOSE-ORPHAN: also consume the approval row if one was captured.
+    # The reverse index (execution_id → approval_id) is RLock-guarded
+    # in Runtime and populated by check_workflow_budget at the
+    # outcome=approved branch. If the SDK crashed before reaching that
+    # branch, the lookup returns None and this is a no-op.
+    try:
+        approval_id = runtime.lookup_pending_approval_id_for_execution(
+            execution_id
+        )
+        if approval_id:
+            runtime.consume_approval(approval_id, execution_id=execution_id)
+    except Exception:
+        # Same posture as the cancel: best-effort, never mask.
         return
 
 

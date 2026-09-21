@@ -2037,6 +2037,55 @@ class Transport:
 
         raise _parse_v3_error_envelope(response, "cancel")
 
+    def consume_approval(
+        self,
+        approval_id: str,
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        """POST /api/v1/approvals/{approval_id}/consume — mark an approved
+        approval row as executed.
+
+        Close-orphan fix (ADR-047, 2026-09-21). The original
+        ``consume_approved`` SQL is only reachable from the orchestrator's
+        Step 6 inline at backend/src/proxy/http/gate/orchestrator.rs:713,
+        but mode="inline" tools bypass /execute entirely — leaving the
+        approval row at status=APPROVED past expires_at. This new
+        endpoint is structurally distinct (no execution_id binding per
+        ADR-046) and closes the orphan class on the SDK success path.
+
+        The body is built by Runtime.consume_approval — it always
+        carries ``organization_id`` (C2 closure) and optionally
+        ``execution_id`` for audit emit only (no binding on the wire).
+
+        Returns:
+            Parsed JSON dict from the backend's ApprovalConsumeResponse
+            (status ∈ {"consumed", "already_consumed", "not_approved"}).
+            Idempotent on retries: already-CONSUMED rows return
+            already_consumed, PENDING/DENIED/EXPIRED rows return
+            not_approved.
+        """
+        body_bytes = _signed_request_body(body)
+        headers = self._build_signed_headers(body=body_bytes)
+
+        try:
+            response = self._client.post(
+                f"{self.api_url}/api/v1/approvals/{approval_id}/consume",
+                content=body_bytes,
+                headers=headers,
+                timeout=5.0,
+            )
+        except httpx.RequestError as e:
+            raise NullRunTransportError(
+                f"Network error on /approvals/.../consume: {e}",
+                source=TransportErrorSource.NETWORK_ERROR,
+                endpoint="consume_approval",
+            ) from e
+
+        if response.status_code == 200:
+            return response.json()  # type: ignore[no-any-return]
+
+        raise _parse_v3_error_envelope(response, "consume_approval")
+
     def heartbeat(
         self,
         chain_id: str,

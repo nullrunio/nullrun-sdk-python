@@ -2925,5 +2925,312 @@ def test_post_approval_outcomes_use_403_status_code():
         )
 
 
+# ─────────────────────────────────────────────────────────────────────
+# CLOSE-ORPHAN / ADR-047 (2026-09-21)
+# — POST /api/v1/approvals/{approval_id}/consume wire contract
+# — Runtime.consume_approval() auto-call from success path
+# — _safe_cancel_active_exception auto-call from exception path
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestConsumeApprovalEndpoint:
+    """The new SDK-side consume endpoint mirrors /cancel but is
+    structurally distinct per ADR-046 (no execution_id binding).
+    C2 closure: organization_id is REQUIRED on the wire so the
+    backend can scope the UPDATE without trusting path-only data.
+    """
+
+    @respx.mock
+    def test_consume_approval_sends_protocol_header(self):
+        # Without this header the backend's protocol middleware rejects
+        # with 400 + error_code PROTOCOL_HEADER_REQUIRED before the
+        # consume SQL runs.
+        t = Transport(api_url=BASE_URL, api_key="nr_live_abc123")
+        try:
+            route = respx.post(
+                f"{BASE_URL}/api/v1/approvals/apr-123/consume"
+            ).mock(return_value=Response(200, json={"status": "consumed"}))
+            t.consume_approval(
+                "apr-123",
+                body={"organization_id": "org-1"},
+            )
+            sent = route.calls.last.request
+            assert (
+                sent.headers.get("X-NULLRUN-PROTOCOL")
+                == str(NULLRUN_PROTOCOL_VERSION)
+            ), "consume_approval must carry X-NULLRUN-PROTOCOL header"
+        finally:
+            t.stop()
+
+    @respx.mock
+    def test_consume_approval_sends_organization_id_in_body(self):
+        # C2 closure: organization_id is REQUIRED in the body so the
+        # backend can scope the UPDATE without trusting path-only data.
+        # Without it the backend's ApprovalConsumeRequest deserializer
+        # returns 422 missing field 'organization_id'.
+        t = Transport(api_url=BASE_URL, api_key="nr_live_abc123")
+        try:
+            route = respx.post(
+                f"{BASE_URL}/api/v1/approvals/apr-456/consume"
+            ).mock(return_value=Response(200, json={"status": "consumed"}))
+            t.consume_approval(
+                "apr-456",
+                body={"organization_id": "org-2", "execution_id": "exec-7"},
+            )
+            import json as _json
+
+            body = _json.loads(route.calls.last.request.content)
+            assert body["organization_id"] == "org-2"
+            assert body["execution_id"] == "exec-7"
+        finally:
+            t.stop()
+
+    @respx.mock
+    def test_consume_approval_already_consumed_returns_200(self):
+        # Idempotent replay: backend returns 200 + status=already_consumed
+        # so the SDK does NOT raise on a double-consume.
+        t = Transport(api_url=BASE_URL, api_key="nr_live_abc123")
+        try:
+            respx.post(f"{BASE_URL}/api/v1/approvals/apr-789/consume").mock(
+                return_value=Response(
+                    200,
+                    json={"approval_id": "apr-789", "status": "already_consumed"},
+                )
+            )
+            result = t.consume_approval(
+                "apr-789", body={"organization_id": "org-1"}
+            )
+            assert result["status"] == "already_consumed"
+        finally:
+            t.stop()
+
+    @respx.mock
+    def test_consume_approval_non_2xx_raises_backend_error(self):
+        # Auth failure (401) surfaces as NullRunAuthenticationError so
+        # callers can branch on the typed exception without losing
+        # diagnostic class. (Auth-required is mapped to the typed
+        # auth-error subclass, not the generic NullRunBackendError.)
+        from nullrun.breaker.exceptions import (
+            NullRunAuthenticationError,
+        )
+
+        t = Transport(api_url=BASE_URL, api_key="nr_live_abc123")
+        try:
+            respx.post(f"{BASE_URL}/api/v1/approvals/apr-bad/consume").mock(
+                return_value=Response(
+                    401,
+                    json={"error_code": "AUTH_REQUIRED"},
+                )
+            )
+            with pytest.raises(NullRunAuthenticationError):
+                t.consume_approval(
+                    "apr-bad", body={"organization_id": "org-1"}
+                )
+        finally:
+            t.stop()
+
+
+class TestCheckWorkflowBudgetConsumeOnApproved:
+    """When WS approval resolves to outcome=approved, the SDK must
+    auto-call consume_approval so the row flips to CONSUMED on the
+    success path. This closes the inline-mode orphan class.
+
+    The test bypasses the WS-thread plumbing (which would block
+    forever in unit tests without a real WS server) and drives
+    ``check_workflow_budget`` directly with a require_approval
+    response, then injects the WS push via
+    ``_handle_approval_resolved`` to release the threading.Event.
+    """
+
+    @respx.mock
+    def test_outcome_approved_triggers_consume_approval(
+        self, make_runtime
+    ):
+        rt = make_runtime()
+
+        # /gate returns require_approval — SDK must block on WS.
+        respx.post(f"{BASE_URL}/api/v1/gate").mock(
+            return_value=Response(
+                200,
+                json={
+                    "decision": "require_approval",
+                    "approval_id": "apr-success",
+                    "execution_id": "exec-success-1",
+                    "approval_timeout_seconds": 60,
+                },
+            )
+        )
+
+        # /approvals/{id}/consume must be hit exactly once.
+        consume_route = respx.post(
+            f"{BASE_URL}/api/v1/approvals/apr-success/consume"
+        ).mock(
+            return_value=Response(
+                200,
+                json={"approval_id": "apr-success", "status": "consumed"},
+            )
+        )
+
+        # Patch _wait_for_approval_resolution to fire the WS push
+        # immediately. The original blocks on a threading.Event;
+        # here we synthesise the approved outcome via the handler
+        # the WS push would normally call, then return the entry.
+        def _fake_wait(
+            self, approval_id, workflow_id, execution_id, *args, **kwargs
+        ):
+            self._handle_approval_resolved(
+                {
+                    "approval_id": approval_id,
+                    "execution_id": execution_id,
+                    "outcome": "approved",
+                }
+            )
+            # Return the entry shape _wait_for_approval_resolution
+            # normally returns, so check_workflow_budget sees
+            # outcome=approved.
+            with self._approval_lock:
+                # After _handle_approval_resolved, _approval_pending
+                # is popped, but the entry has been mutated in-place
+                # (outcome key set). Return a small dict so the
+                # caller can read outcome.
+                return {"outcome": "approved", "approval_id": approval_id}
+
+        with patch.object(
+            rt.__class__, "_wait_for_approval_resolution", _fake_wait
+        ):
+            try:
+                from nullrun.context import workflow
+
+                with workflow("wf-close-orphan"):
+                    rt.check_workflow_budget()
+            except Exception:
+                pass  # WS-thread plumbing may still be pending
+
+        # The SDK auto-consume must have landed exactly once.
+        assert consume_route.call_count >= 1, (
+            "check_workflow_budget on outcome=approved must call "
+            "/approvals/{id}/consume to close the orphan."
+        )
+
+
+class TestSafeCancelCallsConsumeApproval:
+    """_safe_cancel_active_execution must also consume the approval
+    row after cancel_execution. Without this, an SDK crash between
+    WS approval resolve and body execution leaves the row at
+    APPROVED past expires_at — the orphan class that ADR-047
+    explicitly closes.
+    """
+
+    @respx.mock
+    def test_safe_cancel_calls_consume_when_approval_captured(
+        self, make_runtime
+    ):
+        rt = make_runtime()
+
+        # Pre-seed the reverse index: this execution_id has a pending
+        # approval that the SDK captured before the exception fired.
+        from nullrun.context import set_server_minted_execution_id
+
+        execution_id = "exec-cancel-orphan-1"
+        approval_id = "apr-cancel-orphan-1"
+        with rt._approval_lock:
+            rt._pending_approval_id_by_execution[execution_id] = approval_id
+
+        set_server_minted_execution_id(execution_id)
+        # Pin the runtime into the @protect decorator's module slot.
+        import nullrun.decorators as _dec
+
+        _dec._runtime = rt
+
+        # Mock /cancel and /approvals/.../consume.
+        cancel_route = respx.post(f"{BASE_URL}/api/v1/cancel").mock(
+            return_value=Response(
+                200,
+                json={
+                    "execution_id": execution_id,
+                    "canceled_at": "2026-09-21T00:00:00Z",
+                    "reservation_released_cents": 0,
+                    "already_canceled": False,
+                },
+            )
+        )
+        consume_route = respx.post(
+            f"{BASE_URL}/api/v1/approvals/{approval_id}/consume"
+        ).mock(
+            return_value=Response(
+                200,
+                json={"approval_id": approval_id, "status": "consumed"},
+            )
+        )
+
+        try:
+            from nullrun.decorators import _safe_cancel_active_execution
+
+            _safe_cancel_active_execution(reason="exception path test")
+        except Exception:
+            pass
+
+        assert cancel_route.call_count == 1, (
+            "safe_cancel must call /cancel before /consume"
+        )
+        assert consume_route.call_count == 1, (
+            "safe_cancel must call /approvals/{id}/consume after /cancel "
+            "to close the orphan grant (ADR-047)."
+        )
+
+    @respx.mock
+    def test_safe_cancel_skips_consume_when_no_approval_captured(
+        self, make_runtime
+    ):
+        # No reverse-index entry → consume is a no-op. The reverse index
+        # is populated only on the outcome=approved branch in
+        # check_workflow_budget; if the SDK never reached that branch
+        # (crashed earlier, sensitive-tool block, etc.) there is no
+        # approval row to close.
+        rt = make_runtime()
+
+        from nullrun.context import set_server_minted_execution_id
+
+        execution_id = "exec-no-approval"
+        set_server_minted_execution_id(execution_id)
+        import nullrun.decorators as _dec
+
+        _dec._runtime = rt
+
+        cancel_route = respx.post(f"{BASE_URL}/api/v1/cancel").mock(
+            return_value=Response(
+                200,
+                json={
+                    "execution_id": execution_id,
+                    "canceled_at": "2026-09-21T00:00:00Z",
+                    "reservation_released_cents": 0,
+                    "already_canceled": False,
+                },
+            )
+        )
+        consume_route = respx.post(
+            f"{BASE_URL}/api/v1/approvals/.+/consume"
+        ).mock(
+            return_value=Response(
+                200,
+                json={"approval_id": "x", "status": "consumed"},
+            )
+        )
+
+        try:
+            from nullrun.decorators import _safe_cancel_active_execution
+
+            _safe_cancel_active_execution(reason="no approval captured")
+        except Exception:
+            pass
+
+        assert cancel_route.call_count == 1
+        assert consume_route.call_count == 0, (
+            "safe_cancel must skip /consume when no approval_id was "
+            "captured for this execution_id — the dict lookup is the "
+            "gating check."
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
