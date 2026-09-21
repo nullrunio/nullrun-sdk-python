@@ -1,3 +1,47 @@
+## [0.18.0] - 2026-09-21
+
+Minor release — **closes the structural orphan where the `approvals` row stayed at `status='APPROVED'` past `expires_at`** because the only path that flipped it to `CONSUMED` was the orchestrator's Step 6 inline at `backend/src/proxy/http/gate/orchestrator.rs:713`, which `mode="inline"` tools bypass entirely. The fix wires the SDK to call a new structurally-distinct endpoint (`POST /api/v1/approvals/{approval_id}/consume`) from both the success path (after WS approval resolves to `outcome=approved`) and the exception path (`_safe_cancel_active_execution`). Operator-initiated `/cancel` on an approval envelope ALSO consumes the row in spawned Step 4e. Audit emits distinguish operator-cancel from SDK-consume via distinct `matched_rule` strings. Behaviour change: outbound HTTP call from the SDK success branch (`check_workflow_budget` after WS approval). Wire-format unchanged (additive). SDK_MIN_VERSION unchanged.
+
+### Added
+
+- **`POST /api/v1/approvals/{approval_id}/consume`** (backend 2.8.0+). Sibling to `/api/v1/cancel`. Structurally distinct from `consume_approved`: the SQL omits `execution_id` binding per ADR-046 (no cached-replay arm race window), carries `organization_id` filter (C2 closure), and optionally filters by `api_key_id` (P1-A cross-key replay defense). Three response shapes: `consumed` (success), `already_consumed` (idempotent replay), `not_approved` (PENDING/DENIED/EXPIRED — idempotent no-op). All three return 200. See `backend/src/proxy/http/approvals.rs::consume_approval_handler` and ADR-047.
+
+- **`Runtime.consume_approval(approval_id, execution_id=None)`** — best-effort POST to the new endpoint. Catches all exceptions and surfaces them at `logger.debug` so a network blip does NOT block the success path or the exception path. Returns `{"status": "error", "approval_id": ...}` on failure (so callers can branch if they care).
+
+- **`Runtime.lookup_pending_approval_id_for_execution(execution_id)`** — read-only accessor for the reverse-index `execution_id → approval_id` populated by `check_workflow_budget` on the WS-approval success branch. RLock-guarded. Used by `_safe_cancel_active_execution` to close orphan grants on the exception path.
+
+- **`Runtime._mark_approval_resolved_for_execution(execution_id, approval_id)`** — internal writer for the same reverse index. RLock-guarded. Invoked from `check_workflow_budget` after `outcome == "approved"`.
+
+### Changed
+
+- **`check_workflow_budget` auto-calls `consume_approval`** on the `outcome=approved` branch after WS approval resolves (`src/nullrun/runtime.py`). Best-effort: the helper catches all exceptions and surfaces them at `logger.debug`, so a network blip here does NOT block the success path. The `approval_expiry_sweeper` at `backend/src/workers/approval_expiry.rs` will close any rows that slip through within ~5 min, but for `mode="inline"` non-sensitive tools (the dominant class), the success path now closes the row before the operator sees it on the dashboard.
+
+- **`_safe_cancel_active_execution` ALSO calls `consume_approval`** after `cancel_execution` on the exception path (`src/nullrun/decorators.py`). The reverse-index lookup is RLock-guarded; if the SDK crashed before reaching the WS-approval branch the lookup returns `None` and this is a no-op. Same best-effort posture as `cancel_execution` itself — never masks the original exception.
+
+- **`/cancel` mode-gated Step 4e** consumes the approval row (backend, spawned task). Audit emit uses `matched_rule="lifecycle.consume_approved_via_cancel"` + `consume_reason="operator_cancel"`, distinct from the SDK-side `lifecycle.consume_approved_via_sdk` + `sdk_consume_endpoint`. The two `matched_rule` strings give operators forensic distinction between operator-cancel and SDK-side auto-consume on the audit table.
+
+### Why this is needed
+
+Production had 48 `approvals` rows in `status='APPROVED' + consumed_at IS NULL + expires_at < NOW()` — the dashboard's "abandoned grants" view (per ADR-045 §10.1 retraction). Root cause: `consume_approved` SQL at `backend/src/proxy/infra/db.rs:1715` was only reachable from `/execute` orchestrator Step 6, but `mode="inline"` tools bypass `/execute` entirely. The same gap fired on SDK crashes between WS approval push and body execution. Recent SDK releases (v0.16.5 cancel-on-exception, v0.16.8 NR-A015, v0.17.0/0.17.1) closed the budget reservation leak and the sensitive-tool wire-shape gap but NOT this structural orphan. `_safe_cancel_active_execution` (added in v0.16.5) calls `POST /api/v1/cancel`, which only releases the B-10 pending counter + DELs the Redis reservation key — it does NOT touch the `approvals` row. The `approval_expiry_sweeper` at `backend/src/workers/approval_expiry.rs` is PENDING-only by design (ADR-045 §10.1 retraction locked this in) and never transitions APPROVED rows.
+
+The orphan class shrinks from "every inline-mode approval" to "transport blip during success path". The 48 historical rows will close on the sweeper's next pass; no data migration needed. New inline-mode rows close on the SDK success path; new cancel-path rows close on the operator-cancel path. The remaining failure surface is "SDK crashes between WS approval resolve and `consume_approval` HTTP landing", which the sweeper still handles within ~5 min.
+
+### Verification
+
+- `ruff check src tests` — all checks passed.
+- `mypy src/nullrun` — success: no issues found.
+- `pytest -q` — full SDK suite green; 6 new tests added in `tests/test_v3_wire_contract.py::TestConsumeApprovalEndpoint`, `TestCheckWorkflowBudgetConsumeOnApproved`, `TestSafeCancelCallsConsumeApproval`.
+- Wire-format smoke: `pytest -q tests/test_v3_wire_contract.py -k "consume_approval or safe_cancel or protocol_header"`.
+
+### Why two `matched_rule` strings
+
+Operators investigating the `audit_events` table for an "approved → consumed" transition need to know whether the consume came from the SDK auto-consume (meaning the agent successfully executed the approved tool) or from the operator's `/cancel` (meaning the operator cancelled the approval envelope). Conflating them in a single `matched_rule` string would lose this distinction, so we emit two:
+
+- `lifecycle.consume_approved_via_sdk` + `consume_reason="sdk_consume_endpoint"` — SDK side, success path
+- `lifecycle.consume_approved_via_cancel` + `consume_reason="operator_cancel"` — operator-initiated cancel
+
+Both share the same `audit_kind` (`approval.consumed`) and `status` (`success`), so the `approvals` lifecycle view aggregates them correctly while the audit deep-dive filters on `matched_rule` + `consume_reason`.
+
 ## [0.17.1] - 2026-09-15
 
 Patch release — two correctness themes on the 0.17.0 baseline: (1) **`/check` mints a fresh `operation_id` per call** (the previous behaviour — reuse the first call's op_id within the same scope — collided with the backend's `IDEM-01` 11-field semantic-hash dedup whenever a second `/check` had a different `tools` / `model` / `input`, surfacing as a 409 `IDEMPOTENCY_KEY_MISMATCH` and the misleading SDK error `NR-B004` "You've reached the usage limit for this conversation"), and (2) **`_V3_ERROR_CODE_MAP` closes the wire-code gap from backend `fix-wave-2`** (the two NEW wire codes — `INVALID_JSON` (400, `invalid_json` slug, `JsonSyntaxError`) and `INVALID_FIELD` (422, `validation_error` slug, `JsonDataError`) — now round-trip through `NullRunBackendError` instead of falling through to the generic transport fallback at `transport.py:2961`). No behaviour change for code that already handles `NullRunBackendError`; cookbook recipes that branch on `error_code` now retain diagnostic class for parse-level vs schema-level rejections. Wire-format unchanged. SDK_MIN_VERSION unchanged.

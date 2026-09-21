@@ -275,6 +275,35 @@ silently dropping the query.
 
 ---
 
+## Closing orphan grants (v0.18+)
+
+An approval row that lands at `status='APPROVED'` but never flips to
+`CONSUMED` is an "orphan grant" — the operator sees it on the dashboard
+forever (or until the sweeper runs). Two paths close the orphan:
+
+1. **Success path** — when the WebSocket approval push resolves
+   `outcome=approved`, the SDK auto-calls
+   `POST /api/v1/approvals/{approval_id}/consume` so the row flips to
+   `CONSUMED` *before* the function body runs. Best-effort: a network
+   blip is logged at `DEBUG` and the success path is **not** blocked.
+2. **Exception path** — `@protect`'s
+   `_safe_cancel_active_execution` calls
+   `cancel_execution` *and* `consume_approval` (in that order) when an
+   exception fires after `/gate` succeeded. The reverse-index lookup
+   `execution_id → approval_id` is populated by the WS push handler, so
+   if the SDK never reached the WS-approval branch the lookup returns
+   `None` and `consume_approval` is a no-op.
+
+The new endpoint is **structurally distinct** from the orchestrator's
+`consume_approved` SQL (no `execution_id` binding per ADR-046, so it
+does not participate in the cached-replay arm race window) and carries
+`organization_id` for C2 closure. Idempotent: replay returns
+`already_consumed`; PENDING/DENIED/EXPIRED rows return `not_approved`,
+both with HTTP 200. See `src/nullrun/runtime.py::consume_approval`
+and `src/nullrun/transport.py::consume_approval`.
+
+---
+
 ##  Examples
 
 Runnable, copy-pastable examples live in a separate repo so you can adapt without cloning the SDK source:
@@ -295,8 +324,8 @@ Runnable, copy-pastable examples live in a separate repo so you can adapt withou
 | **v0.14.x** | ✅ alpha | Wire protocol v3.31, server-minted execution IDs, MCP, anti-OOM streaming cap |
 | **v0.15.x** | ✅ alpha | ADR-009 governance audit surface, typed `runtime.audit.*`, capability probes for `/audit-log/verify`, fail-OPEN observability closure |
 | **v0.16.x** | ✅ alpha | Phase-1+ `action_digest` on `/gate`, `/execute` `tools` propagation, transient-5xx retry on gate (NR-006), error-code parity (NR-007, 41→56 entries) |
-| **v0.17.x** (current) | ✅ alpha | Chain-setter Token discipline, `_GATE_CACHE` staleness closure, lazy-export repair, circuit-breaker lock unification (sync+async), op_id mint-fresh (DEF-OPID-REUSE-HASH-MISMATCH), error-code map closure (DEF-SDKT-004) |
-| **v0.18** | 📋 planned | OpenTelemetry exporter, Redis-backed offline queue, hardened init contract |
+| **v0.17.x** | ✅ alpha | Chain-setter Token discipline, `_GATE_CACHE` staleness closure, lazy-export repair, circuit-breaker lock unification (sync+async), op_id mint-fresh (DEF-OPID-REUSE-HASH-MISMATCH), error-code map closure (DEF-SDKT-004) |
+| **v0.18.x** (current) | ✅ alpha | Close-orphan fix (ADR-047): SDK auto-calls `POST /api/v1/approvals/{id}/consume` after WS approval resolves to `outcome=approved` and on the `@protect` exception path. Closes the structural orphan where `mode="inline"` tools left approval rows at `status=APPROVED` past `expires_at`. |
 | **v1.0** | 🎯 beta target | Stable wire contract, full async support, type-safe decisions |
 
 [Full roadmap & RFCs →](https://nullrun.io/roadmap)
