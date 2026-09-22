@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "nullrun"
 # Full release history lives in CHANGELOG.md; only the current version
 # is pinned here.
-version = "0.18.0"
+version = "0.18.1"
 # Kept under the 200-char preview threshold so the full line is visible
 # without an "expand" click. The headline is the canonical §1 statement
 # from positioning.md — "runtime decision layer for tool-using AI agents"
@@ -78,49 +78,40 @@ opentelemetry = [
 langgraph = [
     "langgraph>=0.2.0,<1.0",
 ]
-# Phase E1: per-vendor auto-instrumentation dependencies.
-# Each patch in `nullrun.instrumentation.auto` wraps its vendor import in
-# `try/except ImportError` so a user who installs only one extras group
-# does not crash on SDK init. This matches the plan: zero glue code for
-# `nullrun.init(api_key=...)` to track all common LLM vendors.
-openai = ["openai>=1.0,<2.0"]
-anthropic = ["anthropic>=0.20,<1.0"]
-mistral = ["mistralai>=0.4,<1.0"]
-gemini = ["google-genai>=1.0,<2.0"]
-cohere = ["cohere>=5.0,<6.0"]
-bedrock = ["boto3>=1.34,<2.0"]
+# Framework auto-instrumentation dependencies.
+#
+# These extras install framework SDKs whose event systems NullRun
+# subscribes to. NullRun's HTTP-level instrumentation
+# (``patch_httpx`` + ``patch_requests`` + 5 URL-keyed extractors)
+# covers OpenAI / Anthropic / Mistral / Gemini / Cohere / Bedrock
+# WITHOUT requiring their vendor SDKs — all of those vendors route
+# through httpx, and NullRun parses the response body by URL host.
+# The vendor SDK packages are NOT imported anywhere in
+# ``src/nullrun/``, so extras like ``[openai]`` / ``[anthropic]`` /
+# ``[mistral]`` / ``[gemini]`` / ``[cohere]`` / ``[bedrock]`` would
+# be dead weight for the SDK.
+#
+# What NullRun DOES import from these framework SDKs:
+#   - ``agents`` → ``agents.Runner`` (openai-agents tracing model)
+#   - ``langchain`` → ``langchain_core.callbacks.BaseCallbackManager``
+#     + ``langchain_core.language_models.BaseChatModel``
+#   - ``langgraph`` → ``langgraph.pregel.Pregel``
+#   - ``llama-index`` → ``llama_index.core.instrumentation``
+#   - ``crewai`` → ``crewai.Crew`` + ``crewai.events``
+#   - ``autogen`` → ``autogen_agentchat.agents.BaseChatAgent`` +
+#     ``autogen_ext.models.openai.OpenAIChatCompletionClient``
+#
+# Each ``patch_*`` wraps its framework import in
+# ``try/except ImportError`` so ``nullrun.init()`` never crashes when
+# the optional package is missing. Auto-detection: NullRun activates
+# an adapter when the package is installed — the user does NOT need
+# to choose which framework extra to install; installing any one of
+# them auto-enables its adapter.
 agents = ["openai-agents>=0.1,<1.0"]
 langchain = ["langchain-core>=0.3,<1.0"]
-# Phase 7: new framework auto-instrumentation dependencies.
-# Each patch in `nullrun.instrumentation.llama_index`, `crewai`, and
-# `autogen` wraps its framework import in `try/except ImportError` so
-# `nullrun.init()` never crashes when the optional package is missing.
 llama-index = ["llama-index-core>=0.10.20,<1.0"]
 crewai = ["crewai>=0.80,<2.0"]
 autogen = [
-    "autogen-agentchat>=0.4,<1.0",
-    "autogen-ext[openai]>=0.4,<1.0",
-]
-# Server-framework integrations. Each one pulls the framework so the
-# corresponding ``nullrun.integrations.<framework>`` module can be
-# imported. ``nullrun.integrations.__init__`` does NOT eager-import
-# these (the submodules are loaded lazily on first ``from
-# nullrun.integrations import <framework>``), so users who don't use
-# a given framework don't pay its install cost.
-fastapi = [
-    "fastapi>=0.100,<1.0",
-]
-all = [
-    "openai>=1.0,<2.0",
-    "anthropic>=0.20,<1.0",
-    "mistralai>=0.4,<1.0",
-    "google-genai>=1.0,<2.0",
-    "cohere>=5.0,<6.0",
-    "boto3>=1.34,<2.0",
-    "openai-agents>=0.1,<1.0",
-    "langchain-core>=0.3,<1.0",
-    "llama-index-core>=0.10.20,<1.0",
-    "crewai>=0.80,<2.0",
     "autogen-agentchat>=0.4,<1.0",
     "autogen-ext[openai]>=0.4,<1.0",
 ]

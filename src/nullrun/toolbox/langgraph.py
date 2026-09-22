@@ -1,28 +1,62 @@
 """
 LangGraph toolbox helpers for NullRun.
 
-This module is the user-facing entry point for LangGraph
-integrations. It is a thin convenience layer that wires the
-`NullRunCallback` from `nullrun.instrumentation.langgraph` onto a
-LangGraph compiled app so that every `app.invoke(...)` and
-`app.stream(...)` call fires the LangChain callback hooks. The
-callback extracts `input_tokens` / `output_tokens` from the LLM
-response and forwards them to the runtime's `track ` method —
-cost is then recomputed by the backend from the org's pricing
-policy.
+DEPRECATED for auto-instrumentation use cases.
 
-Why this lives in `toolbox/`, not `instrumentation/`:
-  - `instrumentation/` ships the generic, low-level patches
-    (httpx, OpenAI v1+ attribute path, LangChain callback class).
-    These are reusable building blocks.
-  - `toolbox/langgraph.py` ships a ready-to-use `wrapper(app)`
-    that is a single function call for the most common
-    LangGraph case. It is the entry point the user is pointed
-    to from the LangGraph integration docs.
+For typical LangGraph usage, ``nullrun.init_or_die()`` (or just
+``@nullrun.protect`` on the agent function) auto-patches
+``langgraph.pregel.Pregel`` via
+``nullrun.instrumentation.auto.patch_langgraph_compiled`` — the same
+callback injection that this ``wrapper()`` performs manually. The
+auto-patch is the canonical path; users should NOT need to call
+``wrapper(graph)`` themselves.
 
-The previous location `nullrun.instrumentation.langgraph.instrument`
+This ``wrapper()`` remains as an **escape hatch** for three narrow
+cases where the auto-patch cannot run or where the user needs
+explicit control:
+
+  1. Tests with custom runtimes (the auto-patch binds to the active
+     runtime; a test fixture that swaps runtimes mid-flight may need
+     the wrapper to attach to the new runtime directly).
+  2. Apps where ``Pregel`` is imported BEFORE ``nullrun.init_or_die()``
+     AND the import side-effects register a non-Pregel transport
+     that the auto-patch cannot reach.
+  3. Manual control over which ``NullRunCallback`` instance is
+     attached (rare; the default singleton is usually correct).
+
+For the canonical path (90%+ of users), omit this wrapper::
+
+    from nullrun import init_or_die, protect
+
+    init_or_die()
+
+    @protect
+    def my_agent(prompt):
+        return graph.invoke({"messages": [("user", prompt)]})
+
+If you must use this wrapper explicitly (escape hatch)::
+
+    from nullrun import init_or_die
+    from nullrun.toolbox.langgraph import wrapper
+
+    runtime = init_or_die()
+    graph = build_my_graph()
+    graph = wrapper(graph, runtime=runtime)
+    result = graph.invoke({"messages": [("user", "hi")]})
+
+Why this lives in ``toolbox/``, not ``instrumentation/``:
+  - ``instrumentation/`` ships the generic, low-level patches
+    (httpx, OpenAI v1+ attribute path, LangChain callback class,
+    Pregel class-method wrap). These are reusable building blocks
+    and run automatically on ``init_or_die()``.
+  - ``toolbox/langgraph.py`` ships an opinionated one-call wrapper
+    that mutates a specific ``app`` instance in place. It is no
+    longer the recommended path for typical usage.
+
+The previous location ``nullrun.instrumentation.langgraph.instrument``
 has been removed. Users who imported it should switch to
-`nullrun.toolbox.langgraph.wrapper`.
+``nullrun.toolbox.langgraph.wrapper`` (escape hatch only) or rely
+on the auto-patch (canonical path).
 """
 from __future__ import annotations
 
@@ -39,30 +73,27 @@ def wrapper(app: Any, runtime: Any | None = None) -> Any:
     """
     Wrap a compiled LangGraph app with NullRun tracking.
 
-    Every `app.invoke(...)` and `app.stream(...)` call gets a
-    `NullRunCallback` attached so the runtime sees the LLM
+    .. deprecated::
+        For typical usage, rely on the auto-patch in
+        ``nullrun.init_or_die()`` / ``@nullrun.protect``. This wrapper
+        is an escape hatch for the narrow cases documented in the
+        module docstring (custom runtime, Pregel imported before init,
+        manual callback control).
+
+    Every ``app.invoke(...)`` and ``app.stream(...)`` call gets a
+    ``NullRunCallback`` attached so the runtime sees the LLM
     usage for cost accounting and policy enforcement.
 
-    Usage:
-        from nullrun import init
-        from nullrun.toolbox.langgraph import wrapper
-
-        runtime = init 
-        graph = build_my_graph 
-        graph = wrapper(graph, runtime=runtime)
-
-        result = graph.invoke({"messages": [("user", "hi")]})
-
     Args:
-        app: A compiled LangGraph `StateGraph` (anything with
-             `.invoke` and `.stream`).
-        runtime: Optional `NullRunRuntime`. Defaults to the
-             module-level singleton from `get_runtime `.
+        app: A compiled LangGraph ``StateGraph`` (anything with
+             ``.invoke`` and ``.stream``).
+        runtime: Optional ``NullRunRuntime``. Defaults to the
+             module-level singleton from ``get_runtime()``.
 
     Returns:
-        The same `app` object, with `.invoke` and `.stream`
+        The same ``app`` object, with ``.invoke`` and ``.stream``
         wrapped in place. The callback is added to LangChain's
-        `config["callbacks"]` list per call, so multiple
+        ``config["callbacks"]`` list per call, so multiple
         wrappers compose without colliding.
     """
     rt: NullRunRuntime = runtime or get_runtime()

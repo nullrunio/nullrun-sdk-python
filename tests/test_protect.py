@@ -61,6 +61,13 @@ class _RecordingRuntime:
     def check_workflow_budget(self) -> None:
         return None
 
+    def _bump_protect_count(self) -> None:
+        # 2026-09-22: zero-activity diagnostic counter. Tests
+        # that use this stub don't exercise the diagnostic, so a
+        # no-op is correct — the real impl lives on
+        # NullRunRuntime and is exercised by dedicated tests.
+        return None
+
     def is_sensitive_tool(self, fn_name: str) -> bool:  # noqa: ARG002
         return False
 
