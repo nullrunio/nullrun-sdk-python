@@ -98,6 +98,14 @@ class _RecordingRuntime:
     def check_workflow_budget(self) -> None:
         self.gate_calls.append("budget")
 
+    def _bump_protect_count(self) -> None:
+        # 2026-09-22: zero-activity diagnostic counter on the real
+        # NullRunRuntime. Tests don't exercise the warn-once
+        # behaviour, so a no-op stub keeps the @protect call path
+        # runnable without dragging the diagnostic state into
+        # gate-order assertions.
+        return None
+
     def execute(self, tool_name, input_data, mode="auto"):
         self.gate_calls.append("sensitive")
         if not self.is_sensitive_tool(tool_name):

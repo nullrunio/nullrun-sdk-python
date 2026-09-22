@@ -732,6 +732,24 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
 
         self._recent_errors = _RecentErrorRing(capacity=10)
 
+        # 2026-09-22: zero-activity diagnostic counters. The user's
+        # @protect gate is enforced, but enforcement without
+        # observability means the dashboard reports nothing — the
+        # agent runs, costs nothing, and the operator is left
+        # wondering whether NullRun is wired up correctly. These
+        # counters let ``_maybe_warn_zero_activity`` notice the
+        # "protected function ran but no LLM call was ever seen"
+        # pattern and surface a one-time WARNING explaining the
+        # most likely causes (raw httpx calls outside the SDK's
+        # patchable surface, custom transport, async framework
+        # not in the auto-detection table). Lock-free atomic int
+        # bumps are cheap; the warn-once flag ensures we don't
+        # spam on long-lived processes.
+        self._protect_call_count: int = 0
+        self._llm_call_event_count: int = 0
+        self._zero_activity_warned: bool = False
+        self._zero_activity_lock = threading.Lock()
+
         # Layer 3: backend connectivity timestamps for the status
         # snapshot. Set in ``_authenticate`` and updated on every
         # successful / failed backend call thereafter.
@@ -1066,6 +1084,64 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             workflow_state=workflow_state,
             recent_errors=recent_errors,
         )
+
+    def _bump_protect_count(self) -> None:
+        """Increment the per-runtime ``@protect`` invocation counter.
+
+        Cheap: a single CPython int increment is atomic under the GIL
+        so no lock is needed for the bump itself. The lock is only
+        taken in ``_maybe_warn_zero_activity`` to make the
+        read-decide-set sequence atomic with respect to a concurrent
+        caller that flips ``_zero_activity_warned``.
+        """
+        self._protect_call_count += 1
+        self._maybe_warn_zero_activity()
+
+    def _maybe_warn_zero_activity(self) -> None:
+        """Emit a one-time WARNING when ``@protect`` has been called
+        many times but no LLM-call event has ever been recorded.
+
+        This catches the silent-failure mode where the user wires up
+        ``@protect`` correctly but the LLM call never reaches the
+        SDK's instrumentation surface — usually because the agent
+        uses a raw ``httpx.Client`` without the patchable wrapper,
+        a custom transport (gRPC, vendor-specific socket), or a
+        framework that isn't on the auto-detection table yet.
+
+        Threshold: 50 ``@protect`` calls without a single LLM event
+        is the operational signal. The warn-once flag prevents log
+        spam on long-lived processes; the lock makes the read-flag
+        sequence atomic with respect to concurrent ``@protect``
+        calls.
+
+        Operators see the diagnostic at WARNING level so it surfaces
+        in default observability stacks without ``--debug`` noise.
+        """
+        with self._zero_activity_lock:
+            if self._zero_activity_warned:
+                return
+            if self._protect_call_count < 50:
+                return
+            if self._llm_call_event_count > 0:
+                return
+            self._zero_activity_warned = True
+            logger.warning(
+                "NullRun: @protect has been invoked %d times but no "
+                "LLM-call event has been recorded. The gate is enforced "
+                "but cost tracking will be empty in /control-center. "
+                "Most common causes: "
+                "(1) the LLM call uses a raw httpx client without "
+                "NullRun's instrumentation patches (call "
+                "nullrun.init_or_die() before the first request), "
+                "(2) a custom transport / non-HTTP vendor (gRPC, "
+                "WebSocket, SDK-internal socket), "
+                "(3) a framework not in the auto-detection table "
+                "(LangGraph, LangChain, OpenAI Agents, LlamaIndex, "
+                "CrewAI, AutoGen). See "
+                "https://docs.nullrun.io/getting-started/onboarding/ "
+                "for the wiring guide.",
+                self._protect_call_count,
+            )
 
     def _record_error(
         self,
@@ -3891,6 +3967,14 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # Lazy import to keep the runtime import graph acyclic --
         # `nullrun.tracing` deliberately has no SDK-side dependencies.
         from nullrun.tracing import get_current_span
+
+        # 2026-09-22: bump the zero-activity diagnostic counter. This is
+        # the ONLY signal the diagnostic needs — every track_llm call
+        # represents one LLM call observed, regardless of how it got
+        # there (httpx patch, framework callback, manual call). The
+        # counter is the canonical "yes we saw an LLM" answer; the
+        # ``@protect`` counter comes from the decorator's call site.
+        self._llm_call_event_count += 1
 
         event: dict[str, Any] = {
             "type": "llm_call",

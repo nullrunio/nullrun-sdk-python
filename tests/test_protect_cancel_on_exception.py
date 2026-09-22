@@ -109,6 +109,14 @@ class _RecordingRuntime:
         if self._workflow_budget_raises is not None:
             raise self._workflow_budget_raises
 
+    def _bump_protect_count(self) -> None:
+        # 2026-09-22: zero-activity diagnostic counter on the real
+        # NullRunRuntime. The cancel-on-exception tests do not
+        # exercise the diagnostic, so a no-op keeps the @protect
+        # call path runnable without pulling the diagnostic state
+        # into the cancel/capture assertions.
+        return None
+
     def is_sensitive_tool(self, tool_name: str) -> bool:
         # No sensitive tools by default in these tests; sensitive-tool
         # reject coverage is a separate concern (already exercised in
