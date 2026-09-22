@@ -1,4 +1,4 @@
-"""BusinessImpact extraction for @sensitive tools.
+"""BusinessImpact extraction — advanced API for @sensitive(impact=...).
 
 This module is the SDK-side counterpart of the backend's
 ``BusinessImpact`` discriminated union. It exposes a single
@@ -17,10 +17,19 @@ that:
 5. Computes the byte-identical ``action_digest`` the backend
    expects (see ``nullrun.business_impact.compute_action_digest``).
 
+SDK 0.18.1: the canonical public entry point is ``@protect`` —
+it auto-attaches a default ``ToolParamsExtractor`` on every
+protected function so the wire payload carries
+``tool_name + params`` without any second decorator. Bare
+``@sensitive`` is deprecated. This module exists for the
+``@sensitive(impact=...)`` advanced API: library authors who need
+a typed ``BusinessImpact`` envelope (money flows, custom predicate
+maps) and the SHA-256 ``action_digest`` for digest-bound approval.
+
 ## Why this is its own helper, not part of ``@sensitive``
 
-The ``@sensitive`` decorator chain is the integration point, but
-the per-call impact extraction is data-driven and tested
+The ``@sensitive(impact=...)`` decorator chain is the integration
+point, but the per-call impact extraction is data-driven and tested
 independently. Keeping ``extractor.py`` as a pure helper avoids
 the ``inspect.signature()`` cost on every sensitive call (the
 binding result is cached after first extraction via Python's
@@ -41,6 +50,7 @@ semantics of a function argument should not flip silently when
 the function signature is refactored. Concretely:
 
     @nullrun.sensitive(impact=nullrun.money_outflow(argument="amount"))
+    @nullrun.protect
     def refund(amount: int) -> ...   # 50 = 50 cents (minor units)
     def refund(amount: Decimal) -> ... # 50 = $50.00 (5000 cents)
 
@@ -157,6 +167,7 @@ decorator never reaches runtime.
 from __future__ import annotations
 
 import inspect
+import logging
 from collections.abc import Callable
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -771,12 +782,16 @@ def money_outflow(
 # Why ``include_all=True`` is the default (and not opt-in):
 # - Operators adopting ToolParameters Approval Rules need their
 #   tools to ship args without rewriting every decorator site.
-# - Bare ``@sensitive`` (no impact=...) auto-attaches this extractor
-#   in ``_do_sensitive_register`` (see decorators.py) so the
-#   behavior is "every @sensitive tool ships its args by default".
+# - SDK 0.18.1+: ``@protect`` auto-attaches this extractor on every
+#   protected function (see ``protect()`` in decorators.py), so the
+#   behaviour is "every protected tool ships its args by default".
+# - The legacy bare ``@sensitive`` (no impact=...) is deprecated in
+#   0.18.1+; it auto-attached this extractor too, so it was already
+#   equivalent to ``@protect`` alone. It still works in 0.18.x with a
+#   ``DeprecationWarning`` and will be removed in 0.19.x.
 # - Users with sensitive args (e.g. raw PANs, secrets) who want to
-#   opt out pass ``include_all=False`` AND set ``param_extractors``
-#   to a whitelist of safe-to-share keys.
+#   opt out pass ``@sensitive(impact=tool_params(include_all=False))``
+#   explicitly — the advanced API.
 #
 # Why ``param_extractors`` is an explicit map (not a glob):
 # - The operator-facing rule references param names
@@ -788,6 +803,18 @@ def money_outflow(
 
 _TOOL_CALL_EXTRACTOR_ID = "nullrun.tool_call.path"
 _TOOL_CALL_EXTRACTOR_VERSION = "1"
+
+# Per-value size cap for wire-shipped params. Implemented as a
+# truncation, not a rejection: oversize values get a deterministic
+# suffix so the operator can tell from the wire payload that the
+# value was bounded (rather than receiving a value that silently
+# drops without trace). 1024 bytes is an implementation safety
+# limit, not part of the public SDK contract -- the backend can
+# reject any value it doesn't want; the SDK's job is to never
+# build an unbounded payload that could blow past per-request
+# transport limits.
+_TOOL_PARAM_VALUE_MAX_BYTES = 1024
+_TOOL_PARAM_TRUNCATION_MARKER = "...[truncated:{} bytes]"
 
 
 class ToolParamsExtractor:
@@ -831,6 +858,12 @@ class ToolParamsExtractor:
         "include_all",
         "extractor_id",
         "extractor_version",
+        # 0.18.1: marker stamped by ``@protect`` auto-attach so
+        # ``_enforce_sensitive_tool`` can distinguish "SDK installed
+        # this for tooling reasons" from "developer opted in via
+        # ``@sensitive(impact=...)``". Auto-attached extractors do
+        # NOT trigger the policy gate; explicit ones do.
+        "_nullrun_auto_attached",
     )
 
     def __init__(
@@ -911,22 +944,40 @@ class ToolParamsExtractor:
 
         Each value is filtered through ``_safe_for_wire``: only
         JSON-roundtrippable types survive, and PII-masked
-        sentinels are dropped.
+        sentinels are dropped. Surviving values are then bounded
+        (``_bound_value``) — oversize scalars get a deterministic
+        truncation marker; nested containers are walked with a
+        cycle guard so a Python object graph with self-references
+        cannot raise RecursionError out of the extractor.
         """
         result: dict[str, Any] = {}
+        dropped: dict[str, int] = {}
         if self.param_extractors is not None:
             for rule_param, arg_name in self.param_extractors.items():
                 if arg_name not in kwargs:
                     continue
                 value = kwargs[arg_name]
                 if not _safe_for_wire(value):
+                    _record_dropped(dropped, value)
                     continue
-                result[rule_param] = value
+                result[rule_param] = _bound_value(value)
         elif self.include_all:
             for k, v in kwargs.items():
                 if not _safe_for_wire(v):
+                    _record_dropped(dropped, v)
                     continue
-                result[k] = v
+                result[k] = _bound_value(v)
+        if dropped:
+            # Aggregate per extraction -- one DEBUG line, never one
+            # per dropped field. Names and values are NOT logged;
+            # only the type name and count. Operators debugging
+            # "why isn't my rule matching" can enable DEBUG to see
+            # which types their tool's args are being filtered as.
+            _logger.debug(
+                "ToolParamsExtractor dropped %d values: %s",
+                sum(dropped.values()),
+                ", ".join(f"{type_name}={count}" for type_name, count in sorted(dropped.items())),
+            )
         return result
 
 
@@ -972,6 +1023,89 @@ def _safe_for_wire(value: Any) -> bool:
     return False
 
 
+# Module-level logger for extraction diagnostics.
+_logger = logging.getLogger("nullrun.extractor")
+
+
+def _record_dropped(bucket: dict[str, int], value: Any) -> None:
+    """Bucket a dropped value by its type name into the per-call aggregate.
+
+    The bucket is local to one ``_extract_params`` call -- the
+    aggregate DEBUG line is emitted once per extraction, never once
+    per dropped field. ``bucket`` is mutated in place; the caller
+    emits the log line after the walk completes.
+    """
+    bucket[type(value).__name__] = bucket.get(type(value).__name__, 0) + 1
+
+
+def _bound_string(value: str) -> str:
+    """Bound a string value to ``_TOOL_PARAM_VALUE_MAX_BYTES`` bytes.
+
+    Returns the value unchanged when it fits. Otherwise truncates
+    to ``max_bytes - len(marker)`` and appends a deterministic
+    marker showing how many bytes were dropped. The marker is
+    sized so the returned string never exceeds the cap:
+
+        _TOOL_PARAM_TRUNCATION_MARKER = "...[truncated:N bytes]"
+
+    with N = number of bytes that were dropped (NOT the original
+    length). Operators can grep for ``...[truncated:`` in the
+    audit log to spot values that needed bounding.
+    """
+    encoded = value.encode("utf-8", errors="replace")
+    if len(encoded) <= _TOOL_PARAM_VALUE_MAX_BYTES:
+        return value
+    marker = _TOOL_PARAM_TRUNCATION_MARKER.format(
+        len(encoded) - _TOOL_PARAM_VALUE_MAX_BYTES
+    )
+    marker_bytes = len(marker.encode("utf-8"))
+    head = encoded[: _TOOL_PARAM_VALUE_MAX_BYTES - marker_bytes]
+    # Decode back to str so the returned value is still a Python
+    # ``str`` and round-trips through the canonical-JSON layer
+    # the same way the original would have. ``errors="replace"``
+    # is fine here because the marker itself is pure ASCII.
+    return head.decode("utf-8", errors="replace") + marker
+
+
+def _bound_value(value: Any, _seen: set[int] | None = None) -> Any:
+    """Bound a surviving value to the per-value size cap.
+
+    Strings get a deterministic truncation suffix (see
+    ``_bound_string``). Nested ``list`` / ``tuple`` / ``dict`` get
+    walked recursively with a cycle guard so a Python object
+    graph with self-references returns the partial walk instead
+    of raising ``RecursionError`` -- a guard that was implicit
+    when extraction was opt-in (developer had to opt into the
+    failure mode) but became mandatory when extraction became
+    the default for every ``@protect`` call.
+
+    Other JSON-safe types (``int``, ``bool``, ``None``) are
+    inherently bounded and pass through unchanged.
+    """
+    if isinstance(value, str):
+        return _bound_string(value)
+    if isinstance(value, (list, tuple)):
+        if _seen is None:
+            _seen = set()
+        if id(value) in _seen:
+            # Cycle: stop the walk and return what we have so far.
+            # Returning the (possibly partial) container is safer
+            # than raising -- the operator gets to see the partial
+            # structure and the backend can reject or accept.
+            return []
+        _seen = _seen | {id(value)}
+        return [_bound_value(item, _seen) for item in value]
+    if isinstance(value, dict):
+        if _seen is None:
+            _seen = set()
+        if id(value) in _seen:
+            return {}
+        _seen = _seen | {id(value)}
+        return {k: _bound_value(v, _seen) for k, v in value.items()}
+    # int / bool / None are inherently bounded.
+    return value
+
+
 def tool_params(
     param_extractors: dict[str, str] | None = None,
     *,
@@ -979,23 +1113,31 @@ def tool_params(
 ) -> ToolParamsExtractor:
     """Shorthand constructor used by ``@sensitive(impact=tool_params(...))``.
 
-    Every bare ``@sensitive`` tool auto-attaches a
-    ``ToolParamsExtractor(include_all=True)`` (see
-    ``_do_sensitive_register`` in decorators.py), so most users
-    never need to call this function explicitly. The factory
-    below is for two opt-in cases:
+    Every ``@protect`` tool auto-attaches a
+    ``ToolParamsExtractor(include_all=True)`` (see ``protect()``
+    in decorators.py — SDK 0.18.1+), so most users never need to
+    call this function explicitly. The factory below is for two
+    opt-in cases:
 
     1. Explicit ``{rule_param: arg_name}`` mapping when the
        rule name diverges from the function arg name::
 
+           @protect
            @sensitive(impact=tool_params({"user_id": "uid"}))
            def delete_user(uid: int): ...
 
     2. Strict opt-out from auto-capture (rare; for tools whose
        every kwarg is a secret the operator must never see)::
 
+           @protect
            @sensitive(impact=tool_params(include_all=False))
            def handle_secret(token: str): ...
+
+    SDK 0.18.1: bare ``@sensitive`` is deprecated — ``@protect``
+    already auto-attaches the default extractor, so the bare form
+    contributed nothing the canonical form does not. The
+    ``@sensitive(impact=tool_params(...))`` factory form remains
+    the advanced API for typed impact.
 
     Args:
         param_extractors: explicit ``{rule_param: arg_name}`` map.

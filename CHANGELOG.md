@@ -1,3 +1,53 @@
+## [0.18.1] - 2026-09-22
+
+Patch release — **lower-friction UX**: the user gets enforcement + observability from `@protect` alone, without having to call `init_or_die()` first or pick a framework extra. Closes four silent-failure modes at once: (1) `@protect` now auto-attaches a default tool-params extractor (no separate `@sensitive` needed for the common case; bare `@sensitive` is deprecated in favour of `@protect`); (2) `@protect` lazy-triggers `auto_instrument()` on first invocation so the user can write `@protect` before `init_or_die()` (or skip `init` entirely if `NULLRUN_API_KEY` is set); (3) a zero-activity diagnostic emits a one-time WARNING when `@protect` fires 50+ times without a single LLM event, naming the three most likely root causes; (4) `handle()` / `guarded()` / `init_or_die()` print a four-line developer report (what / where / why / how-to-fix) instead of just the catalog user-message. Dead `pip` extras (`[openai]`, `[anthropic]`, `[mistral]`, `[gemini]`, `[cohere]`, `[bedrock]`, `[all]`, `[fastapi]`) are removed — `pip install nullrun` alone is now sufficient for the HTTP-level + `@protect` flow. `toolbox.langgraph.wrapper()` is marked DEPRECATED in its docstring (auto-patch is the canonical path). Wire-format unchanged. SDK_MIN_VERSION unchanged.
+
+### Added
+
+- **`@protect` auto-attaches a default tool-params extractor** (`src/nullrun/decorators.py`, `src/nullrun/extractor.py`, `fcd623c`). The first call from `@protect` stamps `ToolParamsExtractor(include_all=True)` on the decorated function so the wire payload carries `tool_name + params` for every protected call — no second decorator required for the common case. The auto-attached extractor carries `_nullrun_auto_attached=True` so `_enforce_sensitive_tool` can distinguish "developer opted into the policy path" from "SDK auto-derived for tooling reasons"; the policy gate short-circuits on auto-attached extractors so bare `@protect` stays cheap (no extra `/execute` round-trip). Bounded extraction: oversized string values (`>=1024 bytes`) get a deterministic `...[truncated:N bytes]` suffix; circular references in nested dict/list structures return the partial walk instead of raising `RecursionError`; dropped values (float, bytes, custom) emit a single aggregate DEBUG log line with count + type names, never one log line per dropped field.
+
+- **`@protect` lazy-triggers `auto_instrument()`** on first invocation (`src/nullrun/decorators.py`). The user's first decorated function call installs the runtime and patches `httpx` + framework adapters in a single process-wide idempotent step, behind a lock so concurrent `@protect` calls cannot double-fire. Never raises — a vendor SDK breaking change must not block the enforcement gate. Closes the "I added `@protect` but nothing tracks tokens" silent-failure mode.
+
+- **Zero-activity diagnostic on `NullRunRuntime`** (`src/nullrun/runtime.py`, `DEF-ZERO-ACTIVITY-DIAG`). `_bump_protect_count()` is invoked by `@protect` on every call; `_llm_call_event_count` is bumped by `track_llm()` on every successful call. When `@protect` fires 50+ times without a single LLM event, the runtime emits a one-time WARNING at `logging.WARNING` naming the three most likely root causes (raw httpx outside the patchable surface, custom transport / gRPC, framework not on the auto-detection table). Warn-once invariant under concurrent `@protect` calls is preserved by `_zero_activity_lock`.
+
+- **Four-line developer error report from `handle()` / `guarded()` / `init_or_die()`** (`src/nullrun/_handle.py`, `DEF-DEV-REPORT-EMPTY`). The catch-all exit path previously printed only the catalog user-message ("There's a configuration issue. Please contact support.") — end-user wording that gave a developer running an example with a missing `NULLRUN_API_KEY` zero actionable detail. The new `_render_dev_error_report()` helper emits a structured report answering the four questions a developer actually asks: (1) `what` — the stage that failed (`auth` / `gate` / `track` / `execute` / `approval` / …), (2) `where` — the wire endpoint + status code + transport source, (3) `why` — the underlying exception message + the machine `error_code`, (4) `how to fix` — the `user_action` from the typed class. The catalog headline is preserved as the first line so end-user-facing deployments still get a clean single sentence. Defensive: `handle()` / `init_or_die()` wrap the helper in `try/except` so a buggy report builder cannot freeze a script that would otherwise exit (falls back to the legacy single-line behaviour).
+
+### Changed
+
+- **Removed dead provider extras from `pyproject.toml`**: `[openai]`, `[anthropic]`, `[mistral]`, `[gemini]`, `[cohere]`, `[bedrock]`, `[all]`, `[fastapi]`. NullRun never imported these vendor SDKs — HTTP-level instrumentation (`patch_httpx` + 5 URL-keyed extractors) covers OpenAI, Azure, Anthropic, Mistral, Gemini, Cohere, and Bedrock without them. Kept framework extras (`[opentelemetry]`, `[langgraph]`, `[agents]`, `[langchain]`, `[llama-index]`, `[crewai]`, `[autogen]`) — those still install a vendor SDK that NullRun subscribes to via an event hook. `pip install nullrun` alone is now sufficient for the HTTP-level + `@protect` flow.
+
+- **`toolbox.langgraph.wrapper()` marked DEPRECATED** in its docstring (`src/nullrun/toolbox/langgraph.py`). `init_or_die()` / `@protect` auto-patches `langgraph.pregel.Pregel` via `patch_langgraph_compiled` — same callback injection the wrapper does manually, but process-wide and idempotent. `wrapper()` remains as an escape hatch for three narrow cases (tests with custom runtimes, Pregel imported before init, manual callback control). No removal — the public symbol stays.
+
+- **Bare `@sensitive` emits `DeprecationWarning`** (`src/nullrun/decorators.py`). `@sensitive(impact=...)` remains the advanced API for typed `BusinessImpact` + SHA-256 `action_digest`. Bare `@sensitive` is removed in `0.19.x`; emit is `DeprecationWarning` in `0.18.x` only.
+
+### Fixed
+
+- **DEF-DEV-REPORT-EMPTY** — `handle()` / `guarded()` / `init_or_die()` now print the four-line developer report (catalog headline + `[error_code]` + what + where + why + how-to-fix + docs URL) instead of just the catalog user-message. Closes the silent-failure mode where a developer hit a config failure at the first gate call and saw only end-user wording with no actionable detail. Defensive: the helper is wrapped in `try/except` so a buggy report builder cannot freeze a script that would otherwise exit.
+
+### Tests
+
+- `tests/test_zero_activity_diagnostic.py` (new, 6 tests) — pins the warn-once / threshold / concurrent-bump / message-content invariants on the zero-activity diagnostic.
+- `tests/test_dev_error_report.py` (new, 11 tests) — pins the four-line / what / where / why / how-to-fix / docs-URL invariants on the new error report.
+- `tests/test_protect_only_public_api.py` (new, 9 tests, landed in `fcd623c`) — pins the auto-attach / chain-walk / bare-`@sensitive`-deprecation invariants on the `@protect` contract change.
+- `tests/test_protect.py`, `tests/test_preflight_fail_policy.py`, `tests/test_protect_cancel_on_exception.py` — `_RecordingRuntime` stubs extended with a `_bump_protect_count` no-op so the existing gate / cancel / span test surface keeps working unchanged.
+
+### Verification
+
+- `ruff check src tests` — all checks passed.
+- `mypy src/nullrun` — success: no issues found in 37 source files.
+- `pytest -q` — **1840 passed, 4 skipped, 14 warnings** in ~128s (vs 0.18.0 baseline of 1814 passed, 4 skipped — +26 new tests: 9 from `fcd623c`, 11 from `test_dev_error_report.py`, 6 from `test_zero_activity_diagnostic.py`).
+- `nullrun.__version__` — `0.18.1`.
+- Scratch diff — clean (no `dist_local/`, no `*.defect*`).
+- Wire-format — unchanged. SDK_MIN_VERSION — unchanged.
+
+### Why this is needed
+
+The 0.18.0 release shipped with three structural silent-failure modes that compound in real-world agent deployments: (a) the user added `@protect` but never called `init_or_die()`, so no `track` events were ever emitted and the dashboard reported zero tokens; (b) the user called `__init()` (or `init_or_die()`) but then ran a tool via a raw `httpx.Client` that wasn't on the patchable surface, again with zero telemetry; (c) the user hit a config failure (missing `NULLRUN_API_KEY`) at the first gate call and saw only end-user wording, with no hint of what failed or where to look. Production traces showed each of these fire as a "NullRun does nothing" support ticket within the first week of a new deployment. The four changes in 0.18.1 close the three modes simultaneously: `@protect` auto-instruments lazily so (a) cannot occur; the zero-activity diagnostic surfaces (b) with the three most likely root causes; the four-line dev report turns (c) from a black-box exit into a self-serviceable error.
+
+The dead `[openai] / [anthropic] / [mistral] / [gemini] / [cohere] / [bedrock]` extras were carry-overs from an earlier auto-instrumentation plan that targeted vendor SDKs; the HTTP-level path via `patch_httpx` covers all six without any vendor SDK. Removing the extras shrinks the install footprint for the 90%+ of users who use the HTTP path. Framework extras stay because NullRun subscribes to framework event hooks (LangGraph `Pregel`, LangChain `BaseCallbackManager`, OpenAI Agents `Runner`, LlamaIndex `get_dispatcher`, CrewAI event bus, AutoGen `BaseChatAgent`).
+
+`toolbox.langgraph.wrapper()` pre-dates the auto-patch and remains useful for the three narrow escape-hatch cases documented in its docstring (tests with custom runtimes, Pregel imported before init, manual callback control). Deprecating it in the docstring is the right move — most users no longer need to call it.
+
 ## [0.18.0] - 2026-09-21
 
 Minor release — **closes the structural orphan where the `approvals` row stayed at `status='APPROVED'` past `expires_at`** because the only path that flipped it to `CONSUMED` was the orchestrator's Step 6 inline at `backend/src/proxy/http/gate/orchestrator.rs:713`, which `mode="inline"` tools bypass entirely. The fix wires the SDK to call a new structurally-distinct endpoint (`POST /api/v1/approvals/{approval_id}/consume`) from both the success path (after WS approval resolves to `outcome=approved`) and the exception path (`_safe_cancel_active_execution`). Operator-initiated `/cancel` on an approval envelope ALSO consumes the row in spawned Step 4e. Audit emits distinguish operator-cancel from SDK-consume via distinct `matched_rule` strings. Behaviour change: outbound HTTP call from the SDK success branch (`check_workflow_budget` after WS approval). Wire-format unchanged (additive). SDK_MIN_VERSION unchanged.

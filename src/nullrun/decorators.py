@@ -39,6 +39,7 @@ import functools
 import inspect
 import logging
 import os
+import threading
 from collections.abc import Callable
 from contextvars import Token
 from typing import Any, TypeVar
@@ -306,24 +307,74 @@ def _get_or_create_runtime() -> NullRunRuntime:
     the SDK has no local mode: a missing API key must be a hard error
     not a silent allow-all.
 
-    Tries to patch OpenAI on first creation so the auto-instrumentation
-    path picks up the runtime the user will eventually use.
+    After obtaining the runtime, lazily triggers `auto_instrument()` so
+    a user who writes only `@protect` (without calling `init_or_die()`
+    first) still gets vendor SDK detection + token capture. The lazy
+    trigger is idempotent — multiple `@protect` calls in the same
+    process converge on a single `auto_instrument()` invocation. The
+    call is best-effort: if the auto-instrumentation path raises (e.g.
+    a vendor SDK breaks compatibility), the wrapper continues with the
+    enforcement gate so enforcement never silently disappears.
     """
     cached = get_active_runtime()
     if cached is not None:
+        _ensure_auto_instrumented(cached)
         return cached
     # No active runtime yet -- fall back to the canonical
     # get_instance() path. The result is stored in the registry
     # by the metaclass descriptor on NullRunRuntime._instance
     # (see nullrun._singleton), so every consumer that reads
     # `_runtime` afterward sees the same instance.
-    return NullRunRuntime.get_instance()
-    # The previous OpenAI v0.x auto-patch hook was removed in 0.4.0:
-    logger.info("NullRun runtime initialized: mode=cloud")
-    #  writes through the registry descriptor, so
-    # the next caller that reads  (or )
-    # sees the same instance we just created.
-    return NullRunRuntime.get_instance()
+    runtime = NullRunRuntime.get_instance()
+    _ensure_auto_instrumented(runtime)
+    return runtime
+
+
+# Lazy auto-instrumentation trigger (zero-config decorator path).
+#
+# The user-facing API is `nullrun.init_or_die()` which calls `init()`,
+# which calls `auto_instrument(runtime)` directly (see
+# `nullrun/__init__.py::init`). However, a user who writes only
+# ``@nullrun.protect`` without calling ``init_or_die()`` first would
+# still create a runtime via ``NullRunRuntime.get_instance()`` — but
+# no vendor SDK patches would be installed, so token capture would be
+# silently absent.
+#
+# This helper closes that gap. It runs ``auto_instrument()`` exactly
+# once per process (the underlying ``auto.py::auto_instrument`` is
+# itself idempotent, so this is a process-wide fast-path guard).
+# Best-effort: any exception from the patch path is logged at DEBUG
+# and swallowed so the enforcement gate continues to run. The moat is
+# enforcement; instrumentation is best-effort telemetry.
+_auto_instrument_trigger_lock = threading.Lock()
+_auto_instrument_triggered = False
+
+
+def _ensure_auto_instrumented(runtime: Any) -> None:
+    """Lazy auto-instrumentation trigger for ``@protect`` without ``init``.
+
+    Idempotent per process. Safe under concurrent ``@protect`` calls
+    thanks to ``_auto_instrument_trigger_lock``. Never raises — a
+    vendor SDK breaking change must not block the enforcement gate.
+    """
+    global _auto_instrument_triggered
+    with _auto_instrument_trigger_lock:
+        if _auto_instrument_triggered:
+            return
+        try:
+            from nullrun.instrumentation.auto import auto_instrument
+
+            auto_instrument(runtime)
+            _auto_instrument_triggered = True
+        except Exception as exc:  # noqa: BLE001 — best-effort
+            logger.debug(
+                "NullRun: lazy auto_instrument raised %s; "
+                "enforcement continues without vendor instrumentation",
+                exc,
+            )
+            # Don't set the flag — a future @protect call may try again
+            # in case the failure was transient (e.g. an import-order
+            # race where the vendor SDK is now importable).
 
 
 def _next_span() -> SpanContext:
@@ -484,6 +535,41 @@ def protect(fn: F | None = None) -> F | Callable[[F], F]:
         # bound to itself so the next call wraps the target function.
         return protect
 
+    # 0.18.1: every `@protect` call now auto-attaches a default
+    # `ToolParamsExtractor(include_all=True)` on the decorated function
+    # so the wire payload carries ``tool_name + params`` for any
+    # protected tool, not just those that opted in via bare
+    # ``@sensitive``. The extractor is only stamped when no extractor
+    # already exists in the ``__wrapped__`` chain (explicit
+    # ``@sensitive(impact=...)`` wins). This is the single change that
+    # makes ``@protect`` the only public entry point users need:
+    # the SDK now collects every fact it can derive mechanically
+    # (tool identity, kwargs, action_digest) without forcing the
+    # developer to reach for a second decorator. The business
+    # interpretation of those facts remains NullRun policy's job.
+    #
+    # The auto-attached extractor carries ``_nullrun_auto_attached=True``
+    # so ``_enforce_sensitive_tool`` can distinguish "developer
+    # opted into the policy path" from "SDK auto-derived the
+    # extractor for tooling reasons". The policy gate still
+    # short-circuits on auto-attached extractors so bare ``@protect``
+    # stays cheap (no extra ``/execute`` round-trip per call).
+    try:
+        from nullrun.extractor import ToolParamsExtractor
+
+        if _find_extractor_in_chain(fn) is None:
+            auto_extractor = ToolParamsExtractor(include_all=True)
+            auto_extractor._nullrun_auto_attached = True  # type: ignore[attr-defined]
+            _stamp_extractor_on_innermost(fn, auto_extractor)
+    except ImportError:
+        # Defensive: extractor module is part of every SDK build we
+        # ship today. Falling through without an extractor means the
+        # gate runs the legacy approval_id-only path (no business_impact
+        # on the wire) — which is the same behaviour every pre-0.18.1
+        # ``@protect`` already had, so this is a no-op for callers
+        # on a shrunken build.
+        pass
+
     @contextlib.contextmanager
     def _protect_body(args: tuple[Any, ...], kwargs: dict[str, Any], unify_block: bool):
         """Shared ADR-008 Rule-4 scaffolding for sync + async wrappers.
@@ -544,6 +630,16 @@ def protect(fn: F | None = None) -> F | Callable[[F], F]:
             call_tools_token = None
         error: BaseException | None = None
         try:
+            # 2026-09-22: bump the zero-activity diagnostic counter so
+            # the runtime can warn when @protect fires often but no
+            # LLM-call event is ever observed (silent-instrumentation
+            # failure mode). The bump lives at the entry of the gate
+            # so even gates that fail-CLOSED (block / kill) count
+            # toward the diagnosis — the operator still wants to
+            # know if the dashboard shows zero LLM calls despite
+            # the agent running.
+            runtime._bump_protect_count()
+
             # 1. KILL/PAUSE from the dashboard short-circuits
             # everything else. The resolution order is the
             # user-set contextvar first, then the API-key-bound
@@ -722,7 +818,18 @@ def _enforce_sensitive_tool(
     """
     # 2026-07-24 (Root-cause fix): the previous code used
     extractor = getattr(fn, "_nullrun_extractor", None)
-    if not runtime.is_sensitive_tool(fn.__name__) and extractor is None:
+    # 0.18.1: distinguish auto-attached extractors (SDK installed
+    # them for tooling reasons -- "every @protect captures tool_params
+    # automatically") from explicit extractors (developer opted in via
+    # ``@sensitive(impact=...)``). The policy gate still fires for
+    # explicit extractors; auto-attached ones are the SDK's way of
+    # shipping tool_params on the wire without the developer having
+    # to mark the tool sensitive. Bare ``@protect`` stays cheap.
+    extractor_is_explicit = (
+        extractor is not None
+        and not getattr(extractor, "_nullrun_auto_attached", False)
+    )
+    if not runtime.is_sensitive_tool(fn.__name__) and not extractor_is_explicit:
         return
     masked = _safe_kwargs(kwargs)
     # P0-1: positional args are masked the same way as kwargs. Without
@@ -1117,6 +1224,23 @@ def sensitive(
     Mark a function as sensitive. `@protect` will pre-check
     `runtime.execute(...)` before the body runs.
 
+    .. deprecated::
+        Bare ``@sensitive`` is deprecated as of SDK 0.18.1. Since
+        ``@protect`` now auto-attaches the same default tool_params
+        extractor that bare ``@sensitive`` used to install, and since
+        the business interpretation of those params belongs to NullRun
+        policy (not the SDK), the canonical pattern is now just
+        ``@protect``. Bare ``@sensitive`` still works in 0.18.x with a
+        ``DeprecationWarning`` and the legacy behaviour will be
+        removed in 0.19.x.
+
+        The ``@sensitive(impact=...)`` factory form remains supported
+        as an explicit advanced API: it attaches a typed extractor
+        (``money_outflow(...)`` or a custom ``ToolParamsExtractor``
+        map) and registers the tool for the server-side policy
+        path. New code does not need it; library authors wiring
+        approval rules into a custom runtime may still prefer it.
+
     This is the discoverable alternative to the lower-level
     `runtime.add_sensitive_tool(fn.__name__)`. Chain with `@protect`
     in either order (both work via `functools.wraps`); the
@@ -1151,8 +1275,10 @@ def sensitive(
 
     Two forms are accepted:
       - bare: ``@sensitive`` — fn must be the function being decorated.
+        **Deprecated** as of 0.18.1; emits ``DeprecationWarning``.
       - factory: ``@sensitive(impact=...)`` — fn is None, returns a
-        decorator that closes over ``impact``.
+        decorator that closes over ``impact``. Still supported as
+        an advanced API.
 
     Both forms register the tool as sensitive in the runtime so the
     ``_enforce_sensitive_tool`` pre-check fires.
@@ -1168,6 +1294,27 @@ def sensitive(
         return _attach_decorator  # type: ignore[return-value]
 
     # Bare form: @sensitive.
+    # 0.18.1: bare `@sensitive` is deprecated. `@protect` already
+    # auto-attaches a default ToolParamsExtractor (see protect() above),
+    # so the bare form is a duplicate of capability that the user can
+    # get by writing just `@protect`. We keep the old behaviour
+    # (auto-attach + sensitive-tool registration) intact so this is a
+    # warning-only release; the special behaviour will be removed in
+    # 0.19.x. Users who need the sensitive-tool registration (which
+    # short-circuits to the server-side policy path) should switch to
+    # explicit ``@protect`` and call ``runtime.add_sensitive_tool(...)``
+    # in their app bootstrap.
+    import warnings
+
+    warnings.warn(
+        "Bare `@sensitive` is deprecated as of SDK 0.18.1: `@protect` "
+        "now auto-attaches the same default tool_params extractor, and "
+        "the business interpretation of those params belongs to NullRun "
+        "policy, not the SDK. Remove the bare `@sensitive` and rely on "
+        "`@protect` alone. The legacy behaviour will be removed in 0.19.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     if impact is not None:
         _stamp_extractor_on_innermost(fn, impact)
     return _do_sensitive_register(fn)
