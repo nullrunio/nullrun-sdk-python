@@ -210,6 +210,34 @@ def my_agent(prompt: str) -> str:
     return call_llm(prompt)
 
 ```
+
+### Framework adapters — auto-detected
+
+NullRun auto-detects installed frameworks and instruments them automatically
+when `init_or_die()` runs (or when `@protect` first fires). You don't need
+to choose an extra; if a framework is already in your environment, it gets
+patched in place.
+
+| Framework | What gets patched | Trigger |
+|---|---|---|
+| **LangGraph** (`Pregel.invoke` / `stream` / `ainvoke` / `astream`) | `NullRunCallback` injected per call | auto on `init_or_die()` |
+| **LangChain** (`BaseCallbackManager`) | `NullRunCallback` registered | auto on `init_or_die()` |
+| **OpenAI Agents** (`Runner.run` / `run_streamed`) | `RunHooks` / `RunStreamedHooks` instrumented | auto on `init_or_die()` |
+| **LlamaIndex** (`get_dispatcher`) | `LLMChatEndEvent` / `FunctionCallEvent` handlers | auto on `init_or_die()` |
+| **CrewAI** (event bus + `usage_metrics`) | `Agent` / `Task` / `Crew` lifecycle | auto on `init_or_die()` |
+| **AutoGen** (`Agent.run` / `a_run`) | message-streaming hooks (HTTP path is httpx-based) | auto on `init_or_die()` |
+
+**HTTP-level coverage is the foundation** — `httpx` (and `requests`) are
+patched once by `init_or_die()` regardless of vendor. Token counts and
+model info are extracted from response bodies for OpenAI, Azure, Anthropic,
+Mistral, Gemini, Cohere, and Bedrock without those vendor SDKs needing to
+be installed. If you use the raw `httpx.Client` API directly, you get
+cost tracking out of the box.
+
+If you call `@protect` *before* `init_or_die()`, the SDK auto-triggers
+instrumentation lazily on the first decorated call. You can write your
+agent code with the decorator first and the init second — or skip `init`
+entirely if your environment is already configured via `NULLRUN_API_KEY`.
 ---
 
 ## How NullRun compares
