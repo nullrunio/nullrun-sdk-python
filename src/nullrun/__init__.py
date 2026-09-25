@@ -438,8 +438,6 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "set_chain_id": ("nullrun.context", "set_chain_id"),
     "get_chain_op": ("nullrun.context", "get_chain_op"),
     "set_chain_op": ("nullrun.context", "set_chain_op"),
-    # Instrumentation
-    "NullRunCallback": ("nullrun.instrumentation", "NullRunCallback"),
     # Toolbox — framework-specific wrappers. The previous `instrument `
     # helper lived at `nullrun.instrumentation.langgraph.instrument`;
     # it is now `nullrun.toolbox.langgraph.wrapper`. Reachable as

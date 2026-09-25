@@ -4206,13 +4206,6 @@ def track(event: dict[str, Any]) -> dict[str, Any]:
     return get_runtime().track(event)
 
 
-# Explicit alias for `track` -- same call signature, friendlier
-# name for users who reach for `track_event` first. Both names
-# share the same callable object, so `nullrun.track is
-# nullrun.track_event` is True.
-track_event = track
-
-
 def track_llm(
     input_tokens: int,
     output_tokens: int = 0,

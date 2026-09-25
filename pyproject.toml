@@ -71,49 +71,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# OpenTelemetry is an observability standard (not a vendor framework);
+# auto-detected at runtime when installed.
 opentelemetry = [
     "opentelemetry-api>=1.26.0,<2.0",
     "opentelemetry-sdk>=1.26.0,<2.0",
-]
-langgraph = [
-    "langgraph>=0.2.0,<1.0",
-]
-# Framework auto-instrumentation dependencies.
-#
-# These extras install framework SDKs whose event systems NullRun
-# subscribes to. NullRun's HTTP-level instrumentation
-# (``patch_httpx`` + ``patch_requests`` + 5 URL-keyed extractors)
-# covers OpenAI / Anthropic / Mistral / Gemini / Cohere / Bedrock
-# WITHOUT requiring their vendor SDKs — all of those vendors route
-# through httpx, and NullRun parses the response body by URL host.
-# The vendor SDK packages are NOT imported anywhere in
-# ``src/nullrun/``, so extras like ``[openai]`` / ``[anthropic]`` /
-# ``[mistral]`` / ``[gemini]`` / ``[cohere]`` / ``[bedrock]`` would
-# be dead weight for the SDK.
-#
-# What NullRun DOES import from these framework SDKs:
-#   - ``agents`` → ``agents.Runner`` (openai-agents tracing model)
-#   - ``langchain`` → ``langchain_core.callbacks.BaseCallbackManager``
-#     + ``langchain_core.language_models.BaseChatModel``
-#   - ``langgraph`` → ``langgraph.pregel.Pregel``
-#   - ``llama-index`` → ``llama_index.core.instrumentation``
-#   - ``crewai`` → ``crewai.Crew`` + ``crewai.events``
-#   - ``autogen`` → ``autogen_agentchat.agents.BaseChatAgent`` +
-#     ``autogen_ext.models.openai.OpenAIChatCompletionClient``
-#
-# Each ``patch_*`` wraps its framework import in
-# ``try/except ImportError`` so ``nullrun.init()`` never crashes when
-# the optional package is missing. Auto-detection: NullRun activates
-# an adapter when the package is installed — the user does NOT need
-# to choose which framework extra to install; installing any one of
-# them auto-enables its adapter.
-agents = ["openai-agents>=0.1,<1.0"]
-langchain = ["langchain-core>=0.3,<1.0"]
-llama-index = ["llama-index-core>=0.10.20,<1.0"]
-crewai = ["crewai>=0.80,<2.0"]
-autogen = [
-    "autogen-agentchat>=0.4,<1.0",
-    "autogen-ext[openai]>=0.4,<1.0",
 ]
 dev = [
     "pytest>=8.0",

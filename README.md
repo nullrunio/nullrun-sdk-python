@@ -5,8 +5,7 @@
 **Ship AI agents with real-time budget, policy, and human-approval gates.**
 
 Zero-refactor cost control, tool policy enforcement, and audit trail for any
-LLM-powered agent - works with OpenAI, Anthropic, LangGraph, CrewAI, AutoGen,
-LlamaIndex, and your own stack.
+LLM-powered agent — works with any LLM SDK that uses `httpx`, plus your own stack.
 
 [Quickstart](https://docs.nullrun.io/getting-started/onboarding/) · [Docs](https://docs.nullrun.io) · [Examples](https://github.com/nullrunio/nullrun-examples)
 
@@ -63,7 +62,7 @@ Existing observability tools tell you **after** the fact. NullRun enforces **bef
 |---|---|
 |  **Hard & soft budget gates** — atomic Redis-enforced |  **Tool policy enforcement** — block dangerous tools before execution |
 |  **Human-in-the-loop approvals** — pause agent and await `approval_resolved` via WS push |  **Immutable audit trail** — every decision, every tool call, every cent |
-|  **Zero-code instrumentation** — `nullrun.init()` patches `httpx` once for any vendor |  **LangGraph, CrewAI, AutoGen, LlamaIndex** — first-class integrations |
+|  **Zero-code instrumentation** — `nullrun.init()` patches `httpx` once for any vendor |  **No vendor lock-in** — works with any LLM SDK that uses httpx |
 |  **Memory-safe streaming** — 16 MiB response body; full body for usage extraction |  **Lightweight** — no LLM-key storage, no proxy required |
 |  **Server-authoritative cost** — server-minted execution IDs |  **MCP support** — expose tools to agents via Model Context Protocol |
 
@@ -211,33 +210,11 @@ def my_agent(prompt: str) -> str:
 
 ```
 
-### Framework adapters — auto-detected
+If you call `@protect` *before* `init_or_die()`, the SDK lazy-initializes
+the runtime from `NULLRUN_API_KEY` on the first decorated call. You can
+write your agent code with the decorator first and the init second — or
+skip `init` entirely if your environment is already configured.
 
-NullRun auto-detects installed frameworks and instruments them automatically
-when `init_or_die()` runs (or when `@protect` first fires). You don't need
-to choose an extra; if a framework is already in your environment, it gets
-patched in place.
-
-| Framework | What gets patched | Trigger |
-|---|---|---|
-| **LangGraph** (`Pregel.invoke` / `stream` / `ainvoke` / `astream`) | `NullRunCallback` injected per call | auto on `init_or_die()` |
-| **LangChain** (`BaseCallbackManager`) | `NullRunCallback` registered | auto on `init_or_die()` |
-| **OpenAI Agents** (`Runner.run` / `run_streamed`) | `RunHooks` / `RunStreamedHooks` instrumented | auto on `init_or_die()` |
-| **LlamaIndex** (`get_dispatcher`) | `LLMChatEndEvent` / `FunctionCallEvent` handlers | auto on `init_or_die()` |
-| **CrewAI** (event bus + `usage_metrics`) | `Agent` / `Task` / `Crew` lifecycle | auto on `init_or_die()` |
-| **AutoGen** (`Agent.run` / `a_run`) | message-streaming hooks (HTTP path is httpx-based) | auto on `init_or_die()` |
-
-**HTTP-level coverage is the foundation** — `httpx` (and `requests`) are
-patched once by `init_or_die()` regardless of vendor. Token counts and
-model info are extracted from response bodies for OpenAI, Azure, Anthropic,
-Mistral, Gemini, Cohere, and Bedrock without those vendor SDKs needing to
-be installed. If you use the raw `httpx.Client` API directly, you get
-cost tracking out of the box.
-
-If you call `@protect` *before* `init_or_die()`, the SDK auto-triggers
-instrumentation lazily on the first decorated call. You can write your
-agent code with the decorator first and the init second — or skip `init`
-entirely if your environment is already configured via `NULLRUN_API_KEY`.
 ---
 
 ## How NullRun compares
@@ -336,10 +313,6 @@ and `src/nullrun/transport.py::consume_approval`.
 
 Runnable, copy-pastable examples live in a separate repo so you can adapt without cloning the SDK source:
 
--  **[LangGraph](https://docs.nullrun.io/how-to/langgraph/)** — multi-node agent with budget + approval
--  **[CrewAI](https://docs.nullrun.io/how-to/crewai/)** — multi-agent crew with shared budget
--  **[AutoGen](https://docs.nullrun.io/how-to/autogen/)** — group-chat agent with policy gating
--  **[LlamaIndex](https://docs.nullrun.io/how-to/llama-index/)** — RAG pipeline with cost-per-query enforcement
 -  **[Custom tools](https://docs.nullrun.io/how-to/fastapi/)** — register your own tools for policy
 -  **[Multi-agent](https://docs.nullrun.io/how-to/multi-agent/)** — shared budget across sub-agents
 
