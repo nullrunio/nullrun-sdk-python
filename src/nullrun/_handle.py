@@ -8,15 +8,14 @@ the maximum-information path — useful for integrators who want to
 branch on a specific ``error_code`` — but it is **not** the default.
 
 For the common "I just want to run my agent and print a friendly
-message on failure" case, this module provides three one-liners:
+message on failure" case, this module provides two one-liners:
 
 *:func:`nullrun.handle` — context manager.
-*:func:`nullrun.guarded` — decorator.
 *:func:`nullrun.init_or_die` — convenience wrapper around
 :func:`nullrun.init` that catches the ``NR-C001`` "no api_key"
   failure at startup and exits cleanly.
 
-All three translate any:class:`nullrun.NullRunError` into a structured
+Both translate any:class:`nullrun.NullRunError` into a structured
 developer-facing report (error code + what was attempted + where it
 came from + the underlying reason + how to fix it) and then exit
 ``1``. The end-user-friendly wording from
@@ -26,15 +25,15 @@ end-user scripts don't need to branch on the wire shape.
 :class:`nullrun.WorkflowKilledInterrupt` inherits
 from :class:`nullrun.NullRunError` (see the class docstring), so a
 bare ``except NullRunError`` would otherwise swallow the kill signal.
-``handle``/``guarded`` explicitly re-raise it — the kill is a
+``handle`` explicitly re-raises it — the kill is a
 control-plane action, not an SDK failure, and must reach the top of
 the agent loop. Non-NullRun exceptions also propagate
 unchanged.
 
 ``init_or_die`` exists because:func:`nullrun.init` is typically
-called at module top-level — before any ``with handle: `` block or
-``@guarded`` decorator is in scope. Without it, a missing
-``NULLRUN_API_KEY`` env var produces a raw traceback.
+called at module top-level — before any ``with handle: `` block is
+in scope. Without it, a missing ``NULLRUN_API_KEY`` env var produces
+a raw traceback.
 
 Why a separate module
 ---------------------
@@ -60,22 +59,17 @@ makes the module private so it does not collide.
 from __future__ import annotations
 
 import sys
-from collections.abc import Callable
 from contextlib import contextmanager
-from typing import TypeVar
 
 from nullrun.breaker.exceptions import NullRunError, WorkflowKilledInterrupt
 from nullrun.messages import format_user_message
-
-T = TypeVar("T")
 
 
 def _render_dev_error_report(
     exc: NullRunError,
     user_message: str,
 ) -> str:
-    """Render a four-line developer-facing report for ``handle`` /
-    ``guarded``.
+    """Render a four-line developer-facing report for ``handle``.
 
     The previous behaviour (print only ``format_user_message(exc)``)
     leaked zero information when a developer hit a config failure at
@@ -189,7 +183,7 @@ def handle(*, exit_code: int = 1):
       Re-raised explicitly inside the ``except NullRunError`` branch
       because ``WorkflowKilledInterrupt`` sits on the ``NullRunError``
       MRO (Sentry/OTel ``except Exception`` handlers should record kill
-      events; this ``handle``/``guarded`` wrapper opts OUT of that
+      events; this ``handle`` wrapper opts OUT of that
       recording on purpose).
     *:class:`KeyboardInterrupt` /:class:`SystemExit` (``BaseException``) --
       same reason as the kill signal -- never reach the
@@ -216,7 +210,7 @@ def handle(*, exit_code: int = 1):
         yield
     except NullRunError as exc:
         # the NullRunError MRO so Sentry/OTel `except Exception`
-        # handlers record kill events. ``handle``/``guarded`` are the
+        # handlers record kill events. ``handle`` is the
         # friendly-exit pattern, NOT the user-callback pattern -- kill
         # is a control-plane action and must propagate so the agent
         # loop / dashboard resume path can see it. Re-raise explicitly
@@ -236,71 +230,35 @@ def handle(*, exit_code: int = 1):
         sys.exit(exit_code)
 
 
-def guarded(fn: Callable[..., T]) -> Callable[..., T]:
-    """Decorator equivalent of ``with nullrun.handle: ``.
-
-    Wrap a function so any:class:`nullrun.NullRunError` raised inside
-    it is caught, rendered as a user-facing message, and the process
-    exits with code ``1``. ``WorkflowKilledInterrupt`` and other
-    ``BaseException`` subclasses propagate (``handle`` re-raises kill
-    explicitly, see the kill-signal note in the module docstring).
-
-    Pair with:func:`nullrun.protect` for the standard agent loop::
-
-        @nullrun.guarded
-        @nullrun.protect
-        def my_agent(prompt):
-            return call_llm(prompt)
-
-        if __name__ == "__main__":
-            try:
-                print(my_agent("hello"))
-            finally:
-                nullrun.shutdown 
-
-    Args:
-        fn: The function to wrap.
-
-    Returns:
-        A wrapper with the same signature that exits the process on
-        ``NullRunError`` and otherwise returns ``fn``'s value.
-    """
-    def wrapper(*args, **kwargs):
-        with handle():
-            return fn(*args, **kwargs)
-
-    return wrapper
-
-
 def init_or_die(*, api_key: str | None = None, api_url: str | None = None,
                 debug: bool = False, exit_code: int = 1):
     """Call:func:`nullrun.init` and exit cleanly on configuration failure.
 
 :func:`nullrun.init` is typically the first thing a script does
-    before any ``with nullrun.handle: `` block or ``@nullrun.guarded``
-    decorator is in scope. A missing ``api_key`` therefore produces a
-    raw traceback — not a friendly exit. ``init_or_die`` closes that
-    gap by catching the startup:class:`nullrun.NullRunError` (NR-C001
-    "no api_key"), printing the catalog user-message, and exiting.
+    before any ``with nullrun.handle: `` block is in scope. A missing
+    ``api_key`` therefore produces a raw traceback — not a friendly
+    exit. ``init_or_die`` closes that gap by catching the startup
+    :class:`nullrun.NullRunError` (NR-C001 "no api_key"), printing
+    the catalog user-message, and exiting.
 
-    On success returns the:class:`nullrun.NullRunRuntime` singleton
+    On success returns the :class:`nullrun.NullRunRuntime` singleton
     that ``init `` returns — assign it if you need it, ignore it
     otherwise::
 
-        from nullrun import init_or_die, guarded, protect, shutdown
+        from nullrun import init_or_die, protect, shutdown
 
         init_or_die(api_key=os.environ["NULLRUN_API_KEY"])
 
-        @guarded
         @protect
         def my_agent(prompt):
             return call_llm(prompt)
 
         if __name__ == "__main__":
             try:
-                print(my_agent("hello"))
+                with nullrun.handle:
+                    print(my_agent("hello"))
             finally:
-                shutdown 
+                shutdown
 
     Args:
         api_key: NullRun API key (or NULLRUN_API_KEY env var).
@@ -318,7 +276,7 @@ def init_or_die(*, api_key: str | None = None, api_url: str | None = None,
     try:
         return init(api_key=api_key, api_url=api_url, debug=debug)
     except NullRunError as exc:
-        # Same structured report as ``handle()`` / ``guarded`` -- a
+        # Same structured report as ``handle()`` -- a
         # "There's a configuration issue. Please contact support."
         # which gave the developer zero actionable detail. The
         # four-line report here names the missing env var, the URL
@@ -334,4 +292,4 @@ def init_or_die(*, api_key: str | None = None, api_url: str | None = None,
         sys.exit(exit_code)
 
 
-__all__ = ["handle", "guarded", "init_or_die"]
+__all__ = ["handle", "init_or_die"]

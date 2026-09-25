@@ -1,6 +1,6 @@
 """
-Tests for the developer-facing error report rendered by ``handle``,
-``guarded``, and ``init_or_die``.
+Tests for the developer-facing error report rendered by ``handle`` and
+``init_or_die``.
 
 Pre-fix (2026-09-22), the catch-all exit path printed only the catalog
 user-message ("There's a configuration issue. Please contact support.")
@@ -23,11 +23,10 @@ from __future__ import annotations
 import pytest
 
 import nullrun
-from nullrun import guarded, handle
+from nullrun import handle
 from nullrun._handle import _render_dev_error_report
 from nullrun.breaker.exceptions import (
     NullRunAuthenticationError,
-    NullRunBudgetError,
     NullRunError,
     NullRunTransportError,
 )
@@ -124,7 +123,7 @@ def test_report_includes_docs_url():
     assert "https://docs.nullrun.io" in report
 
 
-# --- handle() / guarded() integration tests ---------------------------------
+# --- handle() integration tests ---------------------------------------------
 
 
 def test_handle_prints_full_dev_report(monkeypatch, capsys):
@@ -155,39 +154,6 @@ def test_handle_prints_full_dev_report(monkeypatch, capsys):
     assert "why:" in err
     assert "how to fix:" in err
     assert "Rotate the API key." in err
-
-
-def test_guarded_prints_full_dev_report(monkeypatch, capsys):
-    """``@guarded`` wraps ``handle()`` -- the dev report must surface
-    through the decorator path too, not just the context manager."""
-    exits = []
-
-    def fake_exit(code):
-        exits.append(code)
-        raise SystemExit(code)
-
-    monkeypatch.setattr("sys.exit", fake_exit)
-
-    @guarded
-    def boom():
-        raise NullRunBudgetError(
-            "wf-1",
-            "workflow budget exhausted",
-            error_code="NR-B004",
-            user_action="Wait for the next billing period.",
-        )
-
-    with pytest.raises(SystemExit):
-        boom()
-
-    assert exits == [1]
-    err = capsys.readouterr().err
-    assert "[NR-B004]" in err
-    assert "what:" in err
-    assert "where:" in err
-    assert "why:" in err
-    assert "how to fix:" in err
-    assert "Wait for the next billing period." in err
 
 
 def test_handle_falls_back_to_legacy_on_helper_bug(monkeypatch, capsys):
@@ -250,11 +216,8 @@ def test_handle_report_uses_class_name_for_unknown_endpoint(monkeypatch, capsys)
 # --- sanity: still callable without runtime --------------------------------
 
 
-def test_handle_and_guarded_do_not_require_runtime():
-    """``handle`` / ``guarded`` must work without ``nullrun.init()``.
-    Sanity check that the helper module is importable on its own --
-    this is the same invariant the existing ``test_handle.py`` pins."""
+def test_handle_does_not_require_runtime():
+    """``handle`` must work without ``nullrun.init()``. Sanity check
+    that the helper module is importable on its own."""
     assert callable(handle)
-    assert callable(guarded)
     assert callable(nullrun.handle)
-    assert callable(nullrun.guarded)

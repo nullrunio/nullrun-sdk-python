@@ -11,7 +11,7 @@ it with ``@protect``.
 Everything else exposed by ``nullrun`` is either runtime lifecycle
 (``init``, ``shutdown``, ``on_error``, ``status``), the structured
 exception hierarchy, or message/error-handling helpers
-(``format_user_message``, ``handle``, ``guarded``, ``init_or_die``).
+(``format_user_message``, ``handle``, ``init_or_die``).
 None of those are alternatives to ``@protect`` — they're setup
 and cleanup.
 
@@ -518,7 +518,6 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     # which shadows the lazy export and breaks ``from nullrun import
     # handle``.
     "handle": ("nullrun._handle", "handle"),
-    "guarded": ("nullrun._handle", "guarded"),
     "init_or_die": ("nullrun._handle", "init_or_die"),
     # ADR-009 P1 — governance audit surface (typed wire classes).
     # Users reach these as `from nullrun import AuditQuery` /
@@ -613,16 +612,14 @@ __all__ = [
     "format_user_message",
     "set_user_message",
     # Minimal-boilerplate error handling for scripts. ``handle`` is
-    # the context manager (``with nullrun.handle: ``), ``guarded``
-    # is the decorator (``@nullrun.guarded``). Both translate any
-    # ``NullRunError`` into ``print(format_user_message(exc))`` +
+    # the context manager (``with nullrun.handle: ``). It translates
+    # any ``NullRunError`` into ``print(format_user_message(exc))`` +
     # ``sys.exit(1)``; ``WorkflowKilledInterrupt`` propagates.
     # ``init_or_die`` is the convenience wrapper around ``init``
     # that catches NR-C001 "no api_key" at startup and exits
     # cleanly — without it the user sees a raw traceback before
     # any ``with handle: `` block is in scope.
     "handle",
-    "guarded",
     "init_or_die",
 ]
 
