@@ -1,3 +1,37 @@
+## [0.18.4] - 2026-09-25
+
+### Surface (breaking)
+
+- `nullrun.handle` renamed to `nullrun.guard`. Same `@contextmanager`
+  body (catches `NullRunError`, re-raises `WorkflowKilledInterrupt`,
+  renders the four-line developer report, `sys.exit(1)` on failure).
+  The name `guard` was freed in 0.18.2 when `@guarded` was removed.
+  Migrate by replacing `from nullrun import handle` /
+  `with nullrun.handle:` with `from nullrun import guard` /
+  `with nullrun.guard():`.
+- Top-level `nullrun.status()` removed. Reach the snapshot via
+  `nullrun.get_runtime().status()` (returns the same frozen
+  `NullRunStatus` dataclass). The wrapper's only role was raising
+  `NullRunConfigError(NR-C004)` when no runtime was bound — that
+  path is now `get_runtime()`'s job. `NullRunStatus` itself
+  remains importable as a type.
+
+### Curated surface after 0.18.4
+
+```text
+__version__, init, protect, shutdown, on_error, guard,
+NullRunError, NullRunAuthError, NullRunConfigError,
+NullRunBackendError, NullRunBudgetError, NullRunToolBlockedError,
+WorkflowKilledInterrupt, NullRunWorkflowKilledError,
+NullRunMcpDestructiveBlockedError,
+NullRunMcpReadonlyBypassBlockedError,
+NullRunMcpApprovalRequiredError,
+NullRunApprovalDbUnavailableError,
+format_user_message, set_user_message
+```
+
+(`status` and `handle` dropped; `guard` added. Net -1 symbol vs 0.18.3.)
+
 ## [0.18.3] - 2026-09-25
 
 ### Surface (breaking)

@@ -1,5 +1,5 @@
 """
-Tests for the developer-facing error report rendered by ``handle``
+Tests for the developer-facing error report rendered by ``guard``
 and the CLI ``init(fail_on_exit=True)`` path.
 
 Pre-fix (2026-09-22), the catch-all exit path printed only the catalog
@@ -17,13 +17,15 @@ developer actually asks:
 These tests pin the four-line invariant so a future "let's tidy up the
 error path" cannot silently drop the structured detail back to a single
 sentence.
+
+History: 0.18.4 renamed ``handle`` to ``guard``.
 """
 from __future__ import annotations
 
 import pytest
 
 import nullrun
-from nullrun import handle
+from nullrun import guard
 from nullrun._handle import _render_dev_error_report
 from nullrun.breaker.exceptions import (
     NullRunAuthenticationError,
@@ -123,11 +125,11 @@ def test_report_includes_docs_url():
     assert "https://docs.nullrun.io" in report
 
 
-# --- handle() integration tests ---------------------------------------------
+# --- guard() integration tests ---------------------------------------------
 
 
-def test_handle_prints_full_dev_report(monkeypatch, capsys):
-    """``with handle():`` exits 1 AND writes the four-line dev report
+def test_guard_prints_full_dev_report(monkeypatch, capsys):
+    """``with guard():`` exits 1 AND writes the four-line dev report
     to stderr -- not just the catalog headline."""
     exits = []
 
@@ -138,7 +140,7 @@ def test_handle_prints_full_dev_report(monkeypatch, capsys):
     monkeypatch.setattr("sys.exit", fake_exit)
 
     with pytest.raises(SystemExit):
-        with handle():
+        with guard():
             raise NullRunAuthenticationError(
                 "Auth failed with status 401.",
                 error_code="NR-A003",
@@ -156,9 +158,9 @@ def test_handle_prints_full_dev_report(monkeypatch, capsys):
     assert "Rotate the API key." in err
 
 
-def test_handle_falls_back_to_legacy_on_helper_bug(monkeypatch, capsys):
+def test_guard_falls_back_to_legacy_on_helper_bug(monkeypatch, capsys):
     """Defensive: if the report builder itself raises (a future bug),
-    ``handle()`` must still exit cleanly with the catalog headline.
+    ``guard()`` must still exit cleanly with the catalog headline.
     The defensive fallback path is critical -- a buggy helper cannot
     freeze a script that would otherwise exit."""
     from nullrun import _handle as handle_mod
@@ -177,7 +179,7 @@ def test_handle_falls_back_to_legacy_on_helper_bug(monkeypatch, capsys):
     monkeypatch.setattr("sys.exit", fake_exit)
 
     with pytest.raises(SystemExit):
-        with handle():
+        with guard():
             raise NullRunError("oops", error_code="NR-B002")
 
     assert exits == [1]
@@ -187,7 +189,7 @@ def test_handle_falls_back_to_legacy_on_helper_bug(monkeypatch, capsys):
     assert "temporarily unavailable" in err.lower()
 
 
-def test_handle_report_uses_class_name_for_unknown_endpoint(monkeypatch, capsys):
+def test_guard_report_uses_class_name_for_unknown_endpoint(monkeypatch, capsys):
     """When the exception has no ``endpoint`` attribute, the where
     line uses ``endpoint=N/A (config-time failure)`` so the developer
     can immediately tell that the failure happened at startup, not on
@@ -201,7 +203,7 @@ def test_handle_report_uses_class_name_for_unknown_endpoint(monkeypatch, capsys)
     monkeypatch.setattr("sys.exit", fake_exit)
 
     with pytest.raises(SystemExit):
-        with handle():
+        with guard():
             raise NullRunError(
                 "config-time failure",
                 error_code="NR-C001",
@@ -216,8 +218,8 @@ def test_handle_report_uses_class_name_for_unknown_endpoint(monkeypatch, capsys)
 # --- sanity: still callable without runtime --------------------------------
 
 
-def test_handle_does_not_require_runtime():
-    """``handle`` must work without ``nullrun.init()``. Sanity check
+def test_guard_does_not_require_runtime():
+    """``guard`` must work without ``nullrun.init()``. Sanity check
     that the helper module is importable on its own."""
-    assert callable(handle)
-    assert callable(nullrun.handle)
+    assert callable(guard)
+    assert callable(nullrun.guard)

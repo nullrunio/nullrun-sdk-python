@@ -9,11 +9,17 @@ extra entry points: if you want NullRun to see the call, decorate
 it with ``@protect``.
 
 Everything else exposed by ``nullrun`` is either runtime lifecycle
-(``init``, ``shutdown``, ``on_error``, ``status``), the structured
-exception hierarchy, or message/error-handling helpers
-(``format_user_message``, ``handle``).
-None of those are alternatives to ``@protect`` — they're setup
-and cleanup.
+(``init``, ``shutdown``, ``on_error``), the structured exception
+hierarchy, or message/error-handling helpers (``format_user_message``,
+``guard``). None of those are alternatives to ``@protect`` — they're
+setup and cleanup.
+
+For introspection, reach the runtime snapshot via
+``nullrun.get_runtime().status()`` (returns a frozen
+:class:`NullRunStatus`). There is no top-level ``nullrun.status()``
+wrapper in 0.18.4 — the wrapper existed only to render an
+``NR-C004`` config error before ``init``, which is now the runtime
+class's job.
 
 Usage:
     import nullrun
@@ -111,56 +117,6 @@ def shutdown(timeout: float = 2.0, flush: bool = True) -> None:
     # the second runtime would not be auto-shutdown on process exit.
     global _shutdown_atexit_registered
     _shutdown_atexit_registered = False
-
-
-def status():
-    """Return the current runtime state as a Layer-3
-:class:`NullRunStatus` snapshot.
-
-    Synchronous, thread-safe, side-effect-free — safe to call
-    from the agent loop, the transport flush thread, or a
-    debug console. The returned dataclass is frozen so it can
-    be cached, shared, and compared with ``==``.
-
-    Designed for the "the agent is stuck, what's wrong?"
-    runbook:
-
-        >>> import nullrun
-        >>> print(nullrun.status.summary )
-        NullRunStatus(degraded fallback=last_good@42s reason=last policy fetch failed at 2026-06-24T10:30:15+00:00)
-
-    See ``nullrun.observability.status`` for the state
-    derivation rules (the four headline states:
-    ``ok`` / ``degraded`` / ``offline`` / ``misconfigured``).
-
-    Raises:
-        NullRunConfigError: ``nullrun.init `` has not been
-            called yet, or the runtime was shut down. The
-            snapshot only makes sense when there is a runtime
-            to snapshot.
-    """
-    # Read the module-level ``_runtime`` directly so we do NOT
-    # trigger ``get_instance ``'s lazy construction. ``status ``
-    # must NEVER create a runtime as a side effect — a fresh
-    # import of ``nullrun`` followed by ``nullrun.status ``
-    # should report "no runtime" cleanly, not try to spin one
-    # up (which would itself raise a different config error
-    # about missing api_key).
-    import nullrun.runtime as _rt_mod
-    from nullrun.breaker.exceptions import NullRunConfigError
-
-    rt = _rt_mod._runtime
-    if rt is None:
-        raise NullRunConfigError(
-            "nullrun.status() requires a runtime. Call nullrun.init() first.",
-            error_code="NR-C004",
-            user_action=(
-                "Call nullrun.init(api_key='nr_live_...') before "
-                "calling nullrun.status(). The snapshot only makes "
-                "sense when there is a runtime to inspect."
-            ),
-        )
-    return rt.status()
 
 
 def on_error(hook):
@@ -554,13 +510,18 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     # NullRunError. WorkflowKilledInterrupt (BaseException) still
     # propagates — kill is never swallowed.
     #
-    # The module is named ``_handle.py`` (private, leading underscore)
-    # so it does not collide with the public ``nullrun.handle``
+    # History: 0.18.4 renamed this from ``handle`` to ``guard``.
+    # The module file name is still ``_handle.py`` for the
+    # submodule-shadowing reason explained in that file's docstring;
+    # only the function name ``guard`` is public.
+    #
+    # Why the module is named ``_handle.py`` (private, leading underscore):
+    # so it does not collide with the public ``nullrun.guard``
     # context manager. With a non-underscored name, pytest's test
-    # discovery would pre-import ``nullrun.handle`` as a submodule
-    # which shadows the lazy export and breaks ``from nullrun import
-    # handle``.
-    "handle": ("nullrun._handle", "handle"),
+    # discovery would pre-import ``nullrun.guard`` as a submodule
+    # which shadows the lazy export and breaks
+    # ``from nullrun import guard``.
+    "guard": ("nullrun._handle", "guard"),
     # ADR-009 P1 — governance audit surface (typed wire classes).
     # Users reach these as `from nullrun import AuditQuery` /
     # `from nullrun.audit import ...`. The runtime exposes
@@ -626,9 +587,13 @@ __all__ = [
     # single most important "give the user a chance" API — the
     # user has to know it exists to call it.
     "on_error",
-    # Layer 3: status introspection — synchronous snapshot of the
-    # runtime's state, returns a frozen NullRunStatus.
-    "status",
+    # Layer 3: status introspection is reached via
+    # ``nullrun.get_runtime().status()``. There is intentionally NO
+    # top-level ``nullrun.status()`` wrapper in 0.18.4 — the wrapper
+    # existed only to render NR-C004 before ``init``, which is now
+    # the runtime class's own job. Frozen ``NullRunStatus`` dataclass
+    # itself is importable as ``nullrun.NullRunStatus`` (PEP 562
+    # lazy export from ``nullrun.observability.status``).
     # Layer 1: structured exception base + the most common subclasses
     # the user is expected to ``except`` on. Including them in
     # ``__all__`` means ``from nullrun import *`` and ``dir(nullrun)``
@@ -653,12 +618,13 @@ __all__ = [
     # own wording per error_code without rewriting the SDK.
     "format_user_message",
     "set_user_message",
-    # Minimal-boilerplate error handling for scripts. ``handle`` is
-    # the context manager (``with nullrun.handle: ``). It translates
+    # Minimal-boilerplate error handling for scripts. ``guard`` is
+    # the context manager (``with nullrun.guard():``). It translates
     # any ``NullRunError`` into ``print(format_user_message(exc))`` +
     # ``sys.exit(1)``; ``WorkflowKilledInterrupt`` propagates.
     # CLI fail-fast on missing api_key is `init(fail_on_exit=True)`.
-    "handle",
+    # Renamed from ``handle`` in 0.18.4 — see the _LAZY_EXPORTS block.
+    "guard",
 ]
 
 # The SDK-side ``decision_history`` module was deleted. Decision

@@ -10,7 +10,7 @@ branch on a specific ``error_code`` — but it is **not** the default.
 For the common "I just want to run my agent and print a friendly
 message on failure" case, this module provides one one-liner:
 
-*:func:`nullrun.handle` — context manager that translates any
+*:func:`nullrun.guard` — context manager that translates any
   :class:`nullrun.NullRunError` into a structured developer-facing
   report (error code + what was attempted + where it came from + the
   underlying reason + how to fix it) and then exits ``1``. The
@@ -21,7 +21,7 @@ message on failure" case, this module provides one one-liner:
 :class:`nullrun.WorkflowKilledInterrupt` inherits
 from :class:`nullrun.NullRunError` (see the class docstring), so a
 bare ``except NullRunError`` would otherwise swallow the kill signal.
-``handle`` explicitly re-raises it — the kill is a
+``guard`` explicitly re-raises it — the kill is a
 control-plane action, not an SDK failure, and must reach the top of
 the agent loop. Non-NullRun exceptions also propagate
 unchanged.
@@ -30,6 +30,14 @@ CLI scripts that want the same fail-fast behavior at startup should
 call ``nullrun.init(fail_on_exit=True)`` instead of an ``init_or_die``
 wrapper — the four-line developer report is rendered identically
 and the process exits ``1`` on missing ``NULLRUN_API_KEY``.
+
+History
+-------
+In 0.18.4 this context manager was renamed from ``handle`` to
+``guard``. The previous ``@guarded`` decorator was already removed
+in 0.18.2 (f1721f2), freeing the ``guard`` name; ``guard`` reads as
+a single verb consistent with ``init`` / ``shutdown`` / ``on_error``.
+No deprecation alias — ``nullrun.handle`` simply no longer exists.
 
 Why a separate module
 ---------------------
@@ -42,15 +50,19 @@ breaker module imports.
 
 Why ``_handle.py`` (leading underscore)
 ---------------------------------------
-The public symbol exported from this module is:func:`handle` (a
+The public symbol exported from this module is:func:`guard` (a
 context manager). With a non-underscored module name
 ``nullrun/handle.py``, Python's import machinery pre-binds
 ``nullrun.handle`` to the submodule when anything does
 ``import nullrun.handle`` (for example, pytest's test discovery).
-That binding shadows the lazy export ``"handle": (...)`` in
-:mod:`nullrun`, so ``from nullrun import handle`` returns the
+That binding shadows the lazy export ``"guard": (...)`` in
+:mod:`nullrun`, so ``from nullrun import guard`` returns the
 module object instead of the function. The leading underscore
 makes the module private so it does not collide.
+
+The module file name keeps its historical ``_handle.py`` shape
+because renaming it to ``_guard.py`` is not part of the public
+contract — only the function name ``guard`` is observable.
 """
 from __future__ import annotations
 
@@ -157,7 +169,7 @@ def _render_dev_error_report(
 
 
 @contextmanager
-def handle(*, exit_code: int = 1):
+def guard(*, exit_code: int = 1):
     """Catch ``NullRunError`` and translate it to a developer-facing exit.
 
     Inside the ``with`` block, any:class:`nullrun.NullRunError` is
@@ -179,7 +191,7 @@ def handle(*, exit_code: int = 1):
       Re-raised explicitly inside the ``except NullRunError`` branch
       because ``WorkflowKilledInterrupt`` sits on the ``NullRunError``
       MRO (Sentry/OTel ``except Exception`` handlers should record kill
-      events; this ``handle`` wrapper opts OUT of that
+      events; this ``guard`` wrapper opts OUT of that
       recording on purpose).
     *:class:`KeyboardInterrupt` /:class:`SystemExit` (``BaseException``) --
       same reason as the kill signal -- never reach the
@@ -197,7 +209,7 @@ def handle(*, exit_code: int = 1):
 
         nullrun.init(api_key="nr_live_...")
 
-        with nullrun.handle:
+        with nullrun.guard():
             run_my_agent("hello")
         # ↑ if run_my_agent raised NullRunError, a structured
         # developer report is printed and the script exits 1.
@@ -205,8 +217,9 @@ def handle(*, exit_code: int = 1):
     try:
         yield
     except NullRunError as exc:
-        # the NullRunError MRO so Sentry/OTel `except Exception`
-        # handlers record kill events. ``handle`` is the
+        # Re-raise WorkflowKilledInterrupt explicitly: it shares the
+        # NullRunError MRO so Sentry/OTel `except Exception` handlers
+        # would otherwise record kill events. ``guard`` is the
         # friendly-exit pattern, NOT the user-callback pattern -- kill
         # is a control-plane action and must propagate so the agent
         # loop / dashboard resume path can see it. Re-raise explicitly
@@ -226,4 +239,4 @@ def handle(*, exit_code: int = 1):
         sys.exit(exit_code)
 
 
-__all__ = ["handle"]
+__all__ = ["guard"]

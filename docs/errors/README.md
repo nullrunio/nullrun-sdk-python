@@ -27,7 +27,7 @@ The codes follow a `NR-<CATEGORY><NNN>` pattern:
 | `NR-C000` | Generic config error (default on `NullRunConfigError`; subclasses override) | [NR-C000](NR-C000.md) |
 | `NR-C001` | `nullrun.init()` called with no api_key (no param, no env) | [NR-C001](NR-C001.md) |
 | `NR-C003` | `get_org_status()` called before the runtime is bound to an org | [NR-C003](NR-C003.md) |
-| `NR-C004` | `nullrun.status()` called before `nullrun.init()` | [NR-C004](NR-C004.md) |
+| `NR-C004` | `nullrun.get_runtime()` (or `runtime.status()`) called before `nullrun.init()` | [NR-C004](NR-C004.md) |
 
 ### Authentication (NR-A)
 

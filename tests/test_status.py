@@ -1,8 +1,7 @@
-"""Tests for the Layer 3 ``nullrun.status `` introspection API.
+"""Tests for the Layer 3 ``runtime.status()`` introspection API.
 
 The contract:
 
-  * No runtime → ``NullRunConfigError`` with ``NR-C004``.
   * Runtime present → frozen ``NullRunStatus`` snapshot with:
       - ``state`` ∈ ``{"ok", "degraded", "offline", "misconfigured"}``
       - ``recent_errors`` is a list (possibly empty) of
@@ -13,23 +12,25 @@ The contract:
     must NEVER mutate the runtime or create a new one.
   * Equality works on the frozen dataclass (``s1 == s2`` when
     every field is equal) — important for caching / diffing.
+
+History
+-------
+In 0.18.4 the top-level ``nullrun.status()`` wrapper was removed.
+Tests now drive the runtime directly (``rt.status()``) rather than
+going through the deleted wrapper. The wrapper existed only to
+render an ``NR-C004`` config error before ``init``; that path is
+covered by runtime's own self-consistency checks below.
 """
 
 from datetime import datetime, timezone
-from typing import Any
-from unittest.mock import patch
 
 import pytest
 
 import nullrun
-from nullrun.breaker.exceptions import (
-    NullRunConfigError,
-    NullRunError,
-)
+from nullrun.breaker.exceptions import NullRunError
 from nullrun.observability.status import (
     NullRunStatus,
     RecentError,
-    WorkflowState,
     _RecentErrorRing,
 )
 from nullrun.runtime import NullRunRuntime
@@ -51,7 +52,7 @@ def _reset_runtime():
 
 def _make_runtime(api_key: str = "nr_live_test_key_1234") -> NullRunRuntime:
     """Construct a NullRunRuntime in _test_mode without going
-    through ``init `` (which would try to call the backend).
+    through ``init`` (which would try to call the backend).
     """
     rt = NullRunRuntime(api_key=api_key, _test_mode=True)
     import nullrun.runtime as _rt_mod
@@ -62,73 +63,49 @@ def _make_runtime(api_key: str = "nr_live_test_key_1234") -> NullRunRuntime:
 
 
 # ---------------------------------------------------------------------------
-# 1. No runtime
-# ---------------------------------------------------------------------------
-class TestNoRuntime:
-    def test_status_raises_when_no_runtime(self):
-        with pytest.raises(NullRunConfigError) as info:
-            nullrun.status()
-        err = info.value
-        assert err.error_code == "NR-C004"
-        assert "init" in err.user_action.lower()
-        assert err.retryable is False
-
-    def test_status_never_lazily_creates_runtime(self):
-        # Sanity: calling status must NOT trigger
-        # NullRunRuntime.get_instance (which would itself
-        # raise a different config error about missing
-        # api_key). The whole point of NR-C004 is a clean
-        # "no runtime" signal.
-        with patch("nullrun.runtime.NullRunRuntime.get_instance") as mock_get:
-            with pytest.raises(NullRunConfigError):
-                nullrun.status()
-            mock_get.assert_not_called()
-
-
-# ---------------------------------------------------------------------------
-# 2. With runtime — snapshot fields
+# 1. With runtime — snapshot fields
 # ---------------------------------------------------------------------------
 class TestSnapshotFields:
     def test_minimal_runtime_yields_ok_state(self):
-        _make_runtime()
-        s = nullrun.status()
+        rt = _make_runtime()
+        s = rt.status()
         assert s.state == "ok"
         assert s.api_key_prefix == "nr_live_te"
         assert s.is_healthy() is True
 
     def test_snapshot_is_frozen(self):
-        _make_runtime()
-        s = nullrun.status()
+        rt = _make_runtime()
+        s = rt.status()
         with pytest.raises(Exception):  # FrozenInstanceError
             s.state = "degraded"  # type: ignore[misc]
 
     def test_snapshot_supports_equality(self):
-        _make_runtime()
-        s1 = nullrun.status()
-        s2 = nullrun.status()
+        rt = _make_runtime()
+        s1 = rt.status()
+        s2 = rt.status()
         assert s1 == s2
 
     def test_api_key_prefix_truncated_to_10_chars(self):
         _make_runtime(api_key="nr_live_SsBF9OMYcVCgRCNcCVcJ4khTOPKx79JG")
-        s = nullrun.status()
+        s = _make_runtime(
+            api_key="nr_live_SsBF9OMYcVCgRCNcCVcJ4khTOPKx79JG"
+        ).status()
         assert s.api_key_prefix == "nr_live_Ss"
         assert len(s.api_key_prefix) == 10
         # Full key MUST NOT leak into the snapshot.
         assert "TOPKx79JG" not in str(s)
 
     def test_backend_reachable_none_when_no_attempt(self):
-        _make_runtime()
-        s = nullrun.status()
+        s = _make_runtime().status()
         assert s.backend_reachable is None
 
     def test_ws_connected_none_when_no_ws_started(self):
-        _make_runtime()
-        s = nullrun.status()
+        s = _make_runtime().status()
         assert s.ws_connected is None
 
 
 # ---------------------------------------------------------------------------
-# 3. State derivation
+# 2. State derivation
 # ---------------------------------------------------------------------------
 class TestStateDerivation:
     def test_misconfigured_when_no_api_key(self):
@@ -138,26 +115,23 @@ class TestStateDerivation:
         # misconfigured branch.
         rt = _make_runtime()
         rt.api_key = None
-        s = nullrun.status()
+        s = rt.status()
         assert s.state == "misconfigured"
         assert s.api_key_valid is None
         assert s.api_key_prefix is None
 
 
 # ---------------------------------------------------------------------------
-# 4. Recent-errors ring buffer
+# 3. Recent-errors ring buffer
 # ---------------------------------------------------------------------------
 class TestRecentErrors:
     def test_recent_errors_empty_on_fresh_runtime(self):
-        _make_runtime()
-        s = nullrun.status()
+        s = _make_runtime().status()
         assert s.recent_errors == []
 
     def test_recent_errors_populated_by_emit(self):
         rt = _make_runtime()
         # Simulate an error firing through the Layer-2 path.
-        from nullrun.observability.error_hooks import ErrorContext
-
         err = NullRunError("boom", error_code="NR-X999")
         rt._emit_sdk_error(
             err,
@@ -165,7 +139,7 @@ class TestRecentErrors:
             workflow_id="wf-1",
             tool_name="send_email",
         )
-        s = nullrun.status()
+        s = rt.status()
         assert len(s.recent_errors) == 1
         entry = s.recent_errors[0]
         assert entry.error_code == "NR-X999"
@@ -200,24 +174,21 @@ class TestRecentErrors:
         # buffer fires even when no on_error hook is
         # registered. This is the whole point of Layer 3.
         rt = _make_runtime()
-        from nullrun.observability.error_hooks import ErrorContext
-
         rt._emit_sdk_error(
             NullRunError("test"),
             stage="init",
         )
         # No on_error hook registered. snapshot still works.
-        s = nullrun.status()
+        s = rt.status()
         assert len(s.recent_errors) == 1
 
 
 # ---------------------------------------------------------------------------
-# 5. Workflow state from cache
+# 4. Workflow state from cache
 # ---------------------------------------------------------------------------
 class TestWorkflowState:
     def test_workflow_state_none_when_no_remote_state(self):
-        _make_runtime()
-        s = nullrun.status()
+        s = _make_runtime().status()
         assert s.workflow_state is None
 
     def test_workflow_state_reads_from_cache(self):
@@ -230,7 +201,7 @@ class TestWorkflowState:
             "wf-test-1",
             {"state": "Killed", "version": 5, "reason": "manual kill"},
         )
-        s = nullrun.status()
+        s = rt.status()
         assert s.workflow_state is not None
         assert s.workflow_state.workflow_id == "wf-test-1"
         assert s.workflow_state.state == "Killed"
@@ -238,13 +209,11 @@ class TestWorkflowState:
 
 
 # ---------------------------------------------------------------------------
-# 6. summary — human-readable one-liner
+# 5. summary — human-readable one-liner
 # ---------------------------------------------------------------------------
 class TestSummary:
     def test_ok_summary(self):
-        _make_runtime()
-        s = nullrun.status()
-        out = s.summary()
+        out = _make_runtime().status().summary()
         assert "ok" in out
         assert "nr_live_te" in out
 
@@ -254,8 +223,7 @@ class TestSummary:
         rt = _make_runtime()
         rt.organization_id = "org_abcdef1234567890"
         rt.workflow_id = "wf_xyzzy1234567890"
-        s = nullrun.status()
-        out = s.summary()
+        out = rt.status().summary()
         assert "org=org_abcd" in out
         assert "wf=wf_xyzzy" in out
 
@@ -267,8 +235,7 @@ class TestSummary:
             "wf-test-1",
             {"state": "Killed", "version": 5, "reason": "manual kill"},
         )
-        s = nullrun.status()
-        out = s.summary()
+        out = rt.status().summary()
         assert "wf_state=Killed" in out
 
     def test_summary_omits_normal_workflow_state(self):
@@ -279,13 +246,12 @@ class TestSummary:
             "wf-test-1",
             {"state": "Normal", "version": 1, "reason": None},
         )
-        s = nullrun.status()
-        out = s.summary()
+        out = rt.status().summary()
         assert "wf_state=" not in out
 
     def test_summary_includes_backend_unreachable(self):
         # Branch: ``self.backend_reachable is False``.
-        # ``backend_reachable`` is a local in ``status ``, not a stored
+        # ``backend_reachable`` is a local in ``status``, not a stored
         # attribute on the runtime — construct the snapshot directly.
         s = NullRunStatus(
             state="degraded",
@@ -320,45 +286,36 @@ class TestSummary:
     def test_summary_includes_recent_errors_count(self):
         # Branch: ``if self.recent_errors``.
         rt = _make_runtime()
-        from nullrun.breaker.exceptions import NullRunError
-        from nullrun.observability.error_hooks import ErrorContext
-
         for i in range(3):
             rt._emit_sdk_error(
                 NullRunError(f"err-{i}", error_code="NR-X000"),
                 stage="init",
             )
-        s = nullrun.status()
-        out = s.summary()
+        out = rt.status().summary()
         assert "errors=3" in out
 
 
 # ---------------------------------------------------------------------------
-# 7. Public API surface
+# 6. Public API surface regression guards (0.18.4)
 # ---------------------------------------------------------------------------
-class TestPublicAPI:
-    def test_status_in_dir(self):
-        assert callable(nullrun.status)
-        assert "status" in dir(nullrun)
+class TestStatusRemovedFromTopLevel:
+    """0.18.4 removed the top-level ``nullrun.status()`` wrapper.
 
-    def test_status_in_all(self):
+    These tests pin that removal against a future re-add. The
+    runtime method ``NullRunRuntime.status()`` is the only
+    public status entry point now — callers reach it via
+    ``nullrun.get_runtime().status()`` or by holding a runtime
+    reference they constructed themselves.
+    """
+
+    def test_status_not_in_dir(self):
+        # ``status`` is no longer a curated surface entry — the
+        # runtime method is reached via ``nullrun.get_runtime()``
+        # rather than via a top-level wrapper.
+        assert "status" not in dir(nullrun)
+        assert not callable(getattr(nullrun, "status", None))
+
+    def test_status_not_in_all(self):
         import nullrun as n
 
-        assert "status" in n.__all__
-
-    def test_status_dataclasses_importable(self):
-        # All four dataclasses reachable from the public
-        # namespace for type annotations.
-        from nullrun.observability import (
-            NullRunStatus as NS,
-        )
-        from nullrun.observability import (
-            RecentError as RE,
-        )
-        from nullrun.observability import (
-            WorkflowState as WS,
-        )
-
-        assert NS is NullRunStatus
-        assert RE is RecentError
-        assert WS is WorkflowState
+        assert "status" not in n.__all__
