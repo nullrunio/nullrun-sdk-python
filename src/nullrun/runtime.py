@@ -1940,19 +1940,16 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # always-skipped).
         metrics.inc_runtime("check_calls")
 
-        # AUDIT P0-27 (2026-09-05): hoist the operation_id mint.
-        # Pre-fix, /check minted its own UUID v4 here AND /execute
-        # minted a separate UUID v4 — same logical action produced
-        # two unrelated backend bindings. The mint now lives in a
-        # single contextvar (``_operation_id_var``) so /check,
-        # /execute, and /track all share the SAME value for one
-        # logical action. /track consumes this value via the
-        # ``server_minted_idempotency_key`` contextvar, which the
-        # /check capture path (see ``_capture_server_minted_...``)
-        # sets from ``get_operation_id()`` rather than from the
-        # response-echo (P0-26 — the echo could silently overwrite
-        # with whatever the server returned, even on a different
-        # execution's response).
+        # The operation_id is hoisted into the ``_operation_id_var``
+        # contextvar so /check, /execute, and the post-approval re-fire
+        # within ONE logical action share the SAME value. /track reads
+        # ``get_operation_id()`` via ``_capture_server_minted_*`` rather
+        # than the response echo (the echo could silently overwrite with
+        # whatever the server returned, even on a different execution).
+        # Minting fresh per call avoids the cross-action reuse that
+        # trips IDEM-01 — a guard that returned the cached op_id
+        # when set would leak the scope's first op_id across
+        # subsequent ``check_workflow_budget()`` invocations.
         from nullrun.context import (
             get_operation_id as _get_op_id_for_check,
         )
@@ -1960,34 +1957,6 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             set_operation_id as _set_op_id_for_check,
         )
 
-        # AUDIT P0-27 (2026-09-05) wire-binding invariant is
-        # preserved: /check + /execute (and the post-approval
-        # re-fire) within ONE logical action share the SAME
-        # op_id. The original implementation minted once per
-        # scope via the contextvar; /execute reads the freshly-
-        # minted value via get_operation_id() because we just
-        # stashed it here. /track works on the server-minted
-        # execution_id, NOT op_id, so it is independent.
-        #
-        # Wire-binding invariant: /check + /execute (and the
-        # post-approval re-fire) within ONE logical action share
-        # the SAME op_id. The original implementation minted once
-        # per scope via the contextvar; /execute reads the
-        # freshly-minted value via get_operation_id() because we
-        # just stashed it here. /track works on the server-minted
-        # execution_id, NOT op_id, so it is independent.
-        #
-        # Mint-fresh-per-call removes the cross-action reuse that
-        # trips IDEM-01 (the prior `if op_id is None:` guard
-        # leaked the scope's first op_id across subsequent
-        # ``check_workflow_budget()`` invocations). We still read
-        # the contextvar first to keep the within-action binding
-        # observable and to surface any unexpected caller that
-        # pre-populates ``operation_id`` (e.g. test fixtures).
-        # The read result is intentionally unused: /execute,
-        # which runs synchronously in the SDK after /check,
-        # reads the freshly-stashed value below via
-        # ``get_operation_id()`` — that is the binding.
         op_id = _get_op_id_for_check()
         op_id = str(uuid.uuid4())
         _set_op_id_for_check(op_id)
@@ -2010,42 +1979,31 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
 
         # Prefer the user-set contextvar (explicit `with workflow(...)`
         # block), fall back to the API key's bound workflow. Returns
-        # None only on legacy keys that have never been
-        # workflow-bound -- in that case the check is silently
-        # skipped.
+        # None only on API keys that have never been workflow-bound
+        # -- in that case the check is silently skipped.
         #
-        # L6 audit 2026-08-12: workflow_id is intentionally NOT
-        # forwarded to the /gate wire body. The server derives it
-        # server-side from the API key's 1:1 binding (CLAUDE.md §12
-        # "1 API key = 1 workflow" invariant). Adding it to the wire
-        # would be additive telemetry only — the per-workflow budget
-        # aggregator (`wf:{id}:monthly_cost` + `wf:{id}:bp:{ts}`)
-        # operates on the server's binding, not on a client-claimed
-        # value. The `mode='hard'` corner the audit flagged is a
-        # non-issue: the field is omitted unconditionally, regardless
-        # of enforcement_mode. Workflow_id flows into /track + /events
-        # via `_enrich_event` (line ~2697) for cost attribution; /gate
-        # intentionally keeps the wire minimal.
+        # workflow_id is intentionally NOT forwarded to the /gate
+        # wire body. The server derives it server-side from the API
+        # key's 1:1 binding (CLAUDE.md §12 "1 API key = 1 workflow"
+        # invariant). The per-workflow budget aggregator
+        # (``wf:{id}:monthly_cost`` + ``wf:{id}:bp:{ts}``) operates
+        # on the server's binding, not on a client-claimed value.
+        # The field is omitted unconditionally regardless of
+        # enforcement_mode. Workflow_id flows into /track + /events
+        # via ``_enrich_event`` (line ~2697) for cost attribution;
+        # /gate intentionally keeps the wire minimal.
         workflow_id = self._resolve_workflow_id(get_workflow_id())
         if not workflow_id:
             return
 
-        # Use the real model name from the call context if the user
-        # set it via `set_call_context(model=...)` (or via a future
-        # `with workflow(..., model=...)` block). Earlier SDK
-        # versions always sent the literal string "budget-precheck"
-        # -- a fake sentinel that forced backend pricing lookup to
-        # fall through to the default rate, so projected_cost was
-        # always computed against the wrong per-model rate and
-        # blocked any future per-model budget tier (model-specific
-        # caps) from being enforced correctly. Sending `None` is
-        # fine -- backend `calculate_projected_cost` defaults when
+        # Use the real model name from the call context if the user set
+        # it via `set_call_context(model=...)`. Sending `None` is
+        # fine — backend `calculate_projected_cost` defaults when
         # model is unset, and tool_block enforcement on /gate is
         # best-effort when no tools are sent.
         call_model = get_call_model()
         call_tools = get_call_tools()
 
-        # 2026-07-02 (v0.11.0): forward chain context for soft-mode
         # Chain context for soft-mode enforcement.
         chain_id = get_chain_id()
         chain_op = get_chain_op()
@@ -2103,7 +2061,6 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             check_req["chain_id"] = chain_id
             check_req["chain_op"] = chain_op if chain_op != "auto" else None
 
-        # 2026-07-02 (v0.11.0): idempotency key.
         # operation_id is also the idempotency key — /check and /track
         # with the same operation_id are treated as a single logical
         # action by the backend's binding key.
@@ -2268,12 +2225,8 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             # `approval_timeout_seconds` (i64) and
             # `approval_expires_at` (ISO8601 string) are exposed;
             # we prefer the integer field because it's directly
-            # usable in `event.wait(timeout=...)`. If the backend
-            # only sent the ISO8601 string (e.g. an older proxy
-            # rewriting the field), fall through to the env
-            # default rather than try to parse it inline -- the
-            # field is documented as informational for UI/logs
-            # and isn't required for the SDK's wait math.
+            # usable in `event.wait(timeout=...)`. Falls back to
+            # the env default when the field is absent.
             server_timeout = _validate_approval_timeout(
                 response.get("approval_timeout_seconds"),
                 log_prefix="check_workflow_budget",
@@ -2440,21 +2393,16 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
     def heartbeat(self, chain_id: str) -> dict[str, Any]:
         """POST /api/v1/heartbeat — extend a chain's idle TTL.
 
-        Single-shot wrapper around ``Transport.heartbeat`` matching the
-        ``chain_end`` / ``cancel_execution`` public-API pattern
-        (DEF-HEART-01, 2026-09-11). Use this for one-off TTL extensions;
-        use ``ping_chain`` when you want a wall-clock scheduler that calls
-        this method every N seconds.
+        Single-shot wrapper around ``Transport.heartbeat`` matching
+        the ``chain_end`` / ``cancel_execution`` public-API pattern.
+        Use this for one-off TTL extensions; use ``ping_chain`` when
+        you want a wall-clock scheduler that calls this method every
+        N seconds.
 
-        The wire body is ``{"chain_id": chain_id}`` — HMAC headers carry
-        ``organization_id`` + ``trace_id`` automatically via
-        ``_build_signed_headers``, so no extra kwargs are needed at the
-        transport layer (mirrors the simpler heartbeat shape vs. chain_end's
-        ``organization_id``/``trace_id`` injection).
-
-        The transport layer already raises ``NullRunTransportError(
-        NETWORK_ERROR, "heartbeat")`` for network errors (transport.py:2077),
-        so no reclassification is needed at this layer.
+        The wire body is ``{"chain_id": chain_id}`` — HMAC headers
+        carry ``organization_id`` + ``trace_id`` automatically via
+        ``_build_signed_headers``, so no extra kwargs are needed at
+        the transport layer.
 
         Args:
             chain_id: Active chain_id (UUID v4) registered via
@@ -2939,16 +2887,10 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         on_transport_error: Callable[[Exception], dict[str, Any]] | None = None,
         business_impact: dict[str, Any] | None = None,
         action_digest: str | None = None,
-        # F03 (2026-08-22): accept `tools` kwarg from the
-        # ``@sensitive`` decorator (``_enforce_sensitive_tool``)
-        # so the bridge from decorators.py:735 stays
-        # source-pin-compatible with test_execute_tools_propagation.py
-        # while the runtime also reads ``get_call_tools()``
-        # internally. The kwarg and the contextvar are merged
-        # below — kwarg wins when supplied, otherwise the
-        # contextvar flows through (which the F03 fix in
-        # decorators.py populates from ``fn.__name__`` before
-        # this method is called).
+        # ``tools`` is supplied by the ``@sensitive`` decorator and
+        # merged with the contextvar below — kwarg wins when supplied,
+        # otherwise the contextvar flows through (populated by
+        # decorators.py from ``fn.__name__`` before this method runs).
         tools: tuple[str, ...] | None = None,
     ) -> dict[str, Any]:
         """
@@ -2963,7 +2905,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             mode: Execution mode ("auto", "inline", "strict")
                 - "auto": auto-select based on tool risk
             on_transport_error: Optional callback for transport-error
-                handling (legacy); prefer the typed exception path.
+                handling; prefer the typed exception path.
             business_impact: Typed action payload (Money impact for
                 now). When supplied, the backend uses it to evaluate
                 rule predicates AND stamps the approval row's
@@ -2993,9 +2935,9 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 - "auto" (default): ALWAYS contacts the gateway. This
                   is the cloud-only invariant — budget, rate-limit,
                   and tool-block policies cannot be bypassed by
-                  omitting ``mode``. Pre-v0.x SDKs silently switched
-                  to "inline" for non-sensitive tools, which caused
-                  DEF-TS12-01 (cycle 20260910T0515).
+                  omitting ``mode``. Earlier SDKs silently switched
+                  to "inline" for non-sensitive tools, which was
+                  the source of the DEF-TS12-01 audit cycle.
                 - "inline": explicit opt-out of /execute. Skips ALL
                   enforcement (budget / rate / tool-block); returns
                   a synthetic local allow. Use only when the caller
@@ -3003,10 +2945,9 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                   gateway round-trip. Cannot be combined with
                   sensitive tools — sensitive tools always go to
                   /execute even when "inline" is requested.
-                - "strict": explicit gateway round-trip (same
-                  wire behaviour as "auto" post-DEF-TS12-01, but
-                  useful for audit clarity when the caller wants
-                  the intent on the wire).
+                - "strict": explicit gateway round-trip (same wire
+                  behaviour as "auto", but useful for audit clarity
+                  when the caller wants the intent on the wire).
 
         Raises:
             NullRunBlockedException: If decision is "block"
@@ -3025,25 +2966,16 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # cannot be silently bypassed because the SDK caller used the
         # default ``mode="auto"``.
         #
-        # Pre-fix (DEF-TS12-01, cycle 20260910T0515): ``mode="auto"``
-        # with a non-sensitive tool resolved to ``mode="inline"`` which
-        # returned a synthetic local allow WITHOUT contacting the
-        # gateway. Every operator-configured budget, rate-limit, and
-        # tool-block policy was silently bypassed for non-sensitive
-        # tools. The dashboard showed policies in effect; the SDK
-        # ignored them. This is now fixed: ``mode="auto"`` →
-        # ``"strict"`` unconditionally.
-        #
-        # Explicit opt-out paths (preserved unchanged):
+        # Explicit opt-out paths:
         #   1. ``mode="inline"`` (explicit opt-in by the caller) —
         #      returns the local allow WITHOUT contacting the gateway.
         #      Documented as the only way to skip /execute. Use
         #      sparingly: skips ALL enforcement, not just budget.
         #   2. ``mode="strict"`` (explicit opt-in by the caller) —
         #      forces /execute round-trip regardless of tool
-        #      sensitivity. Identical wire behaviour to ``"auto"``
-        #      post-fix, but useful when the caller wants the
-        #      intent on the wire for audit clarity.
+        #      sensitivity. Identical wire behaviour to ``"auto"``,
+        #      but useful when the caller wants the intent on the
+        #      wire for audit clarity.
         #
         # The two sensitivity checks below still gate the inline
         # fast-path — sensitive tools cannot be silently skipped
@@ -3077,14 +3009,14 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # post-approval re-check so the backend can bind both requests
         # to the same logical action.
         #
-        # AUDIT P0-27 (2026-09-05): read from the same contextvar
-        # /check uses (`_operation_id_var`) instead of minting an
-        # independent UUID v4. The pre-fix `str(uuid.uuid4())`
-        # produced a different value than the one /check used,
-        # silently breaking the backend's operation_id-keyed binding.
-        # If /execute is the FIRST wire call (no prior /check in
-        # scope), mint here and stash in the contextvar; otherwise
-        # reuse whatever /check minted.
+        # Read from the same contextvar /check uses
+        # (``_operation_id_var``) instead of minting an independent
+        # UUID v4 — a fresh mint here would produce a different
+        # value than the one /check used, silently breaking the
+        # backend's operation_id-keyed binding. If /execute is the
+        # FIRST wire call (no prior /check in scope), mint here and
+        # stash in the contextvar; otherwise reuse whatever /check
+        # minted.
         from nullrun.context import (
             get_operation_id as _get_op_id_for_execute,
         )
@@ -3115,32 +3047,21 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
 
             tools = _get_call_tools_for_execute()
 
-        # DEFS-SDKEXEC-GATE-FIRST (2026-09-08): hoist the execution_id
-        # mint to REUSE the server-minted id from a prior /gate call
-        # (set via `_capture_server_minted_execution_id` from the
-        # `reservation_id` field of the /gate response).
+        # Reuse the server-minted execution_id captured from the prior
+        # /gate call (via ``_capture_server_minted_execution_id`` reading
+        # the ``reservation_id`` field of the /gate response). The
+        # backend's ``/api/v1/execute`` runs an existence check on
+        # ``execution:{id}`` and returns 404 EXECUTION_NOT_FOUND when
+        # no prior /gate minted the binding — a fresh-mint here would
+        # always trip that check and translate into a synthetic block.
         #
-        # Why this matters: backend `/api/v1/execute` (the wire
-        # contract enforced by `backend/src/proxy/http/gate/execute.rs`
-        # since DEF-SDKK-022-EXEC-BYPASS, 2026-09-04, RUN_ID=20260904T1500)
-        # runs an existence check on `execution:{id}` in Redis at
-        # `execute.rs:180-208` and returns 404 EXECUTION_NOT_FOUND when
-        # no prior /gate minted the binding. Pre-fix this method minted
-        # a fresh `uuid7_str()` here — the freshly-minted id was never
-        # registered by /gate, so /execute fail-CLOSED with 404 on
-        # EVERY call and the SDK translated the 404 into a synthetic
-        # block ("Gateway returned 404") in
-        # ``transport.py::execute`` (line ~1195).
-        #
-        # Resolution: when a prior /gate captured a server-minted
-        # execution_id into ``_server_minted_execution_id_var``, reuse
-        # it. The decorator-driven ``@protect @sensitive`` path always
-        # runs ``check_workflow_budget()`` BEFORE ``runtime.execute()``
-        # (decorators.py:538 vs :824), so the contextvar is populated
-        # in the common path. Direct callers of ``runtime.execute()``
-        # without a prior /gate will fall through to the fresh-mint
-        # branch below — that's a wire-contract violation and the
-        # backend's 404 is the correct fail-CLOSED response.
+        # The decorator-driven ``@protect @sensitive`` path runs
+        # ``check_workflow_budget()`` BEFORE ``runtime.execute()``, so
+        # the contextvar is populated in the common path. Direct
+        # callers of ``runtime.execute()`` without a prior /gate fall
+        # through to the fresh-mint branch below — that is a
+        # wire-contract violation and the backend's 404 is the correct
+        # fail-CLOSED response.
         from nullrun.context import get_server_minted_execution_id
 
         prior_execution_id = get_server_minted_execution_id()
@@ -3201,10 +3122,10 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             approval_id = result.get("approval_id") or ""
             if not approval_id:
                 metrics.inc_runtime("execute_blocked")
-                # 2026-09-08: typed wire-bug (NR-A004). The server
-                # returned require_approval without an approval_id —
-                # this is a wire-contract bug, NOT a transient failure.
-                # Cookbook code catches this and reports to NULLRUN
+                # Typed wire-bug (NR-A004): the server returned
+                # require_approval without an approval_id. This is a
+                # wire-contract bug, not a transient failure. Cookbook
+                # code catches the typed exception and reports to NULLRUN
                 # support; do NOT retry.
                 raise NullRunApprovalResponseMissingError(
                     workflow_id=workflow_id or UNKNOWN_WORKFLOW_ID,
@@ -3237,8 +3158,8 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             outcome = str(approval_result.get("outcome") or "").lower()
             if outcome != "approved":
                 metrics.inc_runtime("execute_blocked")
-                # 2026-09-08: dispatch typed approval exception by
-                # outcome so cookbook code can react per wire-code:
+                # Dispatch typed approval exception by outcome so
+                # cookbook code can react per wire-code:
                 #   denied  → NR-A011 (NullRunApprovalDeniedError)
                 #   timeout → NR-A012 (NullRunApprovalExpiredError)
                 #   other   → NR-X001 (NullRunBlockedException, generic)
@@ -3279,9 +3200,9 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             result = self._transport.execute(**execute_kwargs)
             if result.get("decision") == "require_approval":
                 metrics.inc_runtime("execute_blocked")
-                # 2026-09-08: typed replay-rejection (NR-A015). The
-                # operator approved but the same approval_id was
-                # already consumed by a concurrent /execute (race).
+                # Typed replay-rejection (NR-A015): the operator
+                # approved but the same approval_id was already
+                # consumed by a concurrent /execute (race).
                 # Cookbook pattern: do NOT retry the same approval_id;
                 # treat as idempotency violation (likely a client
                 # retry loop).
@@ -3554,7 +3475,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             if attempt_index > 0:  # Only add if not default (first attempt)
                 enriched["attempt_index"] = attempt_index
 
-        # 2026-07-04 (v0.12.0 wiring fix — ):
+        # Drop the stale capture.
         if "execution_id" not in enriched:
             import time as _time
 
@@ -3584,7 +3505,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 else:
                     enriched["execution_id"] = smid
 
-        # 2026-07-04: propagate the in-scope
+        # Propagate the in-scope idempotency_key.
         if "idempotency_key" not in enriched:
             from nullrun.context import get_server_minted_idempotency_key
 
@@ -3620,42 +3541,32 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         return enriched
 
     def _route_track(self, wire_event: dict[str, Any]) -> None:
-        """Route a tracked event to v3 single-event /track or
-               legacy batch /track/batch.
+        """Route a tracked event to v3 single-event /track or the
+               batch /track/batch endpoint.
 
                Why this exists
                ---------------
-               Pre-0.12.0 wiring the SDK always called
-               ``self._transport.track(wire_event)`` which posts to the
-               legacy ``/api/v1/track/batch`` (the ``process_span_event``
-               pipeline). That pipeline reads the org's lifetime
-               ``monthly_cost`` counter — drift with the dashboard's
-               period-bound ``bp:{ts}:cost_cents`` per G1
-               and never exercises v3 ``consume_budget_v3`` so the
-               consume ≤ reserve + ε invariant is never validated.
-
-               The fix: route events that have a paired ``/check``
-               reservation (currently: ``llm_call``) to
-               ``track_single`` which posts to ``/api/v1/track``. The
-               backend's consume takes the server-minted execution_id
-               from the request, looks up
-               ``reservation:{execution_id}`` and runs the invariant.
-               Span events still ride /track/batch — they have no
-               reservation to release.
+               Events with a paired ``/check`` reservation (currently
+               ``llm_call``) route to ``track_single`` which posts to
+               ``/api/v1/track``. The backend's consume takes the
+               server-minted execution_id from the request, looks up
+               ``reservation:{execution_id}`` and validates the
+               consume ≤ reserve + ε invariant. Span events still ride
+               /track/batch — they have no reservation to release.
 
                Opt-out
                -------
                ``NULLRUN_V3_TRACK_DISABLE=1`` forces every event
-               through the legacy batch path. Use it on backends that
-               haven't flipped ``NULLRUN_CONSUME_V3_ENABLED=1`` yet.
+               through the batch path. Use it on backends that haven't
+               flipped ``NULLRUN_CONSUME_V3_ENABLED=1`` yet.
 
                Failure mode
                ------------
                ``track_single`` raises on 422 / 503 / 5xx (see
                ``nullrun.breaker.exceptions``). We catch and log at
                WARNING level; the event is dropped (NOT retried via
-               the batch path — that would risk double-billing
-        idempotency contract).
+               the batch path — that would risk double-billing the
+               idempotency contract).
         """
         from nullrun.context import get_server_minted_execution_id
 
@@ -3706,16 +3617,15 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             metrics.inc_runtime("v3_track_single_ok")
         except Exception as exc:  # noqa: BLE001 — transport-level
             metrics.inc_runtime("v3_track_single_failed")
-            # 2026-09-12 (DEF-CACHE-STALE-ALLOW-AFTER-OVERBUDGET):
-            # when the backend refuses the consume with HTTP 422
-            # (CONSUME_OVERBUDGET) or HTTP 402 (REDIS_UNAVAILABLE
-            # on the consume path) the chain has hit its budget
-            # ceiling. Any cached "allow" for the same
-            # (workflow_id, chain_id) must NOT be served for the
-            # next 0–5 s — otherwise a chain firing faster than
-            # the cache TTL over-reserves against a budget the
-            # server has just rejected. Invalidate before logging
-            # so the order in logs matches the order in code.
+            # DEF-CACHE-STALE-ALLOW-AFTER-OVERBUDGET: when the backend
+            # refuses the consume with HTTP 422 (CONSUME_OVERBUDGET)
+            # or HTTP 402 (REDIS_UNAVAILABLE on the consume path)
+            # the chain has hit its budget ceiling. Any cached
+            # "allow" for the same (workflow_id, chain_id) must NOT
+            # be served for the next 0–5 s — otherwise a chain firing
+            # faster than the cache TTL over-reserves against a
+            # budget the server has just rejected. Invalidate before
+            # logging so the order in logs matches the order in code.
             #
             # chain_id lives in the contextvar (set by the
             # ``with chain(...)`` contextmanager or
@@ -3773,10 +3683,10 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             Track result dict from the runtime.
 
         Note:
-            `cost_cents` is no longer a parameter. The backend computes
-            it from `input_tokens` + `output_tokens` + the org's pricing
-            policy. Splitting prompt vs completion matters because most
-            models price them differently.
+            `cost_cents` is computed by the backend from
+            `input_tokens` + `output_tokens` + the org's pricing
+            policy. Splitting prompt vs completion matters because
+            most models price them differently.
         """
         # Lazy import to keep the runtime import graph acyclic --
         # `nullrun.tracing` deliberately has no SDK-side dependencies.
@@ -3839,11 +3749,11 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             Track result dict from the runtime.
 
         Note:
-            `cost_cents` is no longer a parameter. Tool cost is derived
-            from `duration_ms` + the org's policy (or left at 0 if the
-            org doesn't bill tools). `duration_ms` is the public field
-            name; the wire field is `latency_ms` for backward compat
-            with backend consumers.
+            Tool cost is derived from `duration_ms` + the org's
+            policy (or left at 0 if the org doesn't bill tools).
+            `duration_ms` is the public field name; the wire field
+            is `latency_ms` for backward compat with backend
+            consumers.
         """
         from nullrun.tracing import get_current_span
 
@@ -4156,7 +4066,7 @@ def _capture_wire_evidence(response: dict[str, Any]) -> tuple[str | None, str | 
     return action_digest, policy_hash
 
 
-# 2026-07-04 (v0.12.0 wiring fix — ): build the
+# Build the
 def _build_v3_track_payload(
     wire_event: dict[str, Any],
     reservation_id: str,
@@ -4206,7 +4116,7 @@ def _build_v3_track_payload(
         payload["trace_id"] = wire_event["trace_id"]
     if "span_id" in wire_event and wire_event["span_id"]:
         payload["span_id"] = wire_event["span_id"]
-    # 2026-07-12 (multi-agent span attachment): the orchestration
+    # Multi-agent span attachment: the orchestration
     if "parent_trace_id" in wire_event and wire_event["parent_trace_id"]:
         payload["parent_trace_id"] = wire_event["parent_trace_id"]
 
@@ -4224,7 +4134,7 @@ def _build_v3_track_payload(
         if k in wire_event and wire_event[k] is not None:
             payload[k] = wire_event[k]
 
-    # 2026-07-13 (vendor-extractor edge cases, SDK counterpart at
+    # Vendor-extractor edge cases (SDK counterpart of
     for k in (
         "cache_read_tokens",
         "cache_write_tokens",
@@ -4269,11 +4179,11 @@ def _build_v3_track_payload(
 def get_runtime() -> NullRunRuntime:
     """Get or create the global runtime instance.
 
-    Prefers the registry. The legacy global _runtime slot is
-    kept as a backwards-compat cache so external code that
-    imports nullrun.runtime._runtime still works, but the
+    Prefers the registry. The module-level ``_runtime`` slot
+    remains as a compatibility cache so external code that
+    imports ``nullrun.runtime._runtime`` keeps working; the
     canonical source of truth is the registry (see
-    nullrun._registry.RuntimeRegistry).
+    ``nullrun._registry.RuntimeRegistry``).
     """
     cached = get_active_runtime()
     if cached is not None:

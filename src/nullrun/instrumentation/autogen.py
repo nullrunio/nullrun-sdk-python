@@ -101,13 +101,7 @@ def patch_autogen(runtime: Any) -> bool:
                         getattr(usage, "total_tokens", 0) or 0
                     ) or (prompt + completion)
                     if prompt or completion or total:
-                        # used to come only from ``self.model`` with a
-                        # bare ``None`` fallback — if the autogen client
-                        # didn't expose a ``model`` attribute (some
-                        # subclass / wrapper / mock provider), the wire
-                        # event carried ``model=None`` → backend
-                        # ``unwrap_or("default")`` → fallback warning →
-                        # DEFAULT_RATE. Now we try three sources in
+                        # Model extraction tries three sources in
                         # priority order, matching the multi-source
                         # pattern in langgraph's
                         # ``_extract_model_from_response``:

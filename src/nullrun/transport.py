@@ -221,16 +221,16 @@ def _retry_with_backoff(
                                     delay += random.uniform(-jitter * delay, jitter * delay)
     Formula (with Retry-After): actual_delay = min(last_retry_after_seconds, max_delay)
 
-    NR-006 (audit 2026-08-24): when ``retry_on_5xx=True`` a 5xx
-    response is treated as transient infrastructure failure and
-    retried via the same backoff path as network errors. After the
-    retry budget is exhausted the LAST 5xx response is returned
-    (not raised) so the caller can produce a deterministic
-    fail-CLOSED fallback — the audit's "fail-NO-CHECK" violation
-    happens when a 5xx short-circuits to a synthetic block without
-    any retry. Default ``retry_on_5xx=False`` preserves the
-    pre-existing /track and /execute semantics where 5xx is a
-    classified GATEWAY_ERROR that raises immediately.
+    NR-006: when ``retry_on_5xx=True`` a 5xx response is treated as
+    transient infrastructure failure and retried via the same
+    backoff path as network errors. After the retry budget is
+    exhausted the LAST 5xx response is returned (not raised) so
+    the caller can produce a deterministic fail-CLOSED fallback —
+    the audit's "fail-NO-CHECK" violation happens when a 5xx
+    short-circuits to a synthetic block without any retry. Default
+    ``retry_on_5xx=False`` preserves the /track and /execute
+    semantics where 5xx is a classified GATEWAY_ERROR that raises
+    immediately.
     """
     # Eager imports for the exception classes that the ``except``
     # branch below references. Lazy imports inside the ``try`` body
@@ -1852,13 +1852,11 @@ class Transport:
     ) -> dict[str, Any]:
         """POST /api/v1/track — wire-protocol v3 single-event consume.
 
-        . The single-event path is the v3
-                replacement for the legacy `/api/v1/track/batch` POST body.
-                It runs the CONSUME_SCRIPT invariant
-                ``actual_cost <= reserved_cents + epsilon_cents`` (§25
-                ADR-005) and rejects with 422 CONSUME_OVERBUDGET on
-                violation. The reserved binding is the one created by the
-                matching ``/check`` call (same ``reservation_id``).
+        Runs the CONSUME_SCRIPT invariant
+        ``actual_cost <= reserved_cents + epsilon_cents`` (ADR-005)
+        and rejects with 422 CONSUME_OVERBUDGET on violation. The
+        reserved binding is the one created by the matching
+        ``/check`` call (same ``reservation_id``).
 
                 The wire shape is built by ``runtime._build_v3_track_payload``
                 (see ``runtime.py:2679-2776``); this method just forwards
@@ -2259,10 +2257,9 @@ class Transport:
     # ADR-009 P1 — Audit log governance surface (v0.15.0)
     # ====================================================================
     # Five methods exposing the /api/v1/orgs/:org_id/audit-log/* family
-    # of endpoints to SDK consumers. Pre-v0.15.0 SDKs had no audit
-    # client — operators had to curl the wire directly. Now they can
-    # call ``runtime.audit.list(...)`` etc. and get typed dataclasses
-    # back without writing JSON parsing glue.
+    # of endpoints to SDK consumers. Callers invoke
+    # ``runtime.audit.list(...)`` etc. and get typed dataclasses back
+    # without writing JSON parsing glue.
     #
     # All five methods route through the same auth + protocol +
     # trace-context machinery as the other Transport methods — see
@@ -2943,9 +2940,8 @@ def _parse_v3_error_envelope(
 # Lazy import to avoid a hard dependency at module import time.
 # `_parse_v3_error_envelope` is a module-level helper; the exception
 # classes live in `nullrun.breaker.exceptions`. Importing here
-# (rather than at the top of transport.py) keeps the legacy import
-# graph identical and avoids breaking the frozen
-# ``_parse_error_envelope`` test contract.
+# (rather than at the top of transport.py) avoids breaking the
+# frozen ``_parse_error_envelope`` test contract.
 def _build_v3_error_code_map() -> dict[str, type[Exception]]:
     """Construct the v3 error_code → exception class mapping.
 
@@ -3020,28 +3016,23 @@ def _build_v3_error_code_map() -> dict[str, type[Exception]]:
         "RATE_LIMIT_REDIS_UNAVAILABLE": NullRunRateLimitRedisError,
         "BUDGET_DATA_UNAVAILABLE": NullRunBackendError,
         # 402 — approval-create failure family (DEF-ARFLOW-TOOLNAME-01,
-        # the typed ``NullRunApprovalDbUnavailableError`` (NR-A016) so
+        # typed ``NullRunApprovalDbUnavailableError`` (NR-A016) so
         # cookbook code can branch on the typed class instead of
-        # falling through to the base NullRunBlockedException. Pre-B.1
-        # all six collapsed to the base class — operators couldn't tell
-        # apart a transient DB outage from a validation failure.
+        # falling through to the base NullRunBlockedException).
         "APPROVAL_DB_UNAVAILABLE": NullRunApprovalDbUnavailableError,
         "APPROVAL_PERSISTENCE_FAILED": NullRunApprovalDbUnavailableError,
         "APPROVAL_VALIDATION_FAILED": NullRunApprovalDbUnavailableError,
         "APPROVAL_CONFLICT": NullRunApprovalDbUnavailableError,
         "APPROVAL_NOT_FOUND": NullRunApprovalDbUnavailableError,
         "APPROVAL_CREATE_FAILED": NullRunApprovalDbUnavailableError,
-        # audit, A-1+A-2 bundle). Distinct from the /gate
-        # create-failure family above: these are the seven
-        # distinct outcomes that the backend's
-        # `gate_internal()` returns on /execute post-approval
-        # grant-consume (see
-        # `backend/src/proxy/http/gate/internal.rs:3059-3108,
-        # 3115-3138`). Pre-v3.53 the SDK collapsed all six
-        # into NullRunBlockedException — bilateral wire gap.
-        # Post-v3.53 each maps to a typed exception
-        # (NR-A010..NR-A015) so cookbook recipes can branch
-        # on the precise outcome (e.g. ``except
+        # A-1+A-2 bundle. Distinct from the /gate create-failure
+        # family above: these are the seven distinct outcomes that
+        # the backend's ``gate_internal()`` returns on /execute
+        # post-approval grant-consume (see
+        # ``backend/src/proxy/http/gate/internal.rs:3059-3108,
+        # 3115-3138``). Each maps to a typed exception
+        # (NR-A010..NR-A015) so cookbook recipes can branch on the
+        # precise outcome (e.g. ``except
         # NullRunApprovalNotYetApprovedError:`` for wait/poll,
         # ``except NullRunApprovalDeniedError:`` for terminal
         # surface-to-user, ``except

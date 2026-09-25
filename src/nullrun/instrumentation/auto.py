@@ -396,26 +396,23 @@ def _cohere_extractor(body: bytes, status: int) -> ExtractedUsage | None:
 
     response.usage.{tokens, input_tokens, output_tokens}.
     Note: Cohere streaming has no usage in stream — only non-streaming
-    responses carry it. Documented in the plan.
+    responses carry it.
 
-    2026-07-13: v2 has THREE schema changes the SDK
-    silently missed:
+    Three notable schema choices:
 
-      1. ``tool_calls`` live under ``message.tool_calls`` (not at
-         the top level). v1 still used top-level ``tool_calls``;
-         v2 moved them into the assistant message envelope. The
-         top-level path is preserved as a fallback for v1 + the
-         rare v2 adapter that lifts the field back up, so neither
-         version is broken by the new primary path.
+      1. ``tool_calls`` live under ``message.tool_calls``.
+         The top-level path is preserved as a fallback so neither
+         v1 (top-level) nor v2 (nested) is broken by the new
+         primary path.
 
-      2. ``usage.tokens.cached_tokens`` is the v2 cache hit counter
-         (Cohere's inference cache). Previously always read as 0.
+      2. ``usage.tokens.cached_tokens`` is the cache hit counter
+         (Cohere's inference cache).
 
       3. ``finish_reason`` values are UPPERCASE
          (``COMPLETE | MAX_TOKENS | STOP_SEQUENCE | TOOL_CALL |
-         ERROR | TIMEOUT``); the v1 vocabulary was lowercase. The
-         ``_normalize_finish_reason`` helper lower-cases before
-         mapping so both vocabularies work.
+         ERROR | TIMEOUT``); the ``_normalize_finish_reason``
+         helper lower-cases before mapping so both vocabularies
+         work.
     """
     if status >= 400 or not body:
         return None
@@ -661,9 +658,9 @@ PROVIDER_EXTRACTORS: dict[str, Callable[[bytes, int], ExtractedUsage | None]] = 
 
 
 def _extract_model_from_request_body(request: httpx.Request) -> str | None:
-    """2026-06-28 (Issue 2 fix): fall back to the ``model`` field embedded
-    in the LLM request body when the response body extractor returned
-    ``None`` for ``model``.
+    """Fall back to the ``model`` field embedded in the LLM request
+    body when the response body extractor returned ``None`` for
+    ``model``.
 
     The user typically passes ``ChatOpenAI(model="gpt-4.1-mini")`` and
     that string appears in the request body's ``model`` field — even if
@@ -728,15 +725,14 @@ def _check_kill_before_send(runtime: Any, request: httpx.Request) -> None:
       - no workflow can be resolved (no active context, no API key binding)
       - the cached state is anything other than Killed / Paused
 
-    Note: prior to 0.3.0 this also short-circuited in
-    `local_mode` (no api_key). The local_mode branch is gone because
-    api_key is now required at runtime construction — every runtime
-    has a remote control plane to consult.
+    Note: api_key is required at runtime construction — every
+    runtime has a remote control plane to consult. There is no
+    ``local_mode`` short-circuit.
 
     Raises:
-        NullRunWorkflowKilledError: state == "Killed" (2026-09-08:
-            typed signal with error_code=NR-W002 + user_action;
-            subclass of WorkflowKilledInterrupt.)
+        NullRunWorkflowKilledError: state == "Killed" — typed
+            signal with error_code=NR-W002 + user_action; subclass
+            of WorkflowKilledInterrupt.
         WorkflowPausedException: state == "Paused"
     """
     if runtime is None:
@@ -757,7 +753,7 @@ def _check_kill_before_send(runtime: Any, request: httpx.Request) -> None:
     state = runtime._remote_state_for(workflow_id) if hasattr(runtime, "_remote_state_for") else getattr(runtime, "_remote_states", {}).get(workflow_id, {})
     state_name = state.get("state", "Normal")
     if state_name == "Killed":
-        # code can `except NullRunWorkflowKilledError`; legacy
+        # code can `except NullRunWorkflowKilledError`;
         # `except WorkflowKilledInterrupt` still matches (subclass).
         from nullrun.breaker.exceptions import NullRunWorkflowKilledError
         raise NullRunWorkflowKilledError(
@@ -1250,15 +1246,14 @@ def patch_httpx(runtime: Any) -> bool:
 
 
 def _wrap_pre_existing_httpx_clients(runtime: Any) -> tuple[int, int]:
-    """Find httpx clients created before ``patch_httpx`` ran and wrap their
-    transports in NullRun's transports.
+    """Find httpx clients created before ``patch_httpx`` ran and wrap
+    their transports in NullRun's transports.
 
-    Audit 2026-06-29 (init-ordering hazard): the typical sequence
-
-        llm = ChatOpenAI(model=...) # builds internal httpx.Client
-        nullrun.init(api_key=...) # installs the __init__ patch
-
-    leaves ``llm``'s internal client with the unpatched transport.
+    Init-ordering hazard: when an HTTP-using client library is
+    instantiated *before* ``nullrun.init``, its internal
+    ``httpx.Client`` retains the unpatched transport. This back-fill
+    picks up those clients so the same NUL-1 control surface
+    applies to them.
     New ``httpx.Client `` constructions are auto-wrapped by the
     class-level patch; this sweep is the back-fill.
 
@@ -1604,12 +1599,8 @@ def _emit_from_agents_result(runtime: Any, result: Any) -> None:
                     name = (tc.get("function") or {}).get("name")
                     if name:
                         tool_names.append(name)
-            # used to be put on the wire as-is — when the agents SDK
-            # didn't populate the span's ``model`` field (some
-            # custom tracer configs), this shipped ``model=None`` →
-            # backend ``unwrap_or("default")`` → fallback warning.
-            # We also try ``usage["model"]`` (OpenAI usage payload
-            # sometimes carries the resolved model id) and
+            # Falls through to ``usage["model"]`` (OpenAI usage
+            # payload sometimes carries the resolved model id) and
             # ``span["response_metadata"]["model_name"]`` (langchain-
             # style metadata block on the span). Empty / None are
             # dropped — only set ``model`` when we have a real value.
@@ -2066,28 +2057,14 @@ def _emit_streaming_skipped(
     `_extract_model_from_request_body` (sync-only, mirrors
     `_emit`'s pattern at lines 735-739).
 
-    Audit 2026-06-29 (ghost-event dedup): the previous version
-    emitted the event unconditionally and without a `_fingerprint`.
-    Two consequences:
-      1. When the body read fails for an external reason
-         (double-consume by langchain-openai, an upstream that
-         already drained the stream), the SDK produced an
-         `llm_call` with `tokens=0, model=None` — i.e. no useful
-         signal — that still reached the wire. The backend's
-         `into_track_request_v2` handler gate (handler.rs:2046)
-         rejected these with HTTP 422, but the cost-pipeline
-         belt-and-suspenders backstop still logged every one as
-         `cost_pipeline_missing_model_total` and stamped the 1-cent
-         surcharge. Operators saw 30+ ERROR lines per `app.invoke `
-         for a workload that actually had 6 real LLM calls.
-      2. Because no `_fingerprint` was attached, the dedup LRU at
-         `runtime.track ` could not collapse this emission with
-         any sibling emission for the same call.
-    Fix: drop the event entirely when we cannot recover a usable
-    `model` (the request body has been consumed or doesn't carry
-    the field — same signature as a body that genuinely cannot be
-    inspected), and attach a deterministic `_fingerprint` when we
-    do emit so dedup collapses repeats from the same call site.
+    Ghost-event dedup: dropped events carry a deterministic
+    ``_fingerprint`` so the runtime's dedup LRU collapses
+    repeated emissions for the same call site. Events where a
+    usable ``model`` cannot be recovered (request body has been
+    consumed or doesn't carry the field — same signature as a
+    body that genuinely cannot be inspected) are dropped
+    entirely to avoid the cost-pipeline's
+    ``cost_pipeline_missing_model_total`` surcharge.
     """
     # We always emit the streaming-skipped event regardless of
     # whether ``_extract_model_from_request_body`` recovered a model.

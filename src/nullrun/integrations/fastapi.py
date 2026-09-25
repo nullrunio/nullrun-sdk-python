@@ -104,9 +104,9 @@ _DEFAULT_INFRASTRUCTURE_STATUS = 503
 _KILL_STATUS = 503
 
 
-# Locale negotiation helpers removed — the catalog is English-only and
-# ``format_user_message`` no longer takes a ``locale=`` kwarg. Reserved
-# for a future locale-pack release if/when a non-English catalog lands.
+# Locale negotiation helpers reserved for a future locale-pack
+# release. The catalog is English-only and ``format_user_message``
+# takes no ``locale=`` kwarg.
 
 
 def _build_headers(exc: BaseException) -> dict[str, str]:

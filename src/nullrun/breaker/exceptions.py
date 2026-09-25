@@ -802,10 +802,6 @@ class NullRunBudgetRecheckFailedError(NullRunBudgetError):
     ``except NullRunBudgetError:`` pattern keeps matching. New
     ``except NullRunBudgetRecheckFailedError:`` branches on the typed
     shape (recommended: re-/gate then re-/execute).
-
-    Audit: H6 (2026-08-12). Pre-fix SDK 0.14.x collapsed this code
-    into a generic ``NullRunBudgetError("Budget authorization failed")``
-    with no introspection on the running counter.
     """
 
     error_code = "NR-B006"
@@ -1066,12 +1062,11 @@ class NullRunApprovalExpiredError(NullRunBlockedException):
     1. **Wire path** — backend returns APPROVAL_EXPIRED on /execute
        because the operator's grant TTL elapsed between /gate and
        /execute.
-    2. **Client-side timeout path** (added 2026-09-08, the trigger for
-       this typed exception migration) — WS push went silent for
+    2. **Client-side timeout path** — WS push went silent for
        ``approval_timeout_seconds`` (default 300s) without an operator
        decision. The SDK raises this exception instead of the generic
        ``WorkflowKilledInterrupt`` so cookbook code can catch it
-       (`except NullRunApprovalExpiredError`) and react with a fresh
+       (``except NullRunApprovalExpiredError``) and react with a fresh
        approval request.
 
     Cookbook pattern: do NOT retry the same approval_id — request a
@@ -1361,9 +1356,8 @@ class WorkflowKilledInterrupt(NullRunError):
     """
     Raised when a workflow is killed by the NullRun control plane.
 
-    **2026-09-08 migration**: this class is now an ``Exception``
-    subclass (``NullRunError`` parent). Agent recovery code catches
-    the kill signal via ``except WorkflowKilledInterrupt`` or
+    Agent recovery code catches the kill signal via
+    ``except WorkflowKilledInterrupt`` or
     ``except NullRunWorkflowKilledError`` to surface a structured
     error to the user with ``error_code=NR-W002`` and ``user_action``.
 
@@ -1403,10 +1397,9 @@ class WorkflowKilledInterrupt(NullRunError):
             sentry_sdk.capture_exception(exc)
             raise
 
-    Sentry / OpenTelemetry handlers that filter on ``Exception`` will
-    now record kill events — this is the intended new behavior. Code
-    that relies on kill being un-catchable by ``except Exception`` is
-    a regression candidate; see ``docs/kill-contract-migration-2026-09-08.md``.
+    Sentry / OpenTelemetry handlers that filter on ``Exception``
+    record kill events. Code that relies on kill being un-catchable
+    by ``except Exception`` is a regression candidate.
     """
 
     error_code = "NR-W002"
@@ -1448,16 +1441,16 @@ class WorkflowKilledInterrupt(NullRunError):
 class NullRunWorkflowKilledError(WorkflowKilledInterrupt):
     """Typed public name for the kill signal.
 
-    Subclass of :class:`WorkflowKilledInterrupt` (which remains the
-    legacy canonical name) so ``except WorkflowKilledInterrupt``
-    clauses continue to match. New cookbook code should prefer this
-    name (``except NullRunWorkflowKilledError``) for typed dispatch.
+    Subclass of :class:`WorkflowKilledInterrupt` so existing
+    ``except WorkflowKilledInterrupt`` clauses continue to match.
+    New cookbook code should prefer this name
+    (``except NullRunWorkflowKilledError``) for typed dispatch.
 
     Wire code ``NR-W002`` (same as parent). Distinct from
     :class:`NullRunBlockedException` family — kill is a control-plane
     signal (operator or circuit-breaker), not a gate-decision block.
 
-    Cookbook pattern (2026-09-08 migration):
+    Cookbook pattern:
 
         try:
             agent.run()

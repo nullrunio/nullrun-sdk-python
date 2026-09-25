@@ -1,13 +1,13 @@
 """
 BusinessImpact + action_digest — minimal wire helpers.
 
-The 0.18.2 SDK is policy-blind. Every ``@protect`` call computes a
-single canonical ``NoImpact`` envelope and forwards it to
-/execute. The backend's ToolParameters Approval Rules read
-values out of ``tool_kwargs`` directly via the rule's
-``param_name`` field, so the SDK no longer constructs per-tool
-typed impacts (Money, ToolCall). This module exists so the gate
-can send a valid (kind, action_digest) pair.
+Every ``@protect`` call computes a single canonical ``NoImpact``
+envelope and forwards it to /execute. The backend's ToolParameters
+Approval Rules read values out of ``tool_kwargs`` directly via
+the rule's ``param_name`` field, so the SDK emits a single
+canonical envelope rather than per-tool typed impacts. This
+module exists so the gate can send a valid (kind, action_digest)
+pair.
 
 Field contract mirrored by the backend at
 ``backend/src/proxy/gate/business_impact.rs``:
@@ -55,11 +55,10 @@ class NoImpactPayload:
 class BusinessImpact:
     """Top-level BusinessImpact envelope.
 
-    0.18.2: only the ``NoImpact`` payload variant is constructed
-    on the SDK side. The ``money`` and ``tool_call`` factories
-    were removed because the SDK no longer stamps per-tool
-    typed impacts onto functions — every call sends NoImpact and
-    the backend reads live values out of ``tool_kwargs`` via the
+    Only the ``NoImpact`` payload variant is constructed on the
+    SDK side. The ``money`` and ``tool_call`` factories are not
+    part of the SDK surface — every call sends NoImpact and the
+    backend reads live values out of ``tool_kwargs`` via the
     rule's ``param_name``.
     """
 

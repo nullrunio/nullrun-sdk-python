@@ -23,12 +23,12 @@ came from + the underlying reason + how to fix it) and then exit
 :func:`nullrun.format_user_message` is included as the headline so
 end-user scripts don't need to branch on the wire shape.
 
-:class:`nullrun.WorkflowKilledInterrupt` now inherits
-from :class:`nullrun.NullRunError` (the 2026-09-08 migration; see the
-class docstring), so a bare ``except NullRunError`` would otherwise
-swallow the kill signal. ``handle``/``guarded`` explicitly re-raise it
-— the kill is a control-plane action, not an SDK failure, and must
-reach the top of the agent loop. Non-NullRun exceptions also propagate
+:class:`nullrun.WorkflowKilledInterrupt` inherits
+from :class:`nullrun.NullRunError` (see the class docstring), so a
+bare ``except NullRunError`` would otherwise swallow the kill signal.
+``handle``/``guarded`` explicitly re-raise it — the kill is a
+control-plane action, not an SDK failure, and must reach the top of
+the agent loop. Non-NullRun exceptions also propagate
 unchanged.
 
 ``init_or_die`` exists because:func:`nullrun.init` is typically
@@ -187,10 +187,10 @@ def handle(*, exit_code: int = 1):
     *:class:`nullrun.WorkflowKilledInterrupt` -- kill signals must reach
       the top of the agent loop, not be swallowed into a graceful exit.
       Re-raised explicitly inside the ``except NullRunError`` branch
-      because the 2026-09-08 migration moved ``WorkflowKilledInterrupt``
-      onto the ``NullRunError`` MRO (Sentry/OTel ``except Exception``
-      handlers should now record kill events; this ``handle`` /
-      ``guarded`` wrapper opts OUT of that recording on purpose).
+      because ``WorkflowKilledInterrupt`` sits on the ``NullRunError``
+      MRO (Sentry/OTel ``except Exception`` handlers should record kill
+      events; this ``handle``/``guarded`` wrapper opts OUT of that
+      recording on purpose).
     *:class:`KeyboardInterrupt` /:class:`SystemExit` (``BaseException``) --
       same reason as the kill signal -- never reach the
       ``except NullRunError`` branch anyway.
@@ -243,7 +243,7 @@ def guarded(fn: Callable[..., T]) -> Callable[..., T]:
     it is caught, rendered as a user-facing message, and the process
     exits with code ``1``. ``WorkflowKilledInterrupt`` and other
     ``BaseException`` subclasses propagate (``handle`` re-raises kill
-    explicitly, see the 2026-09-08 migration note).
+    explicitly, see the kill-signal note in the module docstring).
 
     Pair with:func:`nullrun.protect` for the standard agent loop::
 

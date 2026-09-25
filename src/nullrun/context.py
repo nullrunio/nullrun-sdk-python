@@ -15,7 +15,7 @@ from contextvars import ContextVar, Token
 # below; ``@protect`` (decorators.py:441) and any other writer must
 # call BOTH sides so runtime readers (``get_trace_id`` /
 # ``get_span_id``) and SpanContext readers (``get_current_span``) see
-# the same trace id. See audit_ui/UI-UX-AUDIT-REPORT.md F-19.
+# the same trace id.
 from .tracing import (
     SpanContext,
     _current_span,
@@ -588,15 +588,14 @@ def clear_operation_id() -> None:
 
 def get_last_gate_action_digest() -> str | None:
     """Return the `action_digest` echoed by the last /gate response, or
-    ``None`` if no echo captured in scope (legacy backend, or a /check
-    that didn't carry a typed business impact).
+    ``None`` if no echo captured in scope.
 
     Wire-additive — pre-v4 backends omit the field entirely
     (``skip_serializing_if = "Option::is_none"`` on the backend); a
-    v4 SDK connecting to a v3 backend reads None and behaves like
-    pre-Slice-B. No false positive.
+    v4 SDK connecting to a v3 backend reads None and proceeds
+    without it. No false positive.
 
-    See ADR-037 Slice B (2026-08-31) for the wire contract.
+    See ADR-037 Slice B for the wire contract.
     """
     return _last_gate_action_digest_var.get()
 
@@ -611,7 +610,7 @@ def get_last_gate_policy_hash() -> str | None:
     `audit_drain.rs:301`). Today this field is always None on the
     wire, so this getter is informational only.
 
-    See ADR-037 Slice B (2026-08-31) for the wire contract.
+    See ADR-037 Slice B for the wire contract.
     """
     return _last_gate_policy_hash_var.get()
 
@@ -622,7 +621,7 @@ def set_last_gate_action_digest(value: str | None) -> None:
     Called by ``runtime._capture_wire_evidence`` immediately after
     ``_capture_server_minted_execution_id`` — the two captures share
     the same lifetime (one /check → one execution_id + one
-    action_digest). See ADR-037 Slice B (2026-08-31).
+    action_digest). See ADR-037 Slice B.
     """
     _last_gate_action_digest_var.set(value)
 
@@ -634,7 +633,7 @@ def set_last_gate_policy_hash(value: str | None) -> None:
     this is always set to None on the wire; this setter is the
     forward-compatible hook for Slice D.
 
-    See ADR-037 Slice B (2026-08-31).
+    See ADR-037 Slice B.
     """
     _last_gate_policy_hash_var.set(value)
 

@@ -401,15 +401,15 @@ class CircuitBreaker:
     async def _on_success_async(self) -> None:
         """Async-safe success handler.
 
-        DEF-CB-LOCK-UNIFICATION-2026-09-12: switched from
-        `_async_lock` (asyncio.Lock) to the single `self._lock`
-        (threading.Lock). Python asyncio is single-threaded; an
-        `with threading.Lock()` inside an `async def` is safe as
-        long as the critical section has no `await`. This section
-        (below) has no `await`, so the sync lock blocks the event
-        loop for zero observable time on the happy path. The
-        trade-off (consistency under sync+async concurrency >
-        minor lock-hold latency) is the point of the fix.
+        DEF-CB-LOCK-UNIFICATION-2026-09-12: uses the single
+        ``self._lock`` (threading.Lock) for both sync and async
+        write paths. Python asyncio is single-threaded; an
+        ``with threading.Lock()`` inside an ``async def`` is safe
+        as long as the critical section has no ``await``. This
+        section has no ``await``, so the sync lock blocks the
+        event loop for zero observable time on the happy path. A
+        single ``_async_lock`` (asyncio.Lock) would not coordinate
+        with concurrent sync threads — hence the unification.
         """
         old_state = self._state
         with self._lock:

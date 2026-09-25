@@ -340,20 +340,16 @@ class WebSocketConnection:
                 # value under the ``api_key`` field — we MUST read it
                 # back from there and use it as the HMAC identifier.
                 #
-                # Pre-FIX-F4 this branch read ``data["api_key_id"]``
-                # which used to be the wire field name on the server
-                # side. That field now carries the same user-facing
-                # value (no longer the internal UUID key_id), so for
-                # backwards compat we accept either field name —
-                # pre-FIX-F4 envelopes may still arrive with
-                # ``api_key_id`` carrying the user-facing string
-                # because the server's only consumers were pre-FIX-F4
-                # SDKs.
+                # The ``data["api_key_id"]`` field carries the
+                # user-facing API key value (not an internal UUID).
+                # Accept either field name for backwards compat —
+                # older envelopes may still arrive with
+                # ``api_key_id`` carrying the user-facing string.
                 #
-                # Fall back to ``self.api_key`` only when the envelope
-                # has neither field (a pre-FIX-D server without
-                # signed_payload), which is a degraded path that
-                # already 403'd in real life per the FIX-C comments.
+                # Fall back to ``self.api_key`` only when the
+                # envelope has neither field (a server without
+                # ``signed_payload``), which is a degraded path that
+                # already 403's in practice.
                 envelope_api_key = (
                     data.get(WS_HMAC_IDENTITY_FIELD)
                     if isinstance(data.get(WS_HMAC_IDENTITY_FIELD), str)
@@ -648,8 +644,8 @@ class WebSocketConnection:
         # Check if this state requires acknowledgment
         #
         # (`runtime.py`) lowercases before comparing so it survives a
-        # server regression to lowercase states. The WS path used to
-        # exact-match only. Without this fallback, a server regression
+        # server regression to lowercase states. The WS path matches
+        # case-insensitively too — without this, a server regression
         # would silently drop the ACK (the existing test pins
         # PascalCase as the happy path, but does not pin what happens
         # if the server emits ``"killed"``).

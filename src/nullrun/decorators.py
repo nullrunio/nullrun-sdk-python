@@ -569,20 +569,20 @@ def protect(fn: F | None = None) -> F | Callable[[F], F]:
         runtime = _get_or_create_runtime()
         span = _next_span()
         token = set_span(span)
-        # the legacy ``_trace_id_var`` / ``_span_id_var`` so the
-        # runtime's ``_enrich_event`` (which reads via
-        # ``get_trace_id()`` / ``get_span_id()`` for cost events
-        # AND for ``parent_trace_id`` derivation at runtime.py:2967)
-        # emits events tagged with the SAME trace_id /
-        # span_id as SpanContext. Without this mirror a bare
+        # Mirror the trace_id / span_id into ``_trace_id_var`` /
+        # ``_span_id_var`` so the runtime's ``_enrich_event`` (which
+        # reads via ``get_trace_id()`` / ``get_span_id()`` for cost
+        # events AND for ``parent_trace_id`` derivation at
+        # runtime.py:2967) emits events tagged with the SAME
+        # trace_id / span_id as SpanContext. Without this mirror a bare
         # ``@protect`` (no enclosing ``with workflow``) sees a
         # tree-break: span_start carries SpanContext.trace_id while
         # llm_call / tool_call carries a freshly generated trace_id.
         # Token-based so a nested ``@protect`` inside an outer
         # ``@protect`` (or inside ``with workflow``)
         # restores the outer trace/span on reset.
-        trace_legacy_token = set_trace_id(span.trace_id)
-        span_legacy_token = set_span_id(span.span_id)
+        trace_token = set_trace_id(span.trace_id)
+        span_token = set_span_id(span.span_id)
         # ``fn.__name__`` when the user did NOT explicitly call
         # ``set_call_context(tools=...)``. The F01 fix
         # (``runtime.execute`` body at runtime.py:2746-2760 and the
@@ -595,8 +595,7 @@ def protect(fn: F | None = None) -> F | Callable[[F], F]:
         # /015/016/017) never reach the approval_rule_eval step.
         # Token-based so a nested @protect inside an outer @protect
         # (or inside ``with workflow``) restores the outer contextvar
-        # on reset — same shape as the legacy
-        # ``_trace_id_var`` / ``_span_id_var`` resets above.
+        # on reset — same shape as the trace/span token resets above.
         _existing_call_tools = get_call_tools()
         if not _existing_call_tools:
             call_tools_token: Token[tuple[str, ...]] | None = _call_tools_var.set(
@@ -662,13 +661,12 @@ def protect(fn: F | None = None) -> F | Callable[[F], F]:
             raise
         finally:
             reset_span(token)
-            # F-19 follow-up: token-based reset matches the legacy
-            # ``_trace_id_var`` / ``_span_id_var`` pattern (paired
-            # with their tokens set above). Order does not matter;
-            # both resets restore the prior contextview regardless
-            # of which one runs first.
-            reset_trace_id(trace_legacy_token)
-            reset_span_id(span_legacy_token)
+            # F-19 follow-up: token-based reset matches the trace/span
+            # token pattern (paired with the tokens set above). Order
+            # does not matter; both resets restore the prior
+            # contextvar regardless of which one runs first.
+            reset_trace_id(trace_token)
+            reset_span_id(span_token)
             # F03 follow-up: reset the per-call tools contextvar if
             # we set it. Outer ``with workflow`` / nested @protect
             # prior value restored; bare @protect leaves the
@@ -782,7 +780,7 @@ def _run_tool_policy_gate(
 
     # Wire-shape compatibility: ``business_impact`` stays None
     # on /execute when no per-tool typed impact is extracted
-    # (the legacy bare @protect shape — backend reads only
+    # (the bare @protect shape — backend reads only
     # ``action_digest`` + ``kwargs`` for ToolParameters Approval
     # Rules). The ``action_digest`` is still computed against
     # the canonical NoImpact envelope so the Phase-1+ wire-shape

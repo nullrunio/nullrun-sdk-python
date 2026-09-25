@@ -14,7 +14,7 @@ Each writer was independent. ``nullrun.init()`` wrote all three;
 ``decorators._get_or_create_runtime()`` wrote only the decorators
 slot. Concurrent ``init()`` + ``@protect`` could race and leave one
 of the three pointing at a dead runtime, dropping ``span_start`` /
-``span_end`` events on the floor (see audit 2026-07-05 H2).
+``span_end`` events on the floor.
 
 The three writers are unified behind a single
 :class:`RuntimeRegistry` so every consumer reads from one place.

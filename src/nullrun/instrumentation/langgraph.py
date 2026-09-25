@@ -461,26 +461,22 @@ class NullRunCallback(BaseCallbackHandler):
         """
         Called when LLM call starts.
 
-        2026-07-12 (multi-agent span attachment): open a child span
-        for the LLM call so the cost event emitted by ``on_llm_end``
-        carries the parent chain's ``trace_id``. Pre-fix this hook
-        was a no-op — ``on_llm_end`` then fell through to
-        ``runtime.track()`` which generates a fresh ``trace_id`` per
-        event, breaking the parent-child span hierarchy on the
-        server side. The frontend "Recent executions" panel then
-        showed 4/5 rows with ``cost_cents=0 / tokens=0`` because the
-        per-row unified SELECT keyed the JOIN on a per-call fresh
-        ``trace_id`` that no other row in the workflow had.
+        Multi-agent span attachment: open a child span for the LLM
+        call so the cost event emitted by ``on_llm_end`` carries
+        the parent chain's ``trace_id``. A no-op here would force
+        ``on_llm_end`` to emit events with a per-call fresh
+        ``trace_id``, breaking the parent-child span hierarchy on
+        the server side.
 
         Behaviour: create a child span from the active framework
-        span (``@protect``-set via `set_span` or a higher-level
-        ``on_chain_start`` via `_active_runs[parent_run_id]`).
-        Record the SpanContext under the LangChain ``run_id`` key so
-        ``on_llm_end`` can look it up. The ``run_id`` callback kwargs
-        are present on langchain >= 0.1; missing run_id is logged
-        and we fall back to creating a synthetic root (best-effort,
-        matches the legacy behaviour so we never throw out of the
-        LangChain callback chain).
+        span (``@protect``-set via ``set_span`` or a higher-level
+        ``on_chain_start`` via ``_active_runs[parent_run_id]``).
+        Record the SpanContext under the LangChain ``run_id`` key
+        so ``on_llm_end`` can look it up. The ``run_id`` callback
+        kwargs are present on langchain >= 0.1; missing run_id is
+        logged and we fall back to creating a synthetic root
+        (best-effort, so we never throw out of the LangChain
+        callback chain).
         """
         run_id = kwargs.get("run_id")
         parent_run_id = kwargs.get("parent_run_id")
@@ -569,32 +565,18 @@ class NullRunCallback(BaseCallbackHandler):
         Extracts usage data and sends to backend for cost computation.
         Does NOT compute cost - backend is source of truth.
 
-        Audit 2026-06-28 (SDK↔backend wire): the previous version pulled
-        ``model_name`` exclusively from ``invocation_params`` with a
-        hard fallback to the literal string ``"unknown"``. When langchain
-        1.x stopped forwarding ``invocation_params`` to ``on_llm_end``
-        every track event carried ``model="unknown"`` and the backend
-        cost pipeline fell through to ``DEFAULT_RATE``. Now we try
-        ``invocation_params.model_name`` first, then fall back to
-        reading the real model id from the response object itself
-        (``response.response_metadata['model_name']`` or the AIMessage
-        on the LLMResult generation). ``"unknown"`` is now a true last
-        resort, not the common case.
+        Reads ``model_name`` from ``invocation_params`` first, then
+        falls back to the response object itself
+        (``response.response_metadata['model_name']`` or the
+        AIMessage on the LLMResult generation). ``"unknown"`` is
+        the last-resort fallback when neither source carries the
+        model — its presence surfaces as an alertable gap rather
+        than a silent default.
 
-        Audit 2026-06-29 (ghost-event dedup): the previous version of
-        this method did NOT attach a ``_fingerprint`` to the event
-        before forwarding it to ``runtime.track ``. Because the
-        dedup LRU only collapses events whose ``_fingerprint``
-        matches, the LangChain callback emission was never deduped
-        against the sibling emission from the httpx transport
-        (``NullRunSyncTransport._emit``), even though both observers
-        fire for the same LLM call. The net effect on a typical
-        ``app.invoke `` with 6 LLM calls was 6-12 duplicate
-        ``llm_call`` events on the wire (instead of 6), plus extra
-        cost-pipeline ERROR noise from ``_emit_streaming_skipped``
-        for body-read failures. The fix derives a stable fingerprint
-        from the LangChain run_id + invocation_params + response id
-        so the dedup LRU can collapse these emissions.
+        Attaches a stable ``_fingerprint`` derived from the
+        LangChain run_id + invocation_params + response id so the
+        runtime dedup LRU collapses sibling emissions between the
+        LangChain callback and the httpx transport hook.
         """
         try:
             # Extract provider/model from invocation params first, then
@@ -978,24 +960,9 @@ def _extract_model_from_response(response: Any) -> str | None:
     """Best-effort model extraction mirroring ``_get_finish_reason``.
 
     Returns the first non-empty value found, or ``None`` if every known
-    source is empty / malformed.
-
-    Audit 2026-06-29 (SDK↔backend wire: silent zero-billing): the chain
-    was checked top-to-bottom and silently returned ``None`` whenever
-    none of the four known locations carried the model. The backend
-    then ``unwrap_or("default")``'d to ``DEFAULT_RATE`` and every call
-    was recorded as ≈$0. We now:
-
-      - promote ``response.llm_output['model_name']`` (the location
-        langchain-openai 1.x uses for the date-suffixed model id
-        ``gpt-4.1-mini-2025-04-14``) to step 1, ahead of the
-        ``response_metadata`` step that langchain 0.x used
-      - add ``response.llm_output['model']`` and a generic
-        "any key containing 'model'" sweep so non-OpenAI wrappers
-        (proxies, custom chat models) still get attributed
-      - log a DEBUG line on the None path so an operator who sees
-        the wire warning in the backend can correlate it to the
-        observation site that produced the event.
+    source is empty / malformed. A ``None`` return path is logged at
+    DEBUG so an operator who sees a wire warning in the backend can
+    correlate it to the observation site that produced the event.
 
     Sources checked, in order:
 

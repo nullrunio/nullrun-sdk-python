@@ -273,9 +273,9 @@ def init(
     raw_key = api_key if api_key is not None else os.getenv("NULLRUN_API_KEY")
     resolved_key = raw_key.strip() if isinstance(raw_key, str) else None
     if not resolved_key:
-        # Layer 1: raise the legacy type (``NullRunAuthenticationError``)
-        # so user code with ``except NullRunAuthenticationError:`` still
-        # catches this case, but stamp the structured ``error_code`` /
+        # Layer 1: raise ``NullRunAuthenticationError`` so user code
+        # with ``except NullRunAuthenticationError:`` still catches
+        # this case, but stamp the structured ``error_code`` /
         # ``user_action`` so a Layer-2 on_error hook (or a
         # ``except NullRunError:`` clause) can branch on the catalog
         # value ``NR-C001`` ("configuration: no api_key") without
@@ -491,11 +491,9 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "NullRunWorkflowKilledError": ("nullrun.breaker.exceptions", "NullRunWorkflowKilledError"),
     # Four typed exception classes that round-trip the MCP umbrella
     # codes (ADR-013, frozen-dormant) and the six APPROVAL_DB_*
-    # sibling codes (DEF-ARFLOW-TOOLNAME-01). Pre-B.1 these all
-    # collapsed to NullRunBlockedException + the generic NR-X001
-    # fallback — cookbook code couldn't branch on the typed arm.
-    # Post-B.1 each maps to its own typed class so
-    # ``except NullRunMcpDestructiveBlockedError:`` etc. work.
+    # sibling codes (DEF-ARFLOW-TOOLNAME-01). Each maps to its own
+    # typed class so ``except
+    # NullRunMcpDestructiveBlockedError:`` etc. work.
     "NullRunMcpDestructiveBlockedError": ("nullrun.breaker.exceptions", "NullRunMcpDestructiveBlockedError"),
     "NullRunMcpReadonlyBypassBlockedError": ("nullrun.breaker.exceptions", "NullRunMcpReadonlyBypassBlockedError"),
     "NullRunMcpApprovalRequiredError": ("nullrun.breaker.exceptions", "NullRunMcpApprovalRequiredError"),

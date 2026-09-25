@@ -11,9 +11,9 @@ Post-Layer-2: every structured SDK failure fires every registered
 hook BEFORE the exception propagates. The hook sees the same
 ``NullRunError`` and an ``ErrorContext`` describing where in the
 lifecycle the error happened. Multiple hooks are supported. Hook
-exceptions are caught and logged at DEBUG (design discussion
-2026-06-24 — visible when DEBUG logging is on, silent at
-INFO/CRITICAL so a misbehaving hook does not break production).
+exceptions are caught and logged at DEBUG — visible when DEBUG
+logging is on, silent at INFO/CRITICAL so a misbehaving hook does
+not break production.
 
 What does NOT fire the hook:
 
@@ -53,7 +53,7 @@ logger = logging.getLogger(__name__)
 # policy_fetch — GET /api/v1/orgs/{org}/policies
 # execute — POST /api/v1/execute (gate decision)
 # track — POST /api/v1/track (event ingest)
-# gate — POST /api/v1/gate (legacy pre-flight)
+# gate — POST /api/v1/gate (pre-flight)
 # check — POST /api/v1/check (budget pre-flight)
 # org_status — get_org_status
 # ws — WebSocket control-plane message handling
@@ -197,13 +197,12 @@ def emit_error(err: Any, ctx: ErrorContext) -> None:
 
     Called from raise sites in the SDK immediately BEFORE the
     ``raise`` statement, so the hook sees the fully-constructed
-    exception while the call stack is still live (design
-    decision C, 2026-06-24).
+    exception while the call stack is still live.
 
-    Hook exceptions are caught and logged at DEBUG (design
-    decision 2026-06-24: silent at INFO/CRITICAL so a
-    misbehaving hook does not break production, visible when
-    DEBUG logging is on so debugging the hook itself is easy).
+    Hook exceptions are caught and logged at DEBUG — silent at
+    INFO/CRITICAL so a misbehaving hook does not break production,
+    visible when DEBUG logging is on so debugging the hook itself
+    is easy.
 
     Snapshot the hook list under the lock so a concurrent
     unregister during dispatch does not mutate the iteration.
