@@ -35,7 +35,6 @@ from nullrun.breaker.exceptions import (
     NullRunConfigError,
     NullRunError,
     NullRunToolBlockedError,
-    WorkflowKilledException,
     WorkflowKilledInterrupt,
     WorkflowPausedException,
 )
@@ -297,13 +296,25 @@ class TestKillBypass:
         assert captured == [], "WorkflowKilledInterrupt must NOT trigger on_error hooks"
 
     def test_killed_exception_does_not_fire_hook(self):
-        # Same bypass applies to the deprecated
-        # WorkflowKilledException (BaseException subclass).
+        # The on_error hook only fires for raises that go through
+        # ``emit_error`` (the SDK's internal raise sites). A direct
+        # ``raise`` in user code never wires through ``emit_error`` —
+        # the hook therefore never fires for ANY exception type,
+        # whether ``WorkflowKilledInterrupt`` (Exception subclass)
+        # or a future BaseException. The semantic the user cares
+        # about: when the SDK kills a workflow, the kill propagates
+        # cleanly without being hijacked by an error-tracking hook.
+        # This test pins that contract for direct raises.
         captured: list[tuple[Any, ErrorContext]] = []
         nullrun.on_error(lambda err, ctx: captured.append((err, ctx)))
-        with pytest.raises(WorkflowKilledException):
-            raise WorkflowKilledException("wf-1", reason="killed")
-        assert captured == []
+        with pytest.raises(WorkflowKilledInterrupt):
+            raise WorkflowKilledInterrupt("wf-1", reason="killed")
+        assert captured == [], (
+            "Hooks only fire for raises that go through emit_error "
+            "(SDK-internal). A bare raise in user code never wires "
+            "through it — kill signals propagate cleanly regardless "
+            "of whether they are BaseException- or Exception-subclass."
+        )
 
     def test_emit_error_skips_baseexception(self):
         # If a BaseException somehow reaches emit_error, the

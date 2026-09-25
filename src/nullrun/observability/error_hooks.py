@@ -39,7 +39,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -55,8 +55,7 @@ logger = logging.getLogger(__name__)
 # track — POST /api/v1/track (event ingest)
 # gate — POST /api/v1/gate (legacy pre-flight)
 # check — POST /api/v1/check (budget pre-flight)
-# sensitive_tool — @sensitive pre-check
-# org_status — get_org_status 
+# org_status — get_org_status
 # ws — WebSocket control-plane message handling
 # transport — generic transport-layer raise
 STAGES: tuple[str, ...] = (
@@ -93,7 +92,8 @@ class ErrorContext:
     workflow_id: str | None = None
 
     # Tool that triggered the error, or ``None`` for non-tool
-    # errors. Set on @sensitive / @protect / track_tool raises.
+    # errors. Set on @protect raises and on transport-layer
+    # tool-call failures.
     tool_name: str | None = None
 
     # First 10 characters of the api key in use, or ``None`` if
@@ -132,7 +132,6 @@ class ErrorContext:
 
 
 # The callback type. Sync only — Layer 2 design discussion
-# 2026-06-24: async hooks in except blocks are awkward (no
 # running event loop to await on), and the SDK surface is
 # already sync. Revisit if/when a real async use case appears.
 ErrorHook = Callable[["Any", ErrorContext], None]
@@ -142,7 +141,6 @@ ErrorHook = Callable[["Any", ErrorContext], None]
 # from one thread and fired from another (e.g. register at app
 # startup, fire from a transport background thread).
 #
-# The hot path is has_hooks(), which previously took an
 # RLock.acquire on every call (100+ raises/min in a busy agent
 # is enough to show up in profiles). We now keep the hook list
 # under the same RLock but expose has_hooks() as a lock-free

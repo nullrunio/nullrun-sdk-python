@@ -210,71 +210,38 @@ def test_track_tool_is_retry_flag(capturing_runtime):
 
 
 # ──────────────────────────────────────────────────────────────
-# Module-level track_llm / track_tool
-# ──────────────────────────────────────────────────────────────
-
-
-def test_module_level_track_llm_attaches_span(capturing_runtime, monkeypatch):
-    """The module-level `nullrun.track_llm` should also pick up the
-    active span — it forwards to the runtime method, which is where
-    the span attachment lives."""
-    from nullrun import runtime as runtime_mod
-
-    # Replace the runtime getter with our capturing wrapper so module-
-    # level calls land in the same buffer as the method-level ones.
-    monkeypatch.setattr(runtime_mod, "get_runtime", lambda: capturing_runtime.runtime)
-
-    span = create_root_span()
-    token = set_span(span)
-    try:
-        runtime_mod.track_llm(input_tokens=7, output_tokens=3)
-    finally:
-        reset_span(token)
-
-    event = capturing_runtime.events[0]
-    assert event["trace_id"] == span.trace_id
-    assert event["span_id"] == span.span_id
-
-
-def test_module_level_track_llm_output_tokens_optional(mock_api):
-    """Calling `nullrun.track_llm(input_tokens=N)` with no output_tokens
-    must not TypeError — the kwarg now defaults to 0.
-
-    Depends on `mock_api` so respx covers `/track/batch`. We also call
-    `nullrun.init(...)` so whatever singleton the module-level
-    `track_llm` resolves points at the mocked URL — without this, a
-    stale singleton from a previous test (or a fresh one built from
-    env defaults) targets the prod URL and respx raises
-    AllMockedAssertionError."""
-    import nullrun
-    from tests.conftest import BASE_URL
-
-    nullrun.init(api_key="test-key-12345678", api_url=BASE_URL)
-    nullrun.track_llm(input_tokens=42)  # smoke test — no exception
-
-
-# ──────────────────────────────────────────────────────────────
 # End-to-end with @protect
 # ──────────────────────────────────────────────────────────────
 
 
-def test_protect_then_track_llm_attaches_to_protect_span(capturing_runtime, monkeypatch):
-    """The integration story: @protect opens a span, a track_llm
-    inside it inherits that span — no manual plumbing needed."""
+def test_protect_then_track_llm_attaches_to_protect_span(capturing_runtime):
+    """The integration story: @protect opens a span, an LLM-call
+    event inside it inherits that span — no manual plumbing needed.
+
+    In 0.18.2 ``@protect`` is the only public entry point for user
+    code; the module-level ``nullrun.track_llm`` was removed because
+    every observable side-effect (LLM call, tool call, etc.) is now
+    a child span under ``@protect``. Auto-instrumentation
+    (``nullrun.instrumentation.auto``) calls the runtime instance
+    method directly when it ships an LLM event, so we exercise the
+    same code path here."""
     import nullrun
     import nullrun.decorators as dec
-    from nullrun import runtime as runtime_mod
     from nullrun.decorators import reset as reset_decorator_runtime
 
-    # Wire both: the @protect emit path (uses dec._runtime) AND the
-    # module-level nullrun.track_llm path (uses runtime_mod.get_runtime).
+    # Wire the @protect emit path so the capturing runtime observes
+    # span_start / span_end + the inner LLM call.
     dec._runtime = capturing_runtime.runtime
-    monkeypatch.setattr(runtime_mod, "get_runtime", lambda: capturing_runtime.runtime)
     try:
 
         @nullrun.protect
         def agent(q):
-            nullrun.track_llm(input_tokens=20, output_tokens=10, model="gpt-4o")
+            # In production this would be the auto-instrumented
+            # httpx call into the LLM SDK — the patcher reaches the
+            # runtime via the same instance method.
+            capturing_runtime.runtime.track_llm(
+                input_tokens=20, output_tokens=10, model="gpt-4o",
+            )
             return "ok"
 
         agent("hi")

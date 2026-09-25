@@ -349,9 +349,8 @@ class TestUnknownActionTypeFailOpen:
 # ─── actions context + init ────────────────────────────────────
 """
 Branch-coverage tests for ``nullrun.actions``, ``nullrun.context``
-``nullrun.__init__``, and the WorkflowKilledException deprecation
-warning. Together these close the last 1-2 % lines that no other
-test file exercises.
+``nullrun.__init__``. Together these close the last 1-2 % lines that
+no other test file exercises.
 """
 
 import threading
@@ -364,7 +363,6 @@ from nullrun.actions import (
     ActionEvent,
 )
 from nullrun.breaker.exceptions import (
-    WorkflowKilledException,
     WorkflowKilledInterrupt,
 )
 
@@ -802,11 +800,27 @@ def test_init_lazy_export_loads_attribute():
 
 
 def test_dir_lists_only_curated_surface():
-    """``dir(nullrun)`` shows only the 6 curated names + __version__."""
+    """``dir(nullrun)`` shows the curated surface + __version__.
+
+    0.18.2: the curated surface shrunk to ``init`` + ``protect`` for
+    user-facing communication. ``track_llm`` / ``track_tool`` /
+    ``track_event`` were removed because ``@protect`` is the only
+    universal entry point — every observable call (tool, LLM, etc.)
+    goes through it. Runtime lifecycle helpers (``shutdown``,
+    ``on_error``, ``status``) and structured exception classes stay
+    visible because they're part of the "give the user a chance"
+    surface (cookbook code branches on them by name)."""
     public = dir(nullrun)
-    # The 6 curated names are explicitly listed.
-    for name in ("init", "protect", "track_llm", "track_tool", "track_event"):
-        assert name in public
+    # The 2 curated user-facing names are explicitly listed.
+    assert "init" in public
+    assert "protect" in public
+    # track_* are no longer in the curated surface — they're
+    # internal runtime methods now (instrumentation uses them).
+    for name in ("track_llm", "track_tool", "track_event", "track"):
+        assert name not in public, (
+            f"{name!r} is back in dir(nullrun) — it should be removed "
+            f"from the curated surface; @protect is the only user entry."
+        )
     # Lazy exports are NOT in dir until first access.
     assert "SpanContext" not in public
     assert "NullRunRuntime" not in public
@@ -818,22 +832,12 @@ def test_init_module_has_all_attribute():
     assert "protect" in nullrun.__all__
 
 
-# ─── WorkflowKilledException deprecation warning ─────────────────────
-
-
-def test_workflow_killed_exception_emits_deprecation_warning():
-    """Constructing the deprecated ``WorkflowKilledException`` triggers
-    a ``DeprecationWarning``.
-    """
-    with warnings.catch_warnings(record=True) as w:
-        warnings.simplefilter("always")
-        WorkflowKilledException(workflow_id="wf-1", reason="x")
-    assert any(issubclass(item.category, DeprecationWarning) for item in w)
+# ─── WorkflowKilledInterrupt (canonical kill signal) ────────────────
 
 
 def test_workflow_killed_interrupt_does_not_emit_warning():
     """Constructing the canonical ``WorkflowKilledInterrupt`` does NOT
-    emit a deprecation warning (the deprecation is on the parent name).
+    emit a deprecation warning.
     """
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
@@ -858,25 +862,3 @@ def test_workflow_killed_interrupt_is_catchable_by_exception():
     assert len(caught) == 1, "Exception should catch WorkflowKilledInterrupt (post-migration)"
     assert isinstance(caught[0], WorkflowKilledInterrupt)
     assert caught[0].error_code == "NR-W002"
-
-
-def test_workflow_killed_interrupt_not_caught_by_except_killed_exception():
-    """2026-09-08 BREAK: legacy ``except WorkflowKilledException``
-    no longer catches the new interrupt (WorkflowKilledInterrupt is
-    no longer a BaseException subclass). Cookbook code must migrate
-    to ``except WorkflowKilledInterrupt`` (canonical) or
-    ``except NullRunWorkflowKilledError`` (preferred typed name).
-    """
-    raised = False
-    try:
-        raise WorkflowKilledInterrupt(workflow_id="wf-1", reason="x")
-    except WorkflowKilledException:
-        pytest.fail(
-            "except WorkflowKilledException should NOT catch the new "
-            "interrupt (2026-09-08 BREAK — migrate to except "
-            "WorkflowKilledInterrupt or except NullRunWorkflowKilledError)"
-        )
-    except WorkflowKilledInterrupt:
-        raised = True
-
-    assert raised, "the new interrupt should propagate through except WorkflowKilledException"

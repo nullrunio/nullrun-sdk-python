@@ -36,7 +36,7 @@ if TYPE_CHECKING:
     # Imported under ``TYPE_CHECKING`` so this module stays importable
     # without pulling in the exception hierarchy (which itself depends
     # on transport / runtime modules).
-    from nullrun.breaker.exceptions import NullRunError
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +107,6 @@ DEFAULT_MESSAGES: dict[str, str] = {
     #   2. Client-side timeout path — WS push went silent for
     #      ``approval_timeout_seconds`` without an operator decision.
     # Cookbook pattern: do NOT retry the same approval_id; request a
-    # fresh row and re-/gate. Pre-fix (2026-09-08), the catalog was
     # missing NR-A012 entirely, so ``format_user_message`` fell
     # through to ``FALLBACK_MESSAGE = "Something went wrong. Please
     # try again."`` — exactly what
@@ -145,7 +144,6 @@ DEFAULT_MESSAGES: dict[str, str] = {
     # the next /gate will mint a fresh reservation against the current
     # available budget.
     "NR-B006": "Your request couldn't be completed because the available capacity changed. Please try again.",
-    # NR-B007: removed 2026-09-10. NullRunBudgetThrottleError was a
     # zombie class — never raised on a wire or runtime path
     # (runtime.py:2116 raises WorkflowPausedException on
     # decision=="throttle"). Catalog entry removed to keep
@@ -156,7 +154,6 @@ DEFAULT_MESSAGES: dict[str, str] = {
     # copy is generic because the cause is operator-side accounting;
     # user should retry (a fresh /gate will recompute the reservation).
     "NR-O001": "Your request couldn't be completed due to a usage accounting discrepancy. Please try again.",
-    # ── B.1 (2026-09-10): MCP umbrella + APPROVAL_DB typed arms.
     # Three MCP umbrella codes (ADR-013, frozen-dormant) and the
     # single NR-A016 typed class for the six APPROVAL_DB_* sibling
     # codes. NR-A016 wording is intentionally close to the generic
@@ -274,7 +271,7 @@ def get_user_message(code: str) -> str:
     return DEFAULT_MESSAGES.get(code, FALLBACK_MESSAGE)
 
 
-def format_user_message(exc: BaseException | object, locale: str = "en") -> str:
+def format_user_message(exc: BaseException | object) -> str:
     """Render a NullRun exception as a user-facing string.
 
     This is the function host code should call when it wants to show
@@ -285,9 +282,6 @@ def format_user_message(exc: BaseException | object, locale: str = "en") -> str:
 
     Args:
         exc: A NullRun exception (or any object exposing ``error_code``).
-        locale: DEPRECATED — reserved for a future locale-pack release. Currently ignored; the catalog is English-only.
-            non-``"en"`` value falls back to the English message. The
-            parameter is reserved for future locale packs.
 
     Returns:
         User-facing string. Always non-empty and safe to display.

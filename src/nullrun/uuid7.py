@@ -59,7 +59,6 @@ def uuid7() -> uuid.UUID:
     rand_bytes = secrets.token_bytes(10)
     # Build the 16-byte payload as a bytearray so the version /
     # variant nibbles can be stamped in place. `bytes` itself does
-    # not support indexed assignment (the pre-fix code reassigned
     # `field = bytearray(field)` first to make `field[6] = ...`
     # work, then fed the bytearray back into `uuid.UUID(bytes=...)`
     # — a TypeError-free round-trip but with two extra copies of

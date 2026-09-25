@@ -78,7 +78,6 @@ class CircuitBreaker:
         self._half_open_calls = 0
         self._half_open_start: float | None = None  # Track half-open entry time
         self._lock = threading.Lock()
-        # DEF-CB-LOCK-UNIFICATION-2026-09-12: removed `_async_lock`.
         # Pre-fix the sync path held `self._lock` and the async path
         # held a separate `asyncio.Lock`, so a sync thread and an
         # async coroutine calling `breaker.call()` concurrently on
@@ -264,7 +263,6 @@ class CircuitBreaker:
     def call(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         """Execute func through circuit breaker. Supports both sync and async functions.
 
- #35: the pre-fix code did the OPEN→HALF_OPEN jitter
         via ``time.sleep`` here, BEFORE dispatching to
         ``_call_sync`` / ``_call_async``. That meant an async
         caller invoking ``breaker.call(async_func,...)`` from

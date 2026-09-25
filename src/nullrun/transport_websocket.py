@@ -7,13 +7,11 @@ when workflow state changes (KILL/PAUSE).
 """
 
 import asyncio
-import hashlib
-import hmac
 import json
 import logging
 import time
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 # CP7 fix: outgoing ACK is now HMAC-signed using the same
 # ``generate_hmac_signature`` helper the HTTP transport uses for
@@ -55,7 +53,6 @@ _MAX_RECONNECT_ATTEMPTS = 10
 # field NAME but disagree on the VALUE: HTTP carries the user-facing
 # ``nr_live_...`` string, WS carries the internal UUID from
 # ``auth_context.key_id ``. Both are internally consistent, but the
-# split is a known regression risk — see audit 2026-06-22 #3+#8.
 WS_HMAC_IDENTITY_FIELD = "api_key"
 
 
@@ -171,7 +168,6 @@ class WebSocketConnection:
         ``finally`` block when the connection drops. This loop waits
         while the receive loop is healthy and reconnects on demand.
 
-        Without the ``continue`` branch, the pre-fix code exited after
         the very first successful ``_connect `` because the
         ``if not self._running`` guard became False the moment
         ``_connect `` set ``_running = True``. That broke the control
@@ -519,7 +515,6 @@ class WebSocketConnection:
                 logger.info(
                     f"Approval {outcome}: id={approval_id} exec={execution_id} wf={workflow_id}"
                 )
-                # L5 / audit 2026-08-12: HMAC-signed ACK for
                 # ``approval_resolved``. Mirrors the Killed/Paused
                 # ACK path at _send_ack. Pre-fix the SDK silently
                 # consumed the frame and never acknowledged — the
@@ -591,7 +586,6 @@ class WebSocketConnection:
                 # CP4 fix: unknown msg_type. Previously this fell
                 # through the entire if/elif chain with no else
                 # so a new WsMessage variant added by the backend
-                # would be silently dropped. The user would only
                 # find out when a control-plane feature stopped
                 # working. Now we log at WARNING with enough
                 # context to debug forward-compat drift.
@@ -653,7 +647,6 @@ class WebSocketConnection:
 
         # Check if this state requires acknowledgment
         #
-        # Audit-2026-06-22 case-defensive: the HTTP-poll path
         # (`runtime.py`) lowercases before comparing so it survives a
         # server regression to lowercase states. The WS path used to
         # exact-match only. Without this fallback, a server regression
@@ -661,7 +654,6 @@ class WebSocketConnection:
         # PascalCase as the happy path, but does not pin what happens
         # if the server emits ``"killed"``).
         #
-        # ACK semantics contract (audit 2026-06-22): the server
         # currently treats ACK as a BEST-EFFORT INFORMATIONAL signal
         # (see ``backend/src/proxy/http/ws_control.rs`` ACK handler
         # comment for the full contract). Only `Killed`/`Paused` are
@@ -746,7 +738,6 @@ class WebSocketConnection:
 
             # Add HMAC fields when both api_key and secret_key are
             # configured. Without secret_key we still send the
-            # plain envelope (matches the pre-fix behaviour for
             # legacy api_keys that don't use HMAC). The backend
             # skips verify when signature is absent.
             if self.api_key and self.secret_key:

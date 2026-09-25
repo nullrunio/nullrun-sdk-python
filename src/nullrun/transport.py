@@ -16,7 +16,6 @@ import threading
 import time
 import uuid
 import weakref
-from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
@@ -69,7 +68,6 @@ __api_version__ = "1.0"
 # `X-NULLRUN-PROTOCOL: <n>` with 400. Bump must be coordinated with backend
 # `proxy::http::gate::protocol` and `/api/v1/capabilities`.
 #
-# v4 (2026-08-31, ADR-037 Slice B): ADDITIVE — /gate response now echoes
 # the SDK-supplied `action_digest` and a `policy_hash` slot (always None
 # today; Slice D wires per-request computation). Wire-additive: v3 SDKs
 # parsing the response simply ignore the new fields; v4 SDKs parsing a
@@ -287,13 +285,11 @@ def _retry_with_backoff(
                     )
                     raise err
                 if result.status_code >= 500 and retry_on_5xx and attempt < max_retries:
-                    # NR-006: treat 5xx as transient infra failure and retry.
                     # Convert to HTTPStatusError so the except branch catches
                     # it as a retryable condition. After retry exhaustion
                     # the helper returns the last response (see below).
                     result.raise_for_status()
                 elif result.status_code >= 500 and not retry_on_5xx:
-                    # Pre-NR-006 behaviour: 5xx without ``retry_on_5xx``
                     # raises HTTPStatusError so the caller (e.g.
                     # ``Transport.execute``) can run its fallback logic
                     # after retry exhaustion produces BreakerTransportError.
@@ -306,7 +302,6 @@ def _retry_with_backoff(
                 # returns a synthetic block; /track batch inspects status
                 # directly). Calling ``raise_for_status()`` here would force
                 # every caller into the except path and retry a permanent
-                # error — the audit's NR-006 PIN 3 pins this non-retry
                 # contract.
 
             return result
@@ -362,7 +357,6 @@ def _retry_with_backoff(
 
             time.sleep(actual_delay)
 
-    # Retry exhaustion. NR-006 path: if the caller opted into
     # ``retry_on_5xx`` and the failure mode was 5xx, return the
     # last response so the caller can synthesize a fallback
     # (e.g. ``Transport.check`` returns the legacy synthetic-block
@@ -392,7 +386,6 @@ class FallbackMode:
     block agent execution, but behavior must be defined and logged.
     """
 
-    # Block if Gateway unavailable. v3.53 audit #4 — DEFAULT for
     # ``Transport.execute()`` and ``ExecuteConfig.fallback_mode``.
     # Per CLAUDE.md §4 "DEFAULT: fail-CLOSED для всех enforcement
     # путей", the /execute enforcement path must not silently allow
@@ -434,12 +427,9 @@ class FlushConfig:
 class ExecuteConfig:
     """Configuration for execute (strict mode) behavior."""
 
-    # Fallback mode when Gateway is unavailable. v3.53 audit #4 —
-    # default is STRICT (fail-CLOSED on enforcement) per CLAUDE.md §4.
-    # Pre-v3.53 the default was PERMISSIVE which silently allowed
-    # local execution on transport failure; that was fail-OPEN on the
-    # primary enforcement path (Transport.execute → /api/v1/execute).
-    fallback_mode: str = FallbackMode.STRICT
+    # Fallback mode when Gateway is unavailable. Default is STRICT
+    # (fail-CLOSED on enforcement) per CLAUDE.md §4.
+    fallback_mode: FallbackMode = FallbackMode.STRICT
     # Gateway timeout in seconds
     timeout: float = 5.0
     # Max retries for execute calls
@@ -657,7 +647,6 @@ class Transport:
         try:
             with open(tmp_path, "a") as f:
                 for event in self._buffer:
-                    # 2026-07-24 (Decimal serialization): same default=str as
                     f.write(json.dumps(event, default=str) + "\n")
                 f.flush()
                 os.fsync(f.fileno())
@@ -1104,7 +1093,6 @@ class Transport:
         tool: str,
         input_data: dict[str, Any],
         mode: str = "auto",
-        # v3.53 audit #4 — default flipped from PERMISSIVE to STRICT
         # to match CLAUDE.md §4 ("DEFAULT: fail-CLOSED для всех
         # enforcement путей"). /execute is the primary enforcement
         # point (see docstring) — when the gateway is unreachable the
@@ -1112,11 +1100,12 @@ class Transport:
         # intentionally want fail-OPEN on this path (dev / test
         # harnesses without a live engine) must opt in by passing
         # ``fallback_mode=FallbackMode.PERMISSIVE`` explicitly.
-        fallback_mode: str = FallbackMode.STRICT,
+        fallback_mode: FallbackMode = FallbackMode.STRICT,
         operation_id: str | None = None,
         approval_id: str | None = None,
-        # Typed-impact + digest-bound approval. Forwarded when @sensitive(impact=...)
-        # built them so the backend can stamp the approval row with the digest.
+        # Typed-impact + digest-bound approval. Forwarded when the
+        # gate built them so the backend can stamp the approval row
+        # with the digest.
         business_impact: dict[str, Any] | None = None,
         action_digest: str | None = None,
         # Tool-call argument bag forwarded on /execute so the gate can compute
@@ -1128,8 +1117,7 @@ class Transport:
         # aggregate. Without this, TB-1 fails closed with `no_tools_field`
         # whenever the workflow has an active `policy.tool_patterns` block.
         # Populated by `runtime.execute` from the `get_call_tools()` contextvar
-        # when the caller invoked `set_call_context(tools=...)` (or the
-        # `_enforce_sensitive_tool` decorator did so on their behalf).
+        # when the caller invoked `set_call_context(tools=...)`.
         tools: tuple[str, ...] | None = None,
         on_transport_error: Callable[[Exception], dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
@@ -1150,9 +1138,7 @@ class Transport:
         method's caller is the single source of truth for
         ``execution_id`` selection.
 
-        Prior to DEF-SDKK-022 the comment here claimed "/execute MUST
         be called rather than /gate" — that contract was the legacy
-        pre-2026-09-04 shape. The post-fix shape is "/execute MUST be
         preceded by /gate for the same execution_id" — the budget
         pre-flight (Transport.check, /api/v1/gate) is the binding
         registrar; /execute is the policy decision that re-uses it.
@@ -1164,13 +1150,14 @@ class Transport:
             tool: Tool to execute
             input_data: Tool input
             mode: Execution mode ("auto", "inline", "strict")
-            fallback_mode: What to do if Gateway unavailable
+            fallback_mode: :class:`FallbackMode` enum (STRICT or
+                PERMISSIVE). Default STRICT (fail-CLOSED on transport
+                failure per CLAUDE.md §4).
             operation_id: Optional idempotency key
             on_transport_error: Optional callback invoked on BreakerTransportError.
                 When set, the callback's return value is returned verbatim; otherwise
-                the request falls through to fallback_mode. The decorator's
-                _enforce_sensitive_tool sets this to convert the error into a
-                NullRunBlockedException (fail-CLOSED).
+                the request falls through to fallback_mode. The gate sets this
+                to convert the error into a NullRunBlockedException (fail-CLOSED).
 
         Returns:
             Dict with:
@@ -1234,7 +1221,6 @@ class Transport:
             elif response.status_code >= 400:
                 # 4xx — don't retry.
                 #
-                # 2026-09-10 (NR-SDK-A015-SURFACE): before the fix,
                 # this branch dropped the wire envelope on the floor
                 # and synthesised a generic ``{"decision": "block",
                 # "explanation": "Gateway returned 409"}`` dict. That
@@ -1260,8 +1246,8 @@ class Transport:
                 # `APPROVAL_REPLAY_REJECTED` → NR-A015 / ``
                 # NullRunApprovalReplayRejectedError``) — and raise
                 # the typed exception so the @protect /
-                # @sensitive / runtime.execute() exception arms
-                # propagate the right class up to the caller.
+                # runtime.execute() exception arms propagate the
+                # right class up to the caller.
                 #
                 # Fall through to the synthetic block shape if the
                 # envelope is unrecognised (plaintext body, malformed
@@ -1271,7 +1257,7 @@ class Transport:
                 # Exception — it never silently swallows a 4xx.
                 try:
                     raise _parse_v3_error_envelope(response, "execute")
-                except NullRunApprovalReplayRejectedError as exc:
+                except NullRunApprovalReplayRejectedError:
                     # The exact case the user reported: the operator
                     # approved, the SDK polled /execute again, and
                     # the backend's atomic consume_approved UPDATE
@@ -1284,32 +1270,31 @@ class Transport:
                     # instead of the fallback.
                     metrics.inc_transport("execute_block_replay_rejected")
                     raise
-                except NullRunBlockedException as exc:
+                except NullRunBlockedException:
                     # All other typed blocks from the dispatch —
                     # budget, rate, tool, approval-deny, etc.
                     # Re-raise for the @protect / runtime.execute
                     # arms to handle.
                     metrics.inc_transport("execute_block_typed")
                     raise
-                except NullRunBackendError as exc:
+                except NullRunBackendError:
                     # 5xx-classified envelope parsed as a typed
                     # backend error (shouldn't normally land here
                     # because the helper maps 5xx to GATEWAY_ERROR
                     # via NullRunTransportError, but stays
                     # defensive). Re-raise.
                     raise
-                except NullRunAuthenticationError as exc:
+                except NullRunAuthenticationError:
                     # 401 envelope parsed as auth error — surface
                     # directly so the caller can react.
                     raise
-                except NullRunTransportError as exc:
+                except NullRunTransportError:
                     # Transport-classified (network, breaker) — not
                     # a real 4xx, but helper may return one if the
                     # envelope shape is ambiguous. Re-raise so the
                     # on_transport_error arm sees it.
                     raise
-                except NullRunDecision as exc:
-                    # DEF-NR-TRANSPORT-CATCHFANIN-GAP (2026-09-10):
+                except NullRunDecision:
                     # umbrella pass-through for typed Decision
                     # subclasses NOT in the NullRunBlockedException
                     # MRO. Specifically:
@@ -1338,8 +1323,7 @@ class Transport:
                     # matches by MRO specificity.
                     metrics.inc_transport("execute_block_decision_typed")
                     raise
-                except NullRunInfrastructureError as exc:
-                    # DEF-NR-TRANSPORT-CATCHFANIN-GAP (2026-09-10):
+                except NullRunInfrastructureError:
                     # umbrella pass-through for typed
                     # Infrastructure subclasses NOT in the
                     # NullRunBackendError / NullRunAuthenticationError /
@@ -1426,7 +1410,7 @@ class Transport:
 
         # All attempts failed - apply fallback mode.
         metrics.inc_transport("fallback_mode_activations")
-        if fallback_mode == FallbackMode.STRICT:
+        if fallback_mode == FallbackMode.STRICT:  # type: ignore[comparison-overlap]
             return {
                 "decision": "block",
                 "decision_source": DecisionSource.FALLBACK,
@@ -1434,11 +1418,11 @@ class Transport:
                 "policy_version": 0,
             }
         else:  # PERMISSIVE (opt-in)
-            # v3.53 audit #4 — PERMISSIVE no longer the default; it
-            # requires the caller to pass fallback_mode=FallbackMode.
-            # PERMISSIVE explicitly. Synthesizes an allow + decision_
-            # source=FALLBACK so the caller / @sensitive decorator can
-            # still observe that the engine was unreachable.
+            # Default is STRICT (fail-CLOSED); PERMISSIVE requires the
+            # caller to pass ``fallback_mode=FallbackMode.PERMISSIVE``
+            # explicitly. Synthesizes an allow + decision_source=FALLBACK
+            # so the caller / @protect decorator can still observe that
+            # the engine was unreachable.
             return {
                 "decision": "allow",
                 "decision_source": DecisionSource.FALLBACK,
@@ -1511,7 +1495,6 @@ class Transport:
         # v0.16.1 (Phase-1+ wire-shape fix): runtime.check_workflow_budget
         # always sets `action_digest` so the gate's
         # `if req.action_digest.is_none()` version-gate passes
-        # (`backend/src/proxy/http/gate/gate.rs:56`, ADR-023 P1-6).
         # Pre-v0.16.1 / Phase-0 callers can still omit it (forwarded
         # only when truthy) without triggering a "field present
         # but None" wire-shape drift.
@@ -1521,24 +1504,21 @@ class Transport:
         # the gate can hash it via `signature::compute_schema_hash`
         # and write the fingerprint into `mcp_tool_signatures`.
         # Legacy SDKs never set this; the backend's gate falls
-        # back to `tool_params` when the field is missing, so
-        # legacy callers do not regress. The shape is
+        # back to a derived signature when the field is missing,
+        # so legacy callers do not regress. The shape is
         # `Optional[dict[str, Any]]` -- the backend
         # canonicalises the JSON before hashing, so field
         # ordering inside the dict does not affect the
         # fingerprint.
         if "tool_arguments" in check_request and check_request["tool_arguments"] is not None:
             gate_request["tool_arguments"] = check_request["tool_arguments"]
-        # Execution Graph v0 (2026-08-06, backend): additive
         _parent_execution_id = check_request.get("parent_execution_id", parent_execution_id)
         if _parent_execution_id is not None:
             gate_request["parent_execution_id"] = _parent_execution_id
 
-        # 2026-07-02 (v0.11.0 refactor): route through the canonical
         body = _signed_request_body(gate_request)
         headers = self._build_signed_headers(body=body)
 
-        # NR-006 (audit 2026-08-24): wrap the gate POST in
         # ``_retry_with_backoff`` with ``retry_on_5xx=True`` and
         # ``max_retries=3`` (per audit recommendation: "less than
         # 10 — /gate is critical and too many retries amplify
@@ -1572,25 +1552,18 @@ class Transport:
                 return response.json()  # type: ignore[no-any-return]
             # 4xx is a REAL gate decision — surface it through the
             # existing block / throttle / soft_pass dispatch in
-            # runtime.check_workflow_budget (lines ~2089-2150).
-            # Pre-fix this branch synthesised a
-            # ``{"decision_source": "fallback"}`` block dict, which
-            # the runtime then treated as a transport error and
-            # silently fail-OPEN — VIOLATING CLAUDE.md §4
-            # fail-CLOSED invariant. Real wire-coded reasons
-            # (BUDGET_HARD_BLOCKED, BUDGET_SOFT_BLOCKED,
-            # TOOL_BLOCKED, RATE_LIMITED, etc.) were all dropped on
-            # the floor.
+            # runtime.check_workflow_budget. The runtime's
+            # ``decision_source != fallback`` check honours the wire
+            # decision and raises ``NullRunBudgetError`` via its
+            # existing ``decision=="block"`` arm. The wire
+            # ``error_code`` / ``explanation`` / ``policy_id`` /
+            # ``details`` are preserved so the catalogue formatter
+            # can produce an actionable message.
             #
-            # 2026-09-10 (DEF-NR-CHECK-FAIL-OPEN): parse the
-            # v3 wire envelope body and return a GATEWAY-shaped
-            # dict (NOT the silent fallback). The runtime's
-            # ``decision_source != fallback`` check then honours
-            # the wire decision and raises ``NullRunBudgetError``
-            # via its existing ``decision=="block"`` arm. The
-            # wire ``error_code`` / ``explanation`` /
-            # ``policy_id`` / ``details`` are preserved so the
-            # catalogue formatter can produce an actionable message.
+            # DEF-NR-TOOLBLOCKED-PARSER: the dedicated parser
+            # branch below translates the typed v3 envelope into a
+            # `NullRunToolBlockedError` (catalog code NR-T001)
+            # instead of the generic NR-X001 fallback.
             if 400 <= response.status_code < 500:
                 try:
                     wire_body = response.json()
@@ -1645,7 +1618,6 @@ class Transport:
                 "suggestions": ["Check API availability"],
             }
         except httpx.RequestError as e:
-            # NR-006: ``_retry_with_backoff`` re-raises network errors
             # after retry exhaustion as ``BreakerTransportError``, but
             # ``httpx.RequestError`` can still surface when the helper
             # raises mid-loop on a non-retryable path (e.g. caller
@@ -1669,7 +1641,6 @@ class Transport:
                 "suggestions": ["Check API availability"],
             }
         except BreakerTransportError as e:
-            # NR-006: the helper exhausted the retry budget on network
             # errors and re-raised as ``BreakerTransportError``. Apply
             # the same translation rule as ``httpx.RequestError``
             # above so the legacy ``on_transport_error`` opt-in
@@ -1801,7 +1772,6 @@ class Transport:
             response = self._client.post(
                 # P0 #5: contract drift — other auth-verify call sites
                 # in this file use `/api/v1/auth/verify` (see runtime.py:599).
-                # Align this rotation call site to the same v1 prefix so the
                 # contract-drift-guard CI catches future divergence.
                 f"{self.api_url}/api/v1/auth/verify",
                 content=body,
@@ -1881,7 +1851,6 @@ class Transport:
             NullRunBackendError: 5xx / BUDGET_DATA_UNAVAILABLE /
                 RATE_LIMIT_REDIS_UNAVAILABLE.
         """
-        # 2026-07-04 (B1): /api/v1/check returns 410 Gone.
         return self.check(request, on_transport_error=on_transport_error)
 
     def track_single(
@@ -1956,7 +1925,6 @@ class Transport:
                 server-side from the request auth, not supplied by the SDK.
                 The docstring now matches the real wire contract.
         """
-        # 2026-07-06 (bug-fix): the previous shape called
         body = _signed_request_body(request)
         headers = self._build_signed_headers(body=body)
 
@@ -2014,7 +1982,6 @@ class Transport:
         if reason:
             request["reason"] = reason
 
-        # 2026-07-06 (bug-fix): same body-before-headers reorder as
         body = _signed_request_body(request)
         headers = self._build_signed_headers(body=body)
 
@@ -2111,7 +2078,6 @@ class Transport:
                     "chain_id":..., "last_active": ts}``).
         """
         request = {"chain_id": chain_id}
-        # 2026-07-06 (bug-fix): same body-before-headers reorder as
         # track_single above.
         body = _signed_request_body(request)
         headers = self._build_signed_headers(body=body)
@@ -2176,7 +2142,6 @@ class Transport:
                     Parsed JSON dict (typically ``{"decision": "allow"
                     "chain_id":...}``).
         """
-        # DEF-CHAIN-END-ORG-ID (2026-09-11): ``Transport.chain_end`` pre-fix
         # POSTed only ``{chain_id, chain_op, execution_id}`` to /gate. The
         # backend's ``GateRequest`` struct
         # (backend/src/proxy/http/gate/internal.rs:156) marks
@@ -2232,7 +2197,6 @@ class Transport:
             "chain_op": "end",
             "action_digest": _compute_action_digest(_BusinessImpact.no_impact()),
         }
-        # 2026-07-06 (bug-fix): same body-before-headers reorder as
         body = _signed_request_body(request)
         headers = self._build_signed_headers(body=body)
 
@@ -2492,7 +2456,6 @@ class Transport:
     ) -> dict[str, Any]:
         """GET /api/v1/orgs/:org_id/audit-log/export/:job_id/status.
 
-        Polls a previously-enqueued export job. When ``status`` flips
         to ``completed`` the ``file_url`` field carries an S3
         presigned URL (or `/tmp/...` path on dev), and an
         ``error_message`` is set on the ``failed`` transition.
@@ -2541,7 +2504,6 @@ class Transport:
         return headers
 
 
-# 2026-07-02 (v0.11.0): ACTIVE v3 error envelope parser.
 def _extract_error_envelope(
     body: Any,
     raw_text: str,
@@ -2651,7 +2613,6 @@ def _safe_json(response: httpx.Response, endpoint: str) -> Any:
     """Parse a response body as JSON, wrapping parse failures.
 
     DEF-ERRHDL-INVALID-JSON-01 (2026-08-11, RUN_ID 20260811-1): the SDK
-    previously propagated ``json.JSONDecodeError`` unchanged to user
     code, which leaks internal file paths and the raw broken payload
     fragment in tracebacks. This helper wraps the parse failure in
     NullRunTransportError with a stable ``error_code`` so callers can
@@ -2667,12 +2628,6 @@ def _safe_json(response: httpx.Response, endpoint: str) -> Any:
     try:
         return response.json()
     except (json.JSONDecodeError, ValueError) as exc:
-        # Body preview capped at 200 chars; truncated to avoid
-        # flooding logs / exception chain.
-        try:
-            body_preview = (response.text or "")[:200]
-        except Exception:
-            body_preview = "<unreadable>"
         raise NullRunTransportError(
             f"Received malformed JSON from {endpoint} "
             f"(status={response.status_code}): {type(exc).__name__}",
@@ -2710,12 +2665,6 @@ def _parse_v3_error_envelope(
     # would create a cycle. The price is one extra import
     # non-2xx response — irrelevant for the failure path.
     from nullrun.breaker.exceptions import (
-        NullRunApprovalDeniedError,
-        NullRunApprovalDigestMismatchError,
-        NullRunApprovalExpiredError,
-        NullRunApprovalNotYetApprovedError,
-        NullRunApprovalReplayRejectedError,
-        NullRunApprovalToolDigestMismatchError,
         NullRunAuthError,
         NullRunBackendError,
         NullRunBlockedException,
@@ -2723,8 +2672,6 @@ def _parse_v3_error_envelope(
         NullRunBudgetRecheckFailedError,
         NullRunChainError,
         NullRunConsumeOverbudgetError,
-        NullRunDecision,
-        NullRunInfrastructureError,
         NullRunProtocolError,
         NullRunRateLimitRedisError,
         NullRunToolBlockedError,
@@ -2740,7 +2687,6 @@ def _parse_v3_error_envelope(
     if not isinstance(body, dict):
         body = {}
 
-    # Drift §3 (2026-07-06): the wire envelope is NOT one shape.
     backend_code, message, details = _extract_error_envelope(body, response.text)
     retry_after_ms: float | None = body.get("retry_after_ms") if isinstance(body, dict) else None
     # Retry-After header takes precedence over the JSON field when
@@ -2800,7 +2746,6 @@ def _parse_v3_error_envelope(
         )
 
     if backend_code == "BUDGET_RECHECK_FAILED":
-        # H6 / 2026-08-12 audit: dedicated typed dispatch so callers
         # can branch on the post-approval recheck failure (NR-B006)
         # vs a fresh /gate block (NR-B004). The dispatcher surfaces
         # ``current_spend_cents`` / ``budget_cents`` from the wire
@@ -2821,7 +2766,6 @@ def _parse_v3_error_envelope(
         "APPROVAL_TOOL_DIGEST_MISMATCH",
         "APPROVAL_REPLAY_REJECTED",
     ):
-        # v3.53 / 2026-08-13 audit, A-1+A-2 bundle: dedicated typed
         # dispatch so callers can branch on the precise grant-consume
         # outcome. Pre-v3.53 the SDK fell through to the catalog
         # fallback path which called ``catalog(full_message, **details)``
@@ -2881,7 +2825,6 @@ def _parse_v3_error_envelope(
                 status_code=status,
             )
         if catalog is NullRunExecutionNotFoundError:
-            # 2026-09-09 audit: dedicated dispatch so callers can
             # read ``execution_id`` / ``endpoint`` / ``regate_required``
             # off the exception without indexing into ``details``.
             # Mirrors the ``NullRunBackendError`` branch above (the
@@ -2956,7 +2899,6 @@ def _parse_v3_error_envelope(
             catalog is NullRunToolBlockedError
             or catalog is NullRunBlockedException
         ):
-            # DEF-NR-TOOLBLOCKED-PARSER (2026-09-10): NullRunBlockedException
             # subclasses require positional ``workflow_id`` + ``reason``
             # (no defaults), so the generic ``catalog(full_message, ...)``
             # fallback below raises TypeError when given a string for
@@ -3059,8 +3001,6 @@ def _build_v3_error_code_map() -> dict[str, type[Exception]]:
         "BUDGET_OVERDRAFT_EXCEEDED": NullRunBudgetError,
         "BUDGET_PERIOD_NOT_STARTED": NullRunBudgetError,
         # Note: BUDGET_REDIS_UNAVAILABLE and RATE_LIMIT_REDIS_UNAVAILABLE
-        # below are the canonical redis-down codes (post-v3.36 rename);
-        # the legacy ``REDIS_UNAVAILABLE`` slug was removed 2026-09-10
         # because the backend never emits it (it is absent from
         # ``GateErrorCode::all()`` in error_codes.rs). A cookbook that
         # extends this map with the legacy slug risks silently matching
@@ -3070,7 +3010,6 @@ def _build_v3_error_code_map() -> dict[str, type[Exception]]:
         # 403 — chain security + workflow state
         "CHAIN_CROSS_ORG": NullRunChainError,
         "CHAIN_ORG_MISMATCH": NullRunChainError,
-        # 403 — Execution Graph v0 (2026-08-06, backend). Sub-agent
         "PARENT_EXECUTION_NOT_FOUND": NullRunChainError,
         "PARENT_EXECUTION_ORG_MISMATCH": NullRunChainError,
         "PARENT_EXECUTION_KEY_MISMATCH": NullRunChainError,
@@ -3097,7 +3036,6 @@ def _build_v3_error_code_map() -> dict[str, type[Exception]]:
         "RATE_LIMIT_REDIS_UNAVAILABLE": NullRunRateLimitRedisError,
         "BUDGET_DATA_UNAVAILABLE": NullRunBackendError,
         # 402 — approval-create failure family (DEF-ARFLOW-TOOLNAME-01,
-        # B.1 symmetry fix 2026-09-10): six sibling codes all map to
         # the typed ``NullRunApprovalDbUnavailableError`` (NR-A016) so
         # cookbook code can branch on the typed class instead of
         # falling through to the base NullRunBlockedException. Pre-B.1
@@ -3109,7 +3047,6 @@ def _build_v3_error_code_map() -> dict[str, type[Exception]]:
         "APPROVAL_CONFLICT": NullRunApprovalDbUnavailableError,
         "APPROVAL_NOT_FOUND": NullRunApprovalDbUnavailableError,
         "APPROVAL_CREATE_FAILED": NullRunApprovalDbUnavailableError,
-        # 403 — approval grant-consume outcomes (v3.53 / 2026-08-13
         # audit, A-1+A-2 bundle). Distinct from the /gate
         # create-failure family above: these are the seven
         # distinct outcomes that the backend's
@@ -3132,7 +3069,6 @@ def _build_v3_error_code_map() -> dict[str, type[Exception]]:
         "APPROVAL_DIGEST_MISMATCH": NullRunApprovalDigestMismatchError,
         "APPROVAL_TOOL_DIGEST_MISMATCH": NullRunApprovalToolDigestMismatchError,
         "APPROVAL_REPLAY_REJECTED": NullRunApprovalReplayRejectedError,
-        # 402 — post-approval budget recheck (H6 / 2026-08-12 audit).
         # Distinct from BUDGET_HARD_BLOCKED: the operator explicitly
         # approved the grant at /gate, but the period-bound counter
         # moved between /gate and /execute (another concurrent
@@ -3140,16 +3076,13 @@ def _build_v3_error_code_map() -> dict[str, type[Exception]]:
         # refresh the reservation envelope and retry /execute.
         # Backed by GateErrorCode::BudgetRecheckFailed in the
         # backend (error_codes.rs).
-        # 2026-09-09 audit: the per-class dispatcher in
         # ``_v3_error_dispatch`` (line ~2477) already routes this to
         # ``NullRunBudgetRecheckFailedError`` (NR-B006) before the
         # catalog fallback — defense-in-depth, this catalog entry
         # now matches the dispatcher.
         "BUDGET_RECHECK_FAILED": NullRunBudgetRecheckFailedError,
-        # NR-007 (audit 2026-08-24): the 19 entries below were missing
         # from the SDK map and caused cookbook recipes that branch on
         # ``error_code`` to fall through to ``NullRunBackendError``.
-        # Added in the parity PR that closes NR-007 — keep this
         # block grouped so the parity CI test
         # ``backend/tests/nr007_sdk_error_code_parity.rs`` has a
         # single regression pin surface. Family mapping rationale
@@ -3179,8 +3112,6 @@ def _build_v3_error_code_map() -> dict[str, type[Exception]]:
         "TOO_MANY_PENDING_APPROVALS": NullRunBlockedException,
         "BUSINESS_IMPACT_INVALID": NullRunBlockedException,
         "VALIDATION_FAILED": NullRunBlockedException,
-        # ── MCP umbrella codes (ADR-013, 2026-08-14, frozen-dormant)
-        # B.1 (2026-09-10): the three umbrella codes map to typed
         # ``NullRunMcp*Error`` subclasses so cookbook code can branch
         # on the precise umbrella path. Pre-B.1 these collapsed to
         # the generic NullRunBlockedException / NR-X001 fallback —
@@ -3199,7 +3130,6 @@ def _build_v3_error_code_map() -> dict[str, type[Exception]]:
         # here indicates a wire-shape drift between client and server.
         "EXECUTION_ID_MALFORMED": NullRunBackendError,
         "EXECUTION_ID_REQUIRED": NullRunBackendError,
-        # 2026-09-09 SDK-drift audit: ``INVALID_EXECUTION_ID`` is
         # emitted by the backend as a typed envelope at
         # ``cancel.rs:142-149`` and ``orchestrator.rs:1327-1334`` —
         # round-trips through the canonical ``v3_error_envelope``
@@ -3207,9 +3137,7 @@ def _build_v3_error_code_map() -> dict[str, type[Exception]]:
         # ``NullRunBackendError`` (sibling to the EXECUTION_ID_*
         # siblings above) — wire-shape drift guard.
         "INVALID_EXECUTION_ID": NullRunBackendError,
-        # 2026-09-09 SDK-drift audit: ``EXECUTION_NOT_FOUND`` is
         # emitted by the backend as a typed envelope at
-        # ``execute.rs:194`` and ``cancel.rs:303`` (post-DEF-SDKK-022
         # routing through ``v3_error_envelope`` + the new
         # ``GateErrorCode::ExecutionNotFound`` variant). Map to the
         # dedicated ``NullRunExecutionNotFoundError`` (NR-EX01) so
@@ -3218,7 +3146,6 @@ def _build_v3_error_code_map() -> dict[str, type[Exception]]:
         # /gate (re-issue /gate then retry /execute) from generic
         # wire-shape drift.
         "EXECUTION_NOT_FOUND": NullRunExecutionNotFoundError,
-        # 2026-09-13 (DEF-SDKT-004 / fix-wave-2): the backend
         # ``From<JsonRejection> for ApiError`` impl routes the two
         # parse-level rejections to distinct wire codes:
         # - ``INVALID_FIELD`` (422 + ``invalid_field`` slug via
@@ -3238,8 +3165,6 @@ def _build_v3_error_code_map() -> dict[str, type[Exception]]:
         # sense of your body" infrastructure-side issues —
         # cookbook recipes that branch on these codes (vs the
         # generic ``VALIDATION_FAILED`` collapse) get the
-        # diagnostic class post-fix that they were missing
-        # pre-fix.
         "INVALID_FIELD": NullRunBackendError,
         "INVALID_JSON": NullRunBackendError,
         # Rate-limit plan lookup failure (Postgres / Redis adjacent).
@@ -3288,7 +3213,6 @@ def _build_v3_error_code_map() -> dict[str, type[Exception]]:
 _V3_ERROR_CODE_MAP: dict[str, type[Exception]] = _build_v3_error_code_map()
 
 
-# ADR (2026-06-28, audit P2.2 close): ``_parse_error_envelope`` below
 def _parse_error_envelope(
     response: httpx.Response,
     endpoint: str,

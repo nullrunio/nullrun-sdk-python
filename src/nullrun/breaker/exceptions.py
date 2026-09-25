@@ -430,11 +430,9 @@ class NullRunChainError(NullRunDecision):
         **kwargs: Any,
     ) -> None:
         self.chain_id = chain_id
-        # Execution Graph v0 (2026-08-06): when the backend rejects
         self.parent_execution_id = parent_execution_id
         self.backend_code = backend_code or self.error_code
         self.details = details or {}
-        # 2026-07-04: preserve the wire HTTP
         self.status_code = status_code
         super().__init__(message, **kwargs)
 
@@ -489,7 +487,6 @@ class NullRunConsumeOverbudgetError(NullRunDecision):
         self.max_allowed_cents = max_allowed_cents
         self.actual_cost_cents = actual_cost_cents
         self.epsilon_cents = epsilon_cents
-        # 2026-07-04: CONSUME_OVERBUDGET maps to
         self.status_code = status_code
         super().__init__(message, **kwargs)
 
@@ -525,7 +522,6 @@ class NullRunWorkflowInactiveError(NullRunDecision):
         **kwargs: Any,
     ) -> None:
         self.workflow_id = workflow_id
-        # 2026-07-04: WORKFLOW_INACTIVE maps to
         self.status_code = status_code
         super().__init__(message, **kwargs)
 
@@ -701,13 +697,12 @@ class NullRunBlockedException(NullRunDecision):
 
     Subclasses (:class:`NullRunBudgetError`,:class:`NullRunToolBlockedError`)
     carry the specific ``error_code`` and ``user_action`` for each
-    block reason. ``except NullRunBlockedException`` continues to
-    match all of them — back-compat.
+    block reason. ``except NullRunBlockedException`` matches every
+    typed block subclass.
 
     Attributes:
         workflow_id: Workflow that was blocked (may be a sentinel like
-            "<unknown>" when the block fires outside a workflow context
-            e.g. the sensitive-tool pre-check).
+            "<unknown>" when the block fires outside a workflow context).
         reason: Human-readable explanation of why the block fired.
         action: One of "block" / "kill" / "pause" — the suggested
             downstream action.
@@ -751,7 +746,6 @@ class NullRunBlockedException(NullRunDecision):
         self.reason = reason
         self.action = action
         self.tool_name = tool_name
-        # 2026-07-04: wire HTTP status preserved
         self.status_code = status_code
         self.details = details
         tool_suffix = f", tool={tool_name}" if tool_name else ""
@@ -863,10 +857,6 @@ class NullRunExecutionNotFoundError(NullRunBackendError):
     ``except NullRunBackendError:`` cookbook pattern keeps matching;
     callers that want to handle this specific case can ``except
     NullRunExecutionNotFoundError`` for a clearer intent.
-
-    Audit: 2026-09-09 SDK-drift audit — pre-fix SDK 0.15.x collapsed
-    this code into a generic ``NullRunBackendError("Execution binding
-    not found")`` with no introspection on whether /gate was missed.
     """
 
     error_code = "NR-EX01"
@@ -935,7 +925,6 @@ class NullRunToolBlockedError(NullRunBlockedException):
 
 
 # ---------------------------------------------------------------------------
-# Approval grant-consume outcomes (v3.53 / 2026-08-13 audit, A-1/A-2)
 # ---------------------------------------------------------------------------
 # These six typed exceptions wire-up the /execute grant-consume outcomes
 # that backend `backend/src/proxy/http/gate/internal.rs:3059-3108, 3115-3138`
@@ -948,7 +937,6 @@ class NullRunToolBlockedError(NullRunBlockedException):
 # instead of string-matching the ``error_message``.
 #
 # All six subclass :class:`NullRunBlockedException` so the legacy
-# ``except NullRunBlockedException:`` pattern keeps matching — back-compat
 # invariant preserved.
 class NullRunApprovalNotYetApprovedError(NullRunBlockedException):
     """The approval row exists but the operator has not yet decided.
@@ -1005,12 +993,10 @@ class NullRunApprovalResponseMissingError(NullRunBlockedException):
     """``/execute`` returned ``require_approval`` but the response body
     did not include an ``approval_id`` — wire-bug / server drift.
 
-    Wire code ``NR-A004`` (was previously set inline on a generic
-    ``NullRunBlockedException`` at runtime.py:2888, 2914, 2929 — promoted
-    to a typed class for parity with the six approval exceptions above).
-    This is distinct from ``NullRunApprovalNotYetApprovedError`` (NR-A010)
-    which is "the operator has not yet decided". Here the operator never
-    had a chance — the wire envelope was incomplete.
+    Wire code ``NR-A004``. This is distinct from
+    ``NullRunApprovalNotYetApprovedError`` (NR-A010) which is "the
+    operator has not yet decided". Here the operator never had a
+    chance — the wire envelope was incomplete.
 
     Cookbook pattern: do NOT retry the same execution_id; the backend
     needs a fix or the wire-shape contract needs re-reading. Log the
@@ -1221,7 +1207,6 @@ class NullRunApprovalToolDigestMismatchError(NullRunBlockedException):
 
 
 # ────────────────────────────────────────────────────────────────────────
-# MCP umbrella codes (ADR-013, 2026-08-14, frozen-dormant per Phase B.1)
 #
 # Pre-B.1 these three wire codes (``MCP_DESTRUCTIVE_BLOCKED``,
 # ``MCP_READONLY_BYPASS_BLOCKED``, ``MCP_APPROVAL_REQUIRED``) all
@@ -1232,7 +1217,6 @@ class NullRunApprovalToolDigestMismatchError(NullRunBlockedException):
 # subclasses so cookbook code can ``except NullRunMcpDestructiveBlockedError:``
 # (etc.) and surface the right user_action verb.
 #
-# ADR-013 (2026-08-14) marks the umbrella as **frozen-dormant** —
 # the underlying ``mcp_destructive_policy`` / ``mcp_readonly_bypass``
 # mechanisms are not currently wired in production but the wire codes
 # are reserved and the SDK must round-trip them so a future enablement
@@ -1330,7 +1314,6 @@ class NullRunApprovalDbUnavailableError(NullRunBlockedException):
 # definition.
 
 
-# NOTE: the following six exception classes were removed in 0.4.0
 # because they had no callers in the SDK or in any test. They were
 # zombie public surface — defined but never raised. If a real use
 # case emerges in the future, they should be re-added with at least
@@ -1374,92 +1357,24 @@ class WorkflowPausedException(NullRunDecision):
         super().__init__(msg)
 
 
-class WorkflowKilledException(BaseException):
-    """
-    DEPRECATED. Use:class:`WorkflowKilledInterrupt` instead.
-
-    Kept for backward compatibility: this class is the *parent* of
-:class:`WorkflowKilledInterrupt`, so user code that does
-    ``except WorkflowKilledException`` will still catch the new raises
-    (``except X`` matches subclasses of ``X`` — and the new class is
-    a subclass of this one).
-
-    A ``DeprecationWarning`` is emitted on construction. The class will
-    be removed in a future major release; migrate new code to
-:class:`WorkflowKilledInterrupt` and update existing
-    ``except WorkflowKilledException`` clauses to
-    ``except WorkflowKilledInterrupt`, or, if recovery is impossible
-    let the exception propagate to the top of the loop.
-
-    This class is **not** an ``Exception`` subclass — kill is a
-    non-recoverable signal and should not be caught by generic
-    ``except Exception`` clauses. Only ``except BaseException`` or the
-    explicit ``except WorkflowKilledInterrupt`` reliably stops the work.
-    See ``docs/kill-contract.md`` for the full rationale.
-
-    NOTE: NOT inheriting from:class:`NullRunError` because
-    ``NullRunError`` is an ``Exception`` subclass — and the kill
-    contract deliberately excludes ``except Exception`` from catching
-    this signal. The structured fields are attached at construction
-    time as instance attributes (not class attributes) so the kill
-    site can still stamp ``error_code`` / ``user_action`` without
-    breaking the BaseException contract.
-    """
-
-    error_code = "NR-W002"
-    user_action = (
-        "The workflow was killed. The body did not run and the kill "
-        "is non-recoverable from inside the agent loop. Inspect the "
-        "reason and, if appropriate, resume the workflow at "
-        "https://app.nullrun.io/workflows/<workflow_id>."
-    )
-    retryable = False
-
-    def __init__(self, workflow_id: str, reason: str) -> None:
-        import warnings as _w
-
-        _w.warn(
-            "WorkflowKilledException is deprecated. Catch "
-            "WorkflowKilledInterrupt (BaseException) instead. The class "
-            "is preserved for backward-compatible `except` clauses but "
-            "will be removed in a future major release.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        self.workflow_id = workflow_id
-        self.reason = reason
-        super().__init__(f"Workflow {workflow_id} killed: {reason}")
-
-
 class WorkflowKilledInterrupt(NullRunError):
     """
     Raised when a workflow is killed by the NullRun control plane.
 
     **2026-09-08 migration**: this class is now an ``Exception``
-    subclass (``NullRunError`` parent) — formerly ``BaseException``.
-    The user override: agent recovery code needs to catch the kill
-    signal via ``except WorkflowKilledInterrupt`` or
+    subclass (``NullRunError`` parent). Agent recovery code catches
+    the kill signal via ``except WorkflowKilledInterrupt`` or
     ``except NullRunWorkflowKilledError`` to surface a structured
     error to the user with ``error_code=NR-W002`` and ``user_action``.
 
-    Migration back-compat guarantees (all three hold):
+    Three catch patterns, all of which work:
 
-      * ``except WorkflowKilledInterrupt`` (new code) — still matches,
-        including legacy raises that haven't been updated.
-      * ``except NullRunError`` — now matches (was NO match before
-        migration; this is the new ability the user wanted).
-      * ``except NullRunWorkflowKilledError`` — matches (preferred
-        typed name for new cookbook code).
-
-    Migration BREAK (acceptable, documented in CHANGELOG):
-
-      * ``except WorkflowKilledException`` (the deprecated parent
-        class) — no longer matches. The parent class remains
-        BaseException and emits DeprecationWarning on construction,
-        but is no longer in the ``WorkflowKilledInterrupt`` MRO. Code
-        that catches the deprecated name must migrate to either
-        ``WorkflowKilledInterrupt`` (keep current name) or
-        ``NullRunWorkflowKilledError`` (preferred typed name).
+      * ``except WorkflowKilledInterrupt`` — canonical.
+      * ``except NullRunError`` — matches via the new ``NullRunError``
+        parent class (this is the ability the typed hierarchy
+        gives the user).
+      * ``except NullRunWorkflowKilledError`` — preferred typed
+        name for new cookbook code.
 
     Fields:
         workflow_id: The workflow that was killed.

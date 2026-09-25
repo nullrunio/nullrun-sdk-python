@@ -65,7 +65,7 @@ from nullrun.breaker.exceptions import (
     NullRunRateLimitRedisError,
     NullRunWorkflowInactiveError,
 )
-from nullrun.transport import Transport
+from nullrun.transport import FallbackMode, Transport
 
 SDK_ROOT = Path(__file__).resolve().parent.parent
 TRANSPORT_PY = SDK_ROOT / "src" / "nullrun" / "transport.py"
@@ -144,7 +144,7 @@ def _execute_kwargs():
         tool="my.tool",
         input_data={},
         on_transport_error="raise",
-        fallback_mode="strict",
+        fallback_mode=FallbackMode.STRICT,
     )
 
 
@@ -173,7 +173,7 @@ class TestDefNrCatchfaninSourcePin:
 
     def test_decision_umbrella_arm_present(self):
         body = _execute_body()
-        assert "except NullRunDecision as exc:" in body, (
+        assert "except NullRunDecision" in body, (
             "DEF-NR-TRANSPORT-CATCHFANIN-GAP: the pass-through arm "
             "for NullRunDecision must be present in "
             "Transport.execute. Pre-fix NullRunChainError / "
@@ -184,7 +184,7 @@ class TestDefNrCatchfaninSourcePin:
 
     def test_infrastructure_umbrella_arm_present(self):
         body = _execute_body()
-        assert "except NullRunInfrastructureError as exc:" in body, (
+        assert "except NullRunInfrastructureError" in body, (
             "DEF-NR-TRANSPORT-CATCHFANIN-GAP: the pass-through arm "
             "for NullRunInfrastructureError must be present in "
             "Transport.execute. Pre-fix NullRunProtocolError / "
@@ -197,8 +197,8 @@ class TestDefNrCatchfaninSourcePin:
         (budget / tool / 6 approval exceptions) still wins on MRO
         specificity. Reorder: order Blocked first, then Decision."""
         body = _execute_body()
-        blocked_idx = body.find("except NullRunBlockedException as exc:")
-        decision_idx = body.find("except NullRunDecision as exc:")
+        blocked_idx = body.find("except NullRunBlockedException")
+        decision_idx = body.find("except NullRunDecision")
         assert blocked_idx != -1, "NullRunBlockedException arm missing"
         assert decision_idx != -1, "NullRunDecision arm missing"
         assert blocked_idx < decision_idx, (
@@ -209,7 +209,7 @@ class TestDefNrCatchfaninSourcePin:
 
     def test_decision_arm_before_fallback(self):
         body = _execute_body()
-        decision_idx = body.find("except NullRunDecision as exc:")
+        decision_idx = body.find("except NullRunDecision")
         fallback_idx = self._fallback_index(body)
         assert decision_idx != -1
         assert decision_idx < fallback_idx, (
@@ -227,10 +227,10 @@ class TestDefNrCatchfaninSourcePin:
         left (Protocol / RateLimitRedis / Config), not everything
         InfrastructureError-shaped."""
         body = _execute_body()
-        backend_idx = body.find("except NullRunBackendError as exc:")
-        auth_idx = body.find("except NullRunAuthenticationError as exc:")
-        transport_idx = body.find("except NullRunTransportError as exc:")
-        infra_idx = body.find("except NullRunInfrastructureError as exc:")
+        backend_idx = body.find("except NullRunBackendError")
+        auth_idx = body.find("except NullRunAuthenticationError")
+        transport_idx = body.find("except NullRunTransportError")
+        infra_idx = body.find("except NullRunInfrastructureError")
         assert backend_idx != -1 and auth_idx != -1 and transport_idx != -1
         assert infra_idx != -1
         # The umbrella must come AFTER all three specific Arms so
@@ -249,7 +249,7 @@ class TestDefNrCatchfaninSourcePin:
 
     def test_infrastructure_arm_before_fallback(self):
         body = _execute_body()
-        infra_idx = body.find("except NullRunInfrastructureError as exc:")
+        infra_idx = body.find("except NullRunInfrastructureError")
         fallback_idx = self._fallback_index(body)
         assert infra_idx != -1
         assert infra_idx < fallback_idx, (
@@ -261,7 +261,7 @@ class TestDefNrCatchfaninSourcePin:
     def test_decision_arm_only_raises(self):
         body = _execute_body()
         m = re.search(
-            r"except NullRunDecision as exc:\s*\n(.*?)(?=\n                except |\Z)",
+            r"except NullRunDecision:\s*\n(.*?)(?=\n                except |\Z)",
             body,
             re.DOTALL,
         )
@@ -289,7 +289,7 @@ class TestDefNrCatchfaninSourcePin:
     def test_infrastructure_arm_only_raises(self):
         body = _execute_body()
         m = re.search(
-            r"except NullRunInfrastructureError as exc:\s*\n(.*?)(?=\n                except |\Z)",
+            r"except NullRunInfrastructureError:\s*\n(.*?)(?=\n                except |\Z)",
             body,
             re.DOTALL,
         )
@@ -533,7 +533,7 @@ class TestDefNrCatchfaninRegressionGuards:
             return_value=httpx.Response(400, text="plaintext body")
         )
         kwargs = _execute_kwargs()
-        kwargs["fallback_mode"] = "strict"
+        kwargs["fallback_mode"] = FallbackMode.STRICT
         try:
             result = transport.execute(**kwargs)
             assert isinstance(result, dict), (

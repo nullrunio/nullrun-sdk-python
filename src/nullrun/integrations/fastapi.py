@@ -71,11 +71,8 @@ instead of ``Accept-Language``).
 """
 from __future__ import annotations
 
-from collections.abc import Callable
-
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from starlette.requests import Request as StarletteRequest
 
 from nullrun.breaker.exceptions import (
     NullRunDecision,
@@ -107,35 +104,9 @@ _DEFAULT_INFRASTRUCTURE_STATUS = 503
 _KILL_STATUS = 503
 
 
-# Locale negotiation helpers
-LocaleResolver = Callable[[Request], str]
-
-
-def _default_locale_resolver(request: Request) -> str:
-    """Parse ``Accept-Language`` and return a 2-letter locale code.
-
-    Falls back to ``"en"`` when the header is missing or malformed.
-    Only the first supported subtag is returned (``en-US`` → ``en``).
-    """
-    header = request.headers.get("accept-language", "")
-    if not header:
-        return "en"
-    first = header.split(",", 1)[0].strip()
-    first = first.split(";", 1)[0].strip()
-    primary = first.split("-", 1)[0].strip().lower()
-    return primary or "en"
-
-
-def _resolve_locale(request: Request, resolver: LocaleResolver | None) -> str:
-    if resolver is None:
-        return _default_locale_resolver(request)
-    try:
-        return resolver(request) or "en"
-    except Exception:
-        # Resolver bugs must not break error responses. Degrade to the
-        # default and continue — the user still gets a clean message
-        # just not in their preferred locale.
-        return "en"
+# Locale negotiation helpers removed — the catalog is English-only and
+# ``format_user_message`` no longer takes a ``locale=`` kwarg. Reserved
+# for a future locale-pack release if/when a non-English catalog lands.
 
 
 def _build_headers(exc: BaseException) -> dict[str, str]:
@@ -180,13 +151,12 @@ async def _decision_handler(
     End-user-facing — the ``user_message`` field is safe to display
     verbatim to the user that triggered the request.
     """
-    locale = _resolve_locale(request, _LOCALE_RESOLVER)
     status = _DECISION_STATUS.get(exc.error_code, _DEFAULT_DECISION_STATUS)
     return JSONResponse(
         status_code=status,
         content={
             "error_code": exc.error_code,
-            "user_message": format_user_message(exc, locale=locale),
+            "user_message": format_user_message(exc),
             "category": "decision",
             "retryable": exc.retryable,
         },
@@ -204,12 +174,11 @@ async def _infrastructure_handler(
     failure (generic "service unavailable"), but ``error_code`` lets
     the operator triage without parsing the user's response.
     """
-    locale = _resolve_locale(request, _LOCALE_RESOLVER)
     return JSONResponse(
         status_code=_DEFAULT_INFRASTRUCTURE_STATUS,
         content={
             "error_code": exc.error_code,
-            "user_message": format_user_message(exc, locale=locale),
+            "user_message": format_user_message(exc),
             "category": "infrastructure",
             "retryable": exc.retryable,
         },
@@ -243,9 +212,8 @@ class NullRunMiddleware:
     register the middleware by hand.
     """
 
-    def __init__(self, app, *, locale_resolver: LocaleResolver | None = None) -> None:
+    def __init__(self, app) -> None:
         self.app = app
-        self.locale_resolver = locale_resolver
 
     async def __call__(self, scope, receive, send) -> None:
         # Lifespan and websocket scopes — pass through unmodified.
@@ -269,13 +237,11 @@ class NullRunMiddleware:
         except WorkflowKilledInterrupt as exc:
             if response_started:
                 raise  # headers already sent — re-raise and let the connection drop
-            request = StarletteRequest(scope, receive)
-            locale = _resolve_locale(request, self.locale_resolver)
             response = JSONResponse(
                 status_code=_KILL_STATUS,
                 content={
                     "error_code": exc.error_code,
-                    "user_message": format_user_message(exc, locale=locale),
+                    "user_message": format_user_message(exc),
                     "category": "killed",
                 },
                 headers=_build_headers(exc),
@@ -283,48 +249,25 @@ class NullRunMiddleware:
             await response(scope, receive, send)
 
 
-# Module-level resolver — set by:func:`install` and read by the
-# FastAPI exception handlers. The middleware gets its own copy via
-# its constructor (Starlette instantiates middleware via
-# ``add_middleware``, which does not let us pass per-request state).
-_LOCALE_RESOLVER: LocaleResolver | None = None
-
-
-def install(
-    app: FastAPI,
-    *,
-    locale_resolver: LocaleResolver | None = None,
-) -> None:
+def install(app: FastAPI) -> None:
     """Register NullRun exception handlers + kill middleware on a FastAPI app.
 
     Idempotent — calling ``install`` twice on the same app replaces
-    the handlers with the latest configuration. The middleware uses
-    the resolver that was passed at the most recent ``install`` call.
+    the handlers with the latest configuration.
 
     Args:
         app: The FastAPI application to instrument.
-        locale_resolver: Optional callable ``(request) -> str``
-            returning a 2-letter locale code. Defaults to parsing
-            ``Accept-Language``.
 
     Example::
 
-        from fastapi import FastAPI, Request
+        from fastapi import FastAPI
         import nullrun
         from nullrun.integrations.fastapi import install
 
         nullrun.init(api_key="...")
-        app = FastAPI 
+        app = FastAPI()
         install(app)
-
-        # Custom resolver: read locale from a session cookie.
-        install(
-            app
-            locale_resolver=lambda req: req.cookies.get("locale", "en")
-        )
     """
-    global _LOCALE_RESOLVER
-    _LOCALE_RESOLVER = locale_resolver
 
     # Exception handlers for Exception subclasses. Starlette dispatches
     # by isinstance, so registering the more specific categories first
@@ -338,7 +281,7 @@ def install(
     # so we add the kill middleware AFTER exception handlers — actually
     # it doesn't matter here because the exception handlers and the
     # middleware handle disjoint exception classes.
-    app.add_middleware(NullRunMiddleware, locale_resolver=locale_resolver)
+    app.add_middleware(NullRunMiddleware)
 
 
 __all__ = ["install", "NullRunMiddleware"]

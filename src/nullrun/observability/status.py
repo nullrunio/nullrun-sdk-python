@@ -51,11 +51,9 @@ versions is gone — SDK is either talking to the backend or it isn't.
 from __future__ import annotations
 
 import logging
-import time
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Any, Optional
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +113,6 @@ class WorkflowState:
     whether the body will run on the next call.
 
     CP1 fix (2026-06-26): the backend WsWorkflowState enum has 5
-    variants, not 3 — Flagged and Tripped were previously silently
     treated as Normal. The SDK now handles all 5 explicitly in
     ``runtime.check_control_plane``; this dataclass reflects the
     full set so the operator-facing status mirrors reality.

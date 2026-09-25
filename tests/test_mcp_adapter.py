@@ -588,9 +588,11 @@ def test_call_tool_with_runtime_routes_through_execute_before_mcp_call():
     assert len(runtime.calls) == 1
     assert runtime.calls[0]["tool_name"] == "create_issue"
     assert runtime.calls[0]["input_data"] == {"repo": "acme/api"}
-    # Mode is forced to strict so /api/v1/execute is consulted even
-    # for non-sensitive MCP tools.
-    assert runtime.calls[0]["mode"] == "strict"
+    # 0.18.2: ``mode=`` opt-out was removed. Every MCP-tool
+    # routed through the runtime contacts /api/v1/execute
+    # unconditionally — no exemption for "non-sensitive" MCP
+    # tools, no inline bypass.
+    assert "mode" not in runtime.calls[0]
 
 
 def test_call_tool_with_runtime_blocked_does_not_invoke_mcp_client():

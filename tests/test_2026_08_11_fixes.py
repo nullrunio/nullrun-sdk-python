@@ -147,11 +147,16 @@ def test_safe_json_helper_exists_and_wraps_json_errors():
         "error_code=NR-T-PARSE (avoids collision with NR-T001 / "
         "NullRunToolBlockedError)"
     )
-    # body_preview truncation is part of the fix; the helper
-    # must slice body to 200 chars max.
-    assert "[:200]" in src, (
-        "_safe_json must truncate body preview to <=200 chars to "
-        "prevent log flooding + PII leak"
+    # body_preview truncation was removed in 0.19 — _safe_json no
+    # longer crafts a truncated preview; the helper just raises
+    # NullRunTransportError. Pin that the source no longer holds a
+    # `[:200]` slice so a future regression that re-introduces it
+    # doesn't silently leak partial bodies into error chains.
+    assert "[:200]" not in src, (
+        "_safe_json must not truncate body previews anymore — the "
+        "helper only raises NullRunTransportError. A future "
+        "regression that re-introduces a truncation slice risks "
+        "leaking partial bodies into the exception chain."
     )
     # runtime.py's _authenticate must USE _safe_json on the 200-OK path
     runtime_src = _production_source(RUNTIME_PATH)

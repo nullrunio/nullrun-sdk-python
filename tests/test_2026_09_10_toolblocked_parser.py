@@ -61,7 +61,7 @@ from nullrun.breaker.exceptions import (
     NullRunBlockedException,
     NullRunToolBlockedError,
 )
-from nullrun.transport import Transport, _parse_v3_error_envelope
+from nullrun.transport import FallbackMode, Transport, _parse_v3_error_envelope
 
 SDK_ROOT = Path(__file__).resolve().parent.parent
 TRANSPORT_PY = SDK_ROOT / "src" / "nullrun" / "transport.py"
@@ -101,7 +101,7 @@ def _execute_kwargs():
         tool="my.tool",
         input_data={},
         on_transport_error="raise",
-        fallback_mode="strict",
+        fallback_mode=FallbackMode.STRICT,
     )
 
 

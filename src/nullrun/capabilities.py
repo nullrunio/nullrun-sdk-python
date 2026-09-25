@@ -81,7 +81,6 @@ SDK_MIN_VERSION_FOR_V3 = "0.12.0"
 # it does NOT carry the v3-gating fields, so probing there always
 # returned None and ``is_v3_ready()`` was always False, leaving
 # every capability flag a no-op at runtime. See capability
-# history note in module docstring (2026-07-06 fix).
 CAPABILITIES_PATH = "/api/v1/capabilities"
 
 
@@ -133,7 +132,6 @@ class ServerCapabilities:
     decision_log: bool = False
     outbox_async_drain: bool = False
     idempotency_keys: bool = False
-    # Execution Graph v0 (2026-08-06, backend): additive
     # `parent_execution_id` wire field on /gate. SDKs probe this
     # flag before sending the field; pre-Graph backends silently
     # ignore unknown fields, but the probe lets SDKs surface a
@@ -142,7 +140,6 @@ class ServerCapabilities:
     # included in `is_v3_ready()` -- it's informational, not a
     # hard gate.
     execution_graph: bool = False
-    # ADR-037 Slice B (2026-08-31, protocol v4): /gate response
     # echoes the SDK-supplied `action_digest` and a `policy_hash`
     # slot (None today; Slice D wires per-request computation).
     # Backend always sends the fields (skip_serializing_if elides
@@ -351,12 +348,10 @@ def parse_capabilities(payload: dict[str, Any]) -> ServerCapabilities:
         decision_log=_v3_flag("decision_log"),
         outbox_async_drain=_v3_flag("outbox_async_drain"),
         idempotency_keys=_v3_flag("idempotency_keys"),
-        # Execution Graph v0 (2026-08-06, backend): additive flag
         # -- defaults to False so pre-Graph backends (which omit
         # the field entirely) yield a fail-closed view where the
         # SDK does NOT send `parent_execution_id`.
         execution_graph=_v3_flag("execution_graph"),
-        # ADR-037 Slice B (2026-08-31, protocol v4): additive
         # flag — defaults to False so pre-Slice-B backends yield
         # a fail-closed view where the SDK does NOT log the
         # wire-evidence echo as "server confirmed". Pre-v4

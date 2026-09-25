@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "nullrun"
 # Full release history lives in CHANGELOG.md; only the current version
 # is pinned here.
-version = "0.18.1"
+version = "0.18.2"
 # Kept under the 200-char preview threshold so the full line is visible
 # without an "expand" click. The headline is the canonical §1 statement
 # from positioning.md — "runtime decision layer for tool-using AI agents"
@@ -463,22 +463,16 @@ line-length = 100
 select = ["E", "F", "I", "UP", "B", "S"]
 ignore = [
     "S101",
-    # Pre-existing violations in master / wip/working-tree: tracked
-    # for follow-up cleanup in a dedicated PR rather than blocking CI.
-    # Categories:
-    #   S110 (try/except/pass) - 14 sites; needs logging, not blanket
-    #                               noqa
-    #   E501 (line too long)    - 13 sites; long descriptive comments
-    #   F841 (unused variable)  - 6 sites; one is the timestamp var
-    #                               in the legacy-code fallback path
-    #   E402 (import order)     - 5 sites; TYPE_CHECKING blocks
-    #   F401 (unused import)    - 2 sites
+    # Pre-existing violations in master. Tracked for follow-up cleanup
+    # in a dedicated PR rather than blocking CI. Categories:
+    #   S110 (try/except/pass) - blanket noqa would hide bugs; needs
+    #                              logging, not blanket noqa
+    #   E501 (line too long)   - long descriptive comments
+    #   E402 (import order)    - TYPE_CHECKING blocks
     "S110",
     "E501",
-    "F841",
     "E402",
-    "F401",
-    # S311 (suspicious random) - 1 site, in circuit_breaker jitter.
+    # S311 (suspicious random) in circuit_breaker jitter.
     # random.uniform is correct for jitter (we want non-cryptographic
     # randomness to spread reconnection timing across workers).
     "S311",

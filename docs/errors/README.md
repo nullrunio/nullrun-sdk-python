@@ -44,7 +44,6 @@ The codes follow a `NR-<CATEGORY><NNN>` pattern:
 |---|---|---|
 | `NR-B001` | Network error: timeout, ConnectError, DNS failure | [NR-B001](NR-B001.md) |
 | `NR-B002` | 5xx from the NullRun backend | [NR-B002](NR-B002.md) |
-| `NR-B003` | `@sensitive` failed to extract a `BusinessImpact` envelope | [NR-B003](NR-B003.md) |
 | `NR-B004` | Budget exhausted | [NR-B004](NR-B004.md) |
 | `NR-B005` | Local circuit breaker tripped | [NR-B005](NR-B005.md) |
 

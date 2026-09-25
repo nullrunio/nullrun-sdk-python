@@ -50,7 +50,6 @@ def patch_llama_index(runtime: Any) -> bool:
             total = int(usage.get("total_tokens", 0) or 0) or (prompt + completion)
             if not (prompt or completion or total):
                 return
-            # Audit 2026-06-28 (SDK↔backend wire): model used to come
             # only from ``event.response.model`` with a bare ``None``
             # fallback — mock providers and some adapters don't
             # populate ``.model`` on ChatResponse, which sent

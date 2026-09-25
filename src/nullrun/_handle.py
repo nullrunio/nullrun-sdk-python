@@ -95,7 +95,6 @@ def _render_dev_error_report(
 
     The catalog ``format_user_message`` wording is included as the
     headline so end-user scripts that just want one sentence still
-    get a sensible line. We do NOT prefix the report with the
     catalog text -- the headline IS the catalog text, then the
     structured detail follows on its own line.
 
@@ -119,7 +118,6 @@ def _render_dev_error_report(
     # 1. WHAT -- the stage that failed. Prefer the explicit ``endpoint``
     # attribute (set on transport errors); fall back to deriving from
     # the class name so an unmapped exception still gives a sensible
-    # label. The class-name fallback strips the ``NullRun`` prefix and
     # ``Error`` suffix so ``NullRunAuthenticationError`` -> "auth".
     stage = endpoint or type(exc).__name__.replace("NullRun", "").replace("Error", "")
     stage = stage.lower() or "unknown"
@@ -217,7 +215,6 @@ def handle(*, exit_code: int = 1):
     try:
         yield
     except NullRunError as exc:
-        # 2026-09-08 migration: WorkflowKilledInterrupt moved onto
         # the NullRunError MRO so Sentry/OTel `except Exception`
         # handlers record kill events. ``handle``/``guarded`` are the
         # friendly-exit pattern, NOT the user-callback pattern -- kill
@@ -322,7 +319,6 @@ def init_or_die(*, api_key: str | None = None, api_url: str | None = None,
         return init(api_key=api_key, api_url=api_url, debug=debug)
     except NullRunError as exc:
         # Same structured report as ``handle()`` / ``guarded`` -- a
-        # missing API key at startup was previously printed as just
         # "There's a configuration issue. Please contact support."
         # which gave the developer zero actionable detail. The
         # four-line report here names the missing env var, the URL

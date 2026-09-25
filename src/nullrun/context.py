@@ -2,21 +2,6 @@
 Context management for NullRun SDK.
 
 Provides workflow and trace context for automatic event correlation.
-
-The previously-defined ``_organization_id_var`` / ``_api_key_id_var``
-contextvars and the ``get_organization_id`` / ``get_api_key_id``
-getters were removed (B27) because:
-  1. No code path ever wrote to them — both getters always
-     returned ``None``.
-  2. ``observability.TenantFilter`` (the only consumer) was
-     removed in 0.3.1.
-  3. The structured-logging tenant-isolation feature moved to
-     the backend in the same release.
-
-If a future use case appears (e.g. per-API-key rate isolation)
-re-introduce the contextvars AND a setter API (token-based like
-``set_attempt_index``) AND wire them in ``NullRunRuntime.__init__``
-from the ``_authenticate`` response.
 """
 
 import uuid
@@ -24,9 +9,7 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 
-# 2026-08-14 (F-19 fix): ``nullrun.tracing`` provides the structured
 # SpanContext that models the parent/child hierarchy a trace timeline
-# needs. ``nullrun.context`` previously owned loose ``_trace_id`` /
 # ``_span_id`` contextvars and now keeps them in lockstep via the
 # ``_mirror_to_span_context`` / ``_mirror_to_legacy_span`` helpers
 # below; ``@protect`` (decorators.py:441) and any other writer must
@@ -70,7 +53,6 @@ _call_mcp_annotations_var: ContextVar[dict[str, bool | None] | None] = ContextVa
     "call_mcp_annotations", default=None
 )
 
-# 2026-07-02 (v0.11.0): chain_id contextvar for soft-mode gate
 # .
 #
 # Soft-mode budget enforcement ONLY allows overdrafts when an
@@ -278,7 +260,6 @@ def set_chain_op(op: str) -> Token[str]:
 
 
 # ---------------------------------------------------------------------------
-# Server-minted execution_id (2026-07-04 — )
 # ---------------------------------------------------------------------------
 #
 # Pre-0.12.0 the SDK sent a client-supplied ``execution_id`` (usually
@@ -324,7 +305,6 @@ _server_minted_execution_id_var: ContextVar[str | None] = ContextVar(
 _server_minted_reservation_at_var: ContextVar[float] = ContextVar(
     "server_minted_reservation_at", default=0.0
 )
-# 2026-07-04: /track idempotency anchor.
 # The /check request carries ``idempotency_key = operation_id`` (UUID v4)
 # the backend's /track handler (handlers.rs:4654-4725) accepts the same
 # key and replays the original response on hit (200 + ``idempotent_replay:
@@ -340,14 +320,12 @@ _server_minted_reservation_at_var: ContextVar[float] = ContextVar(
 _server_minted_idempotency_key_var: ContextVar[str | None] = ContextVar(
     "server_minted_idempotency_key", default=None
 )
-# AUDIT P0-27 (2026-09-05): operation_id hoist.
 #
 # Pre-fix, runtime.py minted operation_id independently at the
 # /check site (line 1913) and the /execute site (line 2749).
 # A single logical action therefore produced two distinct
 # operation_ids — the backend's binding (which keys on
 # operation_id) saw them as two unrelated reservations, and the
-# P0-26 response-echo capture (`response.get("operation_id")`)
 # silently recorded whichever value the server echoed last.
 #
 # Fix: hoist the mint into a single contextvar owned by the
@@ -359,7 +337,6 @@ _server_minted_idempotency_key_var: ContextVar[str | None] = ContextVar(
 _operation_id_var: ContextVar[str | None] = ContextVar(
     "operation_id", default=None
 )
-# ADR-037 Slice B (2026-08-31, protocol v4): wire-evidence echo
 # from /gate response. Both fields are ADR-009 governance columns
 # that the backend now echoes on the /gate response (additive —
 # pre-v4 backends omit the keys entirely via skip_serializing_if).
@@ -521,7 +498,6 @@ def clear_server_minted_execution_id() -> None:
     _server_minted_execution_id_var.set(None)
     _server_minted_reservation_at_var.set(0.0)
     _server_minted_idempotency_key_var.set(None)
-    # ADR-037 Slice B (2026-08-31, protocol v4): also drop the
     # wire-evidence echo slots so a /check in one block never leaks
     # a stale echo into a /track in a sibling block.
     _last_gate_action_digest_var.set(None)
@@ -534,7 +510,6 @@ def set_attempt_index(index: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# AUDIT P0-27 (2026-09-05) — operation_id lifecycle helpers.
 #
 # The runtime mints the operation_id once at the top of the
 # public gate/enforce entry point (``NullRunRuntime.execute``
@@ -603,7 +578,6 @@ def clear_operation_id() -> None:
 
 
 # ---------------------------------------------------------------------------
-# ADR-037 Slice B (2026-08-31, protocol v4): wire-evidence echo
 # ---------------------------------------------------------------------------
 # Read by tests + operators to confirm the gate saw the same
 # `action_digest` the SDK sent (and to surface the architectural
@@ -666,7 +640,6 @@ def set_last_gate_policy_hash(value: str | None) -> None:
 
 
 # ---------------------------------------------------------------------------
-# F-19 (2026-08-14): legacy _trace_id / _span_id token-based setters
 # ---------------------------------------------------------------------------
 #
 # ``nullrun.tracing.SpanContext`` is the canonical source-of-truth at
@@ -719,7 +692,6 @@ def reset_span_id(token: Token[str | None]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# F-19 (2026-08-14): helpers used by ``with workflow`` / ``with span``
 # ---------------------------------------------------------------------------
 #
 # ``with workflow`` writes a fresh root ``SpanContext``; ``with span``
@@ -808,8 +780,8 @@ def set_call_context(
         tools: List of tool names the call intends to use. Backend
             matches each against the workflow's effective
             ``blocked_tools`` aggregate and returns block on any
-            match. Pass ``None`` to leave whatever was previously
-            set, ``[]`` to clear.
+            match. Pass ``None`` to leave the current value
+            unchanged, ``[]`` to clear.
     """
     if model is not None:
         _call_model_var.set(model)
@@ -889,7 +861,6 @@ def workflow(name: str | None = None) -> Generator[str, None, None]:
     workflow_id = name or str(uuid.uuid4())
     trace_id = generate_trace_id()
     # a new workflow gets a fresh span_id too. The
-    # pre-fix code only reset workflow_id and trace_id, so a
     # ``with span("inner"); with workflow("outer")`` block would
     # leave the inner span_id visible inside the workflow scope —
     # the span emitted by the workflow would carry the wrong
@@ -903,7 +874,6 @@ def workflow(name: str | None = None) -> Generator[str, None, None]:
     wf_token = _workflow_id_var.set(workflow_id)
     trace_token = _trace_id_var.set(trace_id)
     span_token = _span_id_var.set(span_id)
-    # F-19 (2026-08-14): dual-write a root SpanContext onto
     # ``_current_span`` so an inner ``@protect`` (or nested
     # ``with span``) derives child spans from THIS workflow's
     # trace_id rather than minting a fresh disconnected root.
@@ -944,7 +914,6 @@ def span(name: str | None = None) -> Generator[str, None, None]:
     """
     span_id = name or generate_span_id()
     token = _span_id_var.set(span_id)
-    # F-19 (2026-08-14): when a SpanContext is already active
     # (e.g. we're inside ``with workflow(...)`` or ``@protect``),
     # push a child SpanContext onto ``_current_span`` so that nested
     # ``@protect`` calls and the runtime's
@@ -992,7 +961,6 @@ def agent(name: str | None = None) -> Generator[str, None, None]:
     # ``generate_trace_id`` / ``generate_span_id``). The previous
     # ``f"agent-{uuid.uuid4.hex}"`` format was 32 hex chars
     # without dashes; backend UUID-typed columns (cost_events.
-    # agent_id, audit_log) silently dropped these to NULL on insert
     # (``Uuid::parse_str(...).ok `` returned None). User-supplied
     # ``name`` is preserved verbatim so existing dashboards continue
     # to work for already-allocated agent ids.
@@ -1036,7 +1004,6 @@ def attempt(attempt_index: int) -> Generator[int, None, None]:
         _attempt_index_var.reset(token)
 
 
-# 2026-07-02 (v0.11.0): chain context manager for soft-mode budget
 # enforcement.
 #
 # Usage:

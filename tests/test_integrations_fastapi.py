@@ -4,9 +4,9 @@ Each test mounts a tiny FastAPI app whose handler raises a specific
 NullRun exception, then asserts the HTTP response matches the
 documented contract (status code, JSON body, headers).
 
-Locale is pinned via the ``Accept-Language`` header (or the custom
-``locale_resolver`` where relevant) so the rendered ``user_message``
-is deterministic.
+The ``Accept-Language`` header is honoured by the SDK's locale
+resolver (locale packs are reserved for a future release; today
+the catalog is English-only).
 """
 from __future__ import annotations
 
@@ -210,48 +210,28 @@ def test_missing_accept_language_falls_back_to_english():
     )
 
 
-def test_custom_locale_resolver_overrides_accept_language():
-    """A custom resolver wins over Accept-Language — useful when the
-    locale comes from a session cookie or JWT claim instead."""
-    def resolver(request: Request) -> str:
-        return request.headers.get("x-locale", "en")
-
+def test_install_accept_language_header_is_ignored_for_now():
+    """The locale resolver was removed when ``format_user_message``
+    stopped taking a ``locale=`` kwarg. ``Accept-Language`` is still
+    sent by the client but the SDK ignores it — the catalog is
+    English-only today."""
     app = FastAPI()
-    nr_fastapi.install(app, locale_resolver=resolver)
+    nr_fastapi.install(app)
 
     @app.get("/trigger")
     def trigger():
         raise exc.NullRunBudgetError("wf", "x")
 
     client = TestClient(app, raise_server_exceptions=False)
-    # Different Accept-Language, but the resolver forces en.
     resp = client.get(
         "/trigger",
-        headers={"Accept-Language": "fr-FR", "x-locale": "en"},
+        headers={"Accept-Language": "fr-FR"},
     )
+    # English catalog is the only one today.
     assert resp.json()["user_message"] == (
         "You've reached the usage limit for this conversation. "
         "Please try again later."
     )
-
-
-def test_resolver_exception_falls_back_to_english():
-    """A buggy resolver must not crash the error response — the user
-    still gets a clean message, just in the default locale."""
-    def bad_resolver(request: Request) -> str:
-        raise RuntimeError("resolver bug")
-
-    app = FastAPI()
-    nr_fastapi.install(app, locale_resolver=bad_resolver)
-
-    @app.get("/trigger")
-    def trigger():
-        raise exc.NullRunBudgetError("wf", "x")
-
-    client = TestClient(app, raise_server_exceptions=False)
-    resp = client.get("/trigger")
-    assert resp.status_code == 429
-    assert "usage limit" in resp.json()["user_message"]
 
 
 # ---------------------------------------------------------------------------

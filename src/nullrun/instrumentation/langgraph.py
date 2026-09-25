@@ -287,7 +287,6 @@ def extract_usage_from_response(response: Any, provider: str, model: str) -> dic
             usage["cache_write_tokens"] = int(cache_write) or 0
         prompt_details = raw.get("prompt_tokens_details") or {}
         if isinstance(prompt_details, dict) and prompt_details.get("cached_tokens"):
-            # OpenAI's prefix-cached prompt hits — best-effort merge.
             usage["cache_read_tokens"] = int(prompt_details.get("cached_tokens") or 0)
         completion_details = raw.get("completion_tokens_details") or {}
         if isinstance(completion_details, dict) and completion_details.get("reasoning_tokens"):
@@ -412,7 +411,6 @@ class NullRunCallback(BaseCallbackHandler):
 
         self._active_runs: OrderedDict[str, SpanContext] = OrderedDict()
         self._active_runs_max: int = _ACTIVE_RUNS_MAX
-        # F-28 (UI-UX-AUDIT 2026-08-14): protect ``_active_runs`` with
         # a reentrant lock so concurrent callbacks on multi-threaded
         # LangChain runners (and free-threaded CPython PEP 703 builds)
         # cannot interleave ``on_chain_start`` / ``on_chain_end`` in a
@@ -438,7 +436,6 @@ class NullRunCallback(BaseCallbackHandler):
         If the dict is at capacity, evict the oldest-inserted entry
         and log a warning so operators can detect chain-end drops.
         """
-        # F-28 (UI-UX-AUDIT 2026-08-14): the cap-check + eviction +
         # insertion must be atomic against ``_end_run`` on a different
         # thread, otherwise two threads can both pass the cap check
         # and one eviction races the other insert (the dict grows
@@ -496,7 +493,6 @@ class NullRunCallback(BaseCallbackHandler):
 
         parent_ctx: SpanContext | None = None
         if parent_run_id:
-            # F-28 (UI-UX-AUDIT 2026-08-14): the lookup is a single
             # ``.get()`` (no nested acquire), but we still hold the
             # lock so a concurrent ``_register_active_run`` /
             # ``_end_run`` cannot observe a partial state where the
@@ -513,7 +509,6 @@ class NullRunCallback(BaseCallbackHandler):
             ctx = create_root_span()
         self._register_active_run(str(run_id), ctx)
 
-        # DEFS-SDKEXEC-LLM-RESERVATION (2026-09-08): pair the LLM
         # span with a server-minted reservation so the matching
         # llm_call cost event emitted by ``on_llm_end`` lands on
         # ``/track_single`` instead of being dropped by
@@ -528,8 +523,6 @@ class NullRunCallback(BaseCallbackHandler):
         # ``_route_track`` will then drop the matching llm_call
         # cost event (v3.66.2 alignment — backend rejects batched
         # llm_call events without a reservation with 503
-        # BUDGET_RECHECK_FAILED). This matches the pre-fix
-        # behaviour because pre-fix the SDK also had no reservation
         # at this site (no /check round-trip happened on the LLM
         # span) and the llm_call cost event was dropped the same
         # way. We swallow ``WorkflowKilledInterrupt`` /
@@ -628,7 +621,6 @@ class NullRunCallback(BaseCallbackHandler):
                 f"usage={usage}, has_usage={usage['has_usage']}"
             )
 
-            # Audit 2026-06-29 (unified fingerprint): derive the same
             # fingerprint the httpx transport computes for the same
             # call, so the dedup LRU at runtime.track collapses the
             # two emissions to a single wire event. Both observers feed
@@ -715,7 +707,6 @@ class NullRunCallback(BaseCallbackHandler):
                 # Stripped at the wire boundary by _WIRE_STRIP_FIELDS —
                 # kept here for in-process dedup + test introspection.
                 "raw_usage": usage["raw_usage"],
-                # Audit 2026-06-29 (unified fingerprint): use the
                 # same helper the httpx transport calls so the dedup
                 # LRU at runtime.track collapses the sibling
                 # emission for the same real LLM call. Pre-fix this
@@ -732,7 +723,6 @@ class NullRunCallback(BaseCallbackHandler):
 
             logger.info(f"NullRun track event: {event}")
 
-            # 2026-07-12 (multi-agent span attachment): the per-LLM-call
             # cost event must carry the parent chain's `trace_id` so the
             # backend's unified SELECT can JOIN `cost_summary` by it.
             # `on_llm_start` already stored the SpanContext under the
@@ -752,7 +742,6 @@ class NullRunCallback(BaseCallbackHandler):
             # upcoming tree-renderer that wants to walk children by
             # the parent's trace bucket.
             llm_run_id = kwargs.get("run_id")
-            # F-28 (UI-UX-AUDIT 2026-08-14): the lookup must hold the
             # lock so a concurrent ``_end_run`` cannot pop the entry
             # between this ``.get()`` and the (later) ``_end_run`` at
             # the bottom of this method — that race produced the
@@ -894,7 +883,6 @@ class NullRunCallback(BaseCallbackHandler):
         """
         parent_ctx: SpanContext | None = None
         if parent_run_id:
-            # F-28 (UI-UX-AUDIT 2026-08-14): same orphan-span race as
             # ``on_llm_start``. The subsequent ``_register_active_run``
             # call already acquires the lock; the reentrant ``RLock``
             # lets us hold it across BOTH the lookup AND the
@@ -927,7 +915,6 @@ class NullRunCallback(BaseCallbackHandler):
     def _end_run(self, run_id: Any, error: str | None = None) -> None:
         if run_id is None:
             return
-        # F-28 (UI-UX-AUDIT 2026-08-14): the pop must be atomic so a
         # concurrent ``_register_active_run`` cannot INSERT an entry
         # for the same ``run_id`` between this pop and the
         # ``runtime.track_event`` call below — the freshly-inserted
@@ -970,7 +957,6 @@ def _extract_node_name(serialized: Any, default: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Audit 2026-06-28 (SDK↔backend wire): model_name on the callback path
 # ---------------------------------------------------------------------------
 # Pre-fix: ``on_llm_end`` pulled ``model_name`` exclusively from
 # ``kwargs['invocation_params']`` with a hard fallback to the literal
@@ -1085,7 +1071,6 @@ def _extract_model_from_response(response: Any) -> str | None:
     # operator can correlate the wire warning back to a specific
     # response shape.
     #
-    # Audit 2026-06-29 (silent zero-billing): the previous version
     # emitted a single DEBUG line with only the response type. That
     # was insufficient when the operator needed to see *which* of
     # the four fallback steps almost-but-didn't match. We now dump
