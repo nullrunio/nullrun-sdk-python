@@ -1123,12 +1123,10 @@ class Transport:
     ) -> dict[str, Any]:
         """Pre-execution policy evaluation via /api/v1/execute (PRIMARY enforcement point).
 
-        Wire contract (revised 2026-09-08, DEFS-SDKEXEC-GATE-FIRST):
-        /execute REQUIRES a prior /gate call that minted the same
-        ``execution_id`` and registered the ``execution:{id}`` binding
-        in Redis. Backend enforcement:
-        ``backend/src/proxy/http/gate/execute.rs:46-208``
-        (DEF-SDKK-022-EXEC-BYPASS, 2026-09-04, RUN_ID=20260904T1500)
+        Wire contract: /execute requires a prior /gate call that minted the
+        same ``execution_id`` and registered the ``execution:{id}``
+        binding in Redis. Backend enforcement:
+        ``backend/src/proxy/http/gate/execute.rs``
         runs ``HGET execution:{id} ORG_FIELD`` on entry; a miss
         returns 404 EXECUTION_NOT_FOUND (fail-CLOSED). The SDK
         therefore MUST thread the execution_id captured by
@@ -1251,10 +1249,9 @@ class Transport:
                 #
                 # Fall through to the synthetic block shape if the
                 # envelope is unrecognised (plaintext body, malformed
-                # JSON, unknown wire code) so behaviour stays
-                # backwards-compatible for legacy / non-v3 backends.
-                # `_parse_v3_error_envelope` always returns an
-                # Exception — it never silently swallows a 4xx.
+                # JSON, unknown wire code). `_parse_v3_error_envelope`
+                # always returns an Exception — it never silently
+                # swallows a 4xx.
                 try:
                     raise _parse_v3_error_envelope(response, "execute")
                 except NullRunApprovalReplayRejectedError:
@@ -1795,7 +1792,7 @@ class Transport:
     # Wire-protocol v3 endpoints
     # =============================================================================
     #
-    # The v3 wire contract adds six endpoints that the legacy /gate +
+    # The v3 wire contract adds six endpoints that the /gate +
     # /execute + /track/batch surface does not cover. Each new method
     # follows the same shape as the existing `check` method:
     #
@@ -1815,14 +1812,10 @@ class Transport:
         request: dict[str, Any],
         on_transport_error: Callable[[Exception], dict[str, Any]] | str | None = None,
     ) -> dict[str, Any]:
-        """Pre-execution gate — wire-protocol v3 (B1 fix 2026-07-04).
+        """Pre-execution gate — wire-protocol v3.
 
-        Pre-fix this method POSTed to ``/api/v1/check``. That endpoint
-        was removed on 2026-06-27 — the handler now returns
-        ``410 Gone`` with a ``replacement: /api/v1/gate`` hint. The
-        SDK's ``check `` method already targets ``/api/v1/gate`` and
-        forwards every v3 wire field — ``chain_id``
-        ``chain_op``, ``idempotency_key``, ``stream``. This method
+        Targets ``/api/v1/gate`` and forwards every v3 wire field —
+        ``chain_id`` ``chain_op``, ``idempotency_key``, ``stream``. This method
         is kept as a v3-named alias so existing call sites and tests
         continue to work; internally it delegates to ``check `` with
         the same body.
@@ -1869,7 +1862,7 @@ class Transport:
 
                 The wire shape is built by ``runtime._build_v3_track_payload``
                 (see ``runtime.py:2679-2776``); this method just forwards
-                whatever dict the caller hands it. The post-fix schema is:
+                whatever dict the caller hands it. The schema is:
 
                 Args:
                     request: Consume request body. Must include:
@@ -1896,8 +1889,7 @@ class Transport:
                 Returns:
                     Parsed JSON dict from the backend's TrackResponse.
                     NOTE: there is NO top-level ``status`` field on the
-                    wire — the legacy pre-v3 docstring claimed one, but
-                    v3/v4 backends emit
+                    wire — backends emit
                     ``{snapshot, actions_taken, processing_mode,
                     cost_source, confidence, event_id,
                     idempotent_replay, stored_response?}``. SDK callers
@@ -1914,16 +1906,12 @@ class Transport:
                         EXECUTION_NOT_BOUND.
                     NullRunAuthenticationError: 401/403.
 
-                 2026-07-04 (B2): pre-fix this docstring (and the
-                surrounding module comment) described a fictitious wire
-                shape ``{execution_id, actual_cost_cents, api_key_id
-                cost_source}``. The backend's actual ``TrackRequestRaw`` is
+                 Wire contract: ``TrackRequestRaw`` is
                 ``{workflow_id, tokens, cost_cents,...}``; ``execution_id``
                 is replaced by ``reservation_id``, ``actual_cost_cents`` is
                 replaced by ``cost_cents`` (the SDK always sends 0 — see
                 ``_WIRE_STRIP_FIELDS``), and ``api_key_id`` is derived
                 server-side from the request auth, not supplied by the SDK.
-                The docstring now matches the real wire contract.
         """
         body = _signed_request_body(request)
         headers = self._build_signed_headers(body=body)
@@ -1971,12 +1959,10 @@ class Transport:
                 Returns:
                     Parsed JSON dict from the backend's CancelResponse.
                     NOTE: there is NO top-level ``status`` field on the
-                    wire — the legacy pre-v3 docstring claimed one.
-                    v3/v4 backends emit
+                    wire — backends emit
                     ``{execution_id, canceled_at, reservation_released_cents,
                     already_canceled}``. SDK callers branch on the HTTP
-                    status only — do NOT read ``data["status"]``
-                    (KeyError on every backend >= 3.66.2).
+                    status only — do NOT read ``data["status"]``.
         """
         request: dict[str, Any] = {"execution_id": execution_id}
         if reason:
@@ -2012,13 +1998,13 @@ class Transport:
         """POST /api/v1/approvals/{approval_id}/consume — mark an approved
         approval row as executed.
 
-        Close-orphan fix (ADR-047, 2026-09-21). The original
-        ``consume_approved`` SQL is only reachable from the orchestrator's
-        Step 6 inline at backend/src/proxy/http/gate/orchestrator.rs:713,
-        but mode="inline" tools bypass /execute entirely — leaving the
-        approval row at status=APPROVED past expires_at. This new
+        Closes the orphan class on the SDK success path: ``consume_approved``
+        SQL is reachable from the orchestrator's Step 6 inline at
+        backend/src/proxy/http/gate/orchestrator.rs:713, but
+        mode="inline" tools bypass /execute entirely — leaving the
+        approval row at status=APPROVED past expires_at. This
         endpoint is structurally distinct (no execution_id binding per
-        ADR-046) and closes the orphan class on the SDK success path.
+        ADR-046).
 
         The body is built by Runtime.consume_approval — it always
         carries ``organization_id`` (C2 closure) and optionally
@@ -2510,8 +2496,8 @@ def _extract_error_envelope(
 ) -> tuple[str, str, dict[str, Any]]:
     """Pull ``(error_code, message, details)`` from any error envelope.
 
-    Drift §3 (2026-07-06): the backend emits three distinct shapes
-    for non-2xx responses. This helper normalises them into the
+    The backend emits three distinct shapes for non-2xx responses.
+    This helper normalises them into the
     ``(error_code, message, details)`` tuple the rest of
     ``_parse_v3_error_envelope`` consumes.
 
@@ -2612,12 +2598,10 @@ def _extract_error_envelope(
 def _safe_json(response: httpx.Response, endpoint: str) -> Any:
     """Parse a response body as JSON, wrapping parse failures.
 
-    DEF-ERRHDL-INVALID-JSON-01 (2026-08-11, RUN_ID 20260811-1): the SDK
-    code, which leaks internal file paths and the raw broken payload
-    fragment in tracebacks. This helper wraps the parse failure in
-    NullRunTransportError with a stable ``error_code`` so callers can
-    ``except`` cleanly and the user sees a short NullRun-family
-    message instead of a Python traceback.
+    The parse failure is wrapped in NullRunTransportError with a
+    stable ``error_code`` so callers can ``except`` cleanly and the
+    user sees a short NullRun-family message instead of a Python
+    traceback.
 
     ``body_preview`` is intentionally truncated to 200 chars and the
     raw ``JSONDecodeError.lineno/colno`` are NOT included in the
@@ -3227,8 +3211,8 @@ def _parse_error_envelope(
     Module-level helper (not a Transport method) so it can be called
     from background threads that do not carry a Transport instance.
 
-    **Audit F-R2-13 (2026-06-22):** no live wire path uses this. It
-    exists for tests only. See the comment block above.
+    **Test-only helper:** no live wire path uses this. See the
+    comment block above.
     """
     status = response.status_code
     try:

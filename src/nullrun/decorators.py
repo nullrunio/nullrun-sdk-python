@@ -279,8 +279,8 @@ def _safe_error_str(error: BaseException | None) -> str | None:
     return _strip_details_balanced(raw)
 
 
-# The legacy module-level slot was removed. Reads/writes now route
-# through the registry (see nullrun._singleton._RuntimeProxyModule).
+# Module-level reads/writes route through the registry
+# (see nullrun._singleton._RuntimeProxyModule).
 
 
 def _get_or_create_runtime() -> NullRunRuntime:
@@ -575,11 +575,11 @@ def protect(fn: F | None = None) -> F | Callable[[F], F]:
         # AND for ``parent_trace_id`` derivation at runtime.py:2967)
         # emits events tagged with the SAME trace_id /
         # span_id as SpanContext. Without this mirror a bare
-        # ``@protect`` (no enclosing ``with workflow``) still saw a
-        # tree-break: span_start carried SpanContext.trace_id while
-        # llm_call / tool_call carried ``generate_trace_id()`` from
-        # the legacy fallback. Token-based so a nested ``@protect``
-        # inside an outer ``@protect`` (or inside ``with workflow``)
+        # ``@protect`` (no enclosing ``with workflow``) sees a
+        # tree-break: span_start carries SpanContext.trace_id while
+        # llm_call / tool_call carries a freshly generated trace_id.
+        # Token-based so a nested ``@protect`` inside an outer
+        # ``@protect`` (or inside ``with workflow``)
         # restores the outer trace/span on reset.
         trace_legacy_token = set_trace_id(span.trace_id)
         span_legacy_token = set_span_id(span.span_id)
@@ -804,7 +804,7 @@ def _run_tool_policy_gate(
     fail_open = os.environ.get("NULLRUN_SENSITIVE_FAIL_OPEN", "").strip() == "1"
     # *display* workflow_id via the runtime's precedence chain
     # (contextvar → self.workflow_id → None). Sentinel stays as the
-    # last resort for legacy / never-bound keys.
+    # last resort for never-bound keys (no workflow context).
     workflow_id = runtime._resolve_workflow_id(get_workflow_id()) or UNKNOWN_WORKFLOW_ID
 
     try:
@@ -904,10 +904,10 @@ def _run_tool_policy_gate(
         )
         raise err from exc
 
-    # Defense in depth: legacy fallback / classification audit. If
-    # the transport ever returns a synthetic dict whose
-    # decision_source marks a fallback, block per ADR-008 fail-CLOSED.
-    # This arm is preserved for defense in depth even though the
+    # Defense in depth: classification audit. If the transport ever
+    # returns a synthetic dict whose decision_source marks a
+    # fallback, block per ADR-008 fail-CLOSED. This arm is preserved
+    # for defense in depth even though the
     # typed transport-error arms above are the canonical path.
     if isinstance(result, dict):
         decision_source = result.get("decision_source", "")

@@ -10,10 +10,9 @@ Modules:
     registry. See that module for the Layer-2 design.
 
 Both are reachable as ``nullrun.observability.metrics`` /
-``nullrun.observability.error_hooks`` for back-compat. The
-metrics singleton lives here (was previously a module-level
-constant in ``observability.py``) — moving it into a package
-was needed to make room for the ``error_hooks`` submodule.
+``nullrun.observability.error_hooks``. The metrics singleton
+lives here — moving it into a package made room for the
+``error_hooks`` submodule.
 """
 
 from __future__ import annotations

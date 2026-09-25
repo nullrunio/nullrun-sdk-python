@@ -229,8 +229,8 @@ def handle(*, exit_code: int = 1):
             )
         except Exception:  # noqa: BLE001
             # Defensive: never let the report builder block the exit.
-            # Fall back to the legacy single-line behaviour so a buggy
-            # helper can't freeze a script that would otherwise exit.
+            # Fall back to the single-line message so a buggy helper
+            # can't freeze a script that would otherwise exit.
             report = format_user_message(exc)
         print(report, file=sys.stderr)
         sys.exit(exit_code)

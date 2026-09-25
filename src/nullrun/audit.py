@@ -26,9 +26,9 @@ because the backend re-projects the legacy `action` into the new
 `event_type` column at read time.
 
 Wire reference:
-    backend/src/proxy/http/audit.rs::AuditEntryResponse (13 governance
-    fields, plus the legacy `action` / `actor` / `actor_label` /
-    `outcome` / `metadata` shape preserved for back-compat).
+    backend/src/proxy/http/audit.rs::AuditEntryResponse — 13
+    governance fields plus `action` / `actor` / `actor_label` /
+    `outcome` / `metadata` for the operator dashboard.
 """
 
 from __future__ import annotations
@@ -278,8 +278,8 @@ class AuditVerifyResult:
     """Outcome of /api/v1/orgs/:org_id/audit-log/verify.
 
     `verified` and `chain_valid` are the same value (the backend
-    surfaces both for back-compat). `first_failure_reason` is one
-    of `content_hash_mismatch` / `previous_hash_mismatch` /
+    surfaces both for the dashboard). `first_failure_reason` is
+    one of `content_hash_mismatch` / `previous_hash_mismatch` /
     `empty_chain` (or None when verified=True).
 
     `hmac_checked` is currently always False — the response

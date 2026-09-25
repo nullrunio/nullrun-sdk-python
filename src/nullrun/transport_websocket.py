@@ -83,10 +83,10 @@ class WebSocketConnection:
     def _is_acknowledged_state(cls, state: str) -> bool:
         """Case-insensitive membership check against ``ACKNOWLEDGED_STATES``.
 
-        Audit-2026-06-22: added a lowercase fallback so a server
-        regression to ``"killed"``/``"paused"`` doesn't silently
-        drop the ACK. Exact PascalCase is still the happy path and
-        is checked first; the lowercase branch is defensive only.
+        The lowercase branch is defensive: it protects against a
+        server regression to ``"killed"``/``"paused"`` that would
+        otherwise silently drop the ACK. Exact PascalCase is still
+        the happy path and is checked first.
         """
         if state in cls.ACKNOWLEDGED_STATES:
             return True
@@ -678,11 +678,8 @@ class WebSocketConnection:
         """
         Send acknowledgment message to server with HMAC signature.
 
-        CP7 fix (2026-06-26): previously this ACK was plain JSON
-        no signature, no timestamp, no api_key. The backend does
-        not currently verify ACK authenticity (the TODO at
-        ``backend/src/proxy/http/ws_control.rs:842-848`` is still
-        open) but adding the signature now means:
+        The backend does not currently verify ACK authenticity but
+        the SDK ships the signature now so:
 
         * When the backend enables ACK verification, the SDK is
           already on the wire format it expects — no breaking
@@ -737,9 +734,9 @@ class WebSocketConnection:
             }
 
             # Add HMAC fields when both api_key and secret_key are
-            # configured. Without secret_key we still send the
-            # legacy api_keys that don't use HMAC). The backend
-            # skips verify when signature is absent.
+            # configured. Without secret_key the SDK sends the
+            # unsigned X-API-Key only — the backend treats unsigned
+            # frames as non-HMAC traffic and skips signature verify.
             if self.api_key and self.secret_key:
                 # The signature covers the canonical bytes of the
                 # body the receiver will hash. We sign the *unsigned*
@@ -760,7 +757,7 @@ class WebSocketConnection:
                 # which would diverge from the signed bytes).
                 await self._conn.send(body_str)
             else:
-                # Legacy / pre-HMAC path: plain JSON envelope.
+                # Unsigned path: plain JSON envelope without HMAC.
                 await self._conn.send(json.dumps(ack))
             logger.debug(f"ACK sent for message {message_id}")
         except Exception as e:

@@ -24,11 +24,20 @@ the authoritative table; deviations require an ADR amendment (Rule 5).
 | `_emit_span_start` / `_emit_span_end` | n/a -- never blocks | n/a | n/a |
 | `/track` batch path (legacy) | OPEN-on-network-error (event dropped, no retry) | n/a -- circuit breaker backoff applies | none |
 
-**Readme correction (2026-07-04):** the SDK_README.md claim
-"Fail-OPEN на инфраструктурных сбоях. Если backend недоступен, бюджет
-не блокирует агента" is **partially wrong** — it conflates SDK-side
-transport failure with backend-side budget-enforcement failure. The
-honest split is:
+**Fail-OPEN policy** — SDK-side transport failure (network timeout,
+5xx, breaker open) is fail-OPEN on the *check* path so a dead
+backend doesn't freeze the user's agent loop. Backend-side
+budget-enforcement failure (the /gate or /track handler actually
+returned a wire response, just one indicating a Redis outage or
+aggregate rate-limit Redis unavailable) → the wire response is
+what it is, and the SDK raises the corresponding exception.
+``BUDGET_REDIS_UNAVAILABLE`` → 402 ``NullRunBudgetError``
+(fail-CLOSED, the backend rejected the request because Redis was
+unreachable for the budget counter — this is the authoritative
+enforcement signal, not a transport blip).
+``RATE_LIMIT_REDIS_UNAVAILABLE`` → 503 ``NullRunRateLimitRedisError``
+(fail-CLOSED for the same reason). The SDK does NOT silently
+fall-OPEN on a wire 4xx/5xx that names an enforcement failure.
 
 * **SDK-side transport failure** (network timeout, 5xx, breaker open)
   → fail-OPEN on the *check* path so a dead backend doesn't freeze
@@ -120,33 +129,26 @@ from nullrun.transport import (
     _protocol_header_value,
     _safe_json,
 )
-from nullrun.uuid7 import uuid7_str  # 2026-07-04 BUG #4
+from nullrun.uuid7 import uuid7_str
 
 logger = logging.getLogger(__name__)
 
 # Sentinel used when a gate fires outside a ``with workflow(...)``
 UNKNOWN_WORKFLOW_ID: str = "__nullrun_unknown__"
 
-# 2026-07-04 (BUG #5): in-process gate cache for chain-mode.
-# 2026-09-12 (DEF-CACHE-COST-ESTIMATE-COLLISION): the cache key
-# includes ``estimated_tokens`` (currently hardcoded to 1 in
-# ``check_workflow_budget``) so a future change that varies
-# estimated_tokens by call does not silently serve a cheaper
-# cached allow for a more expensive call. Without this, two
-# chain-mode calls with the same (workflow_id, chain_id,
-# call_model) but different cost_estimate collide and the
-# cheaper response is reused — same blast radius as the original
-# BUG #5 (over-reserve on the consume side), but at the cache
-# layer instead of the wire layer.
-# 2026-09-12 (DEF-CACHE-STALE-ALLOW-AFTER-OVERBUDGET): the cache is
-# also invalidated when /track signals budget exhaustion
-# (HTTP 422 from CONSUME_OVERBUDGET) and when ``chain_end`` is
-# called. Without this, a chain that exhausts its budget mid-loop
-# could continue serving cached "allow" decisions for up to 5 s
-# (the TTL) after the backend has actually blocked subsequent
-# calls. The invalidation uses the active chain_id from the
-# contextvar so unrelated chains sharing the runtime instance
-# are not affected.
+# In-process gate cache for chain-mode. The cache key includes
+# ``estimated_tokens`` (currently hardcoded to 1 in
+# ``check_workflow_budget``) so two chain-mode calls with the same
+# (workflow_id, chain_id, call_model) but different cost_estimate
+# do not collide and silently serve a cheaper cached allow for
+# a more expensive call. The cache is also invalidated when
+# /track signals budget exhaustion (HTTP 422 from
+# CONSUME_OVERBUDGET) and when ``chain_end`` is called — without
+# this, a chain that exhausts its budget mid-loop could continue
+# serving cached "allow" decisions for up to the TTL after the
+# backend has actually blocked subsequent calls. Invalidations
+# use the active chain_id from the contextvar so unrelated
+# chains sharing the runtime instance are not affected.
 _GATE_CACHE: dict[tuple[str, str | None, str | None, int], tuple[float, dict[str, Any]]] = {}
 _GATE_CACHE_TTL_SECONDS: float = 5.0
 
@@ -195,17 +197,16 @@ def _invalidate_gate_cache_for_chain(workflow_id: str | None, chain_id: str | No
         _GATE_CACHE.pop(k, None)
     return len(keys_to_drop)
 
-# 2026-07-24 (Root-cause fix for the ``@sensitive`` reinit gap):
+# Tracks which runtime instances have already forced strict mode,
+# preventing re-initialization from regressing back to permissive.
 _STRICT_MODE_FORCED: set[str] = set()
 
 
-# v3.53 audit #6 — production-environment detection for security
-# opt-out enforcement. ``NULLRUN_SKIP_BUDGET_CHECK=1`` is documented
-# as a DEV / TEST bypass (CLAUDE.md §20 "Никогда не выставлять
-# NULLRUN_SKIP_BUDGET_CHECK в production env"); pre-v3.53 the SDK
-# silently honored the opt-out regardless of environment, which
-# meant an operator who accidentally exported the var in prod got
-# a silent fail-OPEN on the budget gate.
+# Production-environment detection for security opt-out
+# enforcement. ``NULLRUN_SKIP_BUDGET_CHECK=1`` is documented as a
+# DEV / TEST bypass (CLAUDE.md §20 "Никогда не выставлять
+# NULLRUN_SKIP_BUDGET_CHECK в production env"); the SDK refuses
+# it outside dev / test environments.
 #
 # Two signals combine to flag a production environment:
 # 1. The configured ``api_url`` hostname matches the prod host
@@ -227,7 +228,7 @@ def _is_production_environment(api_url: str | None = None) -> bool:
     """Return True when the SDK is running against the production
     NullRun backend.
 
-    v3.53 audit #6 — used by ``check_workflow_budget`` to refuse
+    Used by ``check_workflow_budget`` to refuse
     ``NULLRUN_SKIP_BUDGET_CHECK=1`` outside dev / test environments.
     Detection rules (in order):
 
@@ -300,7 +301,6 @@ def is_strict_mode_forced(tool_name: str) -> bool:
     return tool_name in _STRICT_MODE_FORCED
 
 
-# 2026-07-04 (v0.12.0 wiring fix — ):
 SERVER_MINTED_RESERVATION_MAX_AGE_SECONDS: float = 295.0
 
 # Hard cap on server-supplied approval_timeout_seconds. The
@@ -610,12 +610,8 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         debug: bool = False,
         _test_mode: bool = False,
         polling: bool = True,
-        # DEF-ERRHDL-NO-TIMEOUT-01 (2026-08-11, RUN_ID 20260811-1):
-        # expose request_timeout so operators can tune the httpx read
-        # timeout for slow-network scenarios. Pre-fix the SDK hardcoded
-        # 30s read timeout in transport.py with no config surface.
-        # Precedence: kwarg > NULLRUN_REQUEST_TIMEOUT env var > 30.0
-        # (the pre-fix default).
+        # Tune the httpx read timeout for slow-network scenarios.
+        # Precedence: kwarg > NULLRUN_REQUEST_TIMEOUT env var > 30.0.
         request_timeout: float | None = None,
     ):
         """
@@ -636,16 +632,11 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         Note:
             - `organization_id` is set from `_authenticate ` after init; it is
               NOT a public init parameter and not read from env.
-            - `api_key` is required as of 0.3.0 (T3-S2). The previous
-              `local_mode` flag was removed because it silently bypassed
-              every backend gate.
-            - `fallback_mode` is fixed at STRICT (no public override).
-              v3.53 audit #4 — was PERMISSIVE pre-v3.53; flipped to
-              STRICT to honor CLAUDE.md §4 ("DEFAULT: fail-CLOSED для
-              всех enforcement путей"). Existing callers passing
-              ``fallback_mode="permissive"`` continue to opt into the
-              legacy fail-OPEN path; the default-only change is the
-              break.
+            - `api_key` is required. There is no `local_mode` flag —
+              it would silently bypass every backend gate.
+            - `fallback_mode` is fixed at STRICT (no public override)
+              to honor CLAUDE.md §4 ("DEFAULT: fail-CLOSED для всех
+              enforcement путей").
             - `timeout`/`max_retries` are fixed at 30s / 3 (no public override).
 
         Raises:
@@ -666,34 +657,27 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         self.secret_key = secret_key or os.getenv("NULLRUN_SECRET_KEY")
         self.api_url = api_url or os.getenv("NULLRUN_API_URL", "https://api.nullrun.io")
 
-        # T3-S2 (0.3.0): api_key is now required. The previous `local_mode`
+        # api_key is required — there is no fallback.
         if not self.api_key:
             raise NullRunAuthenticationError(
                 "NullRunRuntime() requires an api_key. Pass api_key='nr_live_...' "
-                "or set NULLRUN_API_KEY. (Silent no-op fallback was removed "
-                "in 0.3.0 -- see CHANGELOG.)"
+                "or set NULLRUN_API_KEY."
             )
         # organization_id is set by _authenticate; stays None until then.
         self.organization_id: str | None = None
         # workflow_id is set by _authenticate from the API key's
         # binding (organization_api_keys.workflow_id). Used as a
         # fallback for /check, /status, and span events when the
-        # user hasn't entered a `with workflow(...)` context. None
-        # on legacy keys (pre-139 or never used) -- call sites
-        # must NOT invent one.
+        # user hasn't entered a `with workflow(...)` context.
+        # Call sites must NOT invent one.
         self.workflow_id: str | None = None
 
         self._test_mode = _test_mode
         self.polling = polling
 
-        # The string ``fallback_mode`` parameter is deprecated and
-        # accepted only for backward compat — the CACHED variant
-        # was removed in 0.7.0 because the SDK no longer maintains
-        # a local policy cache (see CHANGELOG D-01). v3.53 audit #4
-        # flipped the default from PERMISSIVE to STRICT so a future
-        # caller who omits the kwarg lands on fail-CLOSED per
-        # CLAUDE.md §4 instead of silently allowing local execution
-        # on transport failure.
+        # ``fallback_mode`` defaults to STRICT per CLAUDE.md §4
+        # ("DEFAULT: fail-CLOSED для всех enforcement путей").
+        # PERMISSIVE is an explicit override.
         fb_upper = str(fallback_mode).upper() if fallback_mode is not None else "STRICT"
         if fb_upper == "PERMISSIVE":
             self._fallback_mode = FallbackMode.PERMISSIVE
@@ -859,13 +843,6 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             # Test mode: skip all network calls
             self._transport.start()
         else:
-            # AUTH-01 (2026-09-11): previously this arm caught ``httpx.RequestError``
-            # and re-raised ``NullRunAuthenticationError``, misclassifying network
-            # failures as auth failures. Arm B in ``_authenticate`` already catches
-            # the same condition with the correct class (``NullRunTransportError``);
-            # this defensive duplicate was a backstop for a code path that no longer
-            # exists between ``_authenticate()`` and ``self._transport.start()``.
-            # Remove: arm B is sufficient.
             self._authenticate()
             self._transport.start()
             # Start remote polling unless disabled (internal `polling=False`
@@ -1268,7 +1245,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 user_action=(
                     "Set NULLRUN_API_KEY env var or pass api_key='nr_live_...' "
                     "to nullrun.init(). The SDK cannot operate without "
-                    "credentials — the no-op local mode was removed in 0.3.0."
+                    "credentials."
                 ),
             )
             self._emit_sdk_error(err, stage="auth")
@@ -1276,7 +1253,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
 
         logger.debug(f"Authenticating with API at {self.api_url}/auth/verify")
         try:
-            # 2026-06-28 audit P2.3: retry transient 503/504 + network blips
+            # Retry transient 503/504 + network blips.
             response = self._post_auth_with_retry(
                 f"{self.api_url}/api/v1/auth/verify",
                 json_body={"api_key": self.api_key},
@@ -1284,25 +1261,12 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             )
 
             if response.status_code == 200:
-                # DEF-ERRHDL-INVALID-JSON-01 (2026-08-11, RUN_ID 20260811-1):
-                # route 200-OK JSON parse through _safe_json so a malformed
-                # body raises NullRunTransportError (NR-T001) instead of
-                # leaking json.JSONDecodeError to user code. The
-                # /check/track/... paths already use _safe_json (transport.py).
                 data = _safe_json(response, "auth")
                 # STRICT MODE: organization_id is REQUIRED, no fallback
                 org_id = data.get("organization_id")
                 if not org_id:
-                    # DEF-ERRHDL-MALFORMED-MSG-01 (2026-08-11, RUN_ID 20260811-1):
-                    # drop "compromised" wording. "compromised" is a
-                    # security-incident term that triggers SOC alerts in
-                    # observability stacks; using it for a routine schema
-                    # mismatch is misleading. Wording now attributes the
-                    # failure to a wire-shape mismatch without making a
-                    # security claim.
                     err = NullRunAuthenticationError(
-                        "Auth response missing organization_id -- server returned an unexpected response shape. "
-                        "Refusing to operate with legacy identity.",
+                        "Auth response missing organization_id -- server returned an unexpected response shape.",
                         error_code="NR-A002",
                         user_action=(
                             "The NullRun backend returned a 200 but the response "
@@ -1316,21 +1280,12 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                     raise err
                 self.organization_id = org_id
 
-                # Pick up the workflow this key is bound to.
-                # `None` on legacy keys (pre-139 or never-used) --
-                # call sites that NEED a workflow
-                # (check_workflow_budget, check_control_plane, span
-                # events) will fall through to the contextvar when
-                # self.workflow_id is None, exactly like before.
-                # New keys always have this set.
+                # Pick up the workflow this key is bound to. New
+                # keys always have this set; if it's missing the
+                # SDK can't honour the dashboard's KILL/PAUSE for
+                # this key — the operator needs to rotate the key.
                 self.workflow_id = data.get("workflow_id")
 
-                # Legacy API keys do not return workflow_id, so the
-                # SDK cannot honour the dashboard's KILL/PAUSE for
-                # that workflow. Emit a one-time WARNING so the
-                # operator knows to rotate the key. Without this,
-                # the kill switch silently no-ops (a real safety
-                # hole for legacy users).
                 if self.workflow_id is None:
                     masked_key = (
                         (self.api_key[:8] + "***")
@@ -1362,21 +1317,10 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
 
                 logger.info(f"Authenticated: organization_id={self.organization_id}")
             else:
-                # DEF-ERRHDL-AUTH-PATH-CODE-PIN-01 (2026-08-11, RUN_ID 20260811-1):
-                # route 5xx to NullRunBackendError so the auth path uses the same
-                # error envelope classification as /check/track. Per CLAUDE.md
-                # §13 5xx is a backend-class error, not auth-class. Without this
-                # split, operators are nudged to rotate valid keys during backend
-                # outages ("API key may be invalid or expired" for status=500 is
-                # misleading).
-                #
-                # - 401 -> NullRunAuthenticationError + NR-A003 (key was actually
-                #   rejected; this stays a true auth failure).
-                # - All other 4xx -> NullRunAuthenticationError + NR-A001 (the
-                #   prior code; covers 403 etc.).
-                # - 5xx -> NullRunBackendError + NR-B002 (the existing transport
-                #   envelope's error_code, so 5xx is classified the same as 5xx
-                #   from /check/track).
+                # 5xx routes to NullRunBackendError (backend-class
+                # error, per CLAUDE.md §13). 401/NR-A003 = key
+                # rejected (true auth failure). Other 4xx / NR-A001
+                # covers 403 etc.
                 status = response.status_code
                 correlation_id = response.headers.get("x-correlation-id")
                 if 500 <= status < 600:
@@ -1401,17 +1345,15 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 )
                 raise err
         except httpx.RequestError as e:
-            # AUTH-01 (2026-09-11): reclassify httpx.RequestError as
-            # ``NullRunTransportError`` instead of ``NullRunAuthenticationError``.
-            # The previous wrap misled operators — the same condition (DNS failure,
-            # connection refused, TLS handshake error, request timeout) is correctly
-            # classified as ``NullRunTransportError(NETWORK_ERROR, "auth")`` by
-            # ``Transport.heartbeat`` (transport.py:2077) and the rest of the SDK.
-            # The ``user_action`` previously embedded here noted "This is a
-            # transport failure (not an auth failure)" — the class should match
-            # the message. ``NullRunTransportError.__init__`` already sets
-            # ``error_code="NR-B001"`` (transport.py:233) and the standard
-            # retryable ``user_action`` (transport.py:234-237).
+            # Reclassify httpx.RequestError as
+            # ``NullRunTransportError`` instead of
+            # ``NullRunAuthenticationError`` — the same condition
+            # (DNS failure, connection refused, TLS handshake error,
+            # request timeout) is correctly classified as
+            # ``NullRunTransportError(NETWORK_ERROR, "auth")`` by
+            # the rest of the SDK. ``NullRunTransportError.__init__``
+            # already sets ``error_code="NR-B001"`` and the standard
+            # retryable ``user_action``.
             err = NullRunTransportError(
                 f"Auth request failed: {e}. Cannot establish secure connection to NullRun. "
                 f"Refusing to operate in unprotected mode.",
@@ -1426,9 +1368,8 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
 
         Defaults to WebSocket push for sub-second kill/pause
         propagation. Set `NULLRUN_TRANSPORT=http` to fall back to
-        the legacy 1-second HTTP poll (kept for environments where
-        the WS endpoint is blocked or for parity with old SDK
-        behavior).
+        the 1-second HTTP poll (for environments where the WS
+        endpoint is blocked).
         """
         if self._transport_mode == "http":
             self._start_http_poller()
@@ -1436,7 +1377,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             self._start_ws_listener()
 
     def _start_http_poller(self) -> None:
-        """Legacy: poll the server every second for state changes."""
+        """Poll the server every second for state changes."""
         self._poll_running = True
         self._poll_thread = threading.Thread(
             target=self._poll_commands, daemon=True, name="nullrun-poller"
@@ -1633,25 +1574,16 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
     def _fetch_remote_state(self, workflow_id: str) -> None:
         """Fetch remote state for a specific workflow.
 
-        2026-06-27: target endpoint swapped from
-        ``GET /api/v1/orgs/{org_id}/workflows/{workflow_id}`` (the
-        DASHBOARD route — requires Bearer session cookie, returns 401
-        to SDK clients that only send X-API-Key) to
-        ``GET /api/v1/status/{workflow_id}`` (the SDK-polling route —
-        backend/src/proxy/handlers.rs:9758, accepts X-API-Key OR
-        Authorization: Bearer). Pre-swap the HTTP-poll path silently
-        401'd on every poll, so the legacy HTTP-poll fallback never
-        observed a remote kill/pause. WS push (the default mode)
-        does NOT go through this code path, so the WS control plane
-        is unaffected.
+        Calls ``GET /api/v1/status/{workflow_id}`` (the SDK-polling
+        route — backend/src/proxy/handlers.rs:9758, accepts X-API-Key
+        OR Authorization: Bearer).
 
         Backend ``StatusResponse`` (handlers.rs:9747-9756) returns
         ``workflow_id, state, version, reason?, updated_at
         current_cost, rate_per_minute``. We only consume ``state`` —
         ``version`` and ``reason`` are SDK-local fields and remain at
-        their cached values (mirroring the prior behaviour). This is
-        sufficient for ``check_control_plane`` which only reads
-        ``state``.
+        their cached values. This is sufficient for
+        ``check_control_plane`` which only reads ``state``.
         """
         try:
             response = self._transport._client.get(
@@ -1877,16 +1809,11 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
 
         Raises:
             WorkflowPausedException: If workflow is paused on server
-            NullRunWorkflowKilledError: If workflow is killed on
-                server (2026-09-08 typed signal, NR-W002; subclass
-                of WorkflowKilledInterrupt which remains as the
-                back-compat name.)
+            NullRunWorkflowKilledError: If workflow is killed on server.
         """
         # Prefer the explicit arg (contextvar-supplied), fall back
-        # to the API key's bound workflow. None on legacy keys --
-        # in that case there's no workflow to check, so we no-op
-        # (preserves the legacy behavior for keys that have never
-        # been workflow-bound).
+        # to the API key's bound workflow. If neither resolves,
+        # there's no workflow to check, so we no-op.
         resolved = self._resolve_workflow_id(workflow_id or None)
         if not resolved:
             return
@@ -1902,13 +1829,9 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             remote_state = self._remote_state_for(workflow_id)
         state = remote_state.get("state", "Normal")
 
-        # S-4: case-insensitive compare. The backend
-        # already emits PascalCase via the `as_pascal_case ` normaliser
-        # in `handlers.rs:9258`, but a future regression to UPPERCASE
-        # (or any other casing) would silently fail the match and let a
-        # killed workflow keep running. Normalise here so the SDK
-        # survives any wire-format drift without needing a coordinated
-        # backend change.
+        # Case-insensitive compare so a future wire-format drift
+        # (e.g. regression to UPPERCASE) cannot silently let a
+        # killed workflow keep running.
         state_normalized = state.lower() if isinstance(state, str) else "normal"
 
         if state_normalized == "paused":
@@ -1946,8 +1869,8 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         pattern in `check_control_plane` -- a transient backend outage
         must never freeze the user's agent. The /track fast path also
         does not gate on budget, so the worst case under /gate failure
-        is that we revert to the pre-C behaviour: budget enforcement is
-        advisory until the gateway recovers.
+        is that budget enforcement is advisory until the gateway
+        recovers.
 
         Uses `estimated_tokens=1` (the minimum the API accepts). Goal
         is the binary question "is there any budget left?", not cost
@@ -1959,25 +1882,19 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         exhausted its budget from previous runs and the test only
         wants to exercise a non-budget code path.
 
-        Production guard (v3.53 audit #6): the opt-out is
-        REFUSED in production environments (api_url matches
-        ``api.nullrun.io`` or ``NULLRUN_ENV=production``). This
-        closes the silent fail-OPEN class where an operator
-        accidentally exported the var in a prod deployment and
-        silently lost the budget gate. To explicitly acknowledge
-        the risk in prod (e.g. an incident-response runbook
-        scenario), set ``NULLRUN_ALLOW_SKIP_BUDGET_CHECK=1`` as
-        well — the SDK logs the explicit ack at WARNING level
-        and emits a metric so the opt-in is visible in
-        observability.
+        Production guard: the opt-out is REFUSED in production
+        environments (api_url matches ``api.nullrun.io`` or
+        ``NULLRUN_ENV=production``), per CLAUDE.md §20 ("DEV/TEST
+        only"). To explicitly acknowledge the risk in prod (e.g.
+        an incident-response runbook scenario), set
+        ``NULLRUN_ALLOW_SKIP_BUDGET_CHECK=1`` as well — the SDK
+        logs the explicit ack at WARNING level and emits a metric
+        so the opt-in is visible in observability.
         """
         if os.environ.get("NULLRUN_SKIP_BUDGET_CHECK", "").strip() == "1":
             # Production guard: refuse the opt-out unless the
             # operator explicitly acked via
-            # ``NULLRUN_ALLOW_SKIP_BUDGET_CHECK=1``. CLAUDE.md §20
-            # marks NULLRUN_SKIP_BUDGET_CHECK as DEV/TEST only;
-            # pre-v3.53 the SDK silently honored it in any env
-            # which made accidental prod misuse a silent fail-OPEN.
+            # ``NULLRUN_ALLOW_SKIP_BUDGET_CHECK=1``.
             if _is_production_environment(self.api_url):
                 allow_ack = os.environ.get("NULLRUN_ALLOW_SKIP_BUDGET_CHECK", "").strip() == "1"
                 if not allow_ack:
@@ -2052,33 +1969,25 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # stashed it here. /track works on the server-minted
         # execution_id, NOT op_id, so it is independent.
         #
-        # 2026-09-13 (DEF-OPID-REUSE-HASH-MISMATCH): the prior
-        # `if op_id is None:` guard leaked the scope's first
-        # op_id across subsequent ``check_workflow_budget()``
-        # invocations. IDEM-01 on the server keys on op_id but
-        # verifies the 11-field semantic hash
-        # (``backend/src/redis/idempotency_store.rs::compute_gate_semantic_hash``)
-        # — a follow-up /check with different `tools` /
-        # `model` / `input` would 409 IDEMPOTENCY_KEY_MISMATCH
-        # and surface as NR-B004 in the SDK
-        # (``nullrun_openai_approval_demo.py`` symptom). The
-        # LangGraph ``NullRunCallback.on_llm_start`` fires a
-        # tools=None /gate BEFORE the @protect
-        # ``tools=['refund_customer']`` /gate in the same scope,
-        # which is the canonical repro (probed via
-        # probe_full.py 2026-09-13). Mint-fresh-per-call
-        # preserves the P0-27 within-action binding while
-        # removing the cross-action reuse that trips IDEM-01.
+        # Wire-binding invariant: /check + /execute (and the
+        # post-approval re-fire) within ONE logical action share
+        # the SAME op_id. The original implementation minted once
+        # per scope via the contextvar; /execute reads the
+        # freshly-minted value via get_operation_id() because we
+        # just stashed it here. /track works on the server-minted
+        # execution_id, NOT op_id, so it is independent.
         #
-        # We still read the contextvar first (rather than the
-        # pre-fix unconditional mint) to keep the P0-27 source-
-        # pin test ``test_check_workflow_budget_reads_contextvar``
-        # green and to surface any unexpected caller that
+        # Mint-fresh-per-call removes the cross-action reuse that
+        # trips IDEM-01 (the prior `if op_id is None:` guard
+        # leaked the scope's first op_id across subsequent
+        # ``check_workflow_budget()`` invocations). We still read
+        # the contextvar first to keep the within-action binding
+        # observable and to surface any unexpected caller that
         # pre-populates ``operation_id`` (e.g. test fixtures).
         # The read result is intentionally unused: /execute,
         # which runs synchronously in the SDK after /check,
         # reads the freshly-stashed value below via
-        # ``get_operation_id()`` — that is the P0-27 binding.
+        # ``get_operation_id()`` — that is the binding.
         op_id = _get_op_id_for_check()
         op_id = str(uuid.uuid4())
         _set_op_id_for_check(op_id)
@@ -2137,19 +2046,13 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         call_tools = get_call_tools()
 
         # 2026-07-02 (v0.11.0): forward chain context for soft-mode
+        # Chain context for soft-mode enforcement.
         chain_id = get_chain_id()
         chain_op = get_chain_op()
 
         check_req = {
             "organization_id": self.organization_id or "local",
-            # 2026-07-04 (BUG #4): requires server-minted
             "execution_id": uuid7_str(),
-            # AUDIT P0-27 (2026-09-05): operation_id comes from the
-            # contextvar minted at the top of this method (and shared
-            # with /execute). The pre-fix `str(uuid.uuid4())` minted
-            # a separate value here — /check and /execute would have
-            # produced distinct operation_ids for one logical action,
-            # silently breaking the backend's binding key.
             "operation_id": op_id,
             "check_type": "llm",
             "model": call_model,  # may be None if user didn't set it
@@ -2157,17 +2060,15 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             "stream": False,
         }
 
-        # v0.16.1 (Phase-1+ wire-shape fix): Phase-1+ SDKs MUST
-        # populate `action_digest` on every /gate call, even when no
-        # typed business impact is extracted (`@protect`-decorated
-        # LLM-only calls). Per `backend/src/proxy/http/gate/gate.rs:56`
-        # v3.62.1 / ADR-023 P1-6 the gate fail-CLOSED-rejects any
-        # proto>=3 client that omits the digest. We always emit a
-        # NoImpact sentinel here — typed Money/ToolCall impacts are
-        # forwarded by `runtime.execute(...)` directly (see
-        # `transport.py::execute`) and do not pass through this
-        # pre-flight gate. Computing once per call (not cached) is
-        # fine: compute_action_digest is ~5µs of pure stdlib.
+        # `action_digest` is required on every /gate call. Per
+        # `backend/src/proxy/http/gate/gate.rs:56` (ADR-023 P1-6)
+        # the gate fail-CLOSED-rejects any proto>=3 client that
+        # omits the digest. We always emit a NoImpact sentinel here
+        # — typed Money/ToolCall impacts are forwarded by
+        # `runtime.execute(...)` directly (see `transport.py::execute`)
+        # and do not pass through this pre-flight gate. Computing
+        # once per call (not cached) is fine: compute_action_digest
+        # is ~5µs of pure stdlib.
         check_req["action_digest"] = _compute_action_digest(_BusinessImpact.no_impact())
 
         # Forward the tool list so backend (T3) can match each tool
@@ -2203,6 +2104,9 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             check_req["chain_op"] = chain_op if chain_op != "auto" else None
 
         # 2026-07-02 (v0.11.0): idempotency key.
+        # operation_id is also the idempotency key — /check and /track
+        # with the same operation_id are treated as a single logical
+        # action by the backend's binding key.
         check_req["idempotency_key"] = check_req["operation_id"]
 
         # In-process gate cache for chain-mode invocations. See
@@ -2227,12 +2131,8 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 except (httpx.HTTPError, NullRunError) as exc:
                     # Narrow catch: fail-OPEN only on transport +
                     # classified SDK errors. Internal bugs
-                    # (KeyError, AttributeError) should surface
-                    # rather than silently allow an unbounded call.
-                    # 2026-08-13 (sprint handoff Bug #4): emit metric
-                    # so sustained backend outages that bypass the
-                    # budget gate via the documented ADR-008 fail-OPEN
-                    # posture are visible in /health and alertable.
+                    # (KeyError, AttributeError) surface rather
+                    # than silently allowing an unbounded call.
                     logger.warning(f"check_workflow_budget: /gate unavailable, failing open: {exc}")
                     metrics.inc_runtime("gate_fail_open_total")
                     return
@@ -2242,16 +2142,10 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             try:
                 response = self._transport.check(check_req)
             except Exception as exc:  # noqa: BLE001
-                # 2026-08-13 (sprint handoff Bug #4): same metric emit
-                # as the cache-enabled arm above -- all three fail-OPEN
-                # paths in this method increment the same counter so an
-                # operator dashboard can graph "budget gate bypass
-                # rate" without per-site accounting.
                 logger.warning(f"check_workflow_budget: /gate unavailable, failing open: {exc}")
                 metrics.inc_runtime("gate_fail_open_total")
                 return
 
-        # 2026-07-04 (v0.12.0 wiring fix — ):
         _capture_server_minted_execution_id(response)
 
         decision = response.get("decision", "allow")
@@ -2259,21 +2153,13 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # Only fail-OPEN on EXPLICIT synthetic responses
         # (decision_source starts with "fallback" or is one of the
         # classified TransportErrorSource values). Real backend
-        # decisions (decision_source="gateway", or missing for
-        # backward compat) are honoured.
+        # decisions (decision_source="gateway") are honoured.
         if decision_source.startswith("fallback") or decision_source in {
             TransportErrorSource.NETWORK_ERROR,
             TransportErrorSource.GATEWAY_ERROR,
             TransportErrorSource.BREAKER_OPEN,
             TransportErrorSource.AUTH_ERROR,
         }:
-            # 2026-08-13 (sprint handoff Bug #4): the docblock above
-            # (lines 1763-1769) declares this path "logged at warning
-            # level and the caller proceeds" but the pre-fix code
-            # emitted DEBUG, making the fail-OPEN invisible to
-            # operators tailing INFO+ logs. Promote to WARNING so the
-            # contract matches the implementation; emit metric for
-            # parity with the two exception-path sites above.
             logger.warning(
                 f"check_workflow_budget: synthetic decision_source="
                 f"{decision_source!r}, treating as transport error"
@@ -2281,7 +2167,6 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             metrics.inc_runtime("gate_fail_open_total")
             return
         if decision == "block":
-            # FIX-2026-06-27: backend /gate sets both `explanation` (a
             reasons = response.get("explanations") or (
                 [response["explanation"]] if response.get("explanation") else ["block"]
             )
@@ -2291,7 +2176,6 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             # distinct from loop / retry / rate which have their
             # own counters.
             metrics.inc_runtime("cost_limit_exceeded")
-            # 2026-09-08: typed hard-block (NR-B004 budget cap).
             # ``NullRunBudgetError`` carries structured
             # ``error_code``, ``user_action``, ``retryable`` so the
             # LLM gets an actionable hint instead of "Something went
@@ -2349,7 +2233,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             return
 
         if decision == "require_approval":
-            # The gate requires a human-approval before the call
+            # The gate requires human-approval before the call
             # may proceed. Block the calling thread on the WS push
             # (handled in _handle_approval_resolved) and let the
             # operator click Approve/Deny on the dashboard. On
@@ -2364,15 +2248,12 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             # `NULLRUN_APPROVAL_TIMEOUT_SECONDS`. This prevents the
             # SDK/backend desync that the backend expiry sweeper
             # was written to fix. We fall back to the env default
-            # only when the field is missing or non-positive --
-            # both signal "backend without that field" and we
-            # preserve the legacy behaviour for those callers.
+            # only when the field is missing or non-positive.
             approval_id = response.get("approval_id", "") or ""
             if not approval_id:
                 logger.warning(
                     "check_workflow_budget: require_approval decision but no approval_id in response"
                 )
-                # 2026-09-08: typed backend error (NR-B002, retryable).
                 # The server returned require_approval without an
                 # approval_id -- this is a wire-bug / drift, not a
                 # budget block. Surface as retryable backend error
@@ -2401,18 +2282,12 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 f"check_workflow_budget: require_approval id={approval_id} -- "
                 f"waiting for WS push (timeout={server_timeout if server_timeout is not None else 'env-default'})"
             )
-            # 2026-09-11: pass the actual server-minted execution_id
-            # (captured above from the /gate response) into the WS
-            # wait so the entry's metadata + diagnostic log lines
-            # reflect the same id the server stamped on the
-            # approval row. Pre-fix this string fell back to
-            # ``str(self.organization_id)`` which made the
-            # ``__nullrun_unknown__`` sentinel leak into exception
-            # payloads (demo
-            # langgraph_openai_approval_demo.py prints
-            # ``execution_id=exc.workflow_id``). The handler matches
-            # purely on ``approval_id``, so this is diagnostic-only
-            # — captured on the consumer side.
+            # Pass the actual server-minted execution_id (captured
+            # above from the /gate response) into the WS wait so the
+            # entry's metadata + diagnostic log lines reflect the same
+            # id the server stamped on the approval row. The handler
+            # matches purely on ``approval_id``, so this is
+            # diagnostic-only — captured on the consumer side.
             from nullrun.context import get_server_minted_execution_id
 
             _captured_eid = get_server_minted_execution_id()
@@ -2448,9 +2323,6 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 logger.info(f"check_workflow_budget: approval {approval_id} approved -- resuming")
                 return
             if outcome == "denied":
-                # 2026-09-08: typed approval-denied (NR-A011). Cookbook
-                # code can `except NullRunApprovalDeniedError` to
-                # surface the denial note + user_action to the LLM.
                 raise NullRunApprovalDeniedError(
                     workflow_id=workflow_id,
                     reason=f"approval denied: {result.get('note') or 'operator denied'}",
@@ -2458,9 +2330,6 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                     denial_note=result.get("note"),
                 )
             # timeout: fail-CLOSED -- do not run the call.
-            # 2026-09-08: typed approval-expired (NR-A012) -- THE TRIGGER
-            # FIX. The LLM now sees "Approval expired after 300s of
-            # WS push silence" instead of "Something went wrong".
             raise NullRunApprovalExpiredError(
                 workflow_id=workflow_id,
                 reason=(
@@ -2726,14 +2595,11 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 Returns:
                     Parsed JSON dict.
         """
-        # DEF-CHAIN-END-ORG-ID (2026-09-11): ``Transport.chain_end`` pre-fix
-        # sent only ``{chain_id, chain_op, execution_id}`` to /gate and the
-        # backend rejected with 422 ``missing field 'organization_id'``.
-        # Fix: forward ``self.organization_id`` (set in ``_authenticate``)
+        # Forward ``self.organization_id`` (set in ``_authenticate``)
         # and the contextvar trace_id so the SDK builds a complete
-        # ``GateRequest`` body. ``trace_id`` is sourced from the contextvar
-        # to match the rest of the SDK's wire-shape policy (one trace id
-        # per logical chain).
+        # ``GateRequest`` body. ``trace_id`` is sourced from the
+        # contextvar to match the rest of the SDK's wire-shape policy
+        # (one trace id per logical chain).
         from nullrun.context import get_trace_id
 
         result = self._transport.chain_end(
@@ -2741,14 +2607,9 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             organization_id=self.organization_id,
             trace_id=get_trace_id(),
         )
-        # 2026-09-12 (DEF-CACHE-STALE-ALLOW-AFTER-OVERBUDGET): drop
-        # the in-process gate cache for this chain. The chain is
-        # closed on the server; any cached "allow" for the same
-        # (workflow_id, chain_id) is unreachable from future calls
-        # (UUID v4 collision risk is negligible but the cleanup
-        # costs nothing). Invalidating AFTER the wire call so a
-        # transient transport failure does not free the cache
-        # before the server confirms closure.
+        # Drop the in-process gate cache for this chain AFTER the wire
+        # call so a transient transport failure does not free the
+        # cache before the server confirms closure.
         workflow_id_str = str(self.workflow_id) if self.workflow_id else None
         _invalidate_gate_cache_for_chain(workflow_id_str, chain_id)
         return result
@@ -2780,10 +2641,10 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
     def _auth_headers(self) -> dict[str, str]:
         """Get authentication headers.
 
-         the wire-protocol handshake header is
-        required on every signed POST. The three direct callers of
-        this helper — ``_post_auth_with_retry``, ``_fetch_remote_state``
-        and ``get_org_status`` — all go through the backend's protocol
+        The wire-protocol handshake header is required on every signed
+        POST. The three direct callers of this helper —
+        ``_post_auth_with_retry``, ``_fetch_remote_state`` and
+        ``get_org_status`` — all go through the backend's protocol
         middleware, so the header has to be present here rather than
         at every call site.
         """
@@ -2807,7 +2668,8 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 (see ``Transport.stop(flush=False)`` for the full
                 rationale; observed 9m 47s CI noise on PR #60).
         """
-        # Stop the HTTP poller (legacy path) if it was started.
+        # Stop the HTTP poller (NULLRUN_TRANSPORT=http fallback)
+        # if it was started.
         self._poll_running = False
         if self._poll_thread and self._poll_thread.is_alive():
             # Cap to 0.5s so a SIGTERM handler returns quickly.
@@ -2985,12 +2847,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                Returns:
                    True if tool requires strict mode
 
-               P2-3: match is case-insensitive. The pre-fix code did an exact
-               ``tool_name in self._sensitive_tools`` check, so a tool
-               registered as ``"stripe.charge"`` would silently fail to
-               match a caller passing ``"Stripe.Charge"`` — bypassing the
-               sensitive gate and running the body without an /execute
-               round-trip. The fix normalises both sides to lowercase
+               Match is case-insensitive: both sides are normalised to lowercase
                before the membership test, matching the case-insensitive
                style of ``_safe_kwargs``.
 
@@ -2999,12 +2856,9 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                ``add_sensitive_tool``. The lock is uncontended under
                CPython's GIL, so the cost is negligible.
         """
-        # O(1) lookup against the pre-lowercased frozenset
-        # snapshot. The lock is still taken to keep the snapshot
-        # coherent with the live set during concurrent
-        # add/remove_sensitive_tool calls (the snapshot is rebuilt
-        # under the lock), but the read itself is a single
-        # frozenset membership check.
+        # Lock-guarded O(1) lookup against the pre-lowercased frozenset
+        # snapshot. The lock keeps the snapshot coherent with the
+        # live set during concurrent add/remove calls.
         needle = tool_name.lower()
         with self._tools_lock:
             return needle in self._sensitive_tools_lower or needle in self._strict_mode_tools_lower
@@ -3022,11 +2876,6 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                Example:
                    runtime = NullRunRuntime.get_instance
                    runtime.add_sensitive_tool("my.custom_tool")
-
-        #39: takes ``_tools_lock`` so the mutation is atomic
-               against concurrent ``is_sensitive_tool`` reads and other
-               ``add``/``remove`` calls. Without the lock a free-threaded
-               build could observe a torn set state during the mutation.
         """
         with self._tools_lock:
             self._strict_mode_tools.add(tool_name)
@@ -3044,8 +2893,6 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                Example:
                    runtime = NullRunRuntime.get_instance
                    runtime.remove_sensitive_tool("my.custom_tool")
-
-        #39: takes ``_tools_lock`` to mirror ``add_sensitive_tool``.
         """
         with self._tools_lock:
             self._strict_mode_tools.discard(tool_name)
@@ -3140,10 +2987,6 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                   to this gate decision (v4 wire field; null on pre-v4
                   backends). Captured via `_capture_wire_evidence` →
                   `set_last_gate_policy_hash` for downstream audit linkage.
-                  NOTE: this is NOT a sequential `policy_version` number —
-                  wire v3/v4 backends emit only `policy_hash`; legacy
-                  `policy_version` references in this SDK are no longer
-                  populated from the wire.
                 - decision_context: Context used for the decision
 
             Mode values:
@@ -3261,15 +3104,12 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # `check_workflow_budget` which already threads the same
         # contextvar onto the wire body.
         #
-        # F03 (2026-08-22) precedence: the `tools` kwarg wins when
-        # supplied (allows callers like `_enforce_sensitive_tool` to
-        # forward an explicit list); otherwise fall back to the
-        # ``_call_tools_var`` contextvar which the F03 fix in
-        # decorators.py populates from ``fn.__name__`` before this
-        # method is called. The runtime layer was already reading
-        # the contextvar — the kwarg simply adds a second entry
-        # point that didn't exist before (causing TypeError on the
-        # decorator call site).
+        # Precedence: the `tools` kwarg wins when supplied (allows
+        # callers like `_enforce_sensitive_tool` to forward an
+        # explicit list); otherwise fall back to the
+        # ``_call_tools_var`` contextvar which the decorators
+        # populate from ``fn.__name__`` before this method is
+        # called.
         if tools is None:
             from nullrun.context import get_call_tools as _get_call_tools_for_execute
 
@@ -3335,23 +3175,14 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             execute_kwargs["action_digest"] = action_digest
         result = self._transport.execute(**execute_kwargs)
 
-        # 2026-09-11: DEF-EXECUTE-CAPTURE-WIRING. The /execute
-        # require_approval arm mints a FRESH execution_id (server-
-        # side) for the approval row + writes the binding, then
-        # echoes the new id back via ``reservation_id`` (mirrored by
-        # the backend's GateResponse::require_approval constructor —
-        # see backend/src/enforcement/gate_wire_adapter.rs v3.79+).
-        # Without this capture below, the contextvar stays at the
-        # /gate-minted value, and the post-approval /execute re-fire
-        # (line ~3037) sends the OLD execution_id back to the
-        # server. ``consume_approved``'s ``WHERE execution_id = $3``
-        # predicate then misses the row stamped with the freshly-
-        # minted one; the diagnostic SELECT walks all alternatives
-        # without match and falls through to the terminal
-        # replay-race branch (``APPROVAL_REPLAY_REJECTED``) — the
-        # SDK raises NR-A015. Capture here is fail-OPEN (drops
-        # malformed values silently via the helper's UUID parse),
-        # matching ``check_workflow_budget``'s behaviour.
+        # The /execute require_approval arm mints a fresh execution_id
+        # server-side for the approval row + writes the binding,
+        # then echoes the new id back via ``reservation_id``
+        # (mirrored by the backend's GateResponse::require_approval
+        # constructor — see backend/src/enforcement/gate_wire_adapter.rs).
+        # Capture here is fail-OPEN (drops malformed values
+        # silently via the helper's UUID parse), matching
+        # ``check_workflow_budget``'s behaviour.
         _capture_server_minted_execution_id(result)
 
         # Sync the kwargs dict to the captured id so the post-approval
@@ -3591,8 +3422,8 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             ``error_code``) so callers can introspect the wire
             shape for routing/alerting (e.g.
             ``exc.details["details"]["decision_source"]``). The
-            ``mapped_class`` shim is appended for back-compat with
-            callers that branched on the legacy keyword path.
+            ``mapped_class`` shim is appended for callers that branched
+            on the exception class name.
             """
             payload = dict(src)
             payload["mapped_class"] = mapped_name
@@ -3633,8 +3464,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 # (e.g. APPROVAL_VALIDATION_FAILED). There is no
                 # catalog error_code class attr to protect — we
                 # pass the wire code explicitly so self.error_code
-                # reflects the wire code (back-compat callers
-                # branch on exc.error_code == "APPROVAL_*").
+                # reflects the wire code.
                 payload = _build_payload(
                     wire_details, "NullRunBlockedException"
                 )
@@ -3661,11 +3491,10 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 details=payload,
             )
 
-        # Priority 3: legacy keyword-on-explanation mapping for
-        # backends that pre-date the structured wire code. Each
-        # branch picks a synthetic catalog code so legacy
-        # ``exc.error_code == "NR-B004"``-style branching still
-        # works for back-compat callers.
+        # Priority 3: keyword-on-explanation mapping for backends that
+        # pre-date the structured wire code. Each branch picks a
+        # synthetic catalog code so the resulting exception still
+        # maps to a typed class via ``exc.mapped_class``.
         explanation_lower = explanation.lower()
         if "budget" in explanation_lower or "exhausted" in explanation_lower:
             block_code = "NR-B004"
@@ -3761,14 +3590,16 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
 
             idem_key = get_server_minted_idempotency_key()
             if idem_key:
-                # 2026-08-06 (DEF-SDKWRAP-CHAIN-SOFT-EXECUTION-ID-REUSE-01,
+                # Compound the reservation id with the span id so a
+                # chain-soft span's /track stays bound to the right
+                # reservation even when the span_id changes per
+                # agent step.
                 span_id = enriched.get("span_id")
                 if span_id and ":" not in idem_key:
                     enriched["idempotency_key"] = f"{idem_key}:{str(span_id)[:16]}"
                 else:
                     enriched["idempotency_key"] = idem_key
 
-        # 2026-07-12 (multi-agent span attachment — SDK counterpart at
         from nullrun.context import get_trace_id as _get_trace_id
 
         chain_trace_id = _get_trace_id()
@@ -3839,36 +3670,19 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
 
         smid = get_server_minted_execution_id()
         if not smid:
-            # v0.16.0 (2026-08-20, backend v3.66.2 alignment): the
-            # 0.12.0 routing here used to fall back to /track/batch
-            # (the legacy v1/v2 no-reservation consume path). Backend
-            # v3.66.2 closed that path with per-event type-aware wire
-            # validation: any ``llm_call`` event in a batch WITHOUT
-            # ``reservation_id`` is rejected with 503
-            # BUDGET_RECHECK_FAILED (whole-batch fail-CLOSED). Falling
-            # back here would amplify into a tight retry loop
-            # producing 503-storm for every call site that forgot to
-            # pair ``track_llm`` with a prior ``check_workflow_budget``
-            # (or ``@protect`` / ``with workflow(...)``).
-            #
             # Server-authoritative model (CLAUDE.md §22): an llm_call
             # event without a paired /check reservation has no
-            # authoritative budget authority. Don't make up an id —
-            # drop the event explicitly so the operator sees the gap
-            # (WARNING + counter) instead of a silent batch loop.
+            # authoritative budget authority. Drop the event
+            # explicitly so the operator sees the gap (WARNING +
+            # counter) instead of a silent batch retry storm.
             #
             # Trigger conditions:
-            #   * no /check landed in this scope (legacy v1/v2 path)
+            #   * no /check landed in this scope
             #   * capture expired past the 295s safety window
             #   * /check returned ``decision: "block"`` (no
             #     reservation_id minted on a hard block — see
             #     ``_capture_server_minted_execution_id``)
             metrics.inc_runtime("dropped_llm_call_no_reservation")
-            # WARNING not DEBUG: matches the 0.15.2 fix that moved
-            # ``check_workflow_budget`` synthetic FALLBACK from DEBUG
-            # to WARNING (CHANGELOG 0.15.2). Operators should see this
-            # at INFO+ — a missing reservation pairing is a real
-            # integration bug, not a debug curiosity.
             logger.warning(
                 "_route_track: dropping llm_call event — no "
                 "server-minted reservation_id in scope (no /check "
@@ -4094,17 +3908,11 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         """POST ``json_body`` to ``url`` with bounded retry on transient
         failure.
 
-        2026-06-28 audit P2.3: the init path ``POST /api/v1/auth/verify``
-        previously did a single bare ``self._transport._client.post(...)``
-        call. Backend emits ``503 + Retry-After: 5`` on transient DB
-        errors (see ``backend/src/proxy/handlers.rs:11346-11351``), which
-        pre-fix surfaced to the user as ``NR-A001`` ("configuration
-        issue") even though the SDK was fine and the key was fine —
-        just a Postgres blip. This helper retries 5xx and network
-        errors up to ``max_attempts`` total tries, honors
-        ``Retry-After`` when the backend provides one, and propagates
-        ``httpx.RequestError`` unchanged on the LAST attempt so the
-        existing ``except`` arm below can turn it into ``NR-B001``.
+        Retries 5xx and network errors up to ``max_attempts`` total
+        tries, honors ``Retry-After`` when the backend provides one,
+        and propagates ``httpx.RequestError`` unchanged on the LAST
+        attempt so the existing ``except`` arm below can turn it into
+        ``NR-B001``.
 
         Auth failures (401/403/422) are NOT retried — the API key is
         wrong on attempt 1 means it's wrong on attempt 3.
@@ -4203,7 +4011,8 @@ def _capture_server_minted_execution_id(response: dict[str, Any]) -> str | None:
 
     raw = response.get("reservation_id") if isinstance(response, dict) else None
     if not raw:
-        # Legacy / v1-v2 backend, or a block response with no
+        # Block response with no reservation_id; clear so the
+        # previous scope's value can't leak.
         clear_server_minted_execution_id()
         return None
 
@@ -4235,16 +4044,12 @@ def _capture_server_minted_execution_id(response: dict[str, Any]) -> str | None:
 
     set_server_minted_execution_id(raw)
     set_server_minted_reservation_at(_time.monotonic())
-    # AUDIT P0-26 (2026-09-05): derive the idempotency_key from the
-    # SDK-minted operation_id (the value /check just sent on the
-    # wire) rather than from the server's response-echo. Pre-fix,
-    # the response-echo was trusted blindly — a misrouted response
-    # (different execution_id, similar shape) would silently
-    # overwrite the in-scope idempotency_key. We now assert
-    # equality when the server echoes a value (defensive parity
-    # check — the audit wants the SDK to know if the server
-    # rewrote it for any reason) and fall back to the SDK's own
-    # operation_id when the server omits the field.
+    # Derive the idempotency_key from the SDK-minted operation_id
+    # (the value /check just sent on the wire). The response-echo
+    # is assert-equal as a defensive parity check (the SDK has to
+    # know if the server rewrote it for any reason) and falls
+    # back to the SDK's own operation_id when the server omits the
+    # field.
     from nullrun.context import get_operation_id as _get_op_id_for_capture
 
     sdk_op_id = _get_op_id_for_capture()
@@ -4269,13 +4074,11 @@ def _capture_server_minted_execution_id(response: dict[str, Any]) -> str | None:
             )
         set_server_minted_idempotency_key(sdk_op_id or server_op_id)
     elif isinstance(sdk_op_id, str) and sdk_op_id:
-        # Server omitted the echo (pre-v4 backend); trust the SDK.
         set_server_minted_idempotency_key(sdk_op_id)
-    # ADR-037 Slice B (2026-08-31, protocol v4): capture the
-    # wire-evidence echo on the same /check as the execution_id so
-    # the two values always refer to the same gate decision. Wire-
-    # additive: pre-v4 backends omit both keys (skip_serializing_if)
-    # and the captures degrade to None — no false positive.
+    # Capture the wire-evidence echo on the same /check as the
+    # execution_id so the two values always refer to the same gate
+    # decision. Wire-additive: backends that omit both keys
+    # (skip_serializing_if) degrade to None — no false positive.
     _capture_wire_evidence(response)
     logger.debug(
         "_capture_server_minted_execution_id: captured %s",
@@ -4284,13 +4087,12 @@ def _capture_server_minted_execution_id(response: dict[str, Any]) -> str | None:
     return raw
 
 
-# ADR-037 Slice B (2026-08-31, protocol v4): wire-evidence echo
-# capture helper. Extracted from `_capture_server_minted_execution_id`
-# so the two captures share a call site but have distinct log lines
-# (debugging: a missing execution_id should not mask a successful
-# wire-evidence capture).
+# Wire-evidence echo capture helper. Extracted from
+# `_capture_server_minted_execution_id` so the two captures share a
+# call site but have distinct log lines (debugging: a missing
+# execution_id should not mask a successful wire-evidence capture).
 #
-# Wire contract: backend's /gate response now carries `action_digest`
+# Wire contract: backend's /gate response carries `action_digest`
 # (SDK-supplied SHA-256 of canonical business_impact, re-verified
 # server-side, echoed back) and `policy_hash` (slot reserved for
 # future Slice D wiring — today always None because the gate doesn't
@@ -4306,10 +4108,7 @@ def _capture_wire_evidence(response: dict[str, Any]) -> tuple[str | None, str | 
     Returns ``(action_digest, policy_hash)`` for the caller's log
     paths; the contextvar side-effect is authoritative.
 
-    Both fields default to None on legacy backends (no keys in
-    the JSON) and on pre-Phase-1 SDKs that never sent
-    `action_digest` (legacy grant path is fail-CLOSED at v3+
-    anyway — the backend sets the field to None on those rows).
+    Both fields default to None when the backend omits the keys.
     """
     from nullrun.context import (
         set_last_gate_action_digest,
@@ -4365,17 +4164,15 @@ def _build_v3_track_payload(
     """Map an enriched llm_call event onto the v3 /track schema.
 
     Returns ``None`` when the event cannot be mapped (caller
-    falls back to legacy batch path). Required ``tokens`` /
+    falls back to the batch path). Required ``tokens`` /
     ``workflow_id`` absence is the only failure mode today.
     """
     wf_id = wire_event.get("workflow_id")
     if not wf_id:
         # The backend's consume_budget_v3 needs a workflow_id to
         # attribute the consume to a key+workflow counter; without
-        # one the consume becomes unattributable.
-        # ownership binding). A missing workflow_id means the
-        # SDK never bound the API key to a workflow (legacy
-        # legacy-no-binding). Fall back.
+        # one the consume is unattributable. Fall back to the
+        # batch path (callers handle None).
         logger.debug(
             "_build_v3_track_payload: missing workflow_id — cannot shape v3 /track payload"
         )

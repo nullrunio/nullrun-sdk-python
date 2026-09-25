@@ -205,7 +205,7 @@ class MCPAdapter:
         # permissive MCP server cannot bypass the operator's
         # tool-block / budget / approval policies. See the constructor
         # docstring for the trade-off between the gate path and the
-        # legacy contextvar-only path.
+        # contextvar-only path.
         self._runtime = runtime
 
     def _default_list_tools(self) -> Iterable[Any]:
@@ -299,10 +299,10 @@ class MCPAdapter:
         client-specific kwargs without changing the public
         surface.
 
-        Gate enforcement (v3.53 audit #5): when an MCPAdapter is
-        constructed with ``runtime=`` set, ``call_tool`` routes the
-        invocation through ``runtime.execute(...)`` (the /api/v1/execute
-        gate endpoint) BEFORE the underlying MCP client is called.
+        Gate enforcement: when an MCPAdapter is constructed with
+        ``runtime=`` set, ``call_tool`` routes the invocation through
+        ``runtime.execute(...)`` (the /api/v1/execute gate endpoint)
+        BEFORE the underlying MCP client is called.
         ``decision="block"`` raises ``NullRunBlockedException`` and the
         MCP client is NOT called. ``decision="allow"`` proceeds to the
         MCP client. ``decision="require_approval"`` raises
@@ -311,10 +311,9 @@ class MCPAdapter:
         with ``approval_id=``.
 
         When ``runtime`` is None, ``call_tool`` falls through to the
-        legacy contextvar-only path — the call proceeds without any
+        contextvar-only path — the call proceeds without any
         /api/v1/execute round-trip and the next ``@protect``-decorated
         wrapper picks up the contextvar on its next ``/check`` request.
-        calls inside ``@protect``-decorated functions.
 
         Returns the underlying client's result (when allowed).
         Raises ``NullRunBlockedException`` on gate block; raises the
@@ -372,13 +371,9 @@ class MCPAdapter:
         # tool-block / budget / approval policies actually apply.
         if self._runtime is not None:
             execute_input = arguments if arguments is not None else {}
-            # 0.18.2: there is no ``mode=`` opt-out — every MCP
-            # tool call routed through the runtime contacts
-            # /api/v1/execute unconditionally. The pre-refactor
-            # ``mode="strict"`` was removed because it was the only
-            # way to make the audit-grade path actually apply to
-            # non-sensitive MCP tools; with the inline-mode bypass
-            # gone, that exemption is no longer possible.
+            # Every MCP tool call routed through the runtime contacts
+            # /api/v1/execute unconditionally — there is no
+            # ``mode=`` opt-out for audit bypass.
             execute_result = self._runtime.execute(
                 tool_name=tool_name,
                 input_data=execute_input,

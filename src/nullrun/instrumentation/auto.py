@@ -736,8 +736,7 @@ def _check_kill_before_send(runtime: Any, request: httpx.Request) -> None:
     Raises:
         NullRunWorkflowKilledError: state == "Killed" (2026-09-08:
             typed signal with error_code=NR-W002 + user_action;
-            subclass of WorkflowKilledInterrupt which remains as a
-            back-compat name.)
+            subclass of WorkflowKilledInterrupt.)
         WorkflowPausedException: state == "Paused"
     """
     if runtime is None:
@@ -1783,12 +1782,10 @@ def auto_instrument(runtime: Any) -> bool:
     at least one path was installed (so the caller can log a useful
     'instrumented N paths' message).
 
-    Every patch call is wrapped in ``safe_patch`` (B47) which logs
-    at WARNING if the patch raised a non-ImportError exception. The
-    pre-fix ``try/except Exception: pass # pragma: no cover`` blocks
-    meant a vendor SDK breaking change (e.g. a renamed method)
-    would silently disable cost tracking with no log line. The
-    operator would only find out when the bill arrived.
+    Every patch call is wrapped in ``safe_patch`` which logs at
+    WARNING if the patch raised a non-ImportError exception. A
+    vendor SDK breaking change (e.g. a renamed method) surfaces
+    a log line the operator can grep, not a silent degradation.
 
     """
     global _auto_installed

@@ -68,12 +68,12 @@ def shutdown(timeout: float = 2.0, flush: bool = True) -> None:
     this returns, any further ``nullrun.track(...)`` call or
     ``@protect``-decorated call is a no-op.
 
-    Audit 2026-06-29 (WS graceful close on exit): a long-running
-    script that exits via ``sys.exit `` lets the kernel RST the TCP
-    socket, which the backend logs as WARN "Connection reset
-    without closing handshake". Calling ``nullrun.shutdown ``
-    before exit (or registering it via ``atexit``) eliminates the
-    noisy log. No-op if ``init `` was never called.
+    A long-running script that exits via ``sys.exit `` lets the
+    kernel RST the TCP socket, which the backend logs as WARN
+    "Connection reset without closing handshake". Calling
+    ``nullrun.shutdown `` before exit (or registering it via
+    ``atexit``) eliminates the noisy log. No-op if ``init `` was
+    never called.
 
     Args:
         timeout: seconds to wait for the WS close handshake to
@@ -219,12 +219,11 @@ def init(
     """
     Initialize the NullRun SDK. Call once at application startup.
 
-    `api_key` is **required** as of 0.3.0. The previous silent fallback to
-    "local mode" (a NullRunNoop stub) was removed because it hid policy
-    violations and bypassed every backend gate — a real safety hole. Pass
-    `api_key=...` explicitly or set the `NULLRUN_API_KEY` environment
-    variable before calling `init `. If neither is set, `init ` raises
-    `NullRunAuthenticationError`.
+    `api_key` is **required**. There is no silent fallback mode: every
+    gate calls the backend, and a missing key would silently bypass
+    every backend gate. Pass `api_key=...` explicitly or set the
+    `NULLRUN_API_KEY` environment variable before calling `init `. If
+    neither is set, `init ` raises `NullRunAuthenticationError`.
 
     Args:
         api_key: NullRun API key (or NULLRUN_API_KEY env var). Required.

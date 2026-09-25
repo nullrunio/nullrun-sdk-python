@@ -223,14 +223,7 @@ def _validate_capabilities_payload(payload: Any) -> list[str]:
     a Zod-style guard around :func:`parse_capabilities` so a malformed
     probe response (e.g. non-dict top level, capabilities array instead
     of dict) surfaces a typed warning instead of silently falling
-    through to legacy defaults.
-
-    M8 (audit 2026-08-12): pre-fix, a malformed probe payload silently
-    yielded the conservative defaults via ``payload.get("capabilities")
-    or {}`` and the SDK continued in compatibility mode without
-    informing the operator. Post-fix, the operator sees a structured
-    ``NullRunCapabilitiesValidationError`` at ``init()`` and can
-    diagnose the probe failure before the first /check.
+    through to defaults.
 
     Note: validation is intentionally permissive about MISSING fields
     (the backend may add new fields at any time without bumping the

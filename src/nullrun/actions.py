@@ -180,9 +180,8 @@ class ActionHandler:
 
         Raises:
             NullRunWorkflowKilledError: If action is "kill"
-                (2026-09-08 typed signal, NR-W002; subclass of
-                WorkflowKilledInterrupt which remains as the
-                back-compat name.)
+                (subclass of WorkflowKilledInterrupt, which is
+                the canonical catch name.)
             WorkflowPausedException: If action is "pause"
             NullRunBlockedException: If action is "block"
         """
@@ -247,12 +246,9 @@ class ActionHandler:
     ) -> None:
         """Default kill handler - raises NullRunWorkflowKilledError.
 
-        2026-09-08: typed kill signal (NR-W002). Cookbook code
-        can `except NullRunWorkflowKilledError` to react to
-        operator-initiated kills with structured error_code +
-        user_action. Legacy `except WorkflowKilledInterrupt`
-        still matches because NullRunWorkflowKilledError is a
-        subclass.
+        Cookbook code can `except NullRunWorkflowKilledError` to react
+        to operator-initiated kills with structured error_code +
+        user_action.
         """
         logger.warning(f"KILL action for workflow {workflow_id}: {reason}")
         raise NullRunWorkflowKilledError(

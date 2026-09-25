@@ -85,8 +85,9 @@ class RuntimeRegistry:
     def set(self, runtime: NullRunRuntime) -> NullRunRuntime | None:
         """Install ``runtime`` as the active instance.
 
-        Returns the previously-installed runtime (or ``None``) so
-        the caller can shut it down before it is replaced. The
+        Returns the runtime that was installed before this call
+        (or ``None``) so the caller can shut it down before it is
+        replaced. The
         swap is atomic — a concurrent ``get`` sees either the
         old or the new instance, never a half-constructed one.
         """
