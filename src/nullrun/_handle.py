@@ -27,9 +27,10 @@ the agent loop. Non-NullRun exceptions also propagate
 unchanged.
 
 CLI scripts that want the same fail-fast behavior at startup should
-call ``nullrun.init(fail_on_exit=True)`` instead of an ``init_or_die``
-wrapper — the four-line developer report is rendered identically
-and the process exits ``1`` on missing ``NULLRUN_API_KEY``.
+call ``nullrun.init(fail_on_exit=True)`` — the four-line developer
+report is rendered identically and the process exits ``1`` on missing
+``NULLRUN_API_KEY``. (The standalone ``init_or_die`` wrapper was
+removed in 0.18.3; fail-fast is now a flag on ``init``.)
 
 History
 -------

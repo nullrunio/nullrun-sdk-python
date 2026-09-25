@@ -336,7 +336,7 @@ def _get_or_create_runtime() -> NullRunRuntime:
 # The user-facing API is `nullrun.init()` which calls
 # `auto_instrument(runtime)` directly (see `nullrun/__init__.py::init`).
 # However, a user who writes only
-# ``@nullrun.protect`` without calling ``init_or_die()`` first would
+# ``@nullrun.protect`` without calling ``init()`` first would
 # still create a runtime via ``NullRunRuntime.get_instance()`` — but
 # no vendor SDK patches would be installed, so token capture would be
 # silently absent.
