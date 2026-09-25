@@ -100,4 +100,3 @@ def test_no_init_required():
     # raised during the prior tests. Smoke-test the import path here.
     assert callable(handle)
     assert callable(nullrun.handle)
-    assert callable(nullrun.init_or_die)

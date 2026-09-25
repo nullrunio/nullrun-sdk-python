@@ -282,7 +282,7 @@ def register_strict_mode_forced(tool_name: str) -> None:
 
     Called by ``@sensitive(impact=...)`` at decoration time. The
     name stays in the module-level set until process exit; it
-    is intentionally not cleared by ``init_or_die()`` so a
+    is intentionally not cleared by ``shutdown()`` so a
     second-runtime reinit does not silently drop a tool out of
     strict mode.
     """
@@ -1109,7 +1109,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 "Most common causes: "
                 "(1) the LLM call uses a raw httpx client without "
                 "NullRun's instrumentation patches (call "
-                "nullrun.init_or_die() before the first request), "
+                "nullrun.init() before the first request), "
                 "(2) a custom transport / non-HTTP vendor (gRPC, "
                 "WebSocket, SDK-internal socket), "
                 "(3) a framework not in the auto-detection table "

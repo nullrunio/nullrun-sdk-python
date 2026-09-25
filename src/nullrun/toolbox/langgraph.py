@@ -1,16 +1,16 @@
 """
 LangGraph toolbox helpers for NullRun.
 
-``nullrun.init_or_die()`` (or ``@nullrun.protect`` on the agent
+``nullrun.init()`` (or ``@nullrun.protect`` on the agent
 function) auto-patches ``langgraph.pregel.Pregel`` via
 ``nullrun.instrumentation.auto.patch_langgraph_compiled``, which
 covers every supported LangGraph invocation path.
 
 Use the auto-patch::
 
-    from nullrun import init_or_die, protect
+    from nullrun import init, protect
 
-    init_or_die()
+    init()
 
     @protect
     def my_agent(prompt):

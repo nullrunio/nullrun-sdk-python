@@ -11,7 +11,7 @@ it with ``@protect``.
 Everything else exposed by ``nullrun`` is either runtime lifecycle
 (``init``, ``shutdown``, ``on_error``, ``status``), the structured
 exception hierarchy, or message/error-handling helpers
-(``format_user_message``, ``handle``, ``init_or_die``).
+(``format_user_message``, ``handle``).
 None of those are alternatives to ``@protect`` — they're setup
 and cleanup.
 
@@ -40,6 +40,8 @@ between versions.
 
 from __future__ import annotations
 
+import atexit
+import sys
 import threading as _threading
 
 # Use lazy import inside __getattr__ instead of `import importlib` at
@@ -49,6 +51,12 @@ from nullrun.__version__ import __version__
 # Module-level lock that serialises the three singleton-slot writes
 # inside `init `.
 _init_lock = _threading.Lock()
+
+# Tracks whether `shutdown` is currently registered with `atexit`. The
+# flag persists across `init()` calls (so a second init does not stack
+# a second atexit hook) and is reset by `shutdown()` so a fresh
+# `init()` after a clean shutdown re-registers cleanly.
+_shutdown_atexit_registered = False
 
 # ---------------------------------------------------------------------------
 # Curated public surface
@@ -68,12 +76,11 @@ def shutdown(timeout: float = 2.0, flush: bool = True) -> None:
     this returns, any further ``nullrun.track(...)`` call or
     ``@protect``-decorated call is a no-op.
 
-    A long-running script that exits via ``sys.exit `` lets the
-    kernel RST the TCP socket, which the backend logs as WARN
-    "Connection reset without closing handshake". Calling
-    ``nullrun.shutdown `` before exit (or registering it via
-    ``atexit``) eliminates the noisy log. No-op if ``init `` was
-    never called.
+    ``init()`` auto-registers this function with ``atexit``, so
+    long-running scripts get a clean WS close on process exit without
+    any explicit call. Calling ``shutdown()`` manually is still safe
+    and idempotent — it is a no-op if ``init()`` was never called or
+    has already been shut down.
 
     Args:
         timeout: seconds to wait for the WS close handshake to
@@ -91,9 +98,6 @@ def shutdown(timeout: float = 2.0, flush: bool = True) -> None:
 
     Example::
 
-        import atexit
-        import nullrun
-        atexit.register(nullrun.shutdown)
     """
     # Lazy import so the SDK module-import path stays light (mirrors
     # the pattern in `init` and `status`).
@@ -102,6 +106,11 @@ def shutdown(timeout: float = 2.0, flush: bool = True) -> None:
     if runtime is None:
         return
     runtime.shutdown(flush=flush)
+    # Allow a future `init()` to re-register the atexit hook for the
+    # new runtime. Without this, after a `shutdown()` + `init()` cycle
+    # the second runtime would not be auto-shutdown on process exit.
+    global _shutdown_atexit_registered
+    _shutdown_atexit_registered = False
 
 
 def status():
@@ -215,6 +224,7 @@ def init(
     api_key: str | None = None,
     api_url: str | None = None,
     debug: bool = False,
+    fail_on_exit: bool = False,
 ):
     """
     Initialize the NullRun SDK. Call once at application startup.
@@ -223,12 +233,24 @@ def init(
     gate calls the backend, and a missing key would silently bypass
     every backend gate. Pass `api_key=...` explicitly or set the
     `NULLRUN_API_KEY` environment variable before calling `init `. If
-    neither is set, `init ` raises `NullRunAuthenticationError`.
+    neither is set, `init ` raises `NullRunAuthenticationError` (or,
+    with ``fail_on_exit=True``, prints the four-line developer report
+    to stderr and exits with code 1 — the CLI-friendly path).
+
+    ``init()`` also auto-registers ``nullrun.shutdown()`` via
+    ``atexit``, so a process exit after init gets a clean WS close
+    without an explicit shutdown call.
 
     Args:
         api_key: NullRun API key (or NULLRUN_API_KEY env var). Required.
         api_url: Gateway URL (or NULLRUN_API_URL env var)
         debug: Enable debug logging
+        fail_on_exit: when True, configuration failures print the
+            developer-facing report to stderr and ``sys.exit(1)``
+            instead of raising. Use this for CLI scripts that want a
+            clean exit on missing ``NULLRUN_API_KEY``; library
+            embedders (FastAPI startup, Jupyter) should leave it
+            False and catch the exception instead.
 
     Note: the background control-plane listener (WebSocket + HTTP poll) is
     always started on `init `. To disable it, construct `NullRunRuntime`
@@ -239,7 +261,7 @@ def init(
 
     Raises:
         NullRunAuthenticationError: if neither `api_key` nor
-            `NULLRUN_API_KEY` is set.
+            `NULLRUN_API_KEY` is set AND ``fail_on_exit`` is False.
 
     Example:
         import nullrun
@@ -247,8 +269,8 @@ def init(
         nullrun.init(api_key="your-key")
 
         @nullrun.protect
-        def my_agent: 
-            return agent.run 
+        def my_agent:
+            return agent.run
     """
     import logging
     import os
@@ -258,18 +280,13 @@ def init(
     if debug:
         logger.setLevel(logging.DEBUG)
 
-    # to a NullRunNoop stub in `local_mode`, which silently bypassed every
-    # backend gate (budget, policy, control plane). That was a real
-    # safety hole — production callers were unaware their policies were
-    # not being enforced. We raise instead so the misconfiguration is
-    # caught at startup rather than producing silent allow-all decisions.
-    # Strip whitespace from either the kwarg or the env before the truthiness
-    # check. Python `or` alone accepts " " / "\t" / "\n" as truthy, which
-    # would let a whitespace-only api_key pass init() and reach the gateway
-    # as a malformed `Authorization: Bearer ` header. The strip preserves
-    # embedded legitimate characters (e.g. "  nr_live_xxx  " is normalised
-    # to the canonical form so HMAC signing sees the same value on both
-    # sides of the wire).
+    # Strip whitespace from either the kwarg or the env before the
+    # truthiness check. Python `or` alone accepts " " / "\t" / "\n" as
+    # truthy, which would let a whitespace-only api_key pass init()
+    # and reach the gateway as a malformed `Authorization: Bearer `
+    # header. The strip preserves embedded legitimate characters (e.g.
+    # "  nr_live_xxx  " is normalised to the canonical form so HMAC
+    # signing sees the same value on both sides of the wire).
     raw_key = api_key if api_key is not None else os.getenv("NULLRUN_API_KEY")
     resolved_key = raw_key.strip() if isinstance(raw_key, str) else None
     if not resolved_key:
@@ -295,6 +312,21 @@ def init(
                 "operate without credentials."
             ),
         )
+        # CLI path: render the same four-line developer report
+        # ``handle()`` uses, then sys.exit(1). Library embedders leave
+        # ``fail_on_exit=False`` (default) so the exception propagates
+        # into their own try/except and the host process stays alive
+        # (FastAPI startup, Jupyter, REPL).
+        if fail_on_exit:
+            from nullrun._handle import _render_dev_error_report
+            from nullrun.messages import format_user_message
+
+            try:
+                report = _render_dev_error_report(err, format_user_message(err))
+            except Exception:  # noqa: BLE001
+                report = format_user_message(err)
+            print(report, file=sys.stderr)
+            sys.exit(1)
         # Layer 2: fire the on_error hook BEFORE the raise so the
         # hook sees the call stack still live. Stage = "init" so a
         # log-based hook can attribute the failure to startup
@@ -358,6 +390,17 @@ def init(
         # access. The registry.set(runtime) call above is the authoritative
         # write that every consumer sees.
         NullRunRuntime._instance = runtime
+
+    # Auto-register shutdown with atexit so long-running scripts get a
+    # clean WS close on process exit without an explicit call. The
+    # flag guard makes the registration idempotent across multiple
+    # ``init()`` calls (the C3 fix shuts down the previous runtime
+    # first; the atexit hook stays the same and is no-op when the
+    # runtime is already torn down).
+    global _shutdown_atexit_registered
+    if not _shutdown_atexit_registered:
+        atexit.register(shutdown)
+        _shutdown_atexit_registered = True
 
     # v3.12 / 0.12.0 — server-minted execution_id default ON. Probe
     # the backend's /api/v1/capabilities endpoint and log any
@@ -518,7 +561,6 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     # which shadows the lazy export and breaks ``from nullrun import
     # handle``.
     "handle": ("nullrun._handle", "handle"),
-    "init_or_die": ("nullrun._handle", "init_or_die"),
     # ADR-009 P1 — governance audit surface (typed wire classes).
     # Users reach these as `from nullrun import AuditQuery` /
     # `from nullrun.audit import ...`. The runtime exposes
@@ -615,12 +657,8 @@ __all__ = [
     # the context manager (``with nullrun.handle: ``). It translates
     # any ``NullRunError`` into ``print(format_user_message(exc))`` +
     # ``sys.exit(1)``; ``WorkflowKilledInterrupt`` propagates.
-    # ``init_or_die`` is the convenience wrapper around ``init``
-    # that catches NR-C001 "no api_key" at startup and exits
-    # cleanly — without it the user sees a raw traceback before
-    # any ``with handle: `` block is in scope.
+    # CLI fail-fast on missing api_key is `init(fail_on_exit=True)`.
     "handle",
-    "init_or_die",
 ]
 
 # The SDK-side ``decision_history`` module was deleted. Decision

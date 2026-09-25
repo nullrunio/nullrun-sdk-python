@@ -8,19 +8,15 @@ the maximum-information path — useful for integrators who want to
 branch on a specific ``error_code`` — but it is **not** the default.
 
 For the common "I just want to run my agent and print a friendly
-message on failure" case, this module provides two one-liners:
+message on failure" case, this module provides one one-liner:
 
-*:func:`nullrun.handle` — context manager.
-*:func:`nullrun.init_or_die` — convenience wrapper around
-:func:`nullrun.init` that catches the ``NR-C001`` "no api_key"
-  failure at startup and exits cleanly.
-
-Both translate any:class:`nullrun.NullRunError` into a structured
-developer-facing report (error code + what was attempted + where it
-came from + the underlying reason + how to fix it) and then exit
-``1``. The end-user-friendly wording from
-:func:`nullrun.format_user_message` is included as the headline so
-end-user scripts don't need to branch on the wire shape.
+*:func:`nullrun.handle` — context manager that translates any
+  :class:`nullrun.NullRunError` into a structured developer-facing
+  report (error code + what was attempted + where it came from + the
+  underlying reason + how to fix it) and then exits ``1``. The
+  end-user-friendly wording from :func:`nullrun.format_user_message`
+  is included as the headline so end-user scripts don't need to
+  branch on the wire shape.
 
 :class:`nullrun.WorkflowKilledInterrupt` inherits
 from :class:`nullrun.NullRunError` (see the class docstring), so a
@@ -30,10 +26,10 @@ control-plane action, not an SDK failure, and must reach the top of
 the agent loop. Non-NullRun exceptions also propagate
 unchanged.
 
-``init_or_die`` exists because:func:`nullrun.init` is typically
-called at module top-level — before any ``with handle: `` block is
-in scope. Without it, a missing ``NULLRUN_API_KEY`` env var produces
-a raw traceback.
+CLI scripts that want the same fail-fast behavior at startup should
+call ``nullrun.init(fail_on_exit=True)`` instead of an ``init_or_die``
+wrapper — the four-line developer report is rendered identically
+and the process exits ``1`` on missing ``NULLRUN_API_KEY``.
 
 Why a separate module
 ---------------------
@@ -230,66 +226,4 @@ def handle(*, exit_code: int = 1):
         sys.exit(exit_code)
 
 
-def init_or_die(*, api_key: str | None = None, api_url: str | None = None,
-                debug: bool = False, exit_code: int = 1):
-    """Call:func:`nullrun.init` and exit cleanly on configuration failure.
-
-:func:`nullrun.init` is typically the first thing a script does
-    before any ``with nullrun.handle: `` block is in scope. A missing
-    ``api_key`` therefore produces a raw traceback — not a friendly
-    exit. ``init_or_die`` closes that gap by catching the startup
-    :class:`nullrun.NullRunError` (NR-C001 "no api_key"), printing
-    the catalog user-message, and exiting.
-
-    On success returns the :class:`nullrun.NullRunRuntime` singleton
-    that ``init `` returns — assign it if you need it, ignore it
-    otherwise::
-
-        from nullrun import init_or_die, protect, shutdown
-
-        init_or_die(api_key=os.environ["NULLRUN_API_KEY"])
-
-        @protect
-        def my_agent(prompt):
-            return call_llm(prompt)
-
-        if __name__ == "__main__":
-            try:
-                with nullrun.handle:
-                    print(my_agent("hello"))
-            finally:
-                shutdown
-
-    Args:
-        api_key: NullRun API key (or NULLRUN_API_KEY env var).
-        api_url: Gateway URL (or NULLRUN_API_URL env var).
-        debug: Enable debug logging on the runtime.
-        exit_code: Process exit status to use when init fails.
-
-    Returns:
-        The runtime singleton returned by ``init ``.
-    """
-    # Lazy import — ``init`` pulls in the runtime + transport stack.
-    # Skipping that when init is never called keeps the import path
-    # of ``from nullrun import init_or_die`` light.
-    from nullrun import init
-    try:
-        return init(api_key=api_key, api_url=api_url, debug=debug)
-    except NullRunError as exc:
-        # Same structured report as ``handle()`` -- a
-        # "There's a configuration issue. Please contact support."
-        # which gave the developer zero actionable detail. The
-        # four-line report here names the missing env var, the URL
-        # to obtain a key, and the docs page so the user can self-
-        # serve without opening a support ticket.
-        try:
-            report = _render_dev_error_report(
-                exc, format_user_message(exc)
-            )
-        except Exception:  # noqa: BLE001
-            report = format_user_message(exc)
-        print(report, file=sys.stderr)
-        sys.exit(exit_code)
-
-
-__all__ = ["handle", "init_or_die"]
+__all__ = ["handle"]

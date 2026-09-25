@@ -309,7 +309,7 @@ def _get_or_create_runtime() -> NullRunRuntime:
     not a silent allow-all.
 
     After obtaining the runtime, lazily triggers `auto_instrument()` so
-    a user who writes only `@protect` (without calling `init_or_die()`
+    a user who writes only `@protect` (without calling `init()`
     first) still gets vendor SDK detection + token capture. The lazy
     trigger is idempotent — multiple `@protect` calls in the same
     process converge on a single `auto_instrument()` invocation. The
@@ -333,9 +333,9 @@ def _get_or_create_runtime() -> NullRunRuntime:
 
 # Lazy auto-instrumentation trigger (zero-config decorator path).
 #
-# The user-facing API is `nullrun.init_or_die()` which calls `init()`,
-# which calls `auto_instrument(runtime)` directly (see
-# `nullrun/__init__.py::init`). However, a user who writes only
+# The user-facing API is `nullrun.init()` which calls
+# `auto_instrument(runtime)` directly (see `nullrun/__init__.py::init`).
+# However, a user who writes only
 # ``@nullrun.protect`` without calling ``init_or_die()`` first would
 # still create a runtime via ``NullRunRuntime.get_instance()`` — but
 # no vendor SDK patches would be installed, so token capture would be

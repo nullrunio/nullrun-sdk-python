@@ -1,3 +1,28 @@
+## [0.18.3] - 2026-09-25
+
+### Surface (breaking)
+
+- `nullrun.init_or_die()` removed. CLI fail-fast behavior is now a
+  parameter on `init()`: `nullrun.init(fail_on_exit=True)` prints the
+  same four-line developer report and `sys.exit(1)` on configuration
+  failure.
+- `nullrun.shutdown()` is now auto-registered via `atexit` inside
+  `init()` — long-running scripts get a clean WS close on process
+  exit without an explicit call. Calling `shutdown()` manually
+  remains safe and idempotent.
+
+### Lifecycle
+
+- `init()` gains a `fail_on_exit: bool = False` keyword argument.
+  When True, missing `NULLRUN_API_KEY` (NR-C001) prints the
+  developer-facing report and exits 1 instead of raising. Default
+  False preserves the embedder-friendly raise semantics.
+- The `_shutdown_atexit_registered` module-level flag prevents
+  double registration when `init()` is called more than once.
+
+Top-level `dir(nullrun)` no longer exposes `init_or_die`. All other
+symbols unchanged from 0.18.2.
+
 ## [0.18.2] - 2026-09-22
 
 ### Surface

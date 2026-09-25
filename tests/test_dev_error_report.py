@@ -1,6 +1,6 @@
 """
-Tests for the developer-facing error report rendered by ``handle`` and
-``init_or_die``.
+Tests for the developer-facing error report rendered by ``handle``
+and the CLI ``init(fail_on_exit=True)`` path.
 
 Pre-fix (2026-09-22), the catch-all exit path printed only the catalog
 user-message ("There's a configuration issue. Please contact support.")

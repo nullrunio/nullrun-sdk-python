@@ -210,10 +210,16 @@ def my_agent(prompt: str) -> str:
 
 ```
 
-If you call `@protect` *before* `init_or_die()`, the SDK lazy-initializes
+If you call `@protect` *before* `init()`, the SDK lazy-initializes
 the runtime from `NULLRUN_API_KEY` on the first decorated call. You can
 write your agent code with the decorator first and the init second — or
 skip `init` entirely if your environment is already configured.
+
+For CLI scripts that want fail-fast on missing config, pass
+`fail_on_exit=True` — the SDK prints a four-line developer report and
+exits with code 1 instead of raising. `nullrun.shutdown()` is
+auto-registered via `atexit` inside `init()`, so a clean WS close on
+process exit happens without any explicit call.
 
 ---
 
