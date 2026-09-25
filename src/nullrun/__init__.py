@@ -269,7 +269,7 @@ def init(
             ),
         )
         # CLI path: render the same four-line developer report
-        # ``handle()`` uses, then sys.exit(1). Library embedders leave
+        # ``guard()`` uses, then sys.exit(1). Library embedders leave
         # ``fail_on_exit=False`` (default) so the exception propagates
         # into their own try/except and the host process stays alive
         # (FastAPI startup, Jupyter, REPL).

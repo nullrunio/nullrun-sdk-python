@@ -182,7 +182,7 @@ class TestAutoInstrumentationKillRaisesTyped:
 
 
 class TestHandleKillActionRaisesTyped:
-    """actions.py:249 — nullrun.handle() KILL action → typed."""
+    """actions.py:249 — ActionHandler.handle() KILL action → typed."""
 
     def test_handle_kill_action_raises_typed(self):
         exc = NullRunWorkflowKilledError(

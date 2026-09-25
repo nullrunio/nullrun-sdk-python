@@ -132,7 +132,7 @@ DEFAULT_MESSAGES: dict[str, str] = {
     "NR-A015": "Your request couldn't be completed because the approval has already been used. Please start a new request.",
     # ---- Workflow lifecycle (server-side state) ------------------------------
     # NR-W004: workflow soft-deleted or killed on the server. Distinct
-    # from NR-W002 (BaseException path that bypasses ``nullrun.handle``)
+    # from NR-W002 (BaseException path that bypasses ``nullrun.guard``)
     # and NR-W003 (pause / cooldown). End users see this only after an
     # operator terminated their session from the dashboard; the wording
     # is similar to NR-W002 because the user-visible outcome is the

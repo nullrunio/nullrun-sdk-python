@@ -312,7 +312,7 @@ def test_format_user_message_handles_approval_replay_rejected():
 
 def test_format_user_message_handles_workflow_inactive():
     """NR-W004: workflow soft-deleted / killed on the server. Distinct
-    from NR-W002 (BaseException kill path that bypasses handle()) and
+    from NR-W002 (BaseException kill path that bypasses guard()) and
     NR-W003 (pause / cooldown). End-user copy is similar to NR-W002
     because the user-visible outcome is the same."""
     inactive = exc.NullRunWorkflowInactiveError(

@@ -50,7 +50,7 @@ def main() -> None:
 
     # Late imports so env vars are read by the SDK first.
     import nullrun
-    from nullrun import init, protect, shutdown, on_error, status
+    from nullrun import init, on_error, protect, shutdown
     from nullrun.breaker.exceptions import NullRunBlockedException
 
     # 1. Surface check — only the curated entry points are exposed.
@@ -71,11 +71,13 @@ def main() -> None:
         _fail(f"init() raised: {exc!r}\n{traceback.format_exc()}")
     _ok(f"init() ok against {api_url}")
 
-    # 3. status() after init.
+    # 3. status() after init. 0.18.4 dropped the top-level
+    #    ``nullrun.status()`` wrapper; reach the snapshot via
+    #    ``nullrun.get_runtime().status()`` instead.
     try:
-        st = status()
+        st = nullrun.get_runtime().status()
     except Exception as exc:  # noqa: BLE001
-        _fail(f"status() raised: {exc!r}")
+        _fail(f"nullrun.get_runtime().status() raised: {exc!r}")
     # `status()` returns a typed NullRunStatus object; coerce via
     # ``vars()`` so we can introspect fields without depending on
     # the SDK's internal type name.

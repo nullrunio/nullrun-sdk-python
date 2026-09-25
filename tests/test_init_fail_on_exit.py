@@ -4,7 +4,7 @@ Contract:
 
 * On success, returns whatever the runtime ``init()`` returns.
 * On ``NullRunAuthenticationError`` (e.g. NR-C001 missing api_key),
-  prints the same four-line developer report that ``handle()`` uses
+  prints the same four-line developer report that ``guard()`` uses
   and ``sys.exit(1)``.
 * The default ``init()`` (``fail_on_exit=False``) still raises — the
   library-friendly path.
