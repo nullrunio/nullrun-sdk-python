@@ -105,7 +105,6 @@ def test_patch_crewai_without_async_kickoff(monkeypatch, fresh_patch_module):
     installs the sync wrap and silently skips the async wrap.
     """
     _install_fake_crewai(monkeypatch, with_async=False)
-    from crewai import Crew
 
     from nullrun.instrumentation.crewai import patch_crewai
 

@@ -7,13 +7,11 @@ behaviour, and the ``execute `` mode resolution.
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
 from nullrun.breaker.exceptions import (
-    NullRunBlockedException,
     WorkflowKilledInterrupt,
     WorkflowPausedException,
 )

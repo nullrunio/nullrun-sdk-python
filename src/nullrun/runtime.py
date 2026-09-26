@@ -75,23 +75,20 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
-from typing import Any, Optional
+from typing import Any
 
 import httpx
 
 from nullrun._registry import get_active_runtime
-from nullrun.actions import ActionHandler, ActionType
+from nullrun.actions import ActionHandler
 from nullrun.audit import (  # ADR-009 P1 — governance audit surface
-    AuditEntry,
     AuditExportJob,
     AuditExportStatus,
-    AuditLogMeta,
     AuditLogPage,
     AuditQuery,
     AuditVerifyResult,
 )
 from nullrun.breaker.exceptions import (
-    BreakerError,
     NullRunApprovalDeniedError,
     NullRunApprovalExpiredError,
     NullRunApprovalReplayRejectedError,
@@ -104,7 +101,6 @@ from nullrun.breaker.exceptions import (
     NullRunInfrastructureError,
     NullRunTransportError,
     NullRunWorkflowKilledError,
-    WorkflowKilledInterrupt,
     WorkflowPausedException,
 )
 from nullrun.context import (
@@ -119,7 +115,6 @@ from nullrun.context import (
 from nullrun.observability import metrics
 from nullrun.transport import (
     HEADER_PROTOCOL,
-    NULLRUN_PROTOCOL_VERSION,
     DecisionSource,
     FallbackMode,
     FlushConfig,
@@ -979,15 +974,12 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
           guarantees.
         * ``ok`` — everything healthy.
         """
-        from datetime import datetime, timezone
 
         from nullrun.observability.status import (
             STATE_DEGRADED,
             STATE_MISCONFIGURED,
-            STATE_OFFLINE,
             STATE_OK,
             NullRunStatus,
-            RecentError,
             WorkflowState,
         )
 

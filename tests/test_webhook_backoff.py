@@ -26,7 +26,6 @@ cap so the sleep calls in the test body and the singleton
 idle poll use real wall-clock sleeps.
 """
 
-import time
 from unittest.mock import MagicMock, patch
 
 import pytest

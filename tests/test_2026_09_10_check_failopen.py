@@ -30,7 +30,6 @@ These tests pin BOTH the source shape (the 4xx branch returns
 
 from __future__ import annotations
 
-import json
 import re
 from pathlib import Path
 

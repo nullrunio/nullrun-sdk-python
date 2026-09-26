@@ -563,7 +563,6 @@ def test_call_tool_with_runtime_routes_through_execute_before_mcp_call():
     with the tool_name + input_data forwarded verbatim. Pins that
     ``call_tool`` is no longer a silent pass-through.
     """
-    from nullrun.breaker.exceptions import NullRunBlockedException
 
     client = _MockMcpClient(_github_inventory())
     runtime = _StubRuntime(

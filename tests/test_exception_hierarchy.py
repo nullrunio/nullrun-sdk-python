@@ -30,7 +30,6 @@ import pytest
 
 from nullrun.breaker.exceptions import (
     # Base
-    BreakerError,
     NullRunAuthenticationError,
     NullRunAuthError,
     NullRunBackendError,

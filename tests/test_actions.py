@@ -645,7 +645,6 @@ def test_handle_action_module_helper_dispatches(monkeypatch):
 
 
 def test_register_action_handler_module_helper(monkeypatch):
-    from nullrun import actions as act_mod
 
     h = MagicMock()
     monkeypatch.setattr("nullrun.actions.get_action_handler", lambda: h)
@@ -667,7 +666,7 @@ def test_get_action_handler_returns_singleton():
 
 
 def test_generate_trace_id_is_uuid_format():
-    from nullrun.context import generate_span_id, generate_trace_id
+    from nullrun.context import generate_trace_id
 
     tid = generate_trace_id()
     assert tid.count("-") == 4  # canonical UUID4
@@ -724,7 +723,7 @@ def test_workflow_default_name_is_uuid():
 def test_span_context_manager_restores_on_exit():
     from nullrun.context import get_span_id, span
 
-    with span("outer") as sid:
+    with span("outer"):
         assert get_span_id() == "outer"
     assert get_span_id() is None
 

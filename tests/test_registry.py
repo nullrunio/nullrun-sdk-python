@@ -19,9 +19,6 @@ Covers the single-source-of-truth contract:
 from __future__ import annotations
 
 import threading
-from typing import Any
-
-import pytest
 
 
 def test_registry_get_returns_none_initially():
@@ -31,7 +28,7 @@ def test_registry_get_returns_none_initially():
     # Use a local registry instance to avoid cross-test pollution
     # from the global one (the global is already populated by the
     # test suite's runtime fixtures).
-    reg = get_registry()
+    get_registry()
 
 
 def test_registry_set_returns_previous_instance():
@@ -167,7 +164,6 @@ def test_module_proxy_via_install_runtime_proxy():
     registry proxy. Verified by writing through the module
     attribute and reading from the registry directly (and vice
     versa)."""
-    import sys
     import types
 
     from nullrun._singleton import (

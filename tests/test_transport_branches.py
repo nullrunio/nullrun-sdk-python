@@ -51,7 +51,6 @@ def test_verify_hmac_signature_fresh_and_matching():
     """Fresh timestamp + correct signature → True."""
     import hashlib
     import hmac as _hmac
-    import json as _json
 
     body = '{"x":1}'
     ts = int(time.time())

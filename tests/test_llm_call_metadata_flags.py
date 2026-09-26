@@ -61,7 +61,6 @@ def test_tracked_flag_true_on_normal_call():
     """A normal call (under cap, extractor matched) emits tracked: True
     and NO streaming_skipped flag."""
     from nullrun.instrumentation.auto import (
-        MAX_RESPONSE_BYTES,
         NullRunSyncTransport,
     )
 

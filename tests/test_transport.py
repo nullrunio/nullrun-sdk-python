@@ -553,7 +553,6 @@ class TestTransportFlush:
             t.track({"event": f"e{i}"})
 
         # Flush with CB OPEN will re-queue and enforce max_buffer_size
-        initial_buffer_len = len(t._buffer)
         t._do_flush()
 
         # After flush with CB OPEN, buffer should be capped at max_buffer_size
@@ -1064,7 +1063,6 @@ def test_verify_hmac_signature_fresh_and_matching():
     """Fresh timestamp + correct signature → True."""
     import hashlib
     import hmac as _hmac
-    import json as _json
 
     body = '{"x":1}'
     ts = int(time.time())

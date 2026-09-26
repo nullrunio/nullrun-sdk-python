@@ -24,7 +24,6 @@ leak PII — we just don't get to see the redacted marker. That's
 strictly safer than the pre-fix behavior, where PII was leaking.
 """
 
-import pytest
 
 from nullrun.decorators import _safe_error_str, _safe_repr, _strip_details_balanced
 

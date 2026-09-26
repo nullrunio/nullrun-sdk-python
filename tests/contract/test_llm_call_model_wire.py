@@ -34,8 +34,6 @@ import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import pytest
-
 from nullrun.instrumentation.langgraph import _extract_model_from_response
 
 # ─── _extract_model_from_response: the actual fix ─────────────────────

@@ -409,7 +409,7 @@ def init(
 # in `globals ` so subsequent lookups are O(1) and not visible in
 # `vars(nullrun)` until then. This is the same pattern used by pandas /
 # sqlalchemy / etc. to keep the top-level namespace discoverable.
-_LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
+_LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     # Runtime + context (advanced)
     "NullRunRuntime": ("nullrun.runtime", "NullRunRuntime"),
     "get_runtime": ("nullrun.runtime", "get_runtime"),

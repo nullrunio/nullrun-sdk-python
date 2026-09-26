@@ -16,8 +16,6 @@ dashboards continue to work for already-allocated agent ids.
 
 import uuid
 
-import pytest
-
 
 def test_auto_agent_id_is_valid_uuid():
     """With no name, agent_id must parse as a UUID (the form the

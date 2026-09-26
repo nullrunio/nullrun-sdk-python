@@ -40,7 +40,6 @@ import inspect
 import logging
 import os
 import threading
-import warnings
 from collections.abc import Callable
 from contextvars import Token
 from typing import Any, TypeVar

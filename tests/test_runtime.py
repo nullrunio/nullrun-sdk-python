@@ -474,8 +474,7 @@ class TestRuntimeDI:
 
 # ─── runtime branch tests (kill/pause, mode resolution, etc.) ──────────────────────────────
 
-from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 

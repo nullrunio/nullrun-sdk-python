@@ -62,7 +62,7 @@ class BusinessImpact:
     rule's ``param_name``.
     """
 
-    impact: Any  # Only NoImpactPayload in 0.18.2.
+    impact: NoImpactPayload  # Only NoImpactPayload in 0.18.2.
 
     @property
     def kind(self) -> str:

@@ -332,7 +332,6 @@ class TestTrackEventFingerprint:
             "_fingerprint": "caller-fp-12345678",  # caller's value
         }
         # Simulating the runtime's check: do not overwrite.
-        existing_fp = event.get("_fingerprint")
         if "_fingerprint" not in event:
             event["_fingerprint"] = _fingerprint_for_event_dict(event)
         assert event["_fingerprint"] == "caller-fp-12345678"

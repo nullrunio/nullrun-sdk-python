@@ -25,7 +25,6 @@ from nullrun.breaker.exceptions import (
     NullRunBudgetRecheckFailedError,
     NullRunChainError,
     NullRunConsumeOverbudgetError,
-    NullRunError,
     NullRunProtocolError,
     NullRunRateLimitRedisError,
     NullRunWorkflowInactiveError,
@@ -1552,8 +1551,6 @@ import pytest
 import respx
 
 from nullrun.context import (
-    _server_minted_execution_id_var,
-    _server_minted_reservation_at_var,
     clear_server_minted_execution_id,
     get_server_minted_execution_id,
     get_server_minted_reservation_at,
