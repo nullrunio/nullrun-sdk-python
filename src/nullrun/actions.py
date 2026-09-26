@@ -23,7 +23,6 @@ except ImportError:
 from nullrun.breaker.exceptions import (
     NullRunBlockedException,
     NullRunWorkflowKilledError,
-    WorkflowKilledInterrupt,
     WorkflowPausedException,
 )
 
@@ -181,9 +180,8 @@ class ActionHandler:
 
         Raises:
             NullRunWorkflowKilledError: If action is "kill"
-                (2026-09-08 typed signal, NR-W002; subclass of
-                WorkflowKilledInterrupt which remains as the
-                back-compat name.)
+                (subclass of WorkflowKilledInterrupt, which is
+                the canonical catch name.)
             WorkflowPausedException: If action is "pause"
             NullRunBlockedException: If action is "block"
         """
@@ -213,7 +211,7 @@ class ActionHandler:
                 "running. Investigate ASAP."
             )
             self._record_action(
-                ActionType.BLOCK,  # record what would have happened pre-fix
+                ActionType.BLOCK,
                 workflow_id,
                 f"unknown_action_type:{action}",
                 details,
@@ -235,7 +233,6 @@ class ActionHandler:
             # Don't let handler exceptions propagate. We catch
             # `BaseException` (not just `Exception`) because
             # kill signals (NullRunWorkflowKilledError, the
-            # 2026-09-08-migrated Exception subclass) and any
             # third-party kill-shaped signals must be recorded
             # in history (already done above) and swallowed,
             # NOT re-raised into the caller's frame.
@@ -249,12 +246,9 @@ class ActionHandler:
     ) -> None:
         """Default kill handler - raises NullRunWorkflowKilledError.
 
-        2026-09-08: typed kill signal (NR-W002). Cookbook code
-        can `except NullRunWorkflowKilledError` to react to
-        operator-initiated kills with structured error_code +
-        user_action. Legacy `except WorkflowKilledInterrupt`
-        still matches because NullRunWorkflowKilledError is a
-        subclass.
+        Cookbook code can `except NullRunWorkflowKilledError` to react
+        to operator-initiated kills with structured error_code +
+        user_action.
         """
         logger.warning(f"KILL action for workflow {workflow_id}: {reason}")
         raise NullRunWorkflowKilledError(
@@ -387,7 +381,6 @@ class ActionHandler:
             logger.warning("httpx not installed, cannot send webhook")
             return
 
-        # P3-2: exponential backoff between attempts with a
         # 30s cap. Pre-fix the schedule was linear (``0.5 * (attempt+1)``
         # → 0.5s, 1.0s, 1.5s,...). Linear doesn't back off fast enough
         # when the destination is down — a transient outage produced

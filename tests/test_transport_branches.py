@@ -28,6 +28,7 @@ from nullrun.breaker.exceptions import (
     TransportErrorSource,
 )
 from nullrun.transport import (
+    FallbackMode,
     FlushConfig,
     Transport,
     _parse_error_envelope,
@@ -50,7 +51,6 @@ def test_verify_hmac_signature_fresh_and_matching():
     """Fresh timestamp + correct signature → True."""
     import hashlib
     import hmac as _hmac
-    import json as _json
 
     body = '{"x":1}'
     ts = int(time.time())
@@ -275,19 +275,14 @@ def test_execute_fallback_strict_returns_block():
         trace_id="t-1",
         tool="x",
         input_data={},
-        fallback_mode="strict",
+        fallback_mode=FallbackMode.STRICT,
     )
     assert result["decision"] == "block"
     assert "STRICT" in result["explanation"]
 
 
-# 0.7.0: fallback_mode=CACHED + the local PolicyCache path were
-# removed. The thin-client SDK has no local cache to consult on
-# gateway failure. CACHED now degrades to PERMISSIVE.
-
-
-def test_execute_fallback_cached_degrades_to_permissive():
-    """fallback_mode=CACHED → degrade to PERMISSIVE (no local cache)."""
+def test_execute_fallback_permissive_allows_on_transport_error():
+    """fallback_mode=PERMISSIVE → synthetic allow on transport failure."""
     from nullrun.breaker.exceptions import BreakerTransportError
 
     t = _build_transport()
@@ -298,9 +293,8 @@ def test_execute_fallback_cached_degrades_to_permissive():
         trace_id="t-1",
         tool="x",
         input_data={},
-        fallback_mode="cached",
+        fallback_mode=FallbackMode.PERMISSIVE,
     )
-    # 0.7.0: CACHED silently degrades to PERMISSIVE (allow).
     assert result["decision"] == "allow"
     assert result["decision_source"] == "fallback"
 

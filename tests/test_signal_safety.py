@@ -17,8 +17,6 @@ from __future__ import annotations
 
 import gc
 import signal
-import weakref
-from unittest.mock import patch
 
 import pytest
 
@@ -111,12 +109,6 @@ class TestAtexitViaWeakref:
         try:
             # `weakref.finalize` registers a finalize on the object.
             # The `__call__` method exists on the finalize object.
-            # We can introspect by walking the weakref.finalize
-            # instances attached to the object.
-            finalize_objs = [r for r in gc.get_referrers(t) if isinstance(r, weakref.finalize)]
-            # The weakref is registered as a referrer of t. We can
-            # at minimum check that the atexit registry is not
-            # pinned to t.
             # Note: exact introspection of weakref.finalize is
             # implementation-dependent; we just ensure the object
             # is collectable when no longer referenced.
@@ -132,7 +124,6 @@ class TestAtexitViaWeakref:
             api_url="https://api.test.nullrun.io",
             api_key="test-key-12345678",
         )
-        t_id = id(t)
         del t
         gc.collect()
         # After GC, calling any method on a new transport should
@@ -212,7 +203,6 @@ class TestAtexitViaWeakref:
         The DEBUG log line emitted by the finalizer is the
         user-visible signal that events were dropped.
         """
-        import logging
         import tempfile
 
         # Use a per-test WAL path so we can verify the finalizer

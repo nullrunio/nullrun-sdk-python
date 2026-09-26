@@ -150,7 +150,6 @@ def test_patch_autogen_idempotent(monkeypatch, fresh_patch_module):
 
     from nullrun.instrumentation.autogen import patch_autogen
 
-    first_orig = BaseChatAgent.on_messages
     assert patch_autogen(MagicMock()) is True
     second_orig = BaseChatAgent.on_messages
     assert patch_autogen(MagicMock()) is True

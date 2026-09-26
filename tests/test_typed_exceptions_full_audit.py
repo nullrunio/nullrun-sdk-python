@@ -40,7 +40,6 @@ from nullrun.breaker.exceptions import (
     NullRunBlockedException,
     NullRunBudgetError,
     NullRunWorkflowKilledError,
-    WorkflowKilledException,
     WorkflowKilledInterrupt,
 )
 
@@ -183,7 +182,7 @@ class TestAutoInstrumentationKillRaisesTyped:
 
 
 class TestHandleKillActionRaisesTyped:
-    """actions.py:249 — nullrun.handle() KILL action → typed."""
+    """actions.py:249 — ActionHandler.handle() KILL action → typed."""
 
     def test_handle_kill_action_raises_typed(self):
         exc = NullRunWorkflowKilledError(
@@ -290,10 +289,6 @@ class TestKillContractMigration:
         # recovery requires catching the kill signal.
         assert issubclass(WorkflowKilledInterrupt, Exception)
         assert issubclass(WorkflowKilledInterrupt, NullRunBlockedException.__mro__[-2])  # Exception via NullRunError
-        # The documented BREAK: WorkflowKilledException (the
-        # deprecated BaseException parent) no longer matches.
-        # Code that catches the deprecated name must migrate.
-        assert not issubclass(WorkflowKilledInterrupt, WorkflowKilledException)
 
     def test_old_except_clauses_still_catch_kill(self):
         # Back-compat: cookbook code that does `except

@@ -26,7 +26,7 @@ from nullrun.instrumentation.langgraph import (
     _ACTIVE_RUNS_MAX,
     NullRunCallback,
 )
-from nullrun.tracing import SpanContext, create_root_span
+from nullrun.tracing import create_root_span
 
 
 @pytest.fixture

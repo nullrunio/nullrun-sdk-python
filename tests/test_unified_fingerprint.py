@@ -48,7 +48,6 @@ import pytest
 import respx
 
 from nullrun.instrumentation.auto import (
-    NullRunSyncTransport,
     _fingerprint_for_llm_call,
     _fingerprint_is_seen,
     make_dedup_state,

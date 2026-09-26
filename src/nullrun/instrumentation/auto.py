@@ -172,7 +172,6 @@ def _openai_extractor(body: bytes, status: int) -> ExtractedUsage | None:
         "completion_tokens": completion,
         "total_tokens": total,
         "model": payload.get("model"),
-        # Audit 2026-06-29 (unified fingerprint): the upstream
         # chat-completion id (``payload["id"]``, e.g.
         # ``"chatcmpl-Dw7288WJI4bBDFyQ4DnZvhPUKfaZo"`` for OpenAI) is
         # the tightest discriminator for collapsing the sibling
@@ -203,7 +202,6 @@ def _openai_extractor(body: bytes, status: int) -> ExtractedUsage | None:
 
 
 # ---------------------------------------------------------------------------
-# D2.5 (Audit 2026-06-29): unified LLM-call fingerprint
 # ---------------------------------------------------------------------------
 # The httpx transport and the LangChain callback both observe the same
 # real LLM call, but until this commit they computed fingerprints from
@@ -311,7 +309,6 @@ def _anthropic_extractor(body: bytes, status: int) -> ExtractedUsage | None:
         "completion_tokens": out,
         "total_tokens": inp + out,
         "model": payload.get("model"),
-        # Audit 2026-06-29 (unified fingerprint): Anthropic message id
         # e.g. ``"msg_01HXYZ..."``. See _openai_extractor comment.
         "id": payload.get("id"),
         "cache_read_tokens": int(usage.get("cache_read_input_tokens", 0) or 0),
@@ -376,7 +373,6 @@ def _gemini_extractor(body: bytes, status: int) -> ExtractedUsage | None:
         "completion_tokens": completion,
         "total_tokens": total or (prompt + completion),
         "model": payload.get("modelVersion"),
-        # Audit 2026-06-29 (unified fingerprint): Gemini doesn't
         # currently surface a stable response id at the top level
         # fall back to ``None`` and rely on model+provider to
         # disambiguate. See _openai_extractor for the rationale.
@@ -400,26 +396,23 @@ def _cohere_extractor(body: bytes, status: int) -> ExtractedUsage | None:
 
     response.usage.{tokens, input_tokens, output_tokens}.
     Note: Cohere streaming has no usage in stream — only non-streaming
-    responses carry it. Documented in the plan.
+    responses carry it.
 
-    2026-07-13: v2 has THREE schema changes the SDK
-    silently missed:
+    Three notable schema choices:
 
-      1. ``tool_calls`` live under ``message.tool_calls`` (not at
-         the top level). v1 still used top-level ``tool_calls``;
-         v2 moved them into the assistant message envelope. The
-         top-level path is preserved as a fallback for v1 + the
-         rare v2 adapter that lifts the field back up, so neither
-         version is broken by the new primary path.
+      1. ``tool_calls`` live under ``message.tool_calls``.
+         The top-level path is preserved as a fallback so neither
+         v1 (top-level) nor v2 (nested) is broken by the new
+         primary path.
 
-      2. ``usage.tokens.cached_tokens`` is the v2 cache hit counter
-         (Cohere's inference cache). Previously always read as 0.
+      2. ``usage.tokens.cached_tokens`` is the cache hit counter
+         (Cohere's inference cache).
 
       3. ``finish_reason`` values are UPPERCASE
          (``COMPLETE | MAX_TOKENS | STOP_SEQUENCE | TOOL_CALL |
-         ERROR | TIMEOUT``); the v1 vocabulary was lowercase. The
-         ``_normalize_finish_reason`` helper lower-cases before
-         mapping so both vocabularies work.
+         ERROR | TIMEOUT``); the ``_normalize_finish_reason``
+         helper lower-cases before mapping so both vocabularies
+         work.
     """
     if status >= 400 or not body:
         return None
@@ -483,7 +476,6 @@ def _cohere_extractor(body: bytes, status: int) -> ExtractedUsage | None:
         "completion_tokens": out,
         "total_tokens": total,
         "model": payload.get("model"),
-        # Audit 2026-06-29 (unified fingerprint): Cohere v2 doesn't
         # surface a stable response id at the top level; rely on
         # model+provider for disambiguation. See _openai_extractor.
         "id": payload.get("id") or payload.get("generation_id"),
@@ -639,7 +631,6 @@ def _bedrock_extractor(body: bytes, status: int) -> ExtractedUsage | None:
         "completion_tokens": out,
         "total_tokens": total,
         "model": payload.get("modelId") or payload.get("model"),
-        # Audit 2026-06-29 (unified fingerprint): Bedrock InvokeModel
         # response carries ``id`` at the top level (e.g.
         # ``"msg_01ABC..."`` for Anthropic-on-Bedrock, ``"cmpl-..."``
         # for Mistral-on-Bedrock). Falls back to ``None`` when the
@@ -667,9 +658,9 @@ PROVIDER_EXTRACTORS: dict[str, Callable[[bytes, int], ExtractedUsage | None]] = 
 
 
 def _extract_model_from_request_body(request: httpx.Request) -> str | None:
-    """2026-06-28 (Issue 2 fix): fall back to the ``model`` field embedded
-    in the LLM request body when the response body extractor returned
-    ``None`` for ``model``.
+    """Fall back to the ``model`` field embedded in the LLM request
+    body when the response body extractor returned ``None`` for
+    ``model``.
 
     The user typically passes ``ChatOpenAI(model="gpt-4.1-mini")`` and
     that string appears in the request body's ``model`` field — even if
@@ -734,16 +725,14 @@ def _check_kill_before_send(runtime: Any, request: httpx.Request) -> None:
       - no workflow can be resolved (no active context, no API key binding)
       - the cached state is anything other than Killed / Paused
 
-    Note: prior to 0.3.0 this also short-circuited in
-    `local_mode` (no api_key). The local_mode branch is gone because
-    api_key is now required at runtime construction — every runtime
-    has a remote control plane to consult.
+    Note: api_key is required at runtime construction — every
+    runtime has a remote control plane to consult. There is no
+    ``local_mode`` short-circuit.
 
     Raises:
-        NullRunWorkflowKilledError: state == "Killed" (2026-09-08:
-            typed signal with error_code=NR-W002 + user_action;
-            subclass of WorkflowKilledInterrupt which remains as a
-            back-compat name.)
+        NullRunWorkflowKilledError: state == "Killed" — typed
+            signal with error_code=NR-W002 + user_action; subclass
+            of WorkflowKilledInterrupt.
         WorkflowPausedException: state == "Paused"
     """
     if runtime is None:
@@ -764,8 +753,7 @@ def _check_kill_before_send(runtime: Any, request: httpx.Request) -> None:
     state = runtime._remote_state_for(workflow_id) if hasattr(runtime, "_remote_state_for") else getattr(runtime, "_remote_states", {}).get(workflow_id, {})
     state_name = state.get("state", "Normal")
     if state_name == "Killed":
-        # 2026-09-08: typed kill signal (NR-W002). Cookbook
-        # code can `except NullRunWorkflowKilledError`; legacy
+        # code can `except NullRunWorkflowKilledError`;
         # `except WorkflowKilledInterrupt` still matches (subclass).
         from nullrun.breaker.exceptions import NullRunWorkflowKilledError
         raise NullRunWorkflowKilledError(
@@ -821,7 +809,6 @@ class NullRunSyncTransport(httpx.BaseTransport):
             return self._inner.handle_request(request)
         response = self._inner.handle_request(request)
         try:
-            # P0-3: bounded read — never buffer more than
             # MAX_RESPONSE_BYTES for tracking purposes. Above the cap
             # we skip tracking (the user still gets the full body via
             # the rebuilt response below). The body still needs to
@@ -873,7 +860,6 @@ class NullRunSyncTransport(httpx.BaseTransport):
         body: bytes,
         status: int,
     ) -> None:
-        # 2026-06-28 (Issue 2 fix): if the extractor returned ``None``
         # for ``model`` (response body lacked the field — observed for
         # some OpenAI Responses-API and Anthropic streaming edge cases)
         # fall back to the model name embedded in the request body. The
@@ -928,7 +914,6 @@ class NullRunAsyncTransport(httpx.AsyncBaseTransport):
             return await self._inner.handle_async_request(request)
         response = await self._inner.handle_async_request(request)
         try:
-            # P0-3: bounded read (see sync path for full rationale).
             body = await _aread_body_with_cap(response, MAX_RESPONSE_BYTES)
             if body is None:
                 # 0.9.0: emit llm_call with metadata.streaming_skipped: true
@@ -971,7 +956,6 @@ class NullRunAsyncTransport(httpx.AsyncBaseTransport):
         body: bytes,
         status: int,
     ) -> None:
-        # F-29 (UI-UX-AUDIT 2026-08-14): mirror the sync path's
         # request-body model fallback (lines 882-885) so async
         # Anthropic / OpenAI streaming clients without ``usage.model``
         # don't silently zero-bill. ``_extract_model_from_request_body``
@@ -1155,7 +1139,6 @@ def _fingerprint_for_event_dict(event: dict[str, Any]) -> str:
 _httpx_patched = False
 _httpx_lock = threading.Lock()
 # separate locks for the langchain / langgraph
-# patch functions. The pre-fix code did ``if _x_patched:
 # return True`` and ``getattr(SomeClass, "_nullrun_patched"
 # False)`` without a lock — two threads racing through
 # ``auto_instrument`` simultaneously could both pass the early
@@ -1174,7 +1157,6 @@ _langgraph_lock = threading.Lock()
 # first runtime — silently losing track calls from later test runs.
 _orig_sync_init: Callable[..., Any] | None = None
 _orig_async_init: Callable[..., Any] | None = None
-# Audit 2026-06-29 (reset_for_tests gap): stash the originals of the
 # class methods we wrap so reset_for_tests can put them back. Without
 # this, a second test pass with `_langchain_patched = False` would
 # double-wrap `BaseCallbackManager.__init__`, and similarly for
@@ -1230,7 +1212,6 @@ def patch_httpx(runtime: Any) -> bool:
         _httpx_patched = True
         logger.info("httpx auto-instrumentation installed (sync + async)")
 
-        # Audit 2026-06-29 (init-ordering hazard): the class-level
         # __init__ patch only wraps httpx.Clients created AFTER it is
         # installed. If a user does
         #
@@ -1265,15 +1246,14 @@ def patch_httpx(runtime: Any) -> bool:
 
 
 def _wrap_pre_existing_httpx_clients(runtime: Any) -> tuple[int, int]:
-    """Find httpx clients created before ``patch_httpx`` ran and wrap their
-    transports in NullRun's transports.
+    """Find httpx clients created before ``patch_httpx`` ran and wrap
+    their transports in NullRun's transports.
 
-    Audit 2026-06-29 (init-ordering hazard): the typical sequence
-
-        llm = ChatOpenAI(model=...) # builds internal httpx.Client
-        nullrun.init(api_key=...) # installs the __init__ patch
-
-    leaves ``llm``'s internal client with the unpatched transport.
+    Init-ordering hazard: when an HTTP-using client library is
+    instantiated *before* ``nullrun.init``, its internal
+    ``httpx.Client`` retains the unpatched transport. This back-fill
+    picks up those clients so the same NUL-1 control surface
+    applies to them.
     New ``httpx.Client `` constructions are auto-wrapped by the
     class-level patch; this sweep is the back-fill.
 
@@ -1330,7 +1310,6 @@ def patch_langchain_callback(runtime: Any) -> bool:
     """Install NullRunCallback into the LangChain callback manager so all
     LLM calls (including mock providers) flow through it. Idempotent.
 
- #47: the pre-fix code did ``if _langchain_patched: return``
     and ``getattr(BaseCallbackManager, "_nullrun_patched", False)``
     without a lock; two threads racing through ``auto_instrument``
     simultaneously could both pass the early check, then both
@@ -1355,7 +1334,6 @@ def patch_langchain_callback(runtime: Any) -> bool:
             return True
 
         _orig_init = BaseCallbackManager.__init__
-        # Audit 2026-06-29 (reset_for_tests gap): stash the original
         # on a module-level so reset_for_tests can put it back.
         # Without this, a second test pass with `_langchain_patched
         # = False` would double-wrap.
@@ -1390,7 +1368,6 @@ def patch_langchain_callback(runtime: Any) -> bool:
 # D4b: patch_chat_model_invoke — defensive callback injection at the LLM
 # boundary.
 # ---------------------------------------------------------------------------
-# Audit 2026-06-29 (silent zero-billing): the previous
 # ``patch_langchain_callback`` only wrapped ``BaseCallbackManager.__init__``.
 # When the user instantiates ``ChatOpenAI(...)`` *before* ``nullrun.init``
 # (a common pattern — see SDK examples), the ``ChatOpenAI`` object keeps
@@ -1555,7 +1532,6 @@ def patch_openai_agents(runtime: Any) -> bool:
 
     _orig_run = Runner.run
     _orig_run_sync = getattr(Runner, "run_sync", None)
-    # Audit 2026-06-29 (reset_for_tests gap): stash originals so
     # reset_for_tests can restore them. Without this, a second
     # test pass with `_agents_patched = False` would double-wrap
     # Runner.run / Runner.run_sync.
@@ -1623,13 +1599,8 @@ def _emit_from_agents_result(runtime: Any, result: Any) -> None:
                     name = (tc.get("function") or {}).get("name")
                     if name:
                         tool_names.append(name)
-            # Audit 2026-06-28 (SDK↔backend wire): ``span.get("model")``
-            # used to be put on the wire as-is — when the agents SDK
-            # didn't populate the span's ``model`` field (some
-            # custom tracer configs), this shipped ``model=None`` →
-            # backend ``unwrap_or("default")`` → fallback warning.
-            # We also try ``usage["model"]`` (OpenAI usage payload
-            # sometimes carries the resolved model id) and
+            # Falls through to ``usage["model"]`` (OpenAI usage
+            # payload sometimes carries the resolved model id) and
             # ``span["response_metadata"]["model_name"]`` (langchain-
             # style metadata block on the span). Empty / None are
             # dropped — only set ``model`` when we have a real value.
@@ -1699,7 +1670,6 @@ def patch_langgraph_compiled(runtime: Any) -> bool:
     importable.
 
  #47: same fix as ``patch_langchain_callback`` — the
-    pre-fix code read the patched flag and the class-level marker
     without a lock, so two threads racing through
     ``auto_instrument`` could both fall through to
     ``Pregel.invoke = _wrap_invoke`` and double-wrap the class.
@@ -1803,12 +1773,10 @@ def auto_instrument(runtime: Any) -> bool:
     at least one path was installed (so the caller can log a useful
     'instrumented N paths' message).
 
-    Every patch call is wrapped in ``safe_patch`` (B47) which logs
-    at WARNING if the patch raised a non-ImportError exception. The
-    pre-fix ``try/except Exception: pass # pragma: no cover`` blocks
-    meant a vendor SDK breaking change (e.g. a renamed method)
-    would silently disable cost tracking with no log line. The
-    operator would only find out when the bill arrived.
+    Every patch call is wrapped in ``safe_patch`` which logs at
+    WARNING if the patch raised a non-ImportError exception. A
+    vendor SDK breaking change (e.g. a renamed method) surfaces
+    a log line the operator can grep, not a silent degradation.
 
     """
     global _auto_installed
@@ -1828,7 +1796,6 @@ def auto_instrument(runtime: Any) -> bool:
         paths = [
             safe_patch("httpx", lambda: patch_httpx(runtime)),
             safe_patch("langchain_callback", lambda: patch_langchain_callback(runtime)),
-            # D4b (2026-06-29): belt-and-suspenders callback injection at
             # the BaseChatModel.invoke boundary. Ensures NullRunCallback
             # fires even when the user creates the LLM BEFORE init and
             # the BaseCallbackManager.__init__ patch is somehow bypassed
@@ -1918,7 +1885,6 @@ def reset_for_tests() -> None:
     _orig_pregel_stream = None
     _orig_pregel_ainvoke = None
     _orig_pregel_astream = None
-    # D4b (2026-06-29): restore BaseChatModel.invoke/ainvoke/stream/astream
     # if we patched them, otherwise the next test pass would double-wrap.
     if _orig_chat_model_invoke is not None:
         try:
@@ -1936,7 +1902,6 @@ def reset_for_tests() -> None:
     _orig_chat_model_astream = None
     global _chat_model_invoke_patched
     _chat_model_invoke_patched = False
-    # Audit 2026-06-29 (reset_for_tests gap): pre-fix the function
     # reset the *_patched flag for langchain_callback and openai_agents
     # but did NOT restore the wrapped class methods. A second test
     # pass with `auto._langchain_patched = False; auto_instrument(r)`
@@ -1973,7 +1938,6 @@ def reset_for_tests() -> None:
 
 DEDUP_LRU_MAX = 4096  # 4096 entries give a 410ms dedup window at 10K events/sec
 
-# P0-3: streaming-OOM cap. Pre-fix, the sync transport
 # called ``response.read `` and the async transport called
 # ``await response.aread `` — both buffer the ENTIRE response body
 # in memory. For an OpenAI streaming completion with max_tokens=8192
@@ -2093,28 +2057,14 @@ def _emit_streaming_skipped(
     `_extract_model_from_request_body` (sync-only, mirrors
     `_emit`'s pattern at lines 735-739).
 
-    Audit 2026-06-29 (ghost-event dedup): the previous version
-    emitted the event unconditionally and without a `_fingerprint`.
-    Two consequences:
-      1. When the body read fails for an external reason
-         (double-consume by langchain-openai, an upstream that
-         already drained the stream), the SDK produced an
-         `llm_call` with `tokens=0, model=None` — i.e. no useful
-         signal — that still reached the wire. The backend's
-         `into_track_request_v2` handler gate (handler.rs:2046)
-         rejected these with HTTP 422, but the cost-pipeline
-         belt-and-suspenders backstop still logged every one as
-         `cost_pipeline_missing_model_total` and stamped the 1-cent
-         surcharge. Operators saw 30+ ERROR lines per `app.invoke `
-         for a workload that actually had 6 real LLM calls.
-      2. Because no `_fingerprint` was attached, the dedup LRU at
-         `runtime.track ` could not collapse this emission with
-         any sibling emission for the same call.
-    Fix: drop the event entirely when we cannot recover a usable
-    `model` (the request body has been consumed or doesn't carry
-    the field — same signature as a body that genuinely cannot be
-    inspected), and attach a deterministic `_fingerprint` when we
-    do emit so dedup collapses repeats from the same call site.
+    Ghost-event dedup: dropped events carry a deterministic
+    ``_fingerprint`` so the runtime's dedup LRU collapses
+    repeated emissions for the same call site. Events where a
+    usable ``model`` cannot be recovered (request body has been
+    consumed or doesn't carry the field — same signature as a
+    body that genuinely cannot be inspected) are dropped
+    entirely to avoid the cost-pipeline's
+    ``cost_pipeline_missing_model_total`` surcharge.
     """
     # We always emit the streaming-skipped event regardless of
     # whether ``_extract_model_from_request_body`` recovered a model.
@@ -2123,7 +2073,6 @@ def _emit_streaming_skipped(
     # denominator (``llm_call_count``) stays accurate. When ``model``
     # is ``None`` the backend's into_track_request_v2 gate may log a
     # ``cost_pipeline_missing_model_total`` warning, but that's the
-    # same noise a streaming-skipped response produced pre-0.9.1 and
     # is preferable to silently dropping the event and skewing
     # coverage_pct. The ``metadata.streaming_skipped: True`` flag
     # tells the backend this is a known-skipped emission, not a
@@ -2144,7 +2093,6 @@ def _emit_streaming_skipped(
                     "tracked": False,
                     "streaming_skipped": True,
                 },
-                # Audit 2026-06-29 (unified fingerprint): use the
                 # shared ``_fingerprint_for_llm_call`` helper so this
                 # ghost emission also collapses with any sibling
                 # emission the LangChain callback produces for the
@@ -2153,7 +2101,6 @@ def _emit_streaming_skipped(
                 # provider pair still gives a deterministic key that
                 # matches the callback's emission for the same call
                 # when the callback has the model but not the id.
-                # (The pre-fix ``_fingerprint_for(host, b"<...>", 0)``
                 # sentinel produced a unique-per-path key that
                 # collided with NOTHING.)
                 "_fingerprint": _fingerprint_for_llm_call(

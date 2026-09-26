@@ -1,15 +1,7 @@
 """
 Centralised error handling for auto-instrumentation patchers.
 
-The pre-fix auto-instrumentation modules had 25+ instances of
-``try/except Exception: pass # pragma: no cover`` scattered across
-``auto.py``, ``auto_requests.py``, ``autogen.py``, ``crewai.py``
-``llama_index.py``. If a patch failed in production (typically
-because the vendored SDK changed a method signature) the SDK would
-silently degrade and the user would have no idea why their costs
-were no longer being tracked.
-
-The fix: every patch call goes through ``safe_patch`` (B47) which:
+Every patch call goes through ``safe_patch`` which:
   - Returns ``True``/``False`` based on patch outcome.
   - Logs at WARNING with the patch name + the actual exception
     (so a SRE can grep for ``Auto-instrumentation patch X failed``

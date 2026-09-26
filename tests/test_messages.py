@@ -233,10 +233,10 @@ def test_format_user_message_handles_approval_expired_local_timeout_path():
 
 
 def test_format_user_message_handles_workflow_killed_baseexception():
-    """``WorkflowKilledInterrupt`` is a BaseException subclass. The
-    formatter must still resolve it via the inherited ``error_code``
-    class attribute on ``WorkflowKilledException`` (the deprecated
-    parent class)."""
+    """``WorkflowKilledInterrupt`` carries ``error_code`` on the class
+    itself. The formatter must resolve it via ``error_code`` even
+    though kill signals are intentionally ``BaseException``-subclass
+    so they bypass ``except Exception``."""
     killed = exc.WorkflowKilledInterrupt(workflow_id="wf-1", reason="killed via API")
     # NB: the formatter does NOT catch BaseException — caller's job.
     out = messages.format_user_message(killed)
@@ -312,7 +312,7 @@ def test_format_user_message_handles_approval_replay_rejected():
 
 def test_format_user_message_handles_workflow_inactive():
     """NR-W004: workflow soft-deleted / killed on the server. Distinct
-    from NR-W002 (BaseException kill path that bypasses handle()) and
+    from NR-W002 (BaseException kill path that bypasses guard()) and
     NR-W003 (pause / cooldown). End-user copy is similar to NR-W002
     because the user-visible outcome is the same."""
     inactive = exc.NullRunWorkflowInactiveError(
@@ -396,14 +396,6 @@ def test_format_user_message_falls_back_for_unknown_code():
     returns a non-empty string (the fallback), never raises."""
     weird = exc.NullRunError("msg", error_code="NR-9999")
     assert messages.format_user_message(weird) == messages.FALLBACK_MESSAGE
-
-
-def test_format_user_message_accepts_locale_kwarg():
-    """Locale parameter is reserved; passing anything (including
-    unsupported codes) still returns a usable string."""
-    budget = exc.NullRunBudgetError("wf", "x")
-    assert messages.format_user_message(budget, locale="en")
-    assert messages.format_user_message(budget, locale="ru")  # falls back to en
 
 
 # ---------------------------------------------------------------------------

@@ -8,33 +8,37 @@ the maximum-information path — useful for integrators who want to
 branch on a specific ``error_code`` — but it is **not** the default.
 
 For the common "I just want to run my agent and print a friendly
-message on failure" case, this module provides three one-liners:
+message on failure" case, this module provides one one-liner:
 
-*:func:`nullrun.handle` — context manager.
-*:func:`nullrun.guarded` — decorator.
-*:func:`nullrun.init_or_die` — convenience wrapper around
-:func:`nullrun.init` that catches the ``NR-C001`` "no api_key"
-  failure at startup and exits cleanly.
+*:func:`nullrun.guard` — context manager that translates any
+  :class:`nullrun.NullRunError` into a structured developer-facing
+  report (error code + what was attempted + where it came from + the
+  underlying reason + how to fix it) and then exits ``1``. The
+  end-user-friendly wording from :func:`nullrun.format_user_message`
+  is included as the headline so end-user scripts don't need to
+  branch on the wire shape.
 
-All three translate any:class:`nullrun.NullRunError` into a structured
-developer-facing report (error code + what was attempted + where it
-came from + the underlying reason + how to fix it) and then exit
-``1``. The end-user-friendly wording from
-:func:`nullrun.format_user_message` is included as the headline so
-end-user scripts don't need to branch on the wire shape.
-
-:class:`nullrun.WorkflowKilledInterrupt` now inherits
-from :class:`nullrun.NullRunError` (the 2026-09-08 migration; see the
-class docstring), so a bare ``except NullRunError`` would otherwise
-swallow the kill signal. ``handle``/``guarded`` explicitly re-raise it
-— the kill is a control-plane action, not an SDK failure, and must
-reach the top of the agent loop. Non-NullRun exceptions also propagate
+:class:`nullrun.WorkflowKilledInterrupt` inherits
+from :class:`nullrun.NullRunError` (see the class docstring), so a
+bare ``except NullRunError`` would otherwise swallow the kill signal.
+``guard`` explicitly re-raises it — the kill is a
+control-plane action, not an SDK failure, and must reach the top of
+the agent loop. Non-NullRun exceptions also propagate
 unchanged.
 
-``init_or_die`` exists because:func:`nullrun.init` is typically
-called at module top-level — before any ``with handle: `` block or
-``@guarded`` decorator is in scope. Without it, a missing
-``NULLRUN_API_KEY`` env var produces a raw traceback.
+CLI scripts that want the same fail-fast behavior at startup should
+call ``nullrun.init(fail_on_exit=True)`` — the four-line developer
+report is rendered identically and the process exits ``1`` on missing
+``NULLRUN_API_KEY``. (The standalone ``init_or_die`` wrapper was
+removed in 0.18.3; fail-fast is now a flag on ``init``.)
+
+History
+-------
+In 0.18.4 this context manager was renamed from ``handle`` to
+``guard``. The previous ``@guarded`` decorator was already removed
+in 0.18.2 (f1721f2), freeing the ``guard`` name; ``guard`` reads as
+a single verb consistent with ``init`` / ``shutdown`` / ``on_error``.
+No deprecation alias — ``nullrun.handle`` simply no longer exists.
 
 Why a separate module
 ---------------------
@@ -47,35 +51,34 @@ breaker module imports.
 
 Why ``_handle.py`` (leading underscore)
 ---------------------------------------
-The public symbol exported from this module is:func:`handle` (a
+The public symbol exported from this module is:func:`guard` (a
 context manager). With a non-underscored module name
 ``nullrun/handle.py``, Python's import machinery pre-binds
 ``nullrun.handle`` to the submodule when anything does
 ``import nullrun.handle`` (for example, pytest's test discovery).
-That binding shadows the lazy export ``"handle": (...)`` in
-:mod:`nullrun`, so ``from nullrun import handle`` returns the
+That binding shadows the lazy export ``"guard": (...)`` in
+:mod:`nullrun`, so ``from nullrun import guard`` returns the
 module object instead of the function. The leading underscore
 makes the module private so it does not collide.
+
+The module file name keeps its historical ``_handle.py`` shape
+because renaming it to ``_guard.py`` is not part of the public
+contract — only the function name ``guard`` is observable.
 """
 from __future__ import annotations
 
 import sys
-from collections.abc import Callable
 from contextlib import contextmanager
-from typing import TypeVar
 
 from nullrun.breaker.exceptions import NullRunError, WorkflowKilledInterrupt
 from nullrun.messages import format_user_message
-
-T = TypeVar("T")
 
 
 def _render_dev_error_report(
     exc: NullRunError,
     user_message: str,
 ) -> str:
-    """Render a four-line developer-facing report for ``handle`` /
-    ``guarded``.
+    """Render a four-line developer-facing report for ``handle``.
 
     The previous behaviour (print only ``format_user_message(exc)``)
     leaked zero information when a developer hit a config failure at
@@ -95,7 +98,6 @@ def _render_dev_error_report(
 
     The catalog ``format_user_message`` wording is included as the
     headline so end-user scripts that just want one sentence still
-    get a sensible line. We do NOT prefix the report with the
     catalog text -- the headline IS the catalog text, then the
     structured detail follows on its own line.
 
@@ -119,7 +121,6 @@ def _render_dev_error_report(
     # 1. WHAT -- the stage that failed. Prefer the explicit ``endpoint``
     # attribute (set on transport errors); fall back to deriving from
     # the class name so an unmapped exception still gives a sensible
-    # label. The class-name fallback strips the ``NullRun`` prefix and
     # ``Error`` suffix so ``NullRunAuthenticationError`` -> "auth".
     stage = endpoint or type(exc).__name__.replace("NullRun", "").replace("Error", "")
     stage = stage.lower() or "unknown"
@@ -169,7 +170,7 @@ def _render_dev_error_report(
 
 
 @contextmanager
-def handle(*, exit_code: int = 1):
+def guard(*, exit_code: int = 1):
     """Catch ``NullRunError`` and translate it to a developer-facing exit.
 
     Inside the ``with`` block, any:class:`nullrun.NullRunError` is
@@ -189,10 +190,10 @@ def handle(*, exit_code: int = 1):
     *:class:`nullrun.WorkflowKilledInterrupt` -- kill signals must reach
       the top of the agent loop, not be swallowed into a graceful exit.
       Re-raised explicitly inside the ``except NullRunError`` branch
-      because the 2026-09-08 migration moved ``WorkflowKilledInterrupt``
-      onto the ``NullRunError`` MRO (Sentry/OTel ``except Exception``
-      handlers should now record kill events; this ``handle`` /
-      ``guarded`` wrapper opts OUT of that recording on purpose).
+      because ``WorkflowKilledInterrupt`` sits on the ``NullRunError``
+      MRO (Sentry/OTel ``except Exception`` handlers should record kill
+      events; this ``guard`` wrapper opts OUT of that
+      recording on purpose).
     *:class:`KeyboardInterrupt` /:class:`SystemExit` (``BaseException``) --
       same reason as the kill signal -- never reach the
       ``except NullRunError`` branch anyway.
@@ -209,7 +210,7 @@ def handle(*, exit_code: int = 1):
 
         nullrun.init(api_key="nr_live_...")
 
-        with nullrun.handle:
+        with nullrun.guard():
             run_my_agent("hello")
         # ↑ if run_my_agent raised NullRunError, a structured
         # developer report is printed and the script exits 1.
@@ -217,9 +218,9 @@ def handle(*, exit_code: int = 1):
     try:
         yield
     except NullRunError as exc:
-        # 2026-09-08 migration: WorkflowKilledInterrupt moved onto
-        # the NullRunError MRO so Sentry/OTel `except Exception`
-        # handlers record kill events. ``handle``/``guarded`` are the
+        # Re-raise WorkflowKilledInterrupt explicitly: it shares the
+        # NullRunError MRO so Sentry/OTel `except Exception` handlers
+        # would otherwise record kill events. ``guard`` is the
         # friendly-exit pattern, NOT the user-callback pattern -- kill
         # is a control-plane action and must propagate so the agent
         # loop / dashboard resume path can see it. Re-raise explicitly
@@ -232,110 +233,11 @@ def handle(*, exit_code: int = 1):
             )
         except Exception:  # noqa: BLE001
             # Defensive: never let the report builder block the exit.
-            # Fall back to the legacy single-line behaviour so a buggy
-            # helper can't freeze a script that would otherwise exit.
+            # Fall back to the single-line message so a buggy helper
+            # can't freeze a script that would otherwise exit.
             report = format_user_message(exc)
         print(report, file=sys.stderr)
         sys.exit(exit_code)
 
 
-def guarded(fn: Callable[..., T]) -> Callable[..., T]:
-    """Decorator equivalent of ``with nullrun.handle: ``.
-
-    Wrap a function so any:class:`nullrun.NullRunError` raised inside
-    it is caught, rendered as a user-facing message, and the process
-    exits with code ``1``. ``WorkflowKilledInterrupt`` and other
-    ``BaseException`` subclasses propagate (``handle`` re-raises kill
-    explicitly, see the 2026-09-08 migration note).
-
-    Pair with:func:`nullrun.protect` for the standard agent loop::
-
-        @nullrun.guarded
-        @nullrun.protect
-        def my_agent(prompt):
-            return call_llm(prompt)
-
-        if __name__ == "__main__":
-            try:
-                print(my_agent("hello"))
-            finally:
-                nullrun.shutdown 
-
-    Args:
-        fn: The function to wrap.
-
-    Returns:
-        A wrapper with the same signature that exits the process on
-        ``NullRunError`` and otherwise returns ``fn``'s value.
-    """
-    def wrapper(*args, **kwargs):
-        with handle():
-            return fn(*args, **kwargs)
-
-    return wrapper
-
-
-def init_or_die(*, api_key: str | None = None, api_url: str | None = None,
-                debug: bool = False, exit_code: int = 1):
-    """Call:func:`nullrun.init` and exit cleanly on configuration failure.
-
-:func:`nullrun.init` is typically the first thing a script does
-    before any ``with nullrun.handle: `` block or ``@nullrun.guarded``
-    decorator is in scope. A missing ``api_key`` therefore produces a
-    raw traceback — not a friendly exit. ``init_or_die`` closes that
-    gap by catching the startup:class:`nullrun.NullRunError` (NR-C001
-    "no api_key"), printing the catalog user-message, and exiting.
-
-    On success returns the:class:`nullrun.NullRunRuntime` singleton
-    that ``init `` returns — assign it if you need it, ignore it
-    otherwise::
-
-        from nullrun import init_or_die, guarded, protect, shutdown
-
-        init_or_die(api_key=os.environ["NULLRUN_API_KEY"])
-
-        @guarded
-        @protect
-        def my_agent(prompt):
-            return call_llm(prompt)
-
-        if __name__ == "__main__":
-            try:
-                print(my_agent("hello"))
-            finally:
-                shutdown 
-
-    Args:
-        api_key: NullRun API key (or NULLRUN_API_KEY env var).
-        api_url: Gateway URL (or NULLRUN_API_URL env var).
-        debug: Enable debug logging on the runtime.
-        exit_code: Process exit status to use when init fails.
-
-    Returns:
-        The runtime singleton returned by ``init ``.
-    """
-    # Lazy import — ``init`` pulls in the runtime + transport stack.
-    # Skipping that when init is never called keeps the import path
-    # of ``from nullrun import init_or_die`` light.
-    from nullrun import init
-    try:
-        return init(api_key=api_key, api_url=api_url, debug=debug)
-    except NullRunError as exc:
-        # Same structured report as ``handle()`` / ``guarded`` -- a
-        # missing API key at startup was previously printed as just
-        # "There's a configuration issue. Please contact support."
-        # which gave the developer zero actionable detail. The
-        # four-line report here names the missing env var, the URL
-        # to obtain a key, and the docs page so the user can self-
-        # serve without opening a support ticket.
-        try:
-            report = _render_dev_error_report(
-                exc, format_user_message(exc)
-            )
-        except Exception:  # noqa: BLE001
-            report = format_user_message(exc)
-        print(report, file=sys.stderr)
-        sys.exit(exit_code)
-
-
-__all__ = ["handle", "guarded", "init_or_die"]
+__all__ = ["guard"]

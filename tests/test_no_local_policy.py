@@ -191,7 +191,8 @@ def test_runtime_init_default_fallback_mode_is_strict():
 
 
 def test_runtime_init_permissive_kwarg_still_opt_in():
-    """v3.53 audit #4 — explicit fallback_mode="permissive" still opt-in.
+    """v3.53 audit #4 — explicit fallback_mode=FallbackMode.PERMISSIVE
+    is still opt-in.
 
     The legacy behavior must remain reachable for dev / test harnesses
     that intentionally run without a live policy engine. This test
@@ -205,7 +206,7 @@ def test_runtime_init_permissive_kwarg_still_opt_in():
         api_key="nr_test_dummy_for_v3_53_source_pin",
         _test_mode=True,
         polling=False,
-        fallback_mode="permissive",
+        fallback_mode=FallbackMode.PERMISSIVE,
     )
     assert rt._fallback_mode == FallbackMode.PERMISSIVE
 

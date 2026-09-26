@@ -179,10 +179,8 @@ class TestNullRunRuntimeExecute:
             )
         )
         rt = make_runtime()
-        # Use mode="strict" to force gateway call
-        # (auto mode might use inline for non-sensitive tools)
         with pytest.raises(NullRunBlockedException):
-            rt.execute(tool_name="gpt-4", input_data={}, mode="strict")
+            rt.execute(tool_name="gpt-4", input_data={})
 
     def test_execute_blocked_surfaces_wire_error_code(self, make_runtime, mock_api):
         # DEF-ARFLOW-TOOLNAME-01 (E2E 2026-08-05): the backend now stamps
@@ -226,7 +224,7 @@ class TestNullRunRuntimeExecute:
         )
         rt = make_runtime()
         with pytest.raises(NullRunBlockedException) as exc_info:
-            rt.execute(tool_name="refund_customer", input_data={}, mode="strict")
+            rt.execute(tool_name="refund_customer", input_data={})
         # Catalog typed class wins — not the keyword-guessing fallback.
         assert isinstance(exc_info.value, NullRunApprovalDbUnavailableError)
         # The catalog error_code (NR-A016) is canonical for
@@ -476,8 +474,7 @@ class TestRuntimeDI:
 
 # ─── runtime branch tests (kill/pause, mode resolution, etc.) ──────────────────────────────
 
-from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -642,155 +639,6 @@ def test_check_control_plane_empty_cache_fetches(monkeypatch):
     monkeypatch.setattr(rt, "_fetch_remote_state", lambda wf: fetch_calls.append(wf))
     rt.check_control_plane("wf-1")
     assert fetch_calls == ["wf-1"]
-
-
-# ─── is_sensitive_tool ───────────────────────────────────────────────
-
-
-def test_is_sensitive_tool_built_in_match():
-    rt = _make_test_runtime()
-    assert rt.is_sensitive_tool("stripe.charge") is True
-
-
-def test_is_sensitive_tool_case_insensitive():
-    rt = _make_test_runtime()
-    assert rt.is_sensitive_tool("Stripe.Charge") is True
-    assert rt.is_sensitive_tool("STRIPE.CHARGE") is True
-
-
-def test_is_sensitive_tool_unknown_returns_false():
-    rt = _make_test_runtime()
-    assert rt.is_sensitive_tool("my.custom_tool") is False
-
-
-def test_is_sensitive_tool_after_register():
-    rt = _make_test_runtime()
-    rt.add_sensitive_tool("my.tool")
-    assert rt.is_sensitive_tool("my.tool") is True
-
-
-def test_is_sensitive_tool_after_remove():
-    rt = _make_test_runtime()
-    rt.add_sensitive_tool("my.tool")
-    rt.remove_sensitive_tool("my.tool")
-    assert rt.is_sensitive_tool("my.tool") is False
-
-
-def test_remove_sensitive_tool_unknown_is_silent():
-    rt = _make_test_runtime()
-    rt.remove_sensitive_tool("never.registered")  # must not raise
-
-
-# ─── register_sensitive_tools / get_sensitive_tools ──────────────────
-
-
-def test_register_sensitive_tools_bulk():
-    rt = _make_test_runtime()
-    rt.register_sensitive_tools(["a", "b", "c"])
-    tools = rt.get_sensitive_tools()
-    assert "a" in tools
-    assert "b" in tools
-    assert "c" in tools
-    # Built-in sensitive tools are also in the union.
-    assert "stripe.charge" in tools
-
-
-# 0.9.0: removed six `coverage_report` / `bump_coverage_counter`
-# tests at lines 223-278. The `_coverage_seen` /
-# `_coverage_tracked` / `_coverage_streaming_skipped` dicts
-# `coverage_report `, `track_coverage `
-# `start_coverage_reporter `, `_coverage_reporter_loop `, and
-# `bump_coverage_counter ` method are all gone — coverage is now
-# derived server-side from llm_call span metadata. See plan at
-# `~/.claude/plans/async-swinging-hanrahan.md`.
-
-
-# ─── execute mode resolution ──────────────────────────────────────
-
-
-def test_execute_auto_sensitive_routes_to_strict():
-    rt = _make_test_runtime()
-    rt._transport.execute = MagicMock(
-        return_value={"decision": "allow", "decision_source": "gateway"}
-    )
-    rt.execute("stripe.charge", {"amount": 5})  # sensitive → strict
-    call_args = rt._transport.execute.call_args
-    # Runtime.execute forwards mode as a kwarg.
-    assert call_args.kwargs["mode"] == "strict"
-
-
-def test_execute_auto_non_sensitive_routes_to_strict():
-    """DEF-TS12-01 (2026-09-10): ``mode="auto"`` with a non-sensitive
-    tool now ALWAYS resolves to ``mode="strict"`` and contacts the
-    gateway.
-
-    Pre-fix this was a CRITICAL fail-OPEN: ``mode="auto"`` with a
-    non-sensitive tool silently switched to ``mode="inline"`` which
-    returned a synthetic local allow WITHOUT contacting the gateway.
-    Every operator-configured budget, rate-limit, and tool-block
-    policy was silently bypassed for non-sensitive tools. The
-    dashboard showed policies in effect; the SDK ignored them.
-
-    Post-fix the cloud-only invariant from CLAUDE.md §17 and
-    memory `cloud-only-invariant-sdk` holds: every call routes
-    through /execute when ``mode="auto"`` (the default). The
-    ``mode="inline"`` opt-in is preserved for callers who
-    explicitly want to skip /execute — see
-    ``test_execute_inline_mode_short_circuits_local`` below for
-    the explicit opt-in pin.
-    """
-    rt = _make_test_runtime()
-    rt._transport.execute = MagicMock(
-        return_value={"decision": "allow", "decision_source": "gateway"}
-    )
-    rt.execute("safe.tool", {"x": 1})
-    rt._transport.execute.assert_called_once()
-    assert rt._transport.execute.call_args.kwargs["mode"] == "strict"
-
-
-def test_execute_auto_sensitive_calls_transport():
-    """Auto + sensitive tool → mode=strict → transport.execute is called."""
-    rt = _make_test_runtime()
-    rt._transport.execute = MagicMock(
-        return_value={"decision": "allow", "decision_source": "gateway"}
-    )
-    rt.execute("stripe.charge", {"amount": 5})
-    rt._transport.execute.assert_called_once()
-    assert rt._transport.execute.call_args.kwargs["mode"] == "strict"
-
-
-def test_execute_inline_mode_short_circuits_local():
-    """Inline + non-sensitive tool → LOCAL decision, no HTTP call."""
-    rt = _make_test_runtime()
-    rt._transport.execute = MagicMock()
-    result = rt.execute("safe.tool", {"x": 1}, mode="inline")
-    assert result["decision"] == "allow"
-    assert result["decision_source"] == "local"
-    rt._transport.execute.assert_not_called()
-
-
-def test_execute_inline_sensitive_still_calls_transport():
-    """Inline mode + sensitive tool still routes to /execute."""
-    rt = _make_test_runtime()
-    rt._transport.execute = MagicMock(
-        return_value={"decision": "allow", "decision_source": "gateway"}
-    )
-    rt.execute("stripe.charge", {"amount": 5}, mode="inline")
-    rt._transport.execute.assert_called_once()
-
-
-def test_execute_block_raises_NullRunBlockedException():
-    rt = _make_test_runtime()
-    rt._transport.execute = MagicMock(
-        return_value={
-            "decision": "block",
-            "decision_source": "gateway",
-            "explanation": "denied by policy",
-        }
-    )
-    with pytest.raises(NullRunBlockedException) as excinfo:
-        rt.execute("stripe.charge", {"amount": 5})  # sensitive → routes to /execute
-    assert excinfo.value.reason == "denied by policy"
 
 
 # ─── shutdown ────────────────────────────────────────────────────────

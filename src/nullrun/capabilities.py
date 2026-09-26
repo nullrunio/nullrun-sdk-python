@@ -22,7 +22,7 @@ reports:
   - `enforcement_modes_soft` — True means `NULLRUN_SOFT_LIMIT_ENABLED`
     is on (otherwise the gate downgrades soft → hard)
   - `heartbeat_time_based` — True means /heartbeat uses the
-    time-based cadence (vs. chunk-count deprecated v2 path)
+    time-based cadence (vs. the v2 chunk-count path)
   - `heartbeat_interval_seconds` — recommended /heartbeat cadence
   - `heartbeat_skew_tolerance_seconds` — server tolerates heartbeats
     up to this many seconds past the interval without dedup-rejection
@@ -42,18 +42,11 @@ This module is intentionally lazy: the probe only fires once at
 
 ## Capability history
 
-* 2026-07-06 — fixed P0 (audit §1 capabilities):
-  - probe URL was ``/health`` (legacy v1/v2); backend exposes the
-    canonical contract at ``/api/v1/capabilities``. Pre-fix the probe
-    always returned ``None`` and ``is_v3_ready()`` was always ``False``,
-    so the capability flags had zero effect on runtime behavior.
-  - ``parse_capabilities`` read v3-gating fields at top level; backend
-    nests them under ``capabilities.*``. Pre-fix all four v3 flags
-    read as ``False`` even on a v3-ready backend.
-  - Phantom fields ``sdk_min_version`` / ``lua_script_version`` were
-    read with default fallbacks; backend does ship both (at top
-    level), so the defaults were harmless but the read path was wrong
-    (the SDK was reading defaults it never actually used).
+The capabilities probe reads from the canonical
+``/api/v1/capabilities`` endpoint and parses v3-gating fields from
+the nested ``capabilities.*`` payload. Phantom fields
+``sdk_min_version`` / ``lua_script_version`` are read at top level
+where the backend ships them.
 """
 
 from __future__ import annotations
@@ -76,12 +69,9 @@ SDK_MIN_VERSION_FOR_V3 = "0.12.0"
 
 # Wire path for the canonical capabilities endpoint. The backend
 # exposes this at ``/api/v1/capabilities`` (per
-# ``backend/src/proxy/http/protocol.rs:189``) since 2025-04. The
-# legacy ``/health`` route returns a generic liveness payload —
-# it does NOT carry the v3-gating fields, so probing there always
-# returned None and ``is_v3_ready()`` was always False, leaving
-# every capability flag a no-op at runtime. See capability
-# history note in module docstring (2026-07-06 fix).
+# ``backend/src/proxy/http/protocol.rs:189``). The ``/health`` route
+# returns a generic liveness payload that does NOT carry the
+# v3-gating fields — probing there yields ``None`` for every flag.
 CAPABILITIES_PATH = "/api/v1/capabilities"
 
 
@@ -133,7 +123,6 @@ class ServerCapabilities:
     decision_log: bool = False
     outbox_async_drain: bool = False
     idempotency_keys: bool = False
-    # Execution Graph v0 (2026-08-06, backend): additive
     # `parent_execution_id` wire field on /gate. SDKs probe this
     # flag before sending the field; pre-Graph backends silently
     # ignore unknown fields, but the probe lets SDKs surface a
@@ -142,7 +131,6 @@ class ServerCapabilities:
     # included in `is_v3_ready()` -- it's informational, not a
     # hard gate.
     execution_graph: bool = False
-    # ADR-037 Slice B (2026-08-31, protocol v4): /gate response
     # echoes the SDK-supplied `action_digest` and a `policy_hash`
     # slot (None today; Slice D wires per-request computation).
     # Backend always sends the fields (skip_serializing_if elides
@@ -226,14 +214,7 @@ def _validate_capabilities_payload(payload: Any) -> list[str]:
     a Zod-style guard around :func:`parse_capabilities` so a malformed
     probe response (e.g. non-dict top level, capabilities array instead
     of dict) surfaces a typed warning instead of silently falling
-    through to legacy defaults.
-
-    M8 (audit 2026-08-12): pre-fix, a malformed probe payload silently
-    yielded the conservative defaults via ``payload.get("capabilities")
-    or {}`` and the SDK continued in compatibility mode without
-    informing the operator. Post-fix, the operator sees a structured
-    ``NullRunCapabilitiesValidationError`` at ``init()`` and can
-    diagnose the probe failure before the first /check.
+    through to defaults.
 
     Note: validation is intentionally permissive about MISSING fields
     (the backend may add new fields at any time without bumping the
@@ -305,11 +286,10 @@ def parse_capabilities(payload: dict[str, Any]) -> ServerCapabilities:
     Nested wins when both are present so the test fixtures and the
     canonical shape are unambiguous.
 
-    M8 (audit 2026-08-12): shape errors surface via
-    :func:`_validate_capabilities_payload` before parsing. The
-    caller (``probe_capabilities``) logs them at WARNING so the
-    operator sees the malformed payload without silent fallback to
-    legacy mode.
+    M8: shape errors surface via :func:`_validate_capabilities_payload`
+    before parsing. The caller (``probe_capabilities``) logs them at
+    WARNING so the operator sees the malformed payload without silent
+    fallback.
     """
     # Shape validation — fail loud on type errors, stay quiet on
     # missing keys (permissive forward-compat invariant).
@@ -351,12 +331,10 @@ def parse_capabilities(payload: dict[str, Any]) -> ServerCapabilities:
         decision_log=_v3_flag("decision_log"),
         outbox_async_drain=_v3_flag("outbox_async_drain"),
         idempotency_keys=_v3_flag("idempotency_keys"),
-        # Execution Graph v0 (2026-08-06, backend): additive flag
         # -- defaults to False so pre-Graph backends (which omit
         # the field entirely) yield a fail-closed view where the
         # SDK does NOT send `parent_execution_id`.
         execution_graph=_v3_flag("execution_graph"),
-        # ADR-037 Slice B (2026-08-31, protocol v4): additive
         # flag — defaults to False so pre-Slice-B backends yield
         # a fail-closed view where the SDK does NOT log the
         # wire-evidence echo as "server confirmed". Pre-v4
@@ -379,11 +357,9 @@ def probe_capabilities(api_url: str, timeout: float = 2.0) -> ServerCapabilities
     messages at ``init ``.
 
     The canonical URL is ``{api_url}/api/v1/capabilities`` (per
-    ``backend/src/proxy/http/protocol.rs:189``). Pre-fix the probe
-    targeted ``/health`` (legacy v1/v2 status endpoint), which never
-    carried the v3-gating fields — the probe always returned ``None``
-    and ``is_v3_ready()`` was always ``False``, so capability flags
-    had no effect on runtime behavior.
+    ``backend/src/proxy/http/protocol.rs:189``). The ``/health``
+    status endpoint does NOT carry the v3-gating fields — probing
+    there returns ``None`` for every flag.
     """
     url = api_url.rstrip("/") + CAPABILITIES_PATH
     try:

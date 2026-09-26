@@ -1,10 +1,25 @@
 """
 NullRun Platform SDK.
 
-Enforcement gateway client for AI agents. Curated 6-symbol surface:
-`init`, `protect`, `track_llm`, `track_tool`, `track_event`. Everything
-else is reachable on demand via `from nullrun import X` but does NOT
-appear in `dir(nullrun)`.
+The user-facing entry point is ``@protect`` — the universal gate
+decorator that wraps any function (tool, LLM call, business logic)
+and routes the call through the backend's policy / budget /
+approval pipeline. No parameters, no separate decorators, no
+extra entry points: if you want NullRun to see the call, decorate
+it with ``@protect``.
+
+Everything else exposed by ``nullrun`` is either runtime lifecycle
+(``init``, ``shutdown``, ``on_error``), the structured exception
+hierarchy, or message/error-handling helpers (``format_user_message``,
+``guard``). None of those are alternatives to ``@protect`` — they're
+setup and cleanup.
+
+For introspection, reach the runtime snapshot via
+``nullrun.get_runtime().status()`` (returns a frozen
+:class:`NullRunStatus`). There is no top-level ``nullrun.status()``
+wrapper in 0.18.4 — the wrapper existed only to render an
+``NR-C004`` config error before ``init``, which is now the runtime
+class's job.
 
 Usage:
     import nullrun
@@ -14,12 +29,25 @@ Usage:
     def my_agent(query):
         return call_llm(query)
 
-See README.md for LangGraph, OpenAI Agents, llama-index, crewai, autogen
-auto-instrumentation; CHANGELOG.md for breaking changes between versions.
+    @nullrun.protect
+    def charge_customer(amount_cents: int, customer_id: str):
+        return refund_wire(amount_cents, customer_id)
+
+The backend reads live values out of the call's kwargs and applies
+whatever rules / budgets / approval gates the operator has
+configured on the dashboard. The SDK does not know — and does not
+need to know — whether a call is a tool call, an LLM call, a
+budget operation, or anything else. That's the entire point.
+
+See README.md for LangGraph, OpenAI Agents, llama-index, crewai,
+autogen auto-instrumentation; CHANGELOG.md for breaking changes
+between versions.
 """
 
 from __future__ import annotations
 
+import atexit
+import sys
 import threading as _threading
 
 # Use lazy import inside __getattr__ instead of `import importlib` at
@@ -30,6 +58,12 @@ from nullrun.__version__ import __version__
 # inside `init `.
 _init_lock = _threading.Lock()
 
+# Tracks whether `shutdown` is currently registered with `atexit`. The
+# flag persists across `init()` calls (so a second init does not stack
+# a second atexit hook) and is reset by `shutdown()` so a fresh
+# `init()` after a clean shutdown re-registers cleanly.
+_shutdown_atexit_registered = False
+
 # ---------------------------------------------------------------------------
 # Curated public surface
 # ---------------------------------------------------------------------------
@@ -37,8 +71,7 @@ _init_lock = _threading.Lock()
 # in tab-completion. All other names (legacy Breaker exports,
 # instrumentation, exceptions, …) live in `_LAZY_EXPORTS` below and are
 # loaded on first access via __getattr__.
-from nullrun.decorators import protect  # the gate decorator
-from nullrun.runtime import track_event, track_llm, track_tool
+from nullrun.decorators import protect  # the gate decorator — universal entry point
 
 
 def shutdown(timeout: float = 2.0, flush: bool = True) -> None:
@@ -49,12 +82,11 @@ def shutdown(timeout: float = 2.0, flush: bool = True) -> None:
     this returns, any further ``nullrun.track(...)`` call or
     ``@protect``-decorated call is a no-op.
 
-    Audit 2026-06-29 (WS graceful close on exit): a long-running
-    script that exits via ``sys.exit `` lets the kernel RST the TCP
-    socket, which the backend logs as WARN "Connection reset
-    without closing handshake". Calling ``nullrun.shutdown ``
-    before exit (or registering it via ``atexit``) eliminates the
-    noisy log. No-op if ``init `` was never called.
+    ``init()`` auto-registers this function with ``atexit``, so
+    long-running scripts get a clean WS close on process exit without
+    any explicit call. Calling ``shutdown()`` manually is still safe
+    and idempotent — it is a no-op if ``init()`` was never called or
+    has already been shut down.
 
     Args:
         timeout: seconds to wait for the WS close handshake to
@@ -72,9 +104,6 @@ def shutdown(timeout: float = 2.0, flush: bool = True) -> None:
 
     Example::
 
-        import atexit
-        import nullrun
-        atexit.register(nullrun.shutdown)
     """
     # Lazy import so the SDK module-import path stays light (mirrors
     # the pattern in `init` and `status`).
@@ -83,56 +112,11 @@ def shutdown(timeout: float = 2.0, flush: bool = True) -> None:
     if runtime is None:
         return
     runtime.shutdown(flush=flush)
-
-
-def status():
-    """Return the current runtime state as a Layer-3
-:class:`NullRunStatus` snapshot.
-
-    Synchronous, thread-safe, side-effect-free — safe to call
-    from the agent loop, the transport flush thread, or a
-    debug console. The returned dataclass is frozen so it can
-    be cached, shared, and compared with ``==``.
-
-    Designed for the "the agent is stuck, what's wrong?"
-    runbook:
-
-        >>> import nullrun
-        >>> print(nullrun.status.summary )
-        NullRunStatus(degraded fallback=last_good@42s reason=last policy fetch failed at 2026-06-24T10:30:15+00:00)
-
-    See ``nullrun.observability.status`` for the state
-    derivation rules (the four headline states:
-    ``ok`` / ``degraded`` / ``offline`` / ``misconfigured``).
-
-    Raises:
-        NullRunConfigError: ``nullrun.init `` has not been
-            called yet, or the runtime was shut down. The
-            snapshot only makes sense when there is a runtime
-            to snapshot.
-    """
-    # Read the module-level ``_runtime`` directly so we do NOT
-    # trigger ``get_instance ``'s lazy construction. ``status ``
-    # must NEVER create a runtime as a side effect — a fresh
-    # import of ``nullrun`` followed by ``nullrun.status ``
-    # should report "no runtime" cleanly, not try to spin one
-    # up (which would itself raise a different config error
-    # about missing api_key).
-    import nullrun.runtime as _rt_mod
-    from nullrun.breaker.exceptions import NullRunConfigError
-
-    rt = _rt_mod._runtime
-    if rt is None:
-        raise NullRunConfigError(
-            "nullrun.status() requires a runtime. Call nullrun.init() first.",
-            error_code="NR-C004",
-            user_action=(
-                "Call nullrun.init(api_key='nr_live_...') before "
-                "calling nullrun.status(). The snapshot only makes "
-                "sense when there is a runtime to inspect."
-            ),
-        )
-    return rt.status()
+    # Allow a future `init()` to re-register the atexit hook for the
+    # new runtime. Without this, after a `shutdown()` + `init()` cycle
+    # the second runtime would not be auto-shutdown on process exit.
+    global _shutdown_atexit_registered
+    _shutdown_atexit_registered = False
 
 
 def on_error(hook):
@@ -196,21 +180,33 @@ def init(
     api_key: str | None = None,
     api_url: str | None = None,
     debug: bool = False,
+    fail_on_exit: bool = False,
 ):
     """
     Initialize the NullRun SDK. Call once at application startup.
 
-    `api_key` is **required** as of 0.3.0. The previous silent fallback to
-    "local mode" (a NullRunNoop stub) was removed because it hid policy
-    violations and bypassed every backend gate — a real safety hole. Pass
-    `api_key=...` explicitly or set the `NULLRUN_API_KEY` environment
-    variable before calling `init `. If neither is set, `init ` raises
-    `NullRunAuthenticationError`.
+    `api_key` is **required**. There is no silent fallback mode: every
+    gate calls the backend, and a missing key would silently bypass
+    every backend gate. Pass `api_key=...` explicitly or set the
+    `NULLRUN_API_KEY` environment variable before calling `init `. If
+    neither is set, `init ` raises `NullRunAuthenticationError` (or,
+    with ``fail_on_exit=True``, prints the four-line developer report
+    to stderr and exits with code 1 — the CLI-friendly path).
+
+    ``init()`` also auto-registers ``nullrun.shutdown()`` via
+    ``atexit``, so a process exit after init gets a clean WS close
+    without an explicit shutdown call.
 
     Args:
         api_key: NullRun API key (or NULLRUN_API_KEY env var). Required.
         api_url: Gateway URL (or NULLRUN_API_URL env var)
         debug: Enable debug logging
+        fail_on_exit: when True, configuration failures print the
+            developer-facing report to stderr and ``sys.exit(1)``
+            instead of raising. Use this for CLI scripts that want a
+            clean exit on missing ``NULLRUN_API_KEY``; library
+            embedders (FastAPI startup, Jupyter) should leave it
+            False and catch the exception instead.
 
     Note: the background control-plane listener (WebSocket + HTTP poll) is
     always started on `init `. To disable it, construct `NullRunRuntime`
@@ -221,7 +217,7 @@ def init(
 
     Raises:
         NullRunAuthenticationError: if neither `api_key` nor
-            `NULLRUN_API_KEY` is set.
+            `NULLRUN_API_KEY` is set AND ``fail_on_exit`` is False.
 
     Example:
         import nullrun
@@ -229,8 +225,8 @@ def init(
         nullrun.init(api_key="your-key")
 
         @nullrun.protect
-        def my_agent: 
-            return agent.run 
+        def my_agent:
+            return agent.run
     """
     import logging
     import os
@@ -240,25 +236,19 @@ def init(
     if debug:
         logger.setLevel(logging.DEBUG)
 
-    # T3-S2 (0.3.0): api_key is now required. Previous versions fell back
-    # to a NullRunNoop stub in `local_mode`, which silently bypassed every
-    # backend gate (budget, policy, control plane). That was a real
-    # safety hole — production callers were unaware their policies were
-    # not being enforced. We raise instead so the misconfiguration is
-    # caught at startup rather than producing silent allow-all decisions.
-    # Strip whitespace from either the kwarg or the env before the truthiness
-    # check. Python `or` alone accepts " " / "\t" / "\n" as truthy, which
-    # would let a whitespace-only api_key pass init() and reach the gateway
-    # as a malformed `Authorization: Bearer ` header. The strip preserves
-    # embedded legitimate characters (e.g. "  nr_live_xxx  " is normalised
-    # to the canonical form so HMAC signing sees the same value on both
-    # sides of the wire).
+    # Strip whitespace from either the kwarg or the env before the
+    # truthiness check. Python `or` alone accepts " " / "\t" / "\n" as
+    # truthy, which would let a whitespace-only api_key pass init()
+    # and reach the gateway as a malformed `Authorization: Bearer `
+    # header. The strip preserves embedded legitimate characters (e.g.
+    # "  nr_live_xxx  " is normalised to the canonical form so HMAC
+    # signing sees the same value on both sides of the wire).
     raw_key = api_key if api_key is not None else os.getenv("NULLRUN_API_KEY")
     resolved_key = raw_key.strip() if isinstance(raw_key, str) else None
     if not resolved_key:
-        # Layer 1: raise the legacy type (``NullRunAuthenticationError``)
-        # so user code with ``except NullRunAuthenticationError:`` still
-        # catches this case, but stamp the structured ``error_code`` /
+        # Layer 1: raise ``NullRunAuthenticationError`` so user code
+        # with ``except NullRunAuthenticationError:`` still catches
+        # this case, but stamp the structured ``error_code`` /
         # ``user_action`` so a Layer-2 on_error hook (or a
         # ``except NullRunError:`` clause) can branch on the catalog
         # value ``NR-C001`` ("configuration: no api_key") without
@@ -269,17 +259,30 @@ def init(
             "nullrun.init() requires an api_key. Pass api_key='nr_live_...' "
             "explicitly or set the NULLRUN_API_KEY environment variable. "
             "Whitespace-only values are rejected — strip surrounding spaces "
-            "before passing or exporting the key. "
-            "(Silent no-op fallback was removed in 0.3.0 — see CHANGELOG.)",
+            "before passing or exporting the key.",
             error_code="NR-C001",
             user_action=(
                 "Get an API key at https://app.nullrun.io/settings/api-keys, "
                 "then either pass api_key='nr_live_...' to nullrun.init() or "
                 "set the NULLRUN_API_KEY environment variable. The SDK cannot "
-                "operate without credentials — the silent no-op fallback was "
-                "removed in 0.3.0 because it bypassed every backend gate."
+                "operate without credentials."
             ),
         )
+        # CLI path: render the same four-line developer report
+        # ``guard()`` uses, then sys.exit(1). Library embedders leave
+        # ``fail_on_exit=False`` (default) so the exception propagates
+        # into their own try/except and the host process stays alive
+        # (FastAPI startup, Jupyter, REPL).
+        if fail_on_exit:
+            from nullrun._handle import _render_dev_error_report
+            from nullrun.messages import format_user_message
+
+            try:
+                report = _render_dev_error_report(err, format_user_message(err))
+            except Exception:  # noqa: BLE001
+                report = format_user_message(err)
+            print(report, file=sys.stderr)
+            sys.exit(1)
         # Layer 2: fire the on_error hook BEFORE the raise so the
         # hook sees the call stack still live. Stage = "init" so a
         # log-based hook can attribute the failure to startup
@@ -297,10 +300,6 @@ def init(
 
     # Imported lazily so we don't pull the runtime into the namespace
     # when the user only wants the static helpers.
-    import threading as _threading
-
-    import nullrun.decorators as _dec_mod
-    import nullrun.runtime as _rt_mod
     from nullrun.runtime import NullRunRuntime
 
     # C3 fix: shut down any existing runtime before constructing a new
@@ -348,6 +347,17 @@ def init(
         # write that every consumer sees.
         NullRunRuntime._instance = runtime
 
+    # Auto-register shutdown with atexit so long-running scripts get a
+    # clean WS close on process exit without an explicit call. The
+    # flag guard makes the registration idempotent across multiple
+    # ``init()`` calls (the C3 fix shuts down the previous runtime
+    # first; the atexit hook stays the same and is no-op when the
+    # runtime is already torn down).
+    global _shutdown_atexit_registered
+    if not _shutdown_atexit_registered:
+        atexit.register(shutdown)
+        _shutdown_atexit_registered = True
+
     # v3.12 / 0.12.0 — server-minted execution_id default ON. Probe
     # the backend's /api/v1/capabilities endpoint and log any
     # version mismatch so the operator sees the gap at startup
@@ -388,11 +398,6 @@ def init(
 
     auto_instrument(runtime)
 
-    # 0.9.0: coverage reporter removed. Coverage is now derived
-    # server-side from llm_call span metadata (host + tracked +
-    # streaming_skipped flags). No 60s daemon thread, no per-process
-    # counter dicts.
-
     return runtime
 
 
@@ -404,12 +409,11 @@ def init(
 # in `globals ` so subsequent lookups are O(1) and not visible in
 # `vars(nullrun)` until then. This is the same pattern used by pandas /
 # sqlalchemy / etc. to keep the top-level namespace discoverable.
-_LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
+_LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     # Runtime + context (advanced)
     "NullRunRuntime": ("nullrun.runtime", "NullRunRuntime"),
     "get_runtime": ("nullrun.runtime", "get_runtime"),
     "get_protected_runtime": ("nullrun.decorators", "get_protected_runtime"),
-    "track": ("nullrun.runtime", "track"),
     "reset": ("nullrun.decorators", "reset"),
     "workflow": ("nullrun.context", "workflow"),
     "span": ("nullrun.context", "span"),
@@ -426,30 +430,16 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "set_call_context": ("nullrun.context", "set_call_context"),
     "get_call_model": ("nullrun.context", "get_call_model"),
     "get_call_tools": ("nullrun.context", "get_call_tools"),
-    # 2026-07-02 (v0.11.0): chain context for soft-mode budget gate
-    #. ``chain`` is the contextmanager
-    # ``get_chain_id`` / ``set_chain_id`` are the manual setters.
+    # ``chain`` contextmanager + manual ``get_chain_id`` /
+    # ``set_chain_id`` setters — soft-mode budget gate scoping.
     "chain": ("nullrun.context", "chain"),
     "get_chain_id": ("nullrun.context", "get_chain_id"),
     "set_chain_id": ("nullrun.context", "set_chain_id"),
     "get_chain_op": ("nullrun.context", "get_chain_op"),
     "set_chain_op": ("nullrun.context", "set_chain_op"),
-    # Instrumentation
-    "NullRunCallback": ("nullrun.instrumentation", "NullRunCallback"),
-    # NOTE: `patch_openai` and `unpatch_openai` were removed from
-    # `_LAZY_EXPORTS` because they pointed at non-existent
-    # attributes on `nullrun.instrumentation` (the actual function
-    # is `patch_openai_agents`, with different semantics — it patches
-    # `agents.Runner`, not the `openai` SDK). The pre-fix lazy
-    # entries caused `AttributeError` on first access, which is a
-    # worse failure mode than a clean `ImportError` from
-    # `from nullrun import patch_openai` failing because the symbol
-    # is no longer in the lazy table.
     # Toolbox — framework-specific wrappers. The previous `instrument `
     # helper lived at `nullrun.instrumentation.langgraph.instrument`;
     # it is now `nullrun.toolbox.langgraph.wrapper`. Reachable as
-    # `from nullrun import wrapper` for one-line import.
-    "wrapper": ("nullrun.toolbox.langgraph", "wrapper"),
     # Span / trace context. `tracing.py` is the structured replacement
     # for the loose `_trace_id` / `_span_id` contextvars in
     # `nullrun.context`. `SpanContext` is a single value (parent +
@@ -462,32 +452,6 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "create_child_span": ("nullrun.tracing", "create_child_span"),
     "set_span": ("nullrun.tracing", "set_span"),
     "reset_span": ("nullrun.tracing", "reset_span"),
-    # Decorators
-    "sensitive": ("nullrun.decorators", "sensitive"),
-    # Sensitive impact extractors. The documented decorator pattern
-    # `@nullrun.sensitive(impact=money_outflow(...))` lives in
-    # `decorators.py:1113-1132` and `extractor.py:43`. Both helpers
-    # live in `nullrun.extractor` but are not re-exported at the
-    # top level — `__getattr__` masks any name not in this table, so
-    # `nullrun.money_outflow(...)` previously raised AttributeError
-    # on the first invocation of the documented pattern. Adding the
-    # entries here matches the `NullRunApprovalDbUnavailableError`
-    # lazy-export pattern (see line 514). Workaround
-    # `from nullrun.extractor import money_outflow` still works.
-    "money_outflow": ("nullrun.extractor", "money_outflow"),
-    "tool_params": ("nullrun.extractor", "tool_params"),
-    # Business impact module re-export. The docstrings at
-    # `extractor.py:18` and `extractor.py:799-801` reference
-    # `nullrun.business_impact.compute_action_digest` /
-    # `MoneyImpactExtractor` / `ToolParamsExtractor` as bare dotted
-    # paths. The module is real (`nullrun/business_impact.py`) and
-    # contains those symbols, but PEP 562 `__getattr__` masks
-    # submodule access unless we expose the module object itself.
-    # The `attr_name=None` sentinel below tells `__getattr__` to
-    # return the imported submodule verbatim rather than `getattr`
-    # on it — same shape as `from nullrun import business_impact`
-    # for the user, no manual `import nullrun.business_impact` first.
-    "business_impact": ("nullrun.business_impact", None),
     # Actions
     "ActionHandler": ("nullrun.actions", "ActionHandler"),
     "ActionType": ("nullrun.actions", "ActionType"),
@@ -514,24 +478,19 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     # Zombie exception classes removed. See the NOTE block in
     # breaker/exceptions.py for the list.
     "WorkflowPausedException": ("nullrun.breaker.exceptions", "WorkflowPausedException"),
-    "WorkflowKilledException": ("nullrun.breaker.exceptions", "WorkflowKilledException"),
     "WorkflowKilledInterrupt": ("nullrun.breaker.exceptions", "WorkflowKilledInterrupt"),
     # Sibling typed name for the kill signal. Discovered via
     # ``from nullrun import NullRunWorkflowKilledError``; matches
-    # `WorkflowKilledInterrupt` (BaseException) and the older
-    # `WorkflowKilledException` for back-compat. Cookbook code
+    # `WorkflowKilledInterrupt`. Cookbook code
     # that wants a typed ``except`` clause prefers this over the
     # base-interrupt form (mro-aware dispatch). The class lives at
     # breaker/exceptions.py:1459.
     "NullRunWorkflowKilledError": ("nullrun.breaker.exceptions", "NullRunWorkflowKilledError"),
-    # ── B.1 (2026-09-10): MCP umbrella + APPROVAL_DB symmetry.
     # Four typed exception classes that round-trip the MCP umbrella
     # codes (ADR-013, frozen-dormant) and the six APPROVAL_DB_*
-    # sibling codes (DEF-ARFLOW-TOOLNAME-01). Pre-B.1 these all
-    # collapsed to NullRunBlockedException + the generic NR-X001
-    # fallback — cookbook code couldn't branch on the typed arm.
-    # Post-B.1 each maps to its own typed class so
-    # ``except NullRunMcpDestructiveBlockedError:`` etc. work.
+    # sibling codes (DEF-ARFLOW-TOOLNAME-01). Each maps to its own
+    # typed class so ``except
+    # NullRunMcpDestructiveBlockedError:`` etc. work.
     "NullRunMcpDestructiveBlockedError": ("nullrun.breaker.exceptions", "NullRunMcpDestructiveBlockedError"),
     "NullRunMcpReadonlyBypassBlockedError": ("nullrun.breaker.exceptions", "NullRunMcpReadonlyBypassBlockedError"),
     "NullRunMcpApprovalRequiredError": ("nullrun.breaker.exceptions", "NullRunMcpApprovalRequiredError"),
@@ -551,15 +510,18 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     # NullRunError. WorkflowKilledInterrupt (BaseException) still
     # propagates — kill is never swallowed.
     #
-    # The module is named ``_handle.py`` (private, leading underscore)
-    # so it does not collide with the public ``nullrun.handle``
+    # History: 0.18.4 renamed this from ``handle`` to ``guard``.
+    # The module file name is still ``_handle.py`` for the
+    # submodule-shadowing reason explained in that file's docstring;
+    # only the function name ``guard`` is public.
+    #
+    # Why the module is named ``_handle.py`` (private, leading underscore):
+    # so it does not collide with the public ``nullrun.guard``
     # context manager. With a non-underscored name, pytest's test
-    # discovery would pre-import ``nullrun.handle`` as a submodule
-    # which shadows the lazy export and breaks ``from nullrun import
-    # handle``.
-    "handle": ("nullrun._handle", "handle"),
-    "guarded": ("nullrun._handle", "guarded"),
-    "init_or_die": ("nullrun._handle", "init_or_die"),
+    # discovery would pre-import ``nullrun.guard`` as a submodule
+    # which shadows the lazy export and breaks
+    # ``from nullrun import guard``.
+    "guard": ("nullrun._handle", "guard"),
     # ADR-009 P1 — governance audit surface (typed wire classes).
     # Users reach these as `from nullrun import AuditQuery` /
     # `from nullrun.audit import ...`. The runtime exposes
@@ -580,24 +542,9 @@ def __getattr__(name: str):
     """PEP 562 — lazy attribute access for backward-compatible symbols."""
     if name in _LAZY_EXPORTS:
         module_path, attr_name = _LAZY_EXPORTS[name]
-        # ``attr_name`` is str | None: the sentinel ``None`` means
-        # "return the submodule itself" (see business_impact
-        # re-export at line 490). ``__import__`` with ``fromlist=[]``
-        # returns the top-level package, which is what we want in
-        # both cases.
-        fromlist: list[str] = [attr_name] if attr_name is not None else []
+        fromlist: list[str] = [attr_name]
         module = __import__(module_path, fromlist=fromlist)
-        if attr_name is None:
-            # Sentinel: return the imported module itself (submodule
-            # re-export). Used for `nullrun.business_impact` so the
-            # docstring-referenced dotted paths
-            # (`nullrun.business_impact.compute_action_digest` etc.)
-            # resolve without an explicit `import
-            # nullrun.business_impact` first. See
-            # `_LAZY_EXPORTS['business_impact']` for the rationale.
-            value = module
-        else:
-            value = getattr(module, attr_name)
+        value = getattr(module, attr_name)
         # Cache on the module so subsequent lookups are O(1) and
         # dir(nullrun) still reports the curated public surface until
         # the legacy name is actually accessed.
@@ -622,16 +569,12 @@ def __dir__() -> list[str]:
 __all__ = [
     # Version (single value, always public)
     "__version__",
-    # The curated public surface — six symbols. Everything else
-    # stays importable as `from nullrun import X` for backward
-    # compatibility, but does NOT appear in `dir(nullrun)` until the
-    # user actually accesses it.
+    # The curated public surface. ``protect`` is the universal gate —
+    # every function call that the SDK should see goes through
+    # ``@protect``. The rest is runtime lifecycle, structured
+    # exceptions, or error-handling helpers. Nothing else.
     "init",
-    "protect",  # gate decorator
-    "track_llm",
-    "track_tool",
-    "track_event",
-    # Audit 2026-06-29 (WS graceful close on exit): the user-facing
+    "protect",  # gate decorator — the only user-facing entry point
     # top-level ``shutdown `` sends a clean WS close frame and
     # drains in-flight events. Without it, a long-running script
     # that exits via ``sys.exit `` lets the kernel RST the TCP
@@ -644,19 +587,19 @@ __all__ = [
     # single most important "give the user a chance" API — the
     # user has to know it exists to call it.
     "on_error",
-    # Layer 3: status introspection — synchronous snapshot of the
-    # runtime's state, returns a frozen NullRunStatus.
-    "status",
+    # Layer 3: status introspection is reached via
+    # ``nullrun.get_runtime().status()``. There is intentionally NO
+    # top-level ``nullrun.status()`` wrapper in 0.18.4 — the wrapper
+    # existed only to render NR-C004 before ``init``, which is now
+    # the runtime class's own job. Frozen ``NullRunStatus`` dataclass
+    # itself is importable as ``nullrun.NullRunStatus`` (PEP 562
+    # lazy export from ``nullrun.observability.status``).
     # Layer 1: structured exception base + the most common subclasses
     # the user is expected to ``except`` on. Including them in
     # ``__all__`` means ``from nullrun import *`` and ``dir(nullrun)``
     # surface them for tab-completion — the whole point of giving
     # the user "a chance" is that they need to know the names exist
-    # to catch them. The legacy types (``NullRunBlockedException``
-    # ``NullRunAuthenticationError``, ``WorkflowKilledException``
-    # ``WorkflowPausedException``) stay importable via
-    # ``_LAZY_EXPORTS`` for back-compat — adding them here would
-    # change ``dir(nullrun)`` for existing users.
+    # to catch them.
     "NullRunError",
     "NullRunAuthError",
     "NullRunConfigError",
@@ -665,10 +608,6 @@ __all__ = [
     "NullRunToolBlockedError",
     "WorkflowKilledInterrupt",
     "NullRunWorkflowKilledError",
-    # B.1 (2026-09-10): MCP umbrella + APPROVAL_DB symmetry. The
-    # four typed exception classes are part of the curated public
-    # surface — cookbook code branches on them by name, so they
-    # need to be visible in ``dir(nullrun)`` for tab-completion.
     "NullRunMcpDestructiveBlockedError",
     "NullRunMcpReadonlyBypassBlockedError",
     "NullRunMcpApprovalRequiredError",
@@ -679,26 +618,17 @@ __all__ = [
     # own wording per error_code without rewriting the SDK.
     "format_user_message",
     "set_user_message",
-    # Minimal-boilerplate error handling for scripts. ``handle`` is
-    # the context manager (``with nullrun.handle: ``), ``guarded``
-    # is the decorator (``@nullrun.guarded``). Both translate any
-    # ``NullRunError`` into ``print(format_user_message(exc))`` +
+    # Minimal-boilerplate error handling for scripts. ``guard`` is
+    # the context manager (``with nullrun.guard():``). It translates
+    # any ``NullRunError`` into ``print(format_user_message(exc))`` +
     # ``sys.exit(1)``; ``WorkflowKilledInterrupt`` propagates.
-    # ``init_or_die`` is the convenience wrapper around ``init``
-    # that catches NR-C001 "no api_key" at startup and exits
-    # cleanly — without it the user sees a raw traceback before
-    # any ``with handle: `` block is in scope.
-    "handle",
-    "guarded",
-    "init_or_die",
+    # CLI fail-fast on missing api_key is `init(fail_on_exit=True)`.
+    # Renamed from ``handle`` in 0.18.4 — see the _LAZY_EXPORTS block.
+    "guard",
 ]
 
 # The SDK-side ``decision_history`` module was deleted. Decision
 # history is a backend + dashboard surface only — the SDK does not
 # (and cannot) replay LLM calls because NULLRUN does not store
-# request/response payloads or hold client LLM keys. The orphan
-# ``start_recording`` / ``stop_recording`` methods on
-# ``NullRunRuntime`` are kept as no-op stubs for one minor version
-# for backward compatibility; they will be removed in 0.5.0.
-# Do NOT re-export ReplayManager / ReplaySession / ReplayEvent /
-# EventRecorder.
+# request/response payloads or hold client LLM keys. Do NOT re-export
+# ReplayManager / ReplaySession / ReplayEvent / EventRecorder.

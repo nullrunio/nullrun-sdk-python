@@ -7,13 +7,11 @@ when workflow state changes (KILL/PAUSE).
 """
 
 import asyncio
-import hashlib
-import hmac
 import json
 import logging
 import time
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 # CP7 fix: outgoing ACK is now HMAC-signed using the same
 # ``generate_hmac_signature`` helper the HTTP transport uses for
@@ -55,7 +53,6 @@ _MAX_RECONNECT_ATTEMPTS = 10
 # field NAME but disagree on the VALUE: HTTP carries the user-facing
 # ``nr_live_...`` string, WS carries the internal UUID from
 # ``auth_context.key_id ``. Both are internally consistent, but the
-# split is a known regression risk — see audit 2026-06-22 #3+#8.
 WS_HMAC_IDENTITY_FIELD = "api_key"
 
 
@@ -86,10 +83,10 @@ class WebSocketConnection:
     def _is_acknowledged_state(cls, state: str) -> bool:
         """Case-insensitive membership check against ``ACKNOWLEDGED_STATES``.
 
-        Audit-2026-06-22: added a lowercase fallback so a server
-        regression to ``"killed"``/``"paused"`` doesn't silently
-        drop the ACK. Exact PascalCase is still the happy path and
-        is checked first; the lowercase branch is defensive only.
+        The lowercase branch is defensive: it protects against a
+        server regression to ``"killed"``/``"paused"`` that would
+        otherwise silently drop the ACK. Exact PascalCase is still
+        the happy path and is checked first.
         """
         if state in cls.ACKNOWLEDGED_STATES:
             return True
@@ -171,7 +168,6 @@ class WebSocketConnection:
         ``finally`` block when the connection drops. This loop waits
         while the receive loop is healthy and reconnects on demand.
 
-        Without the ``continue`` branch, the pre-fix code exited after
         the very first successful ``_connect `` because the
         ``if not self._running`` guard became False the moment
         ``_connect `` set ``_running = True``. That broke the control
@@ -344,20 +340,16 @@ class WebSocketConnection:
                 # value under the ``api_key`` field — we MUST read it
                 # back from there and use it as the HMAC identifier.
                 #
-                # Pre-FIX-F4 this branch read ``data["api_key_id"]``
-                # which used to be the wire field name on the server
-                # side. That field now carries the same user-facing
-                # value (no longer the internal UUID key_id), so for
-                # backwards compat we accept either field name —
-                # pre-FIX-F4 envelopes may still arrive with
-                # ``api_key_id`` carrying the user-facing string
-                # because the server's only consumers were pre-FIX-F4
-                # SDKs.
+                # The ``data["api_key_id"]`` field carries the
+                # user-facing API key value (not an internal UUID).
+                # Accept either field name for backwards compat —
+                # older envelopes may still arrive with
+                # ``api_key_id`` carrying the user-facing string.
                 #
-                # Fall back to ``self.api_key`` only when the envelope
-                # has neither field (a pre-FIX-D server without
-                # signed_payload), which is a degraded path that
-                # already 403'd in real life per the FIX-C comments.
+                # Fall back to ``self.api_key`` only when the
+                # envelope has neither field (a server without
+                # ``signed_payload``), which is a degraded path that
+                # already 403's in practice.
                 envelope_api_key = (
                     data.get(WS_HMAC_IDENTITY_FIELD)
                     if isinstance(data.get(WS_HMAC_IDENTITY_FIELD), str)
@@ -519,7 +511,6 @@ class WebSocketConnection:
                 logger.info(
                     f"Approval {outcome}: id={approval_id} exec={execution_id} wf={workflow_id}"
                 )
-                # L5 / audit 2026-08-12: HMAC-signed ACK for
                 # ``approval_resolved``. Mirrors the Killed/Paused
                 # ACK path at _send_ack. Pre-fix the SDK silently
                 # consumed the frame and never acknowledged — the
@@ -591,7 +582,6 @@ class WebSocketConnection:
                 # CP4 fix: unknown msg_type. Previously this fell
                 # through the entire if/elif chain with no else
                 # so a new WsMessage variant added by the backend
-                # would be silently dropped. The user would only
                 # find out when a control-plane feature stopped
                 # working. Now we log at WARNING with enough
                 # context to debug forward-compat drift.
@@ -653,15 +643,13 @@ class WebSocketConnection:
 
         # Check if this state requires acknowledgment
         #
-        # Audit-2026-06-22 case-defensive: the HTTP-poll path
         # (`runtime.py`) lowercases before comparing so it survives a
-        # server regression to lowercase states. The WS path used to
-        # exact-match only. Without this fallback, a server regression
+        # server regression to lowercase states. The WS path matches
+        # case-insensitively too — without this, a server regression
         # would silently drop the ACK (the existing test pins
         # PascalCase as the happy path, but does not pin what happens
         # if the server emits ``"killed"``).
         #
-        # ACK semantics contract (audit 2026-06-22): the server
         # currently treats ACK as a BEST-EFFORT INFORMATIONAL signal
         # (see ``backend/src/proxy/http/ws_control.rs`` ACK handler
         # comment for the full contract). Only `Killed`/`Paused` are
@@ -686,11 +674,8 @@ class WebSocketConnection:
         """
         Send acknowledgment message to server with HMAC signature.
 
-        CP7 fix (2026-06-26): previously this ACK was plain JSON
-        no signature, no timestamp, no api_key. The backend does
-        not currently verify ACK authenticity (the TODO at
-        ``backend/src/proxy/http/ws_control.rs:842-848`` is still
-        open) but adding the signature now means:
+        The backend does not currently verify ACK authenticity but
+        the SDK ships the signature now so:
 
         * When the backend enables ACK verification, the SDK is
           already on the wire format it expects — no breaking
@@ -745,10 +730,9 @@ class WebSocketConnection:
             }
 
             # Add HMAC fields when both api_key and secret_key are
-            # configured. Without secret_key we still send the
-            # plain envelope (matches the pre-fix behaviour for
-            # legacy api_keys that don't use HMAC). The backend
-            # skips verify when signature is absent.
+            # configured. Without secret_key the SDK sends the
+            # unsigned X-API-Key only — the backend treats unsigned
+            # frames as non-HMAC traffic and skips signature verify.
             if self.api_key and self.secret_key:
                 # The signature covers the canonical bytes of the
                 # body the receiver will hash. We sign the *unsigned*
@@ -769,7 +753,7 @@ class WebSocketConnection:
                 # which would diverge from the signed bytes).
                 await self._conn.send(body_str)
             else:
-                # Legacy / pre-HMAC path: plain JSON envelope.
+                # Unsigned path: plain JSON envelope without HMAC.
                 await self._conn.send(json.dumps(ack))
             logger.debug(f"ACK sent for message {message_id}")
         except Exception as e:

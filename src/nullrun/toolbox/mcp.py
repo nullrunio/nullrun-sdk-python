@@ -58,7 +58,6 @@ from dataclasses import dataclass
 from typing import Any
 
 from nullrun.context import (
-    get_call_mcp_annotations,
     set_mcp_tool_context,
 )
 
@@ -156,13 +155,12 @@ class MCPAdapter:
         mcp_client: Any,
         cache_seconds: int = DEFAULT_CACHE_SECONDS,
         list_tools: Callable[[], Iterable[Any]] | None = None,
-        # v3.53 audit #5 — ``runtime`` is optional but RECOMMENDED.
         # When provided, ``call_tool`` routes the invocation through
         # ``runtime.execute(...)`` (the /api/v1/execute gate endpoint)
         # BEFORE the underlying MCP client is called, so the operator's
         # tool-block / budget / approval policies apply to MCP tool
         # calls just like they do to local functions decorated with
-        # ``@protect`` / ``@sensitive``.
+        # ``@protect``.
         #
         # When ``runtime`` is None the adapter falls back to the legacy
         # contextvar-only path (``set_mcp_tool_context``) so callers
@@ -202,13 +200,12 @@ class MCPAdapter:
         # call_tool, refreshed every ``cache_seconds``.
         self._cache: dict[str, _CachedTool] = {}
         self._cached_at: float = 0.0
-        # v3.53 audit #5 — optional runtime for gate enforcement on
         # every ``call_tool``. When provided, ``call_tool`` blocks on
         # ``runtime.execute(...)`` returning decision="block" so a
         # permissive MCP server cannot bypass the operator's
         # tool-block / budget / approval policies. See the constructor
         # docstring for the trade-off between the gate path and the
-        # legacy contextvar-only path.
+        # contextvar-only path.
         self._runtime = runtime
 
     def _default_list_tools(self) -> Iterable[Any]:
@@ -302,10 +299,10 @@ class MCPAdapter:
         client-specific kwargs without changing the public
         surface.
 
-        Gate enforcement (v3.53 audit #5): when an MCPAdapter is
-        constructed with ``runtime=`` set, ``call_tool`` routes the
-        invocation through ``runtime.execute(...)`` (the /api/v1/execute
-        gate endpoint) BEFORE the underlying MCP client is called.
+        Gate enforcement: when an MCPAdapter is constructed with
+        ``runtime=`` set, ``call_tool`` routes the invocation through
+        ``runtime.execute(...)`` (the /api/v1/execute gate endpoint)
+        BEFORE the underlying MCP client is called.
         ``decision="block"`` raises ``NullRunBlockedException`` and the
         MCP client is NOT called. ``decision="allow"`` proceeds to the
         MCP client. ``decision="require_approval"`` raises
@@ -314,11 +311,9 @@ class MCPAdapter:
         with ``approval_id=``.
 
         When ``runtime`` is None, ``call_tool`` falls through to the
-        legacy contextvar-only path — the call proceeds without any
+        contextvar-only path — the call proceeds without any
         /api/v1/execute round-trip and the next ``@protect``-decorated
         wrapper picks up the contextvar on its next ``/check`` request.
-        This preserves back-compat for callers who already wire MCP
-        calls inside ``@protect``-decorated functions.
 
         Returns the underlying client's result (when allowed).
         Raises ``NullRunBlockedException`` on gate block; raises the
@@ -363,7 +358,6 @@ class MCPAdapter:
         # when assembling the next /check request.
         set_mcp_tool_context(tool_class=tool_class, annotations=annotations)
 
-        # v3.53 audit #5 — when a runtime is wired, run the gate
         # synchronously BEFORE invoking the MCP client. This closes
         # the silent bypass where the agentic loop called
         # ``adapter.call_tool`` directly without a ``@protect``
@@ -372,19 +366,17 @@ class MCPAdapter:
         # unless an ``approval_id`` is supplied) — both short-circuit
         # to the call site without touching ``self._mcp_client``.
         #
-        # The runtime is opt-in for back-compat: pre-v3.53 callers
         # who relied on the contextvar-only path continue to work.
         # New integrations should pass ``runtime=`` so the
         # tool-block / budget / approval policies actually apply.
         if self._runtime is not None:
             execute_input = arguments if arguments is not None else {}
+            # Every MCP tool call routed through the runtime contacts
+            # /api/v1/execute unconditionally — there is no
+            # ``mode=`` opt-out for audit bypass.
             execute_result = self._runtime.execute(
                 tool_name=tool_name,
                 input_data=execute_input,
-                # Strict mode forces /api/v1/execute even for
-                # non-sensitive MCP tools — the audit flag is that
-                # MCP calls previously ran without ANY gate check.
-                mode="strict",
             )
             decision = execute_result.get("decision")
             if decision == "block":

@@ -101,14 +101,7 @@ def patch_autogen(runtime: Any) -> bool:
                         getattr(usage, "total_tokens", 0) or 0
                     ) or (prompt + completion)
                     if prompt or completion or total:
-                        # Audit 2026-06-28 (SDK↔backend wire): model
-                        # used to come only from ``self.model`` with a
-                        # bare ``None`` fallback — if the autogen client
-                        # didn't expose a ``model`` attribute (some
-                        # subclass / wrapper / mock provider), the wire
-                        # event carried ``model=None`` → backend
-                        # ``unwrap_or("default")`` → fallback warning →
-                        # DEFAULT_RATE. Now we try three sources in
+                        # Model extraction tries three sources in
                         # priority order, matching the multi-source
                         # pattern in langgraph's
                         # ``_extract_model_from_response``:
@@ -118,7 +111,6 @@ def patch_autogen(runtime: Any) -> bool:
                         # model id, may differ from request if the
                         # server aliased)
                         # 3. None — let the runtime-level warning log
-                        # (added 2026-06-28 in runtime.py:track )
                         # surface which path produced the gap.
                         model = (
                             getattr(self, "model", None)
@@ -152,7 +144,6 @@ def patch_autogen(runtime: Any) -> bool:
             OpenAIChatCompletionClient._nullrun_patched = True  # type: ignore[attr-defined]
     except ImportError:
         # autogen-agentchat present but autogen-ext not installed —
-        # spans still work; usage capture silently skipped.
         pass
 
     BaseChatAgent._nullrun_patched = True  # type: ignore[attr-defined]

@@ -13,7 +13,6 @@ backend file in lock-step — do not edit one side alone.
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import hmac
 import json
@@ -28,7 +27,6 @@ from nullrun.transport import (
     generate_hmac_signature,
     verify_hmac_signature,
 )
-from nullrun.transport_websocket import WebSocketConnection
 
 # ─────────────────────────────────────────────────────────────────────
 # FIX-F3: every POST must carry Authorization: Bearer <api_key> so the

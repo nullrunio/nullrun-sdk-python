@@ -36,7 +36,6 @@ import httpx
 import pytest
 import respx
 
-import nullrun
 from nullrun.breaker.exceptions import NullRunBudgetError
 
 BASE_URL = "https://api.test.nullrun.io"

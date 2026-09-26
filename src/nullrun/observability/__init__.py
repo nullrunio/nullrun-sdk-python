@@ -10,10 +10,9 @@ Modules:
     registry. See that module for the Layer-2 design.
 
 Both are reachable as ``nullrun.observability.metrics`` /
-``nullrun.observability.error_hooks`` for back-compat. The
-metrics singleton lives here (was previously a module-level
-constant in ``observability.py``) — moving it into a package
-was needed to make room for the ``error_hooks`` submodule.
+``nullrun.observability.error_hooks``. The metrics singleton
+lives here — moving it into a package made room for the
+``error_hooks`` submodule.
 """
 
 from __future__ import annotations
@@ -91,7 +90,6 @@ class RuntimeMetrics:
     cost_limit_exceeded: int = 0
     timeouts: int = 0
     loop_detections: int = 0
-    # 2026-08-13 (sprint handoff Bug #4): counter for the
     # fail-OPEN paths in ``check_workflow_budget``. Incremented on
     # three sites (cache-enabled exception, cache-disabled exception,
     # synthetic FALLBACK decision_source). Operators alert on
@@ -100,7 +98,6 @@ class RuntimeMetrics:
     # counter, the failure mode was invisible at INFO log level on
     # the FALLBACK path.
     gate_fail_open_total: int = 0
-    # 2026-08-20 (v0.16.0, backend v3.66.2 alignment): v1/v2 path
     # `/track/batch` with `llm_call` events missing `reservation_id`
     # is now fail-CLOSED at the backend (whole-batch 503 BUDGET_RECHECK_FAILED).
     # Pre-0.16.0 the SDK fell back to that path for calls without a

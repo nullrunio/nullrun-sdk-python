@@ -38,8 +38,6 @@ import threading
 import time
 from typing import Any
 
-import pytest
-
 from nullrun.runtime import NullRunRuntime
 
 
@@ -285,7 +283,7 @@ def _validate_approval_timeout(value, log_prefix):
 
 
 def test_validate_approval_timeout_accepts_in_range_value():
-    from nullrun.runtime import MAX_APPROVAL_TIMEOUT_SECONDS, MIN_APPROVAL_TIMEOUT_SECONDS
+    from nullrun.runtime import MAX_APPROVAL_TIMEOUT_SECONDS
 
     for in_range in (1.0, 5.0, 60.0, 3600.0, MAX_APPROVAL_TIMEOUT_SECONDS):
         assert _validate_approval_timeout(in_range, "t") == in_range

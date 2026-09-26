@@ -42,20 +42,18 @@ doing what I think it's doing?" without inspecting the rest:
     to the user.
   * ``"ok"`` — everything healthy. This is the steady state.
 
-Note (0.7.0): SDK no longer maintains a local ``Policy`` cache. All
-enforcement decisions arrive from the backend via ``/gate`` and
-``/execute``. The "cached policy" degradation state from prior
-versions is gone — SDK is either talking to the backend or it isn't.
+Note: All enforcement decisions arrive from the backend via
+``/gate`` and ``/execute``. The SDK does not maintain a local
+``Policy`` cache — it is either talking to the backend or it
+isn't.
 """
 
 from __future__ import annotations
 
 import logging
-import time
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Any, Optional
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -114,11 +112,10 @@ class WorkflowState:
     user can read ``status.workflow_state.state`` and know
     whether the body will run on the next call.
 
-    CP1 fix (2026-06-26): the backend WsWorkflowState enum has 5
-    variants, not 3 — Flagged and Tripped were previously silently
-    treated as Normal. The SDK now handles all 5 explicitly in
-    ``runtime.check_control_plane``; this dataclass reflects the
-    full set so the operator-facing status mirrors reality.
+    The backend WsWorkflowState enum has 5 distinct values; the SDK
+    handles all 5 explicitly in ``runtime.check_control_plane`` and
+    this dataclass reflects the full set so the operator-facing
+    status mirrors reality.
     """
 
     workflow_id: str

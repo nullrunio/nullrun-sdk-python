@@ -287,7 +287,6 @@ def extract_usage_from_response(response: Any, provider: str, model: str) -> dic
             usage["cache_write_tokens"] = int(cache_write) or 0
         prompt_details = raw.get("prompt_tokens_details") or {}
         if isinstance(prompt_details, dict) and prompt_details.get("cached_tokens"):
-            # OpenAI's prefix-cached prompt hits — best-effort merge.
             usage["cache_read_tokens"] = int(prompt_details.get("cached_tokens") or 0)
         completion_details = raw.get("completion_tokens_details") or {}
         if isinstance(completion_details, dict) and completion_details.get("reasoning_tokens"):
@@ -412,7 +411,6 @@ class NullRunCallback(BaseCallbackHandler):
 
         self._active_runs: OrderedDict[str, SpanContext] = OrderedDict()
         self._active_runs_max: int = _ACTIVE_RUNS_MAX
-        # F-28 (UI-UX-AUDIT 2026-08-14): protect ``_active_runs`` with
         # a reentrant lock so concurrent callbacks on multi-threaded
         # LangChain runners (and free-threaded CPython PEP 703 builds)
         # cannot interleave ``on_chain_start`` / ``on_chain_end`` in a
@@ -438,7 +436,6 @@ class NullRunCallback(BaseCallbackHandler):
         If the dict is at capacity, evict the oldest-inserted entry
         and log a warning so operators can detect chain-end drops.
         """
-        # F-28 (UI-UX-AUDIT 2026-08-14): the cap-check + eviction +
         # insertion must be atomic against ``_end_run`` on a different
         # thread, otherwise two threads can both pass the cap check
         # and one eviction races the other insert (the dict grows
@@ -464,26 +461,22 @@ class NullRunCallback(BaseCallbackHandler):
         """
         Called when LLM call starts.
 
-        2026-07-12 (multi-agent span attachment): open a child span
-        for the LLM call so the cost event emitted by ``on_llm_end``
-        carries the parent chain's ``trace_id``. Pre-fix this hook
-        was a no-op — ``on_llm_end`` then fell through to
-        ``runtime.track()`` which generates a fresh ``trace_id`` per
-        event, breaking the parent-child span hierarchy on the
-        server side. The frontend "Recent executions" panel then
-        showed 4/5 rows with ``cost_cents=0 / tokens=0`` because the
-        per-row unified SELECT keyed the JOIN on a per-call fresh
-        ``trace_id`` that no other row in the workflow had.
+        Multi-agent span attachment: open a child span for the LLM
+        call so the cost event emitted by ``on_llm_end`` carries
+        the parent chain's ``trace_id``. A no-op here would force
+        ``on_llm_end`` to emit events with a per-call fresh
+        ``trace_id``, breaking the parent-child span hierarchy on
+        the server side.
 
         Behaviour: create a child span from the active framework
-        span (``@protect``-set via `set_span` or a higher-level
-        ``on_chain_start`` via `_active_runs[parent_run_id]`).
-        Record the SpanContext under the LangChain ``run_id`` key so
-        ``on_llm_end`` can look it up. The ``run_id`` callback kwargs
-        are present on langchain >= 0.1; missing run_id is logged
-        and we fall back to creating a synthetic root (best-effort,
-        matches the legacy behaviour so we never throw out of the
-        LangChain callback chain).
+        span (``@protect``-set via ``set_span`` or a higher-level
+        ``on_chain_start`` via ``_active_runs[parent_run_id]``).
+        Record the SpanContext under the LangChain ``run_id`` key
+        so ``on_llm_end`` can look it up. The ``run_id`` callback
+        kwargs are present on langchain >= 0.1; missing run_id is
+        logged and we fall back to creating a synthetic root
+        (best-effort, so we never throw out of the LangChain
+        callback chain).
         """
         run_id = kwargs.get("run_id")
         parent_run_id = kwargs.get("parent_run_id")
@@ -496,7 +489,6 @@ class NullRunCallback(BaseCallbackHandler):
 
         parent_ctx: SpanContext | None = None
         if parent_run_id:
-            # F-28 (UI-UX-AUDIT 2026-08-14): the lookup is a single
             # ``.get()`` (no nested acquire), but we still hold the
             # lock so a concurrent ``_register_active_run`` /
             # ``_end_run`` cannot observe a partial state where the
@@ -513,7 +505,6 @@ class NullRunCallback(BaseCallbackHandler):
             ctx = create_root_span()
         self._register_active_run(str(run_id), ctx)
 
-        # DEFS-SDKEXEC-LLM-RESERVATION (2026-09-08): pair the LLM
         # span with a server-minted reservation so the matching
         # llm_call cost event emitted by ``on_llm_end`` lands on
         # ``/track_single`` instead of being dropped by
@@ -528,8 +519,6 @@ class NullRunCallback(BaseCallbackHandler):
         # ``_route_track`` will then drop the matching llm_call
         # cost event (v3.66.2 alignment — backend rejects batched
         # llm_call events without a reservation with 503
-        # BUDGET_RECHECK_FAILED). This matches the pre-fix
-        # behaviour because pre-fix the SDK also had no reservation
         # at this site (no /check round-trip happened on the LLM
         # span) and the llm_call cost event was dropped the same
         # way. We swallow ``WorkflowKilledInterrupt`` /
@@ -576,32 +565,18 @@ class NullRunCallback(BaseCallbackHandler):
         Extracts usage data and sends to backend for cost computation.
         Does NOT compute cost - backend is source of truth.
 
-        Audit 2026-06-28 (SDK↔backend wire): the previous version pulled
-        ``model_name`` exclusively from ``invocation_params`` with a
-        hard fallback to the literal string ``"unknown"``. When langchain
-        1.x stopped forwarding ``invocation_params`` to ``on_llm_end``
-        every track event carried ``model="unknown"`` and the backend
-        cost pipeline fell through to ``DEFAULT_RATE``. Now we try
-        ``invocation_params.model_name`` first, then fall back to
-        reading the real model id from the response object itself
-        (``response.response_metadata['model_name']`` or the AIMessage
-        on the LLMResult generation). ``"unknown"`` is now a true last
-        resort, not the common case.
+        Reads ``model_name`` from ``invocation_params`` first, then
+        falls back to the response object itself
+        (``response.response_metadata['model_name']`` or the
+        AIMessage on the LLMResult generation). ``"unknown"`` is
+        the last-resort fallback when neither source carries the
+        model — its presence surfaces as an alertable gap rather
+        than a silent default.
 
-        Audit 2026-06-29 (ghost-event dedup): the previous version of
-        this method did NOT attach a ``_fingerprint`` to the event
-        before forwarding it to ``runtime.track ``. Because the
-        dedup LRU only collapses events whose ``_fingerprint``
-        matches, the LangChain callback emission was never deduped
-        against the sibling emission from the httpx transport
-        (``NullRunSyncTransport._emit``), even though both observers
-        fire for the same LLM call. The net effect on a typical
-        ``app.invoke `` with 6 LLM calls was 6-12 duplicate
-        ``llm_call`` events on the wire (instead of 6), plus extra
-        cost-pipeline ERROR noise from ``_emit_streaming_skipped``
-        for body-read failures. The fix derives a stable fingerprint
-        from the LangChain run_id + invocation_params + response id
-        so the dedup LRU can collapse these emissions.
+        Attaches a stable ``_fingerprint`` derived from the
+        LangChain run_id + invocation_params + response id so the
+        runtime dedup LRU collapses sibling emissions between the
+        LangChain callback and the httpx transport hook.
         """
         try:
             # Extract provider/model from invocation params first, then
@@ -628,7 +603,6 @@ class NullRunCallback(BaseCallbackHandler):
                 f"usage={usage}, has_usage={usage['has_usage']}"
             )
 
-            # Audit 2026-06-29 (unified fingerprint): derive the same
             # fingerprint the httpx transport computes for the same
             # call, so the dedup LRU at runtime.track collapses the
             # two emissions to a single wire event. Both observers feed
@@ -715,7 +689,6 @@ class NullRunCallback(BaseCallbackHandler):
                 # Stripped at the wire boundary by _WIRE_STRIP_FIELDS —
                 # kept here for in-process dedup + test introspection.
                 "raw_usage": usage["raw_usage"],
-                # Audit 2026-06-29 (unified fingerprint): use the
                 # same helper the httpx transport calls so the dedup
                 # LRU at runtime.track collapses the sibling
                 # emission for the same real LLM call. Pre-fix this
@@ -732,7 +705,6 @@ class NullRunCallback(BaseCallbackHandler):
 
             logger.info(f"NullRun track event: {event}")
 
-            # 2026-07-12 (multi-agent span attachment): the per-LLM-call
             # cost event must carry the parent chain's `trace_id` so the
             # backend's unified SELECT can JOIN `cost_summary` by it.
             # `on_llm_start` already stored the SpanContext under the
@@ -752,7 +724,6 @@ class NullRunCallback(BaseCallbackHandler):
             # upcoming tree-renderer that wants to walk children by
             # the parent's trace bucket.
             llm_run_id = kwargs.get("run_id")
-            # F-28 (UI-UX-AUDIT 2026-08-14): the lookup must hold the
             # lock so a concurrent ``_end_run`` cannot pop the entry
             # between this ``.get()`` and the (later) ``_end_run`` at
             # the bottom of this method — that race produced the
@@ -894,7 +865,6 @@ class NullRunCallback(BaseCallbackHandler):
         """
         parent_ctx: SpanContext | None = None
         if parent_run_id:
-            # F-28 (UI-UX-AUDIT 2026-08-14): same orphan-span race as
             # ``on_llm_start``. The subsequent ``_register_active_run``
             # call already acquires the lock; the reentrant ``RLock``
             # lets us hold it across BOTH the lookup AND the
@@ -927,7 +897,6 @@ class NullRunCallback(BaseCallbackHandler):
     def _end_run(self, run_id: Any, error: str | None = None) -> None:
         if run_id is None:
             return
-        # F-28 (UI-UX-AUDIT 2026-08-14): the pop must be atomic so a
         # concurrent ``_register_active_run`` cannot INSERT an entry
         # for the same ``run_id`` between this pop and the
         # ``runtime.track_event`` call below — the freshly-inserted
@@ -970,7 +939,6 @@ def _extract_node_name(serialized: Any, default: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Audit 2026-06-28 (SDK↔backend wire): model_name on the callback path
 # ---------------------------------------------------------------------------
 # Pre-fix: ``on_llm_end`` pulled ``model_name`` exclusively from
 # ``kwargs['invocation_params']`` with a hard fallback to the literal
@@ -992,24 +960,9 @@ def _extract_model_from_response(response: Any) -> str | None:
     """Best-effort model extraction mirroring ``_get_finish_reason``.
 
     Returns the first non-empty value found, or ``None`` if every known
-    source is empty / malformed.
-
-    Audit 2026-06-29 (SDK↔backend wire: silent zero-billing): the chain
-    was checked top-to-bottom and silently returned ``None`` whenever
-    none of the four known locations carried the model. The backend
-    then ``unwrap_or("default")``'d to ``DEFAULT_RATE`` and every call
-    was recorded as ≈$0. We now:
-
-      - promote ``response.llm_output['model_name']`` (the location
-        langchain-openai 1.x uses for the date-suffixed model id
-        ``gpt-4.1-mini-2025-04-14``) to step 1, ahead of the
-        ``response_metadata`` step that langchain 0.x used
-      - add ``response.llm_output['model']`` and a generic
-        "any key containing 'model'" sweep so non-OpenAI wrappers
-        (proxies, custom chat models) still get attributed
-      - log a DEBUG line on the None path so an operator who sees
-        the wire warning in the backend can correlate it to the
-        observation site that produced the event.
+    source is empty / malformed. A ``None`` return path is logged at
+    DEBUG so an operator who sees a wire warning in the backend can
+    correlate it to the observation site that produced the event.
 
     Sources checked, in order:
 
@@ -1085,7 +1038,6 @@ def _extract_model_from_response(response: Any) -> str | None:
     # operator can correlate the wire warning back to a specific
     # response shape.
     #
-    # Audit 2026-06-29 (silent zero-billing): the previous version
     # emitted a single DEBUG line with only the response type. That
     # was insufficient when the operator needed to see *which* of
     # the four fallback steps almost-but-didn't match. We now dump

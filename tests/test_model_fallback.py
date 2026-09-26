@@ -39,7 +39,6 @@ from nullrun.instrumentation.auto import _extract_model_from_request_body
 
 def _request_with_body(body: bytes | None) -> httpx.Request:
     """Build an httpx.Request whose ``.content`` returns the given body."""
-    req = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
     # httpx.Request stores the content as a property; assignment via
     # ``.read `` requires content to be bytes. The simplest path is
     # to construct with content= via the constructor.

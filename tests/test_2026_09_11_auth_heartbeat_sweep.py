@@ -27,7 +27,6 @@ from __future__ import annotations
 import httpx
 import pytest
 import respx
-from httpx import Response
 
 from nullrun.breaker.exceptions import (
     NullRunAuthenticationError,

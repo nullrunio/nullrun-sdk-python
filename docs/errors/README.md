@@ -27,7 +27,7 @@ The codes follow a `NR-<CATEGORY><NNN>` pattern:
 | `NR-C000` | Generic config error (default on `NullRunConfigError`; subclasses override) | [NR-C000](NR-C000.md) |
 | `NR-C001` | `nullrun.init()` called with no api_key (no param, no env) | [NR-C001](NR-C001.md) |
 | `NR-C003` | `get_org_status()` called before the runtime is bound to an org | [NR-C003](NR-C003.md) |
-| `NR-C004` | `nullrun.status()` called before `nullrun.init()` | [NR-C004](NR-C004.md) |
+| `NR-C004` | `nullrun.get_runtime()` (or `runtime.status()`) called before `nullrun.init()` | [NR-C004](NR-C004.md) |
 
 ### Authentication (NR-A)
 
@@ -44,7 +44,6 @@ The codes follow a `NR-<CATEGORY><NNN>` pattern:
 |---|---|---|
 | `NR-B001` | Network error: timeout, ConnectError, DNS failure | [NR-B001](NR-B001.md) |
 | `NR-B002` | 5xx from the NullRun backend | [NR-B002](NR-B002.md) |
-| `NR-B003` | `@sensitive` failed to extract a `BusinessImpact` envelope | [NR-B003](NR-B003.md) |
 | `NR-B004` | Budget exhausted | [NR-B004](NR-B004.md) |
 | `NR-B005` | Local circuit breaker tripped | [NR-B005](NR-B005.md) |
 

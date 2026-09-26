@@ -6,9 +6,7 @@ frameworks. The user-facing "wrap my compiled app" helpers
 live in `nullrun.toolbox` (e.g. `nullrun.toolbox.langgraph.wrapper`
 which replaced `nullrun.instrumentation.langgraph.instrument`).
 
-The v0.x ``openai.ChatCompletion.create`` patcher was removed
-in 0.4.0 — ``openai>=1.0`` does not expose that attribute. All
-OpenAI v1.0+ traffic is now tracked vendor-independently by the
+All OpenAI v1.0+ traffic is tracked vendor-independently by the
 httpx transport hook in ``nullrun.instrumentation.auto``.
 """
 

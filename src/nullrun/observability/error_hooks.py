@@ -11,9 +11,9 @@ Post-Layer-2: every structured SDK failure fires every registered
 hook BEFORE the exception propagates. The hook sees the same
 ``NullRunError`` and an ``ErrorContext`` describing where in the
 lifecycle the error happened. Multiple hooks are supported. Hook
-exceptions are caught and logged at DEBUG (design discussion
-2026-06-24 — visible when DEBUG logging is on, silent at
-INFO/CRITICAL so a misbehaving hook does not break production).
+exceptions are caught and logged at DEBUG — visible when DEBUG
+logging is on, silent at INFO/CRITICAL so a misbehaving hook does
+not break production.
 
 What does NOT fire the hook:
 
@@ -39,7 +39,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -53,10 +53,9 @@ logger = logging.getLogger(__name__)
 # policy_fetch — GET /api/v1/orgs/{org}/policies
 # execute — POST /api/v1/execute (gate decision)
 # track — POST /api/v1/track (event ingest)
-# gate — POST /api/v1/gate (legacy pre-flight)
+# gate — POST /api/v1/gate (pre-flight)
 # check — POST /api/v1/check (budget pre-flight)
-# sensitive_tool — @sensitive pre-check
-# org_status — get_org_status 
+# org_status — get_org_status
 # ws — WebSocket control-plane message handling
 # transport — generic transport-layer raise
 STAGES: tuple[str, ...] = (
@@ -93,7 +92,8 @@ class ErrorContext:
     workflow_id: str | None = None
 
     # Tool that triggered the error, or ``None`` for non-tool
-    # errors. Set on @sensitive / @protect / track_tool raises.
+    # errors. Set on @protect raises and on transport-layer
+    # tool-call failures.
     tool_name: str | None = None
 
     # First 10 characters of the api key in use, or ``None`` if
@@ -132,7 +132,6 @@ class ErrorContext:
 
 
 # The callback type. Sync only — Layer 2 design discussion
-# 2026-06-24: async hooks in except blocks are awkward (no
 # running event loop to await on), and the SDK surface is
 # already sync. Revisit if/when a real async use case appears.
 ErrorHook = Callable[["Any", ErrorContext], None]
@@ -142,7 +141,6 @@ ErrorHook = Callable[["Any", ErrorContext], None]
 # from one thread and fired from another (e.g. register at app
 # startup, fire from a transport background thread).
 #
-# The hot path is has_hooks(), which previously took an
 # RLock.acquire on every call (100+ raises/min in a busy agent
 # is enough to show up in profiles). We now keep the hook list
 # under the same RLock but expose has_hooks() as a lock-free
@@ -199,13 +197,12 @@ def emit_error(err: Any, ctx: ErrorContext) -> None:
 
     Called from raise sites in the SDK immediately BEFORE the
     ``raise`` statement, so the hook sees the fully-constructed
-    exception while the call stack is still live (design
-    decision C, 2026-06-24).
+    exception while the call stack is still live.
 
-    Hook exceptions are caught and logged at DEBUG (design
-    decision 2026-06-24: silent at INFO/CRITICAL so a
-    misbehaving hook does not break production, visible when
-    DEBUG logging is on so debugging the hook itself is easy).
+    Hook exceptions are caught and logged at DEBUG — silent at
+    INFO/CRITICAL so a misbehaving hook does not break production,
+    visible when DEBUG logging is on so debugging the hook itself
+    is easy.
 
     Snapshot the hook list under the lock so a concurrent
     unregister during dispatch does not mutate the iteration.

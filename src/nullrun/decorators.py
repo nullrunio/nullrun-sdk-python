@@ -50,6 +50,7 @@ from nullrun.breaker.exceptions import (
     WorkflowKilledInterrupt,
     WorkflowPausedException,
 )
+from nullrun.business_impact import BusinessImpact, compute_action_digest
 from nullrun.context import (
     _call_tools_var,
     get_call_tools,
@@ -135,7 +136,6 @@ def _safe_repr(value: object, max_len: int = 50) -> str:
     strings we actually pass through this code path.
 
     P3-3: also consolidates the two-pass flow that
-    previously lived as separate ``_safe_repr`` + ``_strip_details_balanced``
     calls — there are now two callers that compose them, and the
     invariant ``redact BEFORE truncate`` was being maintained by
     convention only. ``_safe_repr`` is now the single source of truth.
@@ -278,8 +278,8 @@ def _safe_error_str(error: BaseException | None) -> str | None:
     return _strip_details_balanced(raw)
 
 
-# The legacy module-level slot was removed. Reads/writes now route
-# through the registry (see nullrun._singleton._RuntimeProxyModule).
+# Module-level reads/writes route through the registry
+# (see nullrun._singleton._RuntimeProxyModule).
 
 
 def _get_or_create_runtime() -> NullRunRuntime:
@@ -308,7 +308,7 @@ def _get_or_create_runtime() -> NullRunRuntime:
     not a silent allow-all.
 
     After obtaining the runtime, lazily triggers `auto_instrument()` so
-    a user who writes only `@protect` (without calling `init_or_die()`
+    a user who writes only `@protect` (without calling `init()`
     first) still gets vendor SDK detection + token capture. The lazy
     trigger is idempotent — multiple `@protect` calls in the same
     process converge on a single `auto_instrument()` invocation. The
@@ -332,10 +332,10 @@ def _get_or_create_runtime() -> NullRunRuntime:
 
 # Lazy auto-instrumentation trigger (zero-config decorator path).
 #
-# The user-facing API is `nullrun.init_or_die()` which calls `init()`,
-# which calls `auto_instrument(runtime)` directly (see
-# `nullrun/__init__.py::init`). However, a user who writes only
-# ``@nullrun.protect`` without calling ``init_or_die()`` first would
+# The user-facing API is `nullrun.init()` which calls
+# `auto_instrument(runtime)` directly (see `nullrun/__init__.py::init`).
+# However, a user who writes only
+# ``@nullrun.protect`` without calling ``init()`` first would
 # still create a runtime via ``NullRunRuntime.get_instance()`` — but
 # no vendor SDK patches would be installed, so token capture would be
 # silently absent.
@@ -513,8 +513,8 @@ def protect(fn: F | None = None) -> F | Callable[[F], F]:
 
             1. `check_control_plane` — KILL/PAUSE is terminal.
             2. `check_workflow_budget` — "any budget left?" via /gate.
-            3. `_enforce_sensitive_tool` — per-tool policy (no-op if not
-                                          marked sensitive).
+            3. `_run_tool_policy_gate` — per-tool policy via /execute
+                                          (runs on every call).
 
         Each gate has its own fail-OPEN/CLOSED policy declared in
         `runtime.py`; see ADR-008 Rule 5 for the full table. `span_end`
@@ -535,49 +535,27 @@ def protect(fn: F | None = None) -> F | Callable[[F], F]:
         # bound to itself so the next call wraps the target function.
         return protect
 
-    # 0.18.1: every `@protect` call now auto-attaches a default
-    # `ToolParamsExtractor(include_all=True)` on the decorated function
-    # so the wire payload carries ``tool_name + params`` for any
-    # protected tool, not just those that opted in via bare
-    # ``@sensitive``. The extractor is only stamped when no extractor
-    # already exists in the ``__wrapped__`` chain (explicit
-    # ``@sensitive(impact=...)`` wins). This is the single change that
-    # makes ``@protect`` the only public entry point users need:
-    # the SDK now collects every fact it can derive mechanically
-    # (tool identity, kwargs, action_digest) without forcing the
-    # developer to reach for a second decorator. The business
-    # interpretation of those facts remains NullRun policy's job.
-    #
-    # The auto-attached extractor carries ``_nullrun_auto_attached=True``
-    # so ``_enforce_sensitive_tool`` can distinguish "developer
-    # opted into the policy path" from "SDK auto-derived the
-    # extractor for tooling reasons". The policy gate still
-    # short-circuits on auto-attached extractors so bare ``@protect``
-    # stays cheap (no extra ``/execute`` round-trip per call).
-    try:
-        from nullrun.extractor import ToolParamsExtractor
-
-        if _find_extractor_in_chain(fn) is None:
-            auto_extractor = ToolParamsExtractor(include_all=True)
-            auto_extractor._nullrun_auto_attached = True  # type: ignore[attr-defined]
-            _stamp_extractor_on_innermost(fn, auto_extractor)
-    except ImportError:
-        # Defensive: extractor module is part of every SDK build we
-        # ship today. Falling through without an extractor means the
-        # gate runs the legacy approval_id-only path (no business_impact
-        # on the wire) — which is the same behaviour every pre-0.18.1
-        # ``@protect`` already had, so this is a no-op for callers
-        # on a shrunken build.
-        pass
+    # NOTE: prior 0.18.x versions auto-attached a default
+    # ``ToolParamsExtractor(include_all=True)`` here and stored it
+    # on the function via ``_nullrun_extractor``. That path was
+    # removed because it forced the SDK to know what an "extractor"
+    # is. The 0.18.2 design is simpler: ``@protect`` has no
+    # per-function state. Every call constructs an opaque
+    # ``NoImpact`` envelope locally and forwards it to
+    # ``runtime.execute(...)``. All policy decisions
+    # (allow / block / require-approval) live on the backend; the
+    # SDK only relays (tool_name, kwargs, args) and renders the
+    # decision back into an exception class.
 
     @contextlib.contextmanager
     def _protect_body(args: tuple[Any, ...], kwargs: dict[str, Any], unify_block: bool):
         """Shared ADR-008 Rule-4 scaffolding for sync + async wrappers.
 
-        Runs the four pre-execution gates (KILL/PAUSE → budget → span
-        start → sensitive-tool policy), yields the runtime so the
-        caller can invoke ``fn`` and ``track_tool`` within the gated
-        region, then emits ``span_end`` with the captured error.
+        Runs the pre-execution gates (KILL/PAUSE → /gate budget
+        pre-flight → span start → /execute tool policy), yields the
+        runtime so the caller can invoke ``fn`` and ``track_tool``
+        within the gated region, then emits ``span_end`` with the
+        captured error.
 
         ``unify_block`` controls the kill/pause signal translation.
         Sync wrappers pass ``True`` so the user sees a single
@@ -590,37 +568,33 @@ def protect(fn: F | None = None) -> F | Callable[[F], F]:
         runtime = _get_or_create_runtime()
         span = _next_span()
         token = set_span(span)
-        # F-19 (2026-08-14): mirror the derived SpanContext back to
-        # the legacy ``_trace_id_var`` / ``_span_id_var`` so the
-        # runtime's ``_enrich_event`` (which reads via
-        # ``get_trace_id()`` / ``get_span_id()`` for cost events
-        # AND for ``parent_trace_id`` derivation at runtime.py:2967)
-        # emits events tagged with the SAME trace_id /
-        # span_id as SpanContext. Without this mirror a bare
-        # ``@protect`` (no enclosing ``with workflow``) still saw a
-        # tree-break: span_start carried SpanContext.trace_id while
-        # llm_call / tool_call carried ``generate_trace_id()`` from
-        # the legacy fallback. Token-based so a nested ``@protect``
-        # inside an outer ``@protect`` (or inside ``with workflow``)
+        # Mirror the trace_id / span_id into ``_trace_id_var`` /
+        # ``_span_id_var`` so the runtime's ``_enrich_event`` (which
+        # reads via ``get_trace_id()`` / ``get_span_id()`` for cost
+        # events AND for ``parent_trace_id`` derivation at
+        # runtime.py:2967) emits events tagged with the SAME
+        # trace_id / span_id as SpanContext. Without this mirror a bare
+        # ``@protect`` (no enclosing ``with workflow``) sees a
+        # tree-break: span_start carries SpanContext.trace_id while
+        # llm_call / tool_call carries a freshly generated trace_id.
+        # Token-based so a nested ``@protect`` inside an outer
+        # ``@protect`` (or inside ``with workflow``)
         # restores the outer trace/span on reset.
-        trace_legacy_token = set_trace_id(span.trace_id)
-        span_legacy_token = set_span_id(span.span_id)
-        # F03 (2026-08-22): populate `_call_tools_var` from
+        trace_token = set_trace_id(span.trace_id)
+        span_token = set_span_id(span.span_id)
         # ``fn.__name__`` when the user did NOT explicitly call
         # ``set_call_context(tools=...)``. The F01 fix
         # (``runtime.execute`` body at runtime.py:2746-2760 and the
         # /gate path at runtime.py:1903-1941) conditionally forwards
         # the per-call tools contextvar onto the wire body, but the
-        # upstream contextvar was never populated for the @protect /
-        # @sensitive decorator path. Without this fix every wire
-        # round-trip omits the `tools` field, the backend's Step 3
-        # tool_block check fails-CLOSED via TB-1
-        # (``no_tools_field``), and approval-rule probes (TC-SDK-014
+        # upstream contextvar was never populated for the @protect
+        # decorator path. Without this fix every wire round-trip
+        # omits the `tools` field, the backend's Step 3 tool_block
+        # check fails-CLOSED via TB-1 (``no_tools_field``), and
         # /015/016/017) never reach the approval_rule_eval step.
         # Token-based so a nested @protect inside an outer @protect
         # (or inside ``with workflow``) restores the outer contextvar
-        # on reset — same shape as the legacy
-        # ``_trace_id_var`` / ``_span_id_var`` resets above.
+        # on reset — same shape as the trace/span token resets above.
         _existing_call_tools = get_call_tools()
         if not _existing_call_tools:
             call_tools_token: Token[tuple[str, ...]] | None = _call_tools_var.set(
@@ -630,7 +604,6 @@ def protect(fn: F | None = None) -> F | Callable[[F], F]:
             call_tools_token = None
         error: BaseException | None = None
         try:
-            # 2026-09-22: bump the zero-activity diagnostic counter so
             # the runtime can warn when @protect fires often but no
             # LLM-call event is ever observed (silent-instrumentation
             # failure mode). The bump lives at the entry of the gate
@@ -654,9 +627,12 @@ def protect(fn: F | None = None) -> F | Callable[[F], F]:
             # 3. Span start — best-effort, never blocks.
             _emit_span_start(runtime, span, fn.__name__)
 
-            # 4. Per-tool policy for @sensitive tools. Fails CLOSED
-            # on transport error (see _enforce_sensitive_tool).
-            _enforce_sensitive_tool(runtime, fn, args, kwargs)
+            # 4. Per-tool policy gate via /execute. Runs on EVERY
+            # @protect call (no extractor / no short-circuit). The
+            # SDK is policy-blind; it ships tool_name + args + kwargs
+            # + the NoImpact envelope/digest to the backend and the
+            # backend decides allow/block/require-approval.
+            _run_tool_policy_gate(runtime, fn, args, kwargs)
 
             yield runtime
         except BaseException as exc:  # noqa: BLE001
@@ -684,16 +660,14 @@ def protect(fn: F | None = None) -> F | Callable[[F], F]:
             raise
         finally:
             reset_span(token)
-            # F-19 follow-up: token-based reset matches the legacy
-            # ``_trace_id_var`` / ``_span_id_var`` pattern (paired
-            # with their tokens set above). Order does not matter;
-            # both resets restore the prior contextview regardless
-            # of which one runs first.
-            reset_trace_id(trace_legacy_token)
-            reset_span_id(span_legacy_token)
+            # F-19 follow-up: token-based reset matches the trace/span
+            # token pattern (paired with the tokens set above). Order
+            # does not matter; both resets restore the prior
+            # contextvar regardless of which one runs first.
+            reset_trace_id(trace_token)
+            reset_span_id(span_token)
             # F03 follow-up: reset the per-call tools contextvar if
             # we set it. Outer ``with workflow`` / nested @protect
-            # callers that previously set the contextvar see their
             # prior value restored; bare @protect leaves the
             # contextvar empty again (the default).
             if call_tools_token is not None:
@@ -763,197 +737,71 @@ def protect(fn: F | None = None) -> F | Callable[[F], F]:
     return sync_wrapper  # type: ignore[return-value]
 
 
-def _enforce_sensitive_tool(
+def _run_tool_policy_gate(
     runtime: Any,
     fn: Callable[..., Any],
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
 ) -> None:
     """
-    Pre-execution policy check for sensitive tools.
+    Pre-execution per-tool policy gate — runs on EVERY ``@protect``.
 
-    If `fn.__name__` is in the runtime's sensitive-tool set (built-in
-    or registered via `add_sensitive_tool` / `@sensitive`), call
-    `runtime.execute(...)` BEFORE the body runs. The /execute endpoint
-    is the authoritative gate; `NullRunBlockedException` propagates to
-    the caller, mirroring the contract of `check_workflow_budget`.
-
-    kwargs are masked via `SENSITIVE_ARG_KEYS` so passwords / tokens
-    never leave the process. The same masking is used for span events.
+    The 0.18.2 design makes every protected call flow through
+    ``runtime.execute`` unconditionally; the SDK is policy-blind
+    and just relays ``tool_name + masked_args + masked_kwargs +
+    NoImpact envelope`` to the /execute endpoint. The backend
+    applies allow/block/require-approval rules.
 
     ## Fail-OPEN/CLOSED Policy (ADR-008)
 
-    This gate is **fail-CLOSED**: the body MUST NOT run when the
-    policy engine is unreachable, regardless of what /execute returns.
-    Two failure paths both result in `NullRunBlockedException`:
+    The per-tool policy gate is **fail-CLOSED**: the body MUST NOT
+    run when the policy engine is unreachable. An unblocked
+    ``charge_card`` running while the policy engine is offline is
+    a security regression, far worse than a denied call during
+    the outage.
 
-    1. **Transport raises** `NullRunTransportError` (the new
-       `on_transport_error="raise"` path): the runtime layer surfaces
-       classified NETWORK / GATEWAY / BREAKER-OPEN failures as
-       exceptions. The body of this gate catches them and re-raises
-       as `NullRunBlockedException` with the source in the reason
-       ("policy engine unavailable: NETWORK_ERROR" etc.).
+    Opt-out: set ``NULLRUN_SENSITIVE_FAIL_OPEN=1`` to restore fail-
+    OPEN behavior on transport error (dev / test only). Real
+    ``decision=block`` from the gateway is still honored and still
+    raises ``NullRunBlockedException``.
 
-    2. **Transport returns a dict** whose `decision_source` starts
-       with `FALLBACK_` (defense in depth — covers the legacy
-       `fallback_mode=PERMISSIVE` path and any future regression in
-       `runtime.execute` that drops the `on_transport_error="raise"`
-       argument). The body of this gate inspects the result and
-       re-raises as `NullRunBlockedException` before the wrapped
-       function runs.
+    ## Wire contract
 
-    This is the opposite of `check_workflow_budget` /
-    `check_control_plane`, which deliberately fail-OPEN — a transient
-    backend outage must not freeze the user's agent. Sensitive tools
-    have a different threat model: an unblocked `charge_card ` that
-    runs when the policy engine is down is worse than a denied
-    `charge_card ` during an outage.
-
-    Opt-out: set `NULLRUN_SENSITIVE_FAIL_OPEN=1` to restore the prior
-    fail-OPEN behavior on transport error. Useful in dev / test
-    environments where the policy engine is intentionally absent.
-    The opt-out is intentionally scoped to the *transport-error*
-    case; a real `decision=block` from the gateway is still honored
-    and still raises `NullRunBlockedException`.
+    Same fields on /execute as before: ``tool_name``,
+    ``{"args": masked_args, "kwargs": masked}``, ``business_impact``
+    (now always ``{"kind": "none"}``), ``action_digest`` (SHA-256
+    over the canonical NoImpact envelope; pinned, deterministic),
+    ``tools``. Backend unchanged — only the SDK's interpretation of
+    what to put in ``business_impact`` simplified.
     """
-    # 2026-07-24 (Root-cause fix): the previous code used
-    extractor = getattr(fn, "_nullrun_extractor", None)
-    # 0.18.1: distinguish auto-attached extractors (SDK installed
-    # them for tooling reasons -- "every @protect captures tool_params
-    # automatically") from explicit extractors (developer opted in via
-    # ``@sensitive(impact=...)``). The policy gate still fires for
-    # explicit extractors; auto-attached ones are the SDK's way of
-    # shipping tool_params on the wire without the developer having
-    # to mark the tool sensitive. Bare ``@protect`` stays cheap.
-    extractor_is_explicit = (
-        extractor is not None
-        and not getattr(extractor, "_nullrun_auto_attached", False)
-    )
-    if not runtime.is_sensitive_tool(fn.__name__) and not extractor_is_explicit:
-        return
     masked = _safe_kwargs(kwargs)
-    # P0-1: positional args are masked the same way as kwargs. Without
     masked_args = _safe_args(fn, args)
 
-    # If the wrapped function carries an ``_nullrun_extractor``
+    # Wire-shape compatibility: ``business_impact`` stays None
+    # on /execute when no per-tool typed impact is extracted
+    # (the bare @protect shape — backend reads only
+    # ``action_digest`` + ``kwargs`` for ToolParameters Approval
+    # Rules). The ``action_digest`` is still computed against
+    # the canonical NoImpact envelope so the Phase-1+ wire-shape
+    # ``tests/test_business_impact.py``.
+    no_impact = BusinessImpact.no_impact()
     business_impact_dict: dict[str, Any] | None = None
-    action_digest_hex: str | None = None
-    # ``extractor`` was already resolved at the top of this
-    # function (line 626) for the gate-skip check; reuse the
-    # binding here so we do not pay for a second ``getattr`` and
-    # so a future change to that lookup applies to both sites.
-    if extractor is not None:
-        try:
-            from nullrun.business_impact import compute_action_digest
-            from nullrun.extractor import MoneyImpactExtractor, ToolParamsExtractor
+    action_digest_hex: str = compute_action_digest(no_impact)
 
-            if isinstance(extractor, MoneyImpactExtractor):
-                impact = extractor.impact_for(fn, args, kwargs)
-                business_impact_dict = impact.to_wire_dict()
-                action_digest_hex = compute_action_digest(impact)
-            elif isinstance(extractor, ToolParamsExtractor):
-                # Free-form tool-call argument bag, matched against
-                # ToolParameters Approval Rules on the backend.
-                # Same wire envelope (BusinessImpact) and same
-                # digest contract as the Money variant -- only the
-                # discriminator and the ``params`` field differ.
-                impact = extractor.impact_for(fn, args, kwargs)
-                business_impact_dict = impact.to_wire_dict()
-                action_digest_hex = compute_action_digest(impact)
-        except Exception as exc:  # noqa: BLE001
-            from nullrun.breaker.exceptions import (
-                NullRunBlockedException,
-                NullRunTransportError,
-                TransportErrorSource,
-            )
-
-            # DEFS-SDKEXEC-WORKFLOW-LABEL (2026-09-08): prefer the
-            # runtime's bound workflow (from _authenticate) over the
-            # sentinel so the displayed label matches what the SDK
-            # actually sends to /gate / /execute. See the matching
-            # note in `_enforce_sensitive_tool` below for the full
-            # rationale.
-            workflow_id = runtime._resolve_workflow_id(get_workflow_id()) or UNKNOWN_WORKFLOW_ID
-            # The user-facing hint depends on which extractor fired.
-            # Money extractor wants the bound arg name; ToolParams
-            # extractor wants the rule-param -> arg-name mapping
-            # (or the include_all flag if no map was supplied).
-            if isinstance(extractor, MoneyImpactExtractor):
-                hint = (
-                    "could not extract a MoneyImpact from the live "
-                    "arguments. Check that the function declares the "
-                    "argument named in `impact=money_outflow(...)`."
-                )
-            elif isinstance(extractor, ToolParamsExtractor):
-                if extractor.param_extractors is not None:
-                    hint = (
-                        "could not extract a ToolCall impact from the "
-                        "live arguments. Check that the function "
-                        "declares every arg named in "
-                        "`impact=tool_params(...)`."
-                    )
-                else:
-                    hint = (
-                        "could not extract a ToolCall impact from the "
-                        "live arguments. The @sensitive tool's kwargs "
-                        "could not be validated for wire emission "
-                        "(unsupported types or invalid param keys)."
-                    )
-            else:
-                # Defensive fallback for a future extractor type
-                # that doesn't update this hint.
-                hint = (
-                    "could not extract business_impact from the live "
-                    "arguments. Check the @sensitive decorator's "
-                    "`impact=...` argument."
-                )
-            err = NullRunBlockedException(
-                workflow_id=workflow_id,
-                reason=(
-                    f"failed to extract business_impact for sensitive tool {fn.__name__!r}: {exc}"
-                ),
-                tool_name=fn.__name__,
-                error_code="NR-B003",
-                user_action=(f"The @sensitive decorator on {fn.__name__!r} {hint}"),
-            )
-            runtime._emit_sdk_error(
-                err,
-                stage="sensitive_tool_extract",
-                workflow_id=workflow_id,
-                tool_name=fn.__name__,
-            )
-            raise NullRunBlockedException(
-                workflow_id=workflow_id,
-                reason=err.reason,
-                tool_name=fn.__name__,
-                error_code="NR-B003",
-                user_action=err.user_action,
-            ) from exc
-
-    # ADR-008: prefer `on_transport_error` (raise classified
     from nullrun.breaker.exceptions import (
         NullRunBlockedException,
-        NullRunDecision,  # DEF-NR-TRANSPORT-CATCHFANIN-GAP (2026-09-10): umbrella arm
-        NullRunExecutionNotFoundError,  # DEF-NR-EX01-REWRAP-LOSS (2026-09-10): pass-through arm
-        NullRunInfrastructureError,  # DEF-NR-TRANSPORT-CATCHFANIN-GAP (2026-09-10): umbrella arm
+        NullRunDecision,
+        NullRunExecutionNotFoundError,
+        NullRunInfrastructureError,
         NullRunTransportError,
-        RateLimitError,  # DEF-NR-R001-REWRAP-LOSS (2026-09-10): pass-through arm
+        RateLimitError,
         TransportErrorSource,
     )
 
     fail_open = os.environ.get("NULLRUN_SENSITIVE_FAIL_OPEN", "").strip() == "1"
-    # DEFS-SDKEXEC-WORKFLOW-LABEL (2026-09-08): resolve the
     # *display* workflow_id via the runtime's precedence chain
-    # (contextvar → self.workflow_id → None) so the label reflects
-    # what the SDK actually sends on the wire (the API key's bound
-    # workflow, when the user hasn't explicitly opened a
-    # ``with workflow(...)`` block). Pre-fix this read only the
-    # contextvar; on every API-key-bound key without an explicit
-    # workflow block the displayed label was the literal sentinel
-    # ``"__nullrun_unknown__"``, which misleads operators reading
-    # the trace and the block message into thinking the gate was
-    # unable to identify the workflow. Sentinel stays as the last
-    # resort for legacy / never-bound keys.
+    # (contextvar → self.workflow_id → None). Sentinel stays as the
+    # last resort for never-bound keys (no workflow context).
     workflow_id = runtime._resolve_workflow_id(get_workflow_id()) or UNKNOWN_WORKFLOW_ID
 
     try:
@@ -962,12 +810,6 @@ def _enforce_sensitive_tool(
         # returning a synthetic dict. The arm below converts the
         # typed error into NullRunBlockedException so the caller's
         # `except NullRunBlockedException` catches it uniformly.
-        #
-        # Thread the typed impact + digest through. When the
-        # decorator did NOT see an extractor, both are None and the
-        # runtime.execute() drops them from the payload; the
-        # backend then uses the approval_id-only grant consume
-        # (the legacy approval_id-only fallback).
         result = runtime.execute(
             fn.__name__,
             {"args": masked_args, "kwargs": masked},
@@ -977,58 +819,21 @@ def _enforce_sensitive_tool(
             tools=get_call_tools(),
         )
     except NullRunExecutionNotFoundError:
-        # DEF-NR-EX01-REWRAP-LOSS (2026-09-10): pass-through arm.
-        # NullRunExecutionNotFoundError IS a NullRunTransportError
-        # (via NullRunBackendError -> NullRunTransportError), so the
-        # generic arm below would rewrap it as
-        # NullRunBlockedException(NR-B00X) and destroy the typed
-        # class + NR-EX01 catalog line. Cookbook code (and
-        # langgraph_openai_approval_demo.py) must be able to
-        # ``except NullRunExecutionNotFoundError`` for the
-        # documented regate_required=True recovery path. Re-raise
-        # BEFORE the NullRunBlockedException arm so the typed
-        # exception propagates unchanged.
         raise
     except RateLimitError:
-        # DEF-NR-R001-REWRAP-LOSS (2026-09-10): pass-through arm.
-        # RateLimitError IS a NullRunTransportError (its parent
-        # class) raised with source=GATEWAY_ERROR on a 429 wire
-        # response (RATE_LIMIT_EXCEEDED). Pre-fix the generic
-        # ``except NullRunTransportError as exc:`` arm below
-        # rewrote every TransportError as
-        # ``NullRunBlockedException(error_code="NR-B002",
-        # reason="policy engine unavailable: GATEWAY_ERROR")`` —
-        # losing ``exc.retry_after`` (gateway's Retry-After /
-        # ``retry_after_ms`` body field converted to seconds),
-        # ``exc.upgrade_url`` (plan-upgrade URL from 429 body),
-        # and ``exc.body`` (parsed 429 envelope). Cookbook code
-        # ``except RateLimitError`` would never match because the
-        # rewrap stripped the typed class. The user-facing
-        # catalog line also lost: NR-B002 says "Our service is
-        # temporarily unavailable. Please try again shortly."
-        # when the correct NR-R001 says "The NullRun backend
-        # rate-limited this API key. Wait ``retry_after`` seconds
-        # (or upgrade the plan) before retrying." Re-raise BEFORE
-        # the NullRunBlockedException arm so the typed exception
-        # propagates with error_code=NR-R001, retry_after,
-        # upgrade_url, and body intact.
         raise
     except NullRunBlockedException:
         # Real policy-block decision from the gateway — propagate as-is.
         raise
     except NullRunTransportError as exc:
-        # ADR-008: classified transport failure. Re-raise as
+        # ADR-008: classified transport failure.
         if fail_open:
             logger.warning(
-                f"sensitive tool pre-check unavailable for {fn.__name__!r}: "
-                f"{exc.source} on /{exc.endpoint}. NULLRUN_SENSITIVE_FAIL_OPEN=1 — body will run."
+                f"tool policy gate unavailable for {fn.__name__!r}: "
+                f"{exc.source} on /{exc.endpoint}. "
+                f"NULLRUN_SENSITIVE_FAIL_OPEN=1 — body will run."
             )
             return
-        # Layer 1: stamp the source-specific error code so the
-        # caller can distinguish "backend is down" from "we tripped
-        # the local circuit breaker". Both are retryable in the
-        # sense that the body will run when the policy engine
-        # recovers, but the body still MUST NOT run now (fail-CLOSED).
         _code = {
             TransportErrorSource.NETWORK_ERROR: "NR-B001",
             TransportErrorSource.GATEWAY_ERROR: "NR-B002",
@@ -1042,90 +847,36 @@ def _enforce_sensitive_tool(
             error_code=_code,
             user_action=(
                 f"The NullRun policy engine is unreachable "
-                f"({exc.source.value}). The body of @sensitive "
+                f"({exc.source.value}). The body of "
                 f"'{fn.__name__}' did NOT run (fail-CLOSED). "
                 f"Set NULLRUN_SENSITIVE_FAIL_OPEN=1 to opt out for "
                 f"tests / staging — production should leave it off."
             ),
         )
-        # Layer 2: fire the on_error hook. The sensitive-tool
-        # path is where a transport failure becomes a hard
-        # deny — observability hooks should see it even if the
-        # user's except clause swallows the exception.
         runtime._emit_sdk_error(
             err,
-            stage="sensitive_tool",
+            stage="tool_policy_gate",
             workflow_id=workflow_id,
             tool_name=fn.__name__,
             extra={"transport_source": exc.source.value},
         )
         raise err from exc
     except NullRunDecision:
-        # DEF-NR-A003-REWRAP-LOSS (2026-09-10, broader scope):
-        # umbrella pass-through for typed Decision subclasses that
-        # reach here without hitting NullRunBlockedException (this
-        # decorator's natural block path) or NullRunTransportError
-        # (the generic rewrap above). Specifically:
-        #   - NullRunChainError (NR-CH001) — chain lifetime /
-        #     cross-org / Execution Graph parent-lineage
-        #     rejections. Needs exc.chain_id,
-        #     exc.parent_execution_id, exc.backend_code preserved.
-        #   - NullRunWorkflowInactiveError (NR-W004) — soft-deleted
-        #     workflow. Needs exc.workflow_id preserved.
-        #   - NullRunConsumeOverbudgetError (NR-O001) — invariant
-        #     violation. Needs exc.execution_id,
-        #     exc.reserved_cents, exc.max_allowed_cents,
-        #     exc.actual_cost_cents preserved.
-        #   - WorkflowPausedException (NR-W003) — needs
-        #     exc.workflow_id, exc.reason, exc.resume_after.
-        # Pre-fix the catch-all rewrap below stamped error_code
-        # NR-B001 on these and discarded every first-class
-        # attribute, blocking the cookbook recovery path for
-        # each. Re-raise BEFORE the catch-all to preserve the
-        # typed instance.
+        # DEF-NR-TRANSPORT-CATCHFANIN-GAP umbrella pass-through:
+        # NullRunChainError, NullRunWorkflowInactiveError,
+        # NullRunConsumeOverbudgetError, WorkflowPausedException —
+        # preserve first-class attributes for cookbook recovery.
         raise
     except NullRunInfrastructureError:
-        # DEF-NR-A003-REWRAP-LOSS (2026-09-10, broader scope):
-        # umbrella pass-through for typed Infrastructure
-        # subclasses that don't match NullRunBackendError,
-        # NullRunAuthenticationError, or NullRunTransportError
-        # above. Specifically:
-        #   - NullRunAuthError (NR-A003) — typed 401 envelope.
-        #     Needs exc.wire_code (API_KEY_REVOKED /
-        #     API_KEY_EXPIRED / API_KEY_DISABLED /
-        #     API_KEY_INVALID / API_KEY_MISSING /
-        #     API_KEY_MALFORMED per v3.38) preserved so ops
-        #     can branch on granular lifecycle state. The
-        #     transport fan-in (transport.py:1294) already
-        #     preserves this via NullRunAuthenticationError
-        #     pass-through, but a refactor that reorders the
-        #     transport arms would surface this here.
-        #   - NullRunProtocolError (NR-P001) — wire-protocol
-        #     mismatch. Needs the catalog line "Upgrade the SDK
-        #     to a version that supports protocol
-        #     X-NULLRUN-PROTOCOL: 4" to reach the cookbook.
-        #   - NullRunRateLimitRedisError (NR-R002) — Redis
-        #     outage for aggregate rate limit (fail-CLOSED).
-        #     Needs the catalog line that distinguishes "Redis
-        #     is down" from generic NR-B002.
-        #   - NullRunConfigError (NR-Cxxx) — malformed config,
-        #     typically surfaced by runtime.execute with bad
-        #     env. Never rewrap a config error as a transient
-        #     transport block — that's misleading.
-        # Pre-fix the catch-all stamped error_code NR-B001 on
-        # these and discarded wire_code (AuthError),
-        # protocol-version info (ProtocolError), and Redis
-        # source-of-failure (RateLimitRedisError). Re-raise
-        # BEFORE the catch-all.
+        # DEF-NR-TRANSPORT-CATCHFANIN-GAP umbrella pass-through:
+        # NullRunAuthError, NullRunProtocolError,
+        # NullRunRateLimitRedisError, NullRunConfigError — preserve
+        # first-class attributes.
         raise
     except Exception as exc:  # noqa: BLE001
-        # Any other exception is a transport / network / backend
-        # failure. Re-raise as NullRunBlockedException so the caller
-        # sees a uniform "this tool was denied" signal — they should
-        # not need to also catch httpx.ConnectError or similar.
         if fail_open:
             logger.warning(
-                f"sensitive tool pre-check unavailable for {fn.__name__!r}: "
+                f"tool policy gate unavailable for {fn.__name__!r}: "
                 f"{exc}. NULLRUN_SENSITIVE_FAIL_OPEN=1 — body will run."
             )
             return
@@ -1136,24 +887,25 @@ def _enforce_sensitive_tool(
             error_code="NR-B001",
             user_action=(
                 f"The NullRun policy engine raised an unexpected "
-                f"exception during the @sensitive pre-check of "
+                f"exception during the @protect pre-check of "
                 f"'{fn.__name__}'. The body did NOT run. Check the "
                 f"chained exception (raise ... from exc) for the "
                 f"root cause."
             ),
         )
-        # Layer 2: emit for the generic exception path too.
-        # (The NullRunTransportError path above already emits
-        # this covers the catch-all ``except Exception`` arm.)
         runtime._emit_sdk_error(
             err,
-            stage="sensitive_tool",
+            stage="tool_policy_gate",
             workflow_id=workflow_id,
             tool_name=fn.__name__,
         )
         raise err from exc
 
-    # Defense in depth (ADR-008 Rule 1 + Rule 2): if `runtime.execute`
+    # Defense in depth: classification audit. If the transport ever
+    # returns a synthetic dict whose decision_source marks a
+    # fallback, block per ADR-008 fail-CLOSED. This arm is preserved
+    # for defense in depth even though the
+    # typed transport-error arms above are the canonical path.
     if isinstance(result, dict):
         decision_source = result.get("decision_source", "")
         if isinstance(decision_source, str) and (
@@ -1168,15 +920,10 @@ def _enforce_sensitive_tool(
         ):
             if fail_open:
                 logger.warning(
-                    f"sensitive tool pre-check for {fn.__name__!r} returned "
+                    f"tool policy gate for {fn.__name__!r} returned "
                     f"{decision_source}; NULLRUN_SENSITIVE_FAIL_OPEN=1 — body will run."
                 )
                 return
-            # Layer 1: stamp the source-specific code on the
-            # fallback block so cookbook code can distinguish
-            # between "the policy engine said block" (NR-T001 etc.)
-            # and "we blocked because the policy engine never
-            # answered" (NR-B001/B002).
             _code = {
                 "NETWORK_ERROR": "NR-B001",
                 "GATEWAY_ERROR": "NR-B002",
@@ -1190,19 +937,15 @@ def _enforce_sensitive_tool(
                 error_code=_code,
                 user_action=(
                     f"The NullRun policy engine returned a fallback "
-                    f"({decision_source}) for @sensitive '{fn.__name__}'. "
-                    f"The body did NOT run. Retry once the policy engine "
-                    f"is back — or set NULLRUN_SENSITIVE_FAIL_OPEN=1 for "
-                    f"tests / staging."
+                    f"({decision_source}) for '{fn.__name__}'. The "
+                    f"body did NOT run. Retry once the policy engine "
+                    f"is back — or set NULLRUN_SENSITIVE_FAIL_OPEN=1 "
+                    f"for tests / staging."
                 ),
             )
-            # Layer 2: emit the on_error hook with the fallback
-            # source as extra metadata so Sentry rules can
-            # distinguish "policy engine is down" from "we
-            # tripped the local circuit breaker".
             runtime._emit_sdk_error(
                 err,
-                stage="sensitive_tool",
+                stage="tool_policy_gate",
                 workflow_id=workflow_id,
                 tool_name=fn.__name__,
                 extra={"decision_source": decision_source},
@@ -1213,215 +956,6 @@ def _enforce_sensitive_tool(
     # NullRunBlockedException by `runtime.execute` — no second check
     # needed here. A `decision=allow` with `decision_source=GATEWAY`
     # (the happy path) just falls through and the body runs.
-
-
-def sensitive(
-    fn: F | None = None,
-    *,
-    impact: Any = None,
-) -> F:
-    """
-    Mark a function as sensitive. `@protect` will pre-check
-    `runtime.execute(...)` before the body runs.
-
-    .. deprecated::
-        Bare ``@sensitive`` is deprecated as of SDK 0.18.1. Since
-        ``@protect`` now auto-attaches the same default tool_params
-        extractor that bare ``@sensitive`` used to install, and since
-        the business interpretation of those params belongs to NullRun
-        policy (not the SDK), the canonical pattern is now just
-        ``@protect``. Bare ``@sensitive`` still works in 0.18.x with a
-        ``DeprecationWarning`` and the legacy behaviour will be
-        removed in 0.19.x.
-
-        The ``@sensitive(impact=...)`` factory form remains supported
-        as an explicit advanced API: it attaches a typed extractor
-        (``money_outflow(...)`` or a custom ``ToolParamsExtractor``
-        map) and registers the tool for the server-side policy
-        path. New code does not need it; library authors wiring
-        approval rules into a custom runtime may still prefer it.
-
-    This is the discoverable alternative to the lower-level
-    `runtime.add_sensitive_tool(fn.__name__)`. Chain with `@protect`
-    in either order (both work via `functools.wraps`); the
-    recommended form is `@sensitive` outside so the name is
-    registered before the wrapper is built:
-
-        @nullrun.sensitive
-        @nullrun.protect
-        def charge_card(amount: int) -> str:
-            ...
-
-    ``@sensitive(impact=money_outflow(...))`` attaches a typed
-    ``MoneyImpactExtractor`` to the function via the
-    ``_nullrun_extractor`` attribute. The wrapper reads it inside
-    ``_enforce_sensitive_tool`` to extract a typed
-    ``BusinessImpact`` + ``action_digest`` from the live call
-    arguments and forward them to /execute, so the backend can
-    stamp the approval row with the digest and refuse tampered
-    payloads on the post-approval re-check.
-
-        @nullrun.sensitive(impact=money_outflow(argument="amount_cents"))
-        @nullrun.protect
-        def refund_customer(amount_cents: int, customer_id: str):
-            ...
-
-    Args:
-        fn: the function to decorate. May be None when used with
-            keyword arguments (the ``@sensitive(impact=...)`` form).
-        impact: typed action extractor. Currently only
-            ``MoneyImpactExtractor`` (returned by
-            ``money_outflow(argument=...)``) is supported.
-
-    Two forms are accepted:
-      - bare: ``@sensitive`` — fn must be the function being decorated.
-        **Deprecated** as of 0.18.1; emits ``DeprecationWarning``.
-      - factory: ``@sensitive(impact=...)`` — fn is None, returns a
-        decorator that closes over ``impact``. Still supported as
-        an advanced API.
-
-    Both forms register the tool as sensitive in the runtime so the
-    ``_enforce_sensitive_tool`` pre-check fires.
-    """
-    # Factory form: @sensitive(impact=...) returns a decorator that
-    if fn is None:
-
-        def _attach_decorator(_fn: F) -> F:
-            if impact is not None:
-                _stamp_extractor_on_innermost(_fn, impact)
-            return _do_sensitive_register(_fn)
-
-        return _attach_decorator  # type: ignore[return-value]
-
-    # Bare form: @sensitive.
-    # 0.18.1: bare `@sensitive` is deprecated. `@protect` already
-    # auto-attaches a default ToolParamsExtractor (see protect() above),
-    # so the bare form is a duplicate of capability that the user can
-    # get by writing just `@protect`. We keep the old behaviour
-    # (auto-attach + sensitive-tool registration) intact so this is a
-    # warning-only release; the special behaviour will be removed in
-    # 0.19.x. Users who need the sensitive-tool registration (which
-    # short-circuits to the server-side policy path) should switch to
-    # explicit ``@protect`` and call ``runtime.add_sensitive_tool(...)``
-    # in their app bootstrap.
-    import warnings
-
-    warnings.warn(
-        "Bare `@sensitive` is deprecated as of SDK 0.18.1: `@protect` "
-        "now auto-attaches the same default tool_params extractor, and "
-        "the business interpretation of those params belongs to NullRun "
-        "policy, not the SDK. Remove the bare `@sensitive` and rely on "
-        "`@protect` alone. The legacy behaviour will be removed in 0.19.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    if impact is not None:
-        _stamp_extractor_on_innermost(fn, impact)
-    return _do_sensitive_register(fn)
-
-
-# Maximum depth for ``__wrapped__`` chain walks. The real chain is
-# at most 3 deep (@sensitive factory + @protect + functools.wraps
-# from @protect); the cap defends against pathological cycles.
-_WRAPPED_CHAIN_MAX_HOPS = 32
-
-
-def _walk_wrapped_chain(fn: Any) -> Any:
-    """Yield each callable in ``fn``'s ``__wrapped__`` chain.
-
-    Stops on ``None``, on a cycle (id already seen), or at
-    ``_WRAPPED_CHAIN_MAX_HOPS`` hops. The original ``fn`` is
-    always yielded first.
-    """
-    seen: set[int] = set()
-    current: Any = fn
-    for _ in range(_WRAPPED_CHAIN_MAX_HOPS):
-        if current is None or id(current) in seen:
-            return
-        seen.add(id(current))
-        yield current
-        current = getattr(current, "__wrapped__", None)
-
-
-def _stamp_extractor_on_innermost(fn: F, impact: Any) -> None:
-    """Stamp ``_nullrun_extractor`` on the innermost callable in the chain.
-
-    Setting the attribute on the innermost callable means the gate's
-    ``_enforce_sensitive_tool`` can read it from the bare user function
-    via a single ``getattr`` call — no chain walk needed.
-    """
-    last: Any = None
-    for current in _walk_wrapped_chain(fn):
-        last = current
-    target = last if last is not None else fn
-    # `setattr` keeps mypy happy without a TYPE_CHECKING
-    # forward-reference declaration; ruff B010 is a stylistic
-    # preference (no functional risk here).
-    setattr(target, "_nullrun_extractor", impact)  # noqa: B010
-
-
-def _find_extractor_in_chain(fn: Any) -> Any:
-    """Walk ``fn.__wrapped__`` looking for a stamped extractor.
-
-    Used by ``_do_sensitive_register`` to detect an explicit
-    ``impact=tool_params({...})`` (or ``impact=money_outflow(...)``)
-    that was already stamped on the bare function by the
-    ``@sensitive`` factory form. Without the chain walk the
-    auto-attach path would see ``None`` on the @protect wrapper
-    and silently stamp its default ToolParamsExtractor on top,
-    breaking the user's explicit map.
-    """
-    for current in _walk_wrapped_chain(fn):
-        ext = getattr(current, "_nullrun_extractor", None)
-        if ext is not None:
-            return ext
-    return None
-
-
-def _do_sensitive_register(fn: F) -> F:
-    # If @sensitive was applied bare (no impact=...), auto-attach a
-    try:
-        from nullrun.extractor import ToolParamsExtractor, tool_params
-
-        # Walk the __wrapped__ chain in case the explicit extractor
-        # was stamped on the bare function (by
-        # ``_stamp_extractor_on_innermost``) and we received the
-        # @protect-wrapped outer function as ``fn``. Without the
-        # chain walk, the auto-attach would silently overwrite
-        # the explicit extractor and break the user's
-        # ``impact=tool_params({...})`` map.
-        if _find_extractor_in_chain(fn) is None:
-            _stamp_extractor_on_innermost(fn, tool_params(include_all=True))
-    except ImportError:
-        # The extractor module is loaded above us on every path
-        # we care about; this ImportError guard is defensive in
-        # case the SDK is shrunk (e.g. for a hypothetical
-        # tool-only build). Falling back to the legacy
-        # approval_id-only grant consume is the safe default --
-        # the wire payload drops the business_impact field and the
-        # backend uses approval_id-only grant consume.
-        pass
-
-    try:
-        # Use the same slot the @protect wrapper uses so the
-        # registration lands on the same runtime instance the
-        # wrapper will consult. Falling back to get_runtime
-        # would hit a different singleton and silently no-op in
-        # tests that build a custom runtime.
-        rt = _get_or_create_runtime()
-        rt.add_sensitive_tool(fn.__name__)
-        # 2026-07-24 (Root-cause fix): the runtime singleton
-        from nullrun.runtime import register_strict_mode_forced
-
-        register_strict_mode_forced(fn.__name__)
-    except Exception as exc:
-        # Sensitive tool registration is part of the fail-CLOSED contract
-        raise RuntimeError(
-            f"@sensitive registration failed for {fn.__name__!r}: {exc}. "
-            "Cannot proceed without runtime; tool will be blocked until "
-            "NullRun initializes correctly."
-        ) from exc
-    return fn
 
 
 def reset() -> None:

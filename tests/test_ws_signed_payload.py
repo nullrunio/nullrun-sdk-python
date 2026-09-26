@@ -25,9 +25,6 @@ The contract verified here:
 
 from __future__ import annotations
 
-import asyncio
-import hashlib
-import hmac
 import json
 import time
 
@@ -102,7 +99,6 @@ def _build_legacy_envelope(message: dict, api_key: str, secret_key: str) -> dict
     that on the wire so the receiver has to fall back to the legacy
     "verify against the full wire bytes" path.
     """
-    timestamp = int(time.time())
     # Pre-FIX-C: the server was signing the same bytes it is putting on
     # the wire (full envelope), so to make this envelope verify-able
     # under the legacy "full wire bytes" rule we have to sign the

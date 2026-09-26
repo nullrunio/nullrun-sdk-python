@@ -432,3 +432,131 @@ class TestInitRejectsWhitespaceApiKey:
         monkeypatch.delenv("NULLRUN_API_KEY", raising=False)
         with pytest.raises(NullRunAuthenticationError, match="api_key"):
             NullRunRuntime(api_key="   ")
+
+
+class TestInitRegistersAtexitShutdown:
+    """``init()`` auto-registers ``nullrun.shutdown`` with ``atexit``
+    so long-running scripts get a clean WS close on process exit
+    without an explicit shutdown call. Users should not have to
+    remember to call ``shutdown()`` themselves.
+
+    These tests stub ``NullRunRuntime`` so they do no network at
+    all — they only verify the atexit wiring in ``init()`` and
+    ``shutdown()``.
+    """
+
+    @staticmethod
+    def _stub_runtime(monkeypatch):
+        """Replace ``NullRunRuntime`` with a no-network no-op so the
+        atexit tests stay fully offline (no httpx, no real DNS)."""
+        from nullrun.runtime import NullRunRuntime
+
+        class _FakeRuntime:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                self.api_url = kwargs.get("api_url", "")
+                self.api_key = kwargs.get("api_key", "")
+                self.organization_id = "fake-org"
+                self.workflow_id = "fake-wf"
+                self._instance = self
+
+            def shutdown(self, flush=True):
+                pass
+
+        monkeypatch.setattr(NullRunRuntime, "__init__", _FakeRuntime.__init__)
+        monkeypatch.setattr(NullRunRuntime, "shutdown", _FakeRuntime.shutdown)
+        # Skip the capability probe + auto_instrument (both touch network
+        # even with the stub, because they're called as module-level
+        # functions and read the real ``api_url`` we passed in).
+        monkeypatch.setattr(
+            "nullrun.capabilities.probe_capabilities", lambda url: None
+        )
+        monkeypatch.setattr(
+            "nullrun.instrumentation.auto.auto_instrument", lambda rt: None
+        )
+
+    def test_init_registers_shutdown_with_atexit(self, monkeypatch):
+        """After ``init()`` succeeds, ``shutdown`` is in atexit's
+        registered list."""
+        import atexit as atexit_mod
+
+        import nullrun as nullrun_mod
+
+        # Reset the module-level flag — other tests in this session
+        # may have already registered shutdown() with atexit, which
+        # would cause the flag guard to skip re-registration.
+        monkeypatch.setattr(nullrun_mod, "_shutdown_atexit_registered", False)
+        self._stub_runtime(monkeypatch)
+
+        registered = []
+
+        def fake_register(func, *args, **kwargs):
+            registered.append(func)
+
+        monkeypatch.setattr(atexit_mod, "register", fake_register)
+        monkeypatch.setenv("NULLRUN_API_KEY", "test-key-12345678")
+
+        nullrun_mod.init()
+        try:
+            assert nullrun_mod.shutdown in registered
+        finally:
+            nullrun_mod.shutdown()
+
+    def test_init_does_not_double_register_atexit(self, monkeypatch):
+        """Two ``init()`` calls (the C3 fix scenario) must not stack
+        two atexit entries for ``shutdown``."""
+        import atexit as atexit_mod
+
+        import nullrun as nullrun_mod
+
+        monkeypatch.setattr(nullrun_mod, "_shutdown_atexit_registered", False)
+        self._stub_runtime(monkeypatch)
+
+        registered = []
+
+        def fake_register(func, *args, **kwargs):
+            registered.append(func)
+
+        monkeypatch.setattr(atexit_mod, "register", fake_register)
+        monkeypatch.setenv("NULLRUN_API_KEY", "test-key-12345678")
+
+        nullrun_mod.init()
+        nullrun_mod.init()
+        try:
+            # shutdown should appear at most ONCE in registered (the
+            # flag guard prevents stacking).
+            assert registered.count(nullrun_mod.shutdown) <= 1
+        finally:
+            nullrun_mod.shutdown()
+
+    def test_shutdown_resets_atexit_flag(self, monkeypatch):
+        """After ``shutdown()``, a fresh ``init()`` re-registers
+        ``shutdown`` with atexit so the new runtime gets a clean
+        exit."""
+        import atexit as atexit_mod
+
+        import nullrun as nullrun_mod
+
+        monkeypatch.setattr(nullrun_mod, "_shutdown_atexit_registered", False)
+        self._stub_runtime(monkeypatch)
+
+        registered = []
+
+        def fake_register(func, *args, **kwargs):
+            registered.append(func)
+
+        monkeypatch.setattr(atexit_mod, "register", fake_register)
+        monkeypatch.setenv("NULLRUN_API_KEY", "test-key-12345678")
+
+        nullrun_mod.init()
+        initial_count = registered.count(nullrun_mod.shutdown)
+        nullrun_mod.shutdown()
+        nullrun_mod.init()
+        try:
+            final_count = registered.count(nullrun_mod.shutdown)
+            assert final_count == initial_count + 1, (
+                f"expected re-registration after shutdown, "
+                f"got {initial_count} -> {final_count}"
+            )
+        finally:
+            nullrun_mod.shutdown()

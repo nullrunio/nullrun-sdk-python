@@ -213,7 +213,7 @@ class TestTransport:
             trace_id="trace-789",
             tool="my.tool",
             input_data={},
-            fallback_mode="strict",
+            fallback_mode=FallbackMode.STRICT,
         )
         assert result["decision"] == "block"
         assert result["decision_source"] == "fallback"
@@ -230,14 +230,14 @@ class TestTransport:
             trace_id="trace-789",
             tool="my.tool",
             input_data={},
-            fallback_mode="permissive",
+            fallback_mode=FallbackMode.PERMISSIVE,
         )
         assert result["decision"] == "allow"
         assert result["decision_source"] == "fallback"
 
     @respx.mock
-    def test_execute_fallback_cached_degrades_to_permissive(self, transport):
-        """0.7.0: CACHED fallback mode degrades to PERMISSIVE (no local cache)."""
+    def test_execute_fallback_permissive_allows_on_execute_error(self, transport):
+        """PERMISSIVE fallback mode allows when /execute is unavailable."""
         respx.post("https://api.test.nullrun.io/api/v1/execute").mock(
             return_value=httpx.Response(500, text="Server Error")
         )
@@ -247,10 +247,10 @@ class TestTransport:
             trace_id="trace-789",
             tool="my.tool",
             input_data={},
-            fallback_mode="cached",
+            fallback_mode=FallbackMode.PERMISSIVE,
         )
-        # 0.7.0: thin client — no local cache to consult on gateway
-        # failure. CACHED silently degrades to PERMISSIVE.
+        # The SDK is a thin client — no local cache to consult on
+        # gateway failure. PERMISSIVE allows the request.
         assert result["decision"] == "allow"
         assert result["decision_source"] == "fallback"
 
@@ -553,7 +553,6 @@ class TestTransportFlush:
             t.track({"event": f"e{i}"})
 
         # Flush with CB OPEN will re-queue and enforce max_buffer_size
-        initial_buffer_len = len(t._buffer)
         t._do_flush()
 
         # After flush with CB OPEN, buffer should be capped at max_buffer_size
@@ -603,49 +602,6 @@ class TestTransportFlush:
 # Sensitive Tools API tests
 # ──────────────────────────────────────────────────────────────
 
-
-class TestSensitiveToolsAPI:
-    def test_add_sensitive_tool(self, make_runtime):
-        """add_sensitive_tool marks a tool as sensitive."""
-        rt = make_runtime()
-        rt.add_sensitive_tool("my.custom_tool")
-        assert "my.custom_tool" in rt.get_sensitive_tools()
-
-    def test_remove_sensitive_tool(self, make_runtime):
-        """remove_sensitive_tool unmarks a tool as sensitive."""
-        rt = make_runtime()
-        rt.add_sensitive_tool("my.custom_tool")
-        rt.remove_sensitive_tool("my.custom_tool")
-        assert "my.custom_tool" not in rt.get_sensitive_tools()
-
-    def test_register_sensitive_tools_batch(self, make_runtime):
-        """register_sensitive_tools adds multiple tools at once."""
-        rt = make_runtime()
-        rt.register_sensitive_tools(["tool1", "tool2", "tool3"])
-        tools = rt.get_sensitive_tools()
-        assert "tool1" in tools
-        assert "tool2" in tools
-        assert "tool3" in tools
-
-    def test_sensitive_tools_default_set(self, make_runtime):
-        """Default sensitive tools include dangerous operations."""
-        rt = make_runtime()
-        # Built-in sensitive tools
-        assert "stripe.charge" in rt.get_sensitive_tools()
-        assert "db.delete" in rt.get_sensitive_tools()
-        assert "file.delete" in rt.get_sensitive_tools()
-
-    def test_is_sensitive_tool(self, make_runtime):
-        """is_sensitive_tool returns True for sensitive tools."""
-        rt = make_runtime()
-        rt.add_sensitive_tool("my.sensitive_tool")
-        assert rt.is_sensitive_tool("my.sensitive_tool") is True
-        assert rt.is_sensitive_tool("my.normal_tool") is False
-
-
-# ──────────────────────────────────────────────────────────────
-# HMAC signature tests
-# ──────────────────────────────────────────────────────────────
 
 
 class TestTransportHMAC:
@@ -1085,6 +1041,7 @@ from nullrun.breaker.exceptions import (
     TransportErrorSource,
 )
 from nullrun.transport import (
+    FallbackMode,
     FlushConfig,
     _parse_error_envelope,
     verify_hmac_signature,
@@ -1106,7 +1063,6 @@ def test_verify_hmac_signature_fresh_and_matching():
     """Fresh timestamp + correct signature → True."""
     import hashlib
     import hmac as _hmac
-    import json as _json
 
     body = '{"x":1}'
     ts = int(time.time())
@@ -1333,7 +1289,7 @@ def test_execute_fallback_strict_returns_block():
         trace_id="t-1",
         tool="x",
         input_data={},
-        fallback_mode="strict",
+        fallback_mode=FallbackMode.STRICT,
     )
     assert result["decision"] == "block"
     assert "STRICT" in result["explanation"]
@@ -1344,8 +1300,8 @@ def test_execute_fallback_strict_returns_block():
 # gateway failure. CACHED now degrades to PERMISSIVE.
 
 
-def test_execute_fallback_cached_degrades_to_permissive():
-    """fallback_mode=CACHED → degrade to PERMISSIVE (no local cache)."""
+def test_execute_fallback_permissive_allows_on_transport_error():
+    """fallback_mode=PERMISSIVE → synthetic allow on transport failure."""
     from nullrun.breaker.exceptions import BreakerTransportError
 
     t = _build_transport()
@@ -1356,11 +1312,10 @@ def test_execute_fallback_cached_degrades_to_permissive():
         trace_id="t-1",
         tool="x",
         input_data={},
-        fallback_mode="cached",
+        fallback_mode=FallbackMode.PERMISSIVE,
     )
-    # 0.7.0: CACHED silently degrades to PERMISSIVE (allow).
     assert result["decision"] == "allow"
-    assert result["decision_source"] == "fallback"
+    assert "PERMISSIVE" in result["explanation"]
 
 
 def test_execute_fallback_permissive_default():

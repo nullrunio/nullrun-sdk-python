@@ -17,8 +17,8 @@ Back-compat invariants (do not break in Layer 1):
      ``NullRunBudgetError`` and ``NullRunToolBlockedError``.
   C. ``except NullRunTransportError`` still catches
      ``NullRunBackendError`` and ``RateLimitError``.
-  D. ``except WorkflowKilledException`` still catches
-     ``WorkflowKilledInterrupt`` (BaseException inheritance).
+  D. ``except WorkflowKilledInterrupt`` still catches
+     ``NullRunWorkflowKilledError`` (subclass relationship).
   E. ``except Exception`` does NOT catch ``WorkflowKilledInterrupt``.
 
 The tests below are the safety net for the above — a future
@@ -30,7 +30,6 @@ import pytest
 
 from nullrun.breaker.exceptions import (
     # Base
-    BreakerError,
     NullRunAuthenticationError,
     NullRunAuthError,
     NullRunBackendError,
@@ -45,7 +44,6 @@ from nullrun.breaker.exceptions import (
     NullRunTransportError,
     RateLimitError,
     TransportErrorSource,
-    WorkflowKilledException,
     WorkflowKilledInterrupt,
     # Workflow state
     WorkflowPausedException,
@@ -90,10 +88,6 @@ class TestHierarchyRoots:
         # migration or justify the revert in a comment.
         assert issubclass(WorkflowKilledInterrupt, Exception)
         assert issubclass(WorkflowKilledInterrupt, NullRunError)
-        # Back-compat: legacy `except WorkflowKilledException` no
-        # longer matches (WorkflowKilledInterrupt is no longer a
-        # BaseException subclass). This is the documented BREAK.
-        assert not issubclass(WorkflowKilledInterrupt, WorkflowKilledException)
 
 
 # ---------------------------------------------------------------------------
@@ -159,20 +153,13 @@ class TestBackCompat:
         with pytest.raises(NullRunTransportError):
             raise NullRunBackendError("5xx", endpoint="/api/v1/check", status_code=503)
 
-    def test_killed_interrupt_caught_by_killed_exception(self):
-        # 2026-09-08 migration: WorkflowKilledException (the
-        # deprecated BaseException parent) no longer matches the
-        # new Exception subclass. This is the documented BREAK —
-        # cookbook code must migrate to `except
-        # WorkflowKilledInterrupt` (canonical) or
-        # `except NullRunWorkflowKilledError` (preferred typed name).
-        with pytest.raises(WorkflowKilledException):
-            # WorkflowKilledException is itself a BaseException
-            # subclass, so this raises WorkflowKilledException
-            # directly (which is still BaseException). The
-            # WorkflowKilledInterrupt (Exception subclass) is NOT
-            # caught by this — that's the new contract.
-            raise WorkflowKilledException("wf-1", reason="killed via API")
+    def test_killed_interrupt_caught_by_killed_interrupt(self):
+        # Canonical name: ``WorkflowKilledInterrupt`` is now an
+        # Exception subclass (NullRunError parent), catchable by
+        # ``except WorkflowKilledInterrupt`` or
+        # ``except NullRunWorkflowKilledError``.
+        with pytest.raises(WorkflowKilledInterrupt):
+            raise WorkflowKilledInterrupt("wf-1", reason="killed via API")
 
     def test_killed_interrupt_not_caught_by_exception(self):
         # 2026-09-08 migration REVERSAL: WorkflowKilledInterrupt is

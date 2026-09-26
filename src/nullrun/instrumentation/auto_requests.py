@@ -176,8 +176,12 @@ def patch_requests(runtime: Any) -> bool:
     with _requests_lock:
         if _requests_patched:
             return True
+        # `requests` is an optional dep. The bare ``try: import
+        # requests`` is the cheapest availability probe; the
+        # `_requests_patched` guard above short-circuits repeated
+        # patch calls on a hot path.
         try:
-            import requests  # type: ignore[import-not-found]
+            import requests  # noqa: F401  -- availability probe only
         except ImportError:
             logger.debug("requests not installed; auto-instrumentation skipped")
             return False
