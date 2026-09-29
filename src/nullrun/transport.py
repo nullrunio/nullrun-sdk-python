@@ -978,8 +978,10 @@ class Transport:
         """Send batch to server. Returns SendResult with retry info. Wrapped by _retry_with_backoff."""
         logger.debug(f"Sending batch of {len(batch)} events to {self.api_url}/api/v1/track/batch")
         body = _signed_request_body({"events": batch})
-        headers = self._build_signed_headers(body=body)
 
+        # S008: re-sign per attempt — see the long note at
+        # `do_execute_request` (same defect, same fix).
+        #
         # Inner function is the unit of retry:
         # * 5xx → retry helper backs off. 429 honors Retry-After.
         # * 4xx (other than 429) → return as-is; these are real client bugs
@@ -988,7 +990,7 @@ class Transport:
             resp = self._client.post(
                 f"{self.api_url}/api/v1/track/batch",
                 content=body,
-                headers=headers,
+                headers=self._build_signed_headers(body=body),
             )
             if resp.status_code >= 500 or resp.status_code == 429:
                 # raise_for_status turns this into HTTPStatusError; the retry
@@ -1191,13 +1193,29 @@ class Transport:
             gate_request["tools"] = list(tools)
 
         body = _signed_request_body(gate_request)
-        headers = self._build_signed_headers(body=body)
 
+        # S008 / DEF-MP-TS12-ENF-01 (2026-09-29): sign INSIDE the
+        # retry closure. Pre-fix `headers` was built once here, so
+        # every one of the (up to 10) retries replayed a byte-identical
+        # signature. The backend's S008 replay guard
+        # (`hmac:replay:{key_fp}:{sig_hash}`, `hmac_verify.rs`) marks
+        # the first occurrence and rejects the rest as HMAC_REPLAY —
+        # so a single transient 5xx turned the whole retry budget into
+        # a wall of replay rejections, and the 401 that came back was
+        # indistinguishable from a genuinely invalid key.
+        #
+        # `_build_signed_headers` recomputes `int(time.time())` and the
+        # HMAC on every call, so each attempt now carries a distinct
+        # `sig_hash` and is not a replay. The backend deferred exactly
+        # this fix ("the Python SDK builds its signed headers ONCE
+        # outside the retry closure ... Tracked as S008 v2") pending
+        # this change. A true single-use `X-Nonce` remains a protocol
+        # change and is deliberately still out of scope.
         def do_execute_request() -> httpx.Response:
             return self._client.post(
                 f"{self.api_url}/api/v1/execute",
                 content=body,
-                headers=headers,
+                headers=self._build_signed_headers(body=body),
                 timeout=5.0,
             )
 
@@ -1514,8 +1532,15 @@ class Transport:
             gate_request["parent_execution_id"] = _parent_execution_id
 
         body = _signed_request_body(gate_request)
-        headers = self._build_signed_headers(body=body)
 
+        # S008 / DEF-MP-TS12-ENF-01 (2026-09-29): sign INSIDE the
+        # retry closure. Pre-fix `headers` was built once, so each of
+        # the 3 retries replayed a byte-identical signature and the
+        # backend's S008 guard rejected the retry as HMAC_REPLAY. That
+        # 401 is what surfaced to `check_workflow_budget` as a
+        # credential error during the TS-12 cycle (prod x684). See the
+        # long note at `do_execute_request` for the full rationale.
+        #
         # ``_retry_with_backoff`` with ``retry_on_5xx=True`` and
         # ``max_retries=3`` (per audit recommendation: "less than
         # 10 — /gate is critical and too many retries amplify
@@ -1529,7 +1554,7 @@ class Transport:
             return self._client.post(
                 f"{self.api_url}/api/v1/gate",
                 content=body,
-                headers=headers,
+                headers=self._build_signed_headers(body=body),
                 timeout=5.0,
             )
 
