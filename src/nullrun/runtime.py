@@ -17,7 +17,7 @@ the authoritative table; deviations require an ADR amendment (Rule 5).
 
 | Gate | Transport-error behavior | Recovery behavior | Opt-out |
 |---|---|---|---|
-| `check_workflow_budget` | OPEN (skip check, log warning) | silent post-hoc correction in `/track` events via `cost_correction_applied=true` | `NULLRUN_SKIP_BUDGET_CHECK=1` -- **full billing bypass**, not just check bypass (see docstring WARNING) |
+| `check_workflow_budget` | OPEN (skip check, log warning) for TRANSPORT errors; **CLOSED for authentication errors** (401 raises `NullRunAuthError` — see below) | silent post-hoc correction in `/track` events via `cost_correction_applied=true` | `NULLRUN_SKIP_BUDGET_CHECK=1` -- **full billing bypass**, not just check bypass (see docstring WARNING) |
 | `check_control_plane` | OPEN (treat state as `Normal`) | deferred enforcement -- next WS-push or `/status` poll sees the true state | none |
 | `_enforce_sensitive_tool` (default `_fallback_mode=strict` since v3.53) | CLOSED -- transport returns `decision=block, decision_source=FALLBACK_*` | n/a | none for the strict path; `NULLRUN_SENSITIVE_FAIL_OPEN=1` opts into the legacy permissive override |
 | `_enforce_sensitive_tool` (`_fallback_mode=permissive`, opt-in) | CLOSED -- body MUST NOT run when `decision_source` is any `FALLBACK_*` | n/a (body did not run) | `NULLRUN_SENSITIVE_FAIL_OPEN=1` -- explicitly documented as "OPEN-when-engine-unavailable" |
@@ -42,6 +42,14 @@ fall-OPEN on a wire 4xx/5xx that names an enforcement failure.
 * **SDK-side transport failure** (network timeout, 5xx, breaker open)
   → fail-OPEN on the *check* path so a dead backend doesn't freeze
   the user's agent loop (this is what the README describes).
+* **Authentication failure (401)** → fail-CLOSED.
+  ``NullRunAuthError`` propagates. A 401 is a CREDENTIAL/CONFIG
+  failure, not a transient transport condition: no retry can fix a
+  revoked key, and there is no post-hoc correction path in ``/track``
+  that can retroactively authorise a call the backend refused. Failing
+  OPEN here means the agent proceeds on a request the backend never
+  approved. Added 2026-09-29 (DEF-MP-TS12-ENF-01) — this NARROWS the
+  fail-OPEN set, it does not widen enforcement.
 * **Backend-side budget-enforcement failure** (the /gate or /track
   handler actually returned a wire response, just one indicating a
   Redis outage or aggregate rate-limit Redis unavailable) → the
@@ -2077,6 +2085,20 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 # Cache miss or expired — go to the server, then store.
                 try:
                     response = self._transport.check(check_req)
+                except NullRunAuthenticationError:
+                    # DEF-MP-TS12-ENF-01 (RUN_ID 20260929T1338, 2026-09-29):
+                    # a 401 is a CREDENTIAL failure, not a transport
+                    # failure, and must NOT be read as "allowed".
+                    #
+                    # `_retry_with_backoff` raises `NullRunAuthError` (a
+                    # `NullRunAuthenticationError`) on any 401 and
+                    # re-raises it WITHOUT retrying. Pre-fix the
+                    # `except` clauses below swallowed it and returned
+                    # None, which the caller reads as "no block" — the
+                    # agent proceeded on a request the backend had
+                    # refused. Classification is by TYPE here, never by
+                    # inspecting the message.
+                    raise
                 except (httpx.HTTPError, NullRunError) as exc:
                     # Narrow catch: fail-OPEN only on transport +
                     # classified SDK errors. Internal bugs
@@ -2090,6 +2112,11 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         else:
             try:
                 response = self._transport.check(check_req)
+            except NullRunAuthenticationError:
+                # Same rationale as the cached branch above. Ordering
+                # matters: this arm precedes the broad `except
+                # Exception`, which is a superset.
+                raise
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"check_workflow_budget: /gate unavailable, failing open: {exc}")
                 metrics.inc_runtime("gate_fail_open_total")
@@ -2107,7 +2134,16 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             TransportErrorSource.NETWORK_ERROR,
             TransportErrorSource.GATEWAY_ERROR,
             TransportErrorSource.BREAKER_OPEN,
-            TransportErrorSource.AUTH_ERROR,
+            # DEF-MP-TS12-ENF-01: `AUTH_ERROR` removed. This set is the
+            # ADR-008 transport-failure classification, documented as
+            # exactly `FALLBACK_NETWORK_ERROR` / `FALLBACK_GATEWAY_ERROR`
+            # / `FALLBACK_BREAKER_OPEN` (module docstring, "Fail-OPEN
+            # policy" section) — auth was never part of it. Including it
+            # meant a credential failure was reinterpreted as "transport
+            # error" and the call was allowed. Removing it brings the
+            # code back in line with the documented policy rather than
+            # deviating from it; a 401 now reaches the `decision ==
+            # "block"` arm and raises.
         }:
             logger.warning(
                 f"check_workflow_budget: synthetic decision_source="
