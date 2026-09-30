@@ -40,7 +40,15 @@ import pytest
 # langchain_core import; post-fix it must get PAST the import and fail
 # (or succeed) on the network instead. Either way the ModuleNotFoundError
 # for langchain_core must not appear.
-_BLOCK_AND_PROBE = textwrap.dedent(
+#
+# `_RAISE` is substituted per-case: `ModuleNotFoundError` models the
+# package being ABSENT, plain `ImportError` models it being PRESENT BUT
+# BROKEN (e.g. a pydantic v1/v2 mismatch inside langchain's own import
+# chain). Both must degrade to the `object` fallback. The second is the
+# case the original fix missed — it caught only the narrower
+# `ModuleNotFoundError`, so a broken-but-installed langchain-core still
+# crashed `import nullrun` with the original DEF-MP-TS12-SDK-05 traceback.
+_BLOCK_AND_PROBE_TEMPLATE = textwrap.dedent(
     """
     import sys
 
@@ -49,7 +57,7 @@ _BLOCK_AND_PROBE = textwrap.dedent(
             if name == "langchain_core" or name.startswith("langchain_core."):
                 return self
         def load_module(self, name):
-            raise ModuleNotFoundError("No module named '%s'" % name)
+            raise {raise_expr}
 
     sys.meta_path.insert(0, _BlockLangChainCore())
     for _m in [m for m in sys.modules if m.startswith("langchain_core")]:
@@ -57,6 +65,9 @@ _BLOCK_AND_PROBE = textwrap.dedent(
 
     import nullrun
     print("IMPORT_OK")
+
+    from nullrun.instrumentation.langgraph import BaseCallbackHandler
+    print("FALLBACK:" + BaseCallbackHandler.__name__)
 
     from nullrun.runtime import NullRunRuntime
     try:
@@ -78,10 +89,22 @@ _BLOCK_AND_PROBE = textwrap.dedent(
     """
 )
 
+# The package is not installed at all.
+_BLOCK_AND_PROBE = _BLOCK_AND_PROBE_TEMPLATE.format(
+    raise_expr='ModuleNotFoundError("No module named \'%s\'" % name)'
+)
 
-def _run_probe() -> str:
+# The package IS installed but its own import chain is broken. This is
+# the pydantic-v1/v2 case, and the reason the guard must catch
+# `ImportError` rather than only its `ModuleNotFoundError` subclass.
+_BROKEN_AND_PROBE = _BLOCK_AND_PROBE_TEMPLATE.format(
+    raise_expr='ImportError("cannot import name X from pydantic (v1/v2 mismatch)")'
+)
+
+
+def _run_probe(source: str | None = None) -> str:
     proc = subprocess.run(
-        [sys.executable, "-c", _BLOCK_AND_PROBE],
+        [sys.executable, "-c", source or _BLOCK_AND_PROBE],
         capture_output=True,
         text=True,
         timeout=120,
@@ -136,4 +159,45 @@ class TestLangGraphOptional:
         assert BaseCallbackHandler is RealBase, (
             "with langchain-core installed, NullRunCallback must subclass the "
             "real BaseCallbackHandler so LangChain recognises the handler"
+        )
+
+    def test_langchain_broken_not_just_absent(self):
+        """A PRESENT-BUT-BROKEN langchain-core must not crash the import.
+
+        This is the case the original fix missed. It guarded with
+        `except ModuleNotFoundError`, which covers only "this module does
+        not exist". A langchain-core that is installed but whose own
+        dependency chain is broken — the pydantic v1/v2 mismatch being
+        the common one — raises a plain `ImportError` from *inside* that
+        chain, which the narrow guard did not catch, so it propagated
+        out of module scope and `import nullrun` died with the original
+        DEF-MP-TS12-SDK-05 traceback.
+
+        Every sibling guard in the SDK catches `ImportError`; this site
+        was the lone outlier. The fallback (`object`) is correct for
+        every failure mode here, so the fix is behaviour-preserving.
+        """
+        out = _run_probe(_BROKEN_AND_PROBE)
+        assert "IMPORT_OK" in out, (
+            "a broken-but-installed langchain-core must not break "
+            "`import nullrun` — the guard must catch ImportError, not only "
+            "ModuleNotFoundError.\n" + out
+        )
+        assert "FALLBACK:object" in out, (
+            "with langchain-core broken, NullRunCallback must fall back to "
+            "an `object` base.\n" + out
+        )
+
+    def test_langchain_broken_does_not_break_init(self):
+        """`init()` must also survive a broken langchain-core.
+
+        Complements the import-level check: the original defect killed
+        users at `NullRunRuntime(...)`, not at `import nullrun`, so a
+        test that only asserts the import would miss the regression.
+        """
+        out = _run_probe(_BROKEN_AND_PROBE)
+        assert ("INIT_OK" in out) or ("INIT_REACHED_NETWORK" in out), (
+            "NullRunRuntime.__init__ still fails when langchain-core is "
+            "installed-but-broken. It must reach the network layer the "
+            "same way it does when the package is absent.\n" + out
         )

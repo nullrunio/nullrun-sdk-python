@@ -60,9 +60,28 @@ from nullrun.tracing import (
 #
 # `langchain-core` is deliberately NOT added to core dependencies — that
 # would impose a heavy framework dependency on every consumer.
+#
+# The guard catches `ImportError`, NOT the narrower
+# `ModuleNotFoundError` — this is the only site in the SDK that used
+# the narrow form, against 9 siblings that all catch `ImportError`
+# (`transport.py`, `transport_websocket.py`, `auto.py`, `autogen.py`,
+# `crewai.py`, `llama_index.py`, `auto_requests.py`).
+#
+# The distinction matters: `ModuleNotFoundError` covers only "this
+# module does not exist". A plain `ImportError` is what a PRESENT-BUT-
+# BROKEN langchain-core raises from its own dependency chain — the
+# pydantic v1/v2 case being the common one. Under the narrow guard
+# that propagates out of module scope and `import nullrun` dies, which
+# is the exact DEF-MP-TS12-SDK-05 crash, just via a narrower trigger:
+# the guard would only have protected users with langchain-core absent
+# and left users with it broken still crashing at `init()`.
+#
+# `object` is the correct fallback for every failure mode here —
+# `NullRunCallback` calls no `super()` and defines every method it
+# needs — so widening the catch is behaviour-preserving.
 try:  # pragma: no cover - exercised by the absence test
     from langchain_core.callbacks import BaseCallbackHandler
-except ModuleNotFoundError:  # pragma: no cover
+except ImportError:  # pragma: no cover
     BaseCallbackHandler = object  # type: ignore[assignment, misc]
 
 logger = logging.getLogger(__name__)
