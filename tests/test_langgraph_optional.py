@@ -51,12 +51,22 @@ import pytest
 _BLOCK_AND_PROBE_TEMPLATE = textwrap.dedent(
     """
     import sys
+    import importlib.abc
+    import importlib.machinery
 
-    class _BlockLangChainCore:
-        def find_module(self, name, path=None):
+    class _BlockLangChainCore(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+        # The previous version of this fixture used the legacy PEP 302
+        # ``find_module`` / ``load_module`` pair, which the modern
+        # import machinery (3.12+, namespace packages) bypasses — so the
+        # blocker was never consulted and ``BaseCallbackHandler`` imported
+        # successfully, masking the regression this test exists to catch.
+        # ``find_spec`` is the protocol finders MUST implement today.
+        def find_spec(self, name, path, target=None):
             if name == "langchain_core" or name.startswith("langchain_core."):
-                return self
-        def load_module(self, name):
+                return importlib.machinery.ModuleSpec(name, self)
+        def create_module(self, spec):
+            return None
+        def exec_module(self, module):
             raise {raise_expr}
 
     sys.meta_path.insert(0, _BlockLangChainCore())
@@ -91,7 +101,7 @@ _BLOCK_AND_PROBE_TEMPLATE = textwrap.dedent(
 
 # The package is not installed at all.
 _BLOCK_AND_PROBE = _BLOCK_AND_PROBE_TEMPLATE.format(
-    raise_expr='ModuleNotFoundError("No module named \'%s\'" % name)'
+    raise_expr='ModuleNotFoundError("No module named \'%s\'" % module.__name__)'
 )
 
 # The package IS installed but its own import chain is broken. This is
