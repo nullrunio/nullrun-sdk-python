@@ -131,6 +131,7 @@ from nullrun.transport import (
     _emit_for_transport_error,
     _protocol_header_value,
     _safe_json,
+    is_fallback_decision_source,
 )
 from nullrun.uuid7 import uuid7_str
 
@@ -2126,25 +2127,18 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
 
         decision = response.get("decision", "allow")
         decision_source = response.get("decision_source", DecisionSource.GATEWAY)
-        # Only fail-OPEN on EXPLICIT synthetic responses
-        # (decision_source starts with "fallback" or is one of the
-        # classified TransportErrorSource values). Real backend
+        # Only fail-OPEN on EXPLICIT synthetic responses. Real backend
         # decisions (decision_source="gateway") are honoured.
-        if decision_source.startswith("fallback") or decision_source in {
-            TransportErrorSource.NETWORK_ERROR,
-            TransportErrorSource.GATEWAY_ERROR,
-            TransportErrorSource.BREAKER_OPEN,
-            # DEF-MP-TS12-ENF-01: `AUTH_ERROR` removed. This set is the
-            # ADR-008 transport-failure classification, documented as
-            # exactly `FALLBACK_NETWORK_ERROR` / `FALLBACK_GATEWAY_ERROR`
-            # / `FALLBACK_BREAKER_OPEN` (module docstring, "Fail-OPEN
-            # policy" section) — auth was never part of it. Including it
-            # meant a credential failure was reinterpreted as "transport
-            # error" and the call was allowed. Removing it brings the
-            # code back in line with the documented policy rather than
-            # deviating from it; a 401 now reaches the `decision ==
-            # "block"` arm and raises.
-        }:
+        #
+        # DEF-MP-TS12-ENF-01: this was the copy that got `AUTH_ERROR`
+        # removed (Fix D) — a credential failure must not be
+        # reinterpreted as "transport error, carry on". The same
+        # predicate was ALSO written out in
+        # `decorators._run_tool_policy_gate`, and that copy still had
+        # `AUTH_ERROR` and tested an uppercase `"FALLBACK_"` prefix
+        # that no transport code path produces. Both now call the
+        # single definition, `transport.is_fallback_decision_source`.
+        if is_fallback_decision_source(decision_source):
             logger.warning(
                 f"check_workflow_budget: synthetic decision_source="
                 f"{decision_source!r}, treating as transport error"

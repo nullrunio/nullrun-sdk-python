@@ -410,6 +410,48 @@ class DecisionSource:
     LOCAL = "local"
 
 
+def is_fallback_decision_source(source: object) -> bool:
+    """True when ``source`` marks a SYNTHETIC decision, not a real one.
+
+    A decision is synthetic when the transport degraded instead of
+    reaching the gateway. ADR-008's fail-OPEN/CLOSED rules then apply;
+    a real ``gateway`` decision is always honoured regardless.
+
+    Two shapes exist, both produced by this module:
+
+    * ``DecisionSource.FALLBACK`` (``"fallback"``) — the generic
+      degradation, e.g. ``fallback_mode=STRICT`` or a gateway response
+      that could not be parsed into a decision.
+    * a ``TransportErrorSource`` member (``"NETWORK_ERROR"``,
+      ``"GATEWAY_ERROR"``, ``"BREAKER_OPEN"``) — returned only when the
+      caller passed ``on_transport_error="open"`` or ``"closed"``.
+      ``TransportErrorSource`` is a ``str`` Enum, so these compare
+      equal to their uppercase string form.
+
+    ``AUTH_ERROR`` is deliberately NOT a fallback. It is a credential
+    failure, not an unreachable gate: the transport re-raises
+    ``NullRunAuthenticationError`` rather than degrading, and treating
+    it as a transport error would let a bad API key read as "engine
+    unavailable, carry on". DEF-MP-TS12-ENF-01.
+
+    This function exists because the predicate was previously written
+    out twice — in ``runtime.check_workflow_budget`` and in
+    ``decorators._run_tool_policy_gate`` — and the copies had already
+    drifted: one matched lowercase ``"fallback"`` and the other
+    uppercase ``"FALLBACK_"`` (a prefix no code path produces, so that
+    copy's first clause could never fire), and only one had
+    ``AUTH_ERROR`` removed. Two hand-maintained copies of a
+    security-relevant predicate is one copy too many.
+    """
+    if not isinstance(source, str):
+        return False
+    return source == DecisionSource.FALLBACK or source in {
+        TransportErrorSource.NETWORK_ERROR.value,
+        TransportErrorSource.GATEWAY_ERROR.value,
+        TransportErrorSource.BREAKER_OPEN.value,
+    }
+
+
 @dataclass
 class FlushConfig:
     """Configuration for transport flush behavior."""
@@ -3298,6 +3340,7 @@ __all__ = [
     "HEADER_PROTOCOL",
     "NULLRUN_PROTOCOL_VERSION",
     "DecisionSource",
+    "is_fallback_decision_source",
     "FallbackMode",
     "FlushConfig",
     "ExecuteConfig",

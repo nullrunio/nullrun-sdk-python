@@ -62,6 +62,7 @@ from nullrun.context import (
     set_trace_id,
 )
 from nullrun.runtime import NullRunRuntime, get_runtime
+from nullrun.transport import is_fallback_decision_source
 
 # Sentinel used when a gate fires outside a workflow context.
 UNKNOWN_WORKFLOW_ID = "__nullrun_unknown__"
@@ -960,16 +961,17 @@ def _run_tool_policy_gate(
     # typed transport-error arms above are the canonical path.
     if isinstance(result, dict):
         decision_source = result.get("decision_source", "")
-        if isinstance(decision_source, str) and (
-            decision_source.startswith("FALLBACK_")
-            or decision_source
-            in {
-                TransportErrorSource.NETWORK_ERROR,
-                TransportErrorSource.GATEWAY_ERROR,
-                TransportErrorSource.BREAKER_OPEN,
-                TransportErrorSource.AUTH_ERROR,
-            }
-        ):
+        # DEF-MP-TS12-ENF-01: this arm used to test
+        # `startswith("FALLBACK_")` — an UPPERCASE prefix that no code
+        # path in the transport produces, since the real value is
+        # `DecisionSource.FALLBACK == "fallback"`. The clause could
+        # therefore never fire, and it still carried
+        # `TransportErrorSource.AUTH_ERROR`, which the same predicate
+        # in `runtime.check_workflow_budget` had already had removed
+        # (Fix D). One shared definition now, in
+        # `transport.is_fallback_decision_source`, so the two copies
+        # cannot drift apart again.
+        if is_fallback_decision_source(decision_source):
             if fail_open:
                 logger.warning(
                     f"tool policy gate for {fn.__name__!r} returned "
