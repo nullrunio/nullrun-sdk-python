@@ -1,6 +1,6 @@
 """tests/test_mcp_adapter_gate_closed.py — MCPAdapter is never ungated.
 
-B2, 2026-09-30 (ADR-037). Continues the cluster started by
+B2, 2026-09-30 (ADR-061). Continues the cluster started by
 DEF-MP-TS12-ENF-01 (QA cycle RUN_ID 20260929T1338).
 
 The bypass

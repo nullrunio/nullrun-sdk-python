@@ -169,7 +169,7 @@ class MCPAdapter:
         # When ``runtime`` is None the adapter resolves the global
         # runtime itself, on the same terms ``@protect`` does
         # (``get_active_runtime()`` then ``NullRunRuntime.get_instance()``).
-        # B2 (2026-09-30 / ADR-037) removed the previous behaviour,
+        # B2 (2026-09-30 / ADR-061) removed the previous behaviour,
         # which was: ``runtime=None`` meant "no /execute round-trip at
         # all". The MCP call went straight through and the only thing
         # the operator got was a contextvar that a *later* ``@protect``

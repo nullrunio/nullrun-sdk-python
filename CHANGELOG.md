@@ -53,7 +53,7 @@ The per-runtime sensitivity registry (`add_sensitive_tool`,
 `register_sensitive_tools`, `remove_sensitive_tool`,
 `is_sensitive_tool`, `get_sensitive_tools`) is **unchanged** — it
 is a separate documented surface, and no longer has a consumer
-inside `execute`. See ADR-037.
+inside `execute`. See ADR-061.
 
 ### Fixed
 

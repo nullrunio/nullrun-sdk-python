@@ -1,6 +1,6 @@
 """tests/test_inline_bypass_closed.py — `mode="inline"` is gone.
 
-B1, 2026-09-30 (ADR-037). Part of the DEF-MP-TS12-ENF-01 cluster that
+B1, 2026-09-30 (ADR-061). Part of the DEF-MP-TS12-ENF-01 cluster that
 followed RUN_ID 20260929T1338.
 
 The bypass

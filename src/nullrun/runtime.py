@@ -2997,7 +2997,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                   behaviour as "auto", but useful for audit clarity
                   when the caller wants the intent on the wire).
 
-                "inline" was removed in 0.19.0 (B1 / ADR-037) and
+                "inline" was removed in 0.19.0 (B1 / ADR-061) and
                 now raises `NullRunConfigError`. It skipped /execute
                 entirely — budget, rate-limit and tool-block all
                 bypassed — and its only guard was a sensitivity
@@ -3051,7 +3051,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 "call now goes through /execute. If you were using "
                 'inline to avoid a round-trip, use mode="auto" (the '
                 "default) and treat the extra latency as the cost of "
-                "actually being enforced. See ADR-037.",
+                "actually being enforced. See ADR-061.",
                 error_code="NR-S001",
             )
 
