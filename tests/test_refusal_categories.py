@@ -14,6 +14,11 @@ not allowed" — and an agent handed that will adapt and retry against
 a stop an operator deliberately placed. That is the bypass ADR-061
 closed on the server side, re-opened client-side.
 
+The second half of the file pins the negative cases for
+`on_denied="message"`: that flag acts on `denied` and on NOTHING
+else. A budget exhaustion, a pause, a breaker trip, and a backend
+fault all keep their own exceptions no matter how the host
+configured the flag.
 """
 
 from __future__ import annotations
@@ -31,6 +36,7 @@ from nullrun.breaker.categories import (
 from nullrun.breaker.exceptions import (
     NullRunBlockedException,
     NullRunBudgetError,
+    NullRunDeniedError,
     NullRunError,
     NullRunInfrastructureError,
 )
@@ -200,6 +206,91 @@ class TestTransportBoundary:
         assert result["category"] is None
 
 
+class TestOnDeniedIsDeniedOnly:
+    """`on_denied="message"` acts on `denied` and on nothing else."""
+
+    def test_denied_becomes_a_message_carrying_exception(self, make_runtime, mock_api):
+        respx.post(GATE_URL).mock(
+            return_value=_refusal("TOOL_BLOCKED", "denied", status=403)
+        )
+        rt = make_runtime(on_denied="message")
+        with pytest.raises(NullRunDeniedError) as exc:
+            rt.check_workflow_budget()
+        assert exc.value.model_safe_text() == "TOOL_BLOCKED is not permitted."
+        assert isinstance(exc.value, NullRunBlockedException), (
+            "existing `except NullRunBlockedException` handlers must keep matching"
+        )
+
+    @pytest.mark.parametrize("category", ["budget", "halt", "infra"])
+    def test_non_denied_categories_never_become_a_message(
+        self, category, make_runtime, mock_api
+    ):
+        """The negative tests.
+
+        For each non-`denied` category, pick a real error code of
+        that category and assert the refusal does NOT surface as
+        `NullRunDeniedError` — i.e. the host cannot read it as
+        something the model should be told.
+        """
+        code, status = next(
+            (c, st) for c, (cat, st) in REAL_REFUSALS.items() if cat == category
+        )
+        respx.post(GATE_URL).mock(return_value=_refusal(code, category, status=status))
+        rt = make_runtime(on_denied="message")
+        with pytest.raises(NullRunError) as exc:
+            rt.check_workflow_budget()
+        assert not isinstance(exc.value, NullRunDeniedError), (
+            f"{code} is category={category}; on_denied must not reach it"
+        )
+        # And nothing model-readable rides along.
+        assert not isinstance(getattr(exc.value, "agent_message", None), str)
+
+    def test_default_is_raise_and_denied_stays_a_plain_block(
+        self, make_runtime, mock_api
+    ):
+        respx.post(GATE_URL).mock(
+            return_value=_refusal("TOOL_BLOCKED", "denied", status=403)
+        )
+        rt = make_runtime()
+        assert rt.on_denied == "raise"
+        with pytest.raises(NullRunError) as exc:
+            rt.check_workflow_budget()
+        assert not isinstance(exc.value, NullRunDeniedError)
+
+    def test_absent_category_raises_even_with_message_enabled(
+        self, make_runtime, mock_api
+    ):
+        """The opt-in must not become a way to accept junk.
+
+        `on_denied="message"` is a statement about `denied`. It is
+        not permission to guess a category.
+        """
+        respx.post(GATE_URL).mock(
+            return_value=_refusal("TOOL_BLOCKED", None, status=403)
+        )
+        rt = make_runtime(on_denied="message")
+        with pytest.raises(NullRunUnclassifiedRefusalError):
+            rt.check_workflow_budget()
+
+    def test_unknown_on_denied_value_is_rejected_at_construction(self):
+        with pytest.raises(ValueError, match="on_denied"):
+            NullRunRuntime(
+                api_key="test-key-12345678",
+                api_url=BASE_URL,
+                polling=False,
+                on_denied="message-all",
+            )
+
+    def test_budget_category_keeps_its_own_exception(self, make_runtime, mock_api):
+        """Not just "not a message" — the right class, unchanged."""
+        respx.post(GATE_URL).mock(
+            return_value=_refusal("BUDGET_HARD_BLOCKED", "budget", status=402)
+        )
+        rt = make_runtime(on_denied="message")
+        with pytest.raises(NullRunBudgetError):
+            rt.check_workflow_budget()
+
+
 class TestFailOpenDoesNotSwallowIt:
     """The hole the whole feature exists to close.
 
@@ -237,9 +328,12 @@ class TestFailOpenDoesNotSwallowIt:
 
         ADR-008 promises a dead backend does not freeze the agent.
         Narrowing it for refusals must not narrow it for outages.
+        `on_denied="message"` is set deliberately: the host has asked
+        for the most permissive handling available, and it still must
+        not turn an unreachable gate into a block.
         """
         respx.post(GATE_URL).mock(
             side_effect=httpx.ConnectError("connection refused")
         )
-        rt = make_runtime()
+        rt = make_runtime(on_denied="message")
         assert rt.check_workflow_budget() is None

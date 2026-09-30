@@ -802,6 +802,60 @@ class NullRunBlockedException(NullRunDecision):
         )
 
 
+class NullRunDeniedError(NullRunBlockedException):
+    """ADR-062 ``denied``: an operator refused **this call** on policy.
+
+    Raised only when the host opted in with
+    ``nullrun.init(on_denied="message")`` and the gate answered with
+    ``category == "denied"``. That is the single condition: a
+    ``budget``, ``halt``, or ``infra`` refusal never becomes this
+    class no matter what the flag says, because those three describe
+    walls the model cannot climb, and a model handed a friendly
+    sentence about one will tool-shop and retry.
+
+    The distinction this class buys the host is
+    :attr:`agent_message` — server-authored text the backend
+    guarantees is safe to place in the model's context. It is
+    populated from the wire field of the same name, which the
+    backend sets **only** for ``denied``
+    (``gate.rs::attach_refusal_surface``). When the server sent no
+    such text the attribute is ``None`` and the host must not
+    substitute its own wording.
+
+    With the default ``on_denied="raise"`` a denial surfaces as the
+    ordinary code-specific exception (``NullRunToolBlockedError`` and
+    friends) and this class is never raised — the opt-in is what
+    changes the shape of the refusal, not the enforcement.
+    """
+
+    error_code = "NR-D001"
+    user_action = (
+        "The operator's policy refused this specific call. Adjust the call "
+        "(different tool, different arguments) or ask them to widen the "
+        "policy — no other call is affected by this refusal."
+    )
+    retryable = False
+
+    def __init__(
+        self,
+        *args: Any,
+        agent_message: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        self.agent_message = agent_message
+        super().__init__(*args, **kwargs)
+
+    def model_safe_text(self) -> str | None:
+        """The server's model-safe text, or ``None`` if it sent none.
+
+        The single accessor, so a host cannot reach for
+        ``str(exc)`` — which mixes in the endpoint, the HTTP status
+        and the error code, none of which are model-safe — and get
+        operator internals into the model's context by accident.
+        """
+        return self.agent_message
+
+
 class NullRunBudgetError(NullRunBlockedException):
     """Budget exhausted — every cost-bearing call will be rejected.
 

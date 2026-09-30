@@ -181,6 +181,7 @@ def init(
     api_url: str | None = None,
     debug: bool = False,
     fail_on_exit: bool = False,
+    on_denied: str = "raise",
 ):
     """
     Initialize the NullRun SDK. Call once at application startup.
@@ -207,6 +208,19 @@ def init(
             clean exit on missing ``NULLRUN_API_KEY``; library
             embedders (FastAPI startup, Jupyter) should leave it
             False and catch the exception instead.
+        on_denied: ``"raise"`` (default) or ``"message"``. ADR-062
+            §2.2. When the gate refuses a call with
+            ``category="denied"`` — an operator rejected THIS call,
+            and a different one might pass — ``"message"`` raises
+            ``NullRunDeniedError``, whose ``agent_message`` is
+            text the backend guarantees is safe to show the model.
+
+            The flag acts on ``denied`` and nothing else. A
+            ``budget`` / ``halt`` / ``infra`` refusal raises its own
+            typed exception either way, and a refusal the SDK cannot
+            classify at all raises
+            ``NullRunUnclassifiedRefusalError`` rather than being
+            guessed into one of them.
 
     Note: the background control-plane listener (WebSocket + HTTP poll) is
     always started on `init `. To disable it, construct `NullRunRuntime`
@@ -336,6 +350,7 @@ def init(
             api_key=api_key,
             api_url=api_url,
             debug=debug,
+            on_denied=on_denied,
         )
         registry.set(runtime)
 

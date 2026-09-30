@@ -96,7 +96,10 @@ from nullrun.audit import (  # ADR-009 P1 — governance audit surface
     AuditQuery,
     AuditVerifyResult,
 )
-from nullrun.breaker.categories import NullRunUnclassifiedRefusalError
+from nullrun.breaker.categories import (
+    DecisionCategory,
+    NullRunUnclassifiedRefusalError,
+)
 from nullrun.breaker.exceptions import (
     NullRunApprovalDeniedError,
     NullRunApprovalExpiredError,
@@ -106,6 +109,7 @@ from nullrun.breaker.exceptions import (
     NullRunBackendError,
     NullRunBlockedException,
     NullRunBudgetError,
+    NullRunDeniedError,
     NullRunError,
     NullRunInfrastructureError,
     NullRunTransportError,
@@ -558,6 +562,12 @@ class AuditProxy:
 # before.
 from nullrun._singleton import _NullRunRuntimeMeta
 
+#: The two accepted ``on_denied`` values. A frozenset rather than a
+#: literal ``in`` chain so the constructor's error message and any
+#: future call site cannot drift apart on the vocabulary.
+_ON_DENIED_VALUES = frozenset({"raise", "message"})
+
+
 class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
     """
     Central runtime for NullRun SDK.
@@ -612,6 +622,8 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # Tune the httpx read timeout for slow-network scenarios.
         # Precedence: kwarg > NULLRUN_REQUEST_TIMEOUT env var > 30.0.
         request_timeout: float | None = None,
+        # ADR-062 §2.2. "raise" (default) | "message".
+        on_denied: str = "raise",
     ):
         """
         Initialize NullRun Runtime.
@@ -627,6 +639,26 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                      control-plane listener (WS or HTTP poll). Defaults True
                      in production. Set False when the test environment
                      cannot tolerate a background thread opening sockets.
+            on_denied: What to do with a ``category="denied"`` refusal.
+                     ``"raise"`` (default) keeps current behaviour — the
+                     code-specific exception propagates and the host
+                     decides what to show. ``"message"`` raises
+                     ``NullRunDeniedError``, whose ``agent_message`` is
+                     server-authored text the backend guarantees is safe
+                     to place in the model's context.
+
+                     This flag acts on ``denied`` and on NOTHING else.
+                     A ``budget`` / ``halt`` / ``infra`` refusal raises
+                     its own typed exception whatever this is set to:
+                     a model told "your budget is exhausted" tool-shops
+                     and retries, a model told about a pause tries to
+                     route around a stop an operator deliberately
+                     placed, and a backend fault is not the model's
+                     problem to solve at all. An unclassifiable refusal
+                     (absent or unrecognised ``category``) raises
+                     ``NullRunUnclassifiedRefusalError`` under both
+                     values.
+
         Note:
             - `organization_id` is set from `_authenticate ` after init; it is
               NOT a public init parameter and not read from env.
@@ -638,6 +670,10 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             - `timeout`/`max_retries` are fixed at 30s / 3 (no public override).
 
         Raises:
+            ValueError: if ``on_denied`` is neither ``"raise"`` nor
+                ``"message"``. Rejected at construction rather than
+                silently treated as ``"raise"``, so a typo cannot
+                quietly disable the message path a host asked for.
             NullRunAuthenticationError: if neither `api_key` nor
                 `NULLRUN_API_KEY` is set. The public `init ` surface
                 performs the same check first and produces a clearer
@@ -654,6 +690,17 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         self.api_key = raw_key.strip() if isinstance(raw_key, str) else None
         self.secret_key = secret_key or os.getenv("NULLRUN_SECRET_KEY")
         self.api_url = api_url or os.getenv("NULLRUN_API_URL", "https://api.nullrun.io")
+
+        if on_denied not in _ON_DENIED_VALUES:
+            raise ValueError(
+                f"on_denied must be one of {sorted(_ON_DENIED_VALUES)!r}, got {on_denied!r}. "
+                "It selects the shape of a category='denied' refusal only — a budget / "
+                "halt / infra refusal raises its own exception either way."
+            )
+        #: See the ``on_denied`` argument. Read only at the block
+        #: site in ``check_workflow_budget``, and only reached for
+        #: ``DecisionCategory.DENIED``.
+        self.on_denied = on_denied
 
         # api_key is required — there is no fallback.
         if not self.api_key:
@@ -2405,6 +2452,28 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             reasons = response.get("explanations") or (
                 [response["explanation"]] if response.get("explanation") else ["block"]
             )
+            # ADR-062 §2.2. ``Transport.check`` resolved the category
+            # at the wire boundary and already raised if it could
+            # not, so by the time a block reaches here ``category``
+            # is either a real ``DecisionCategory`` or ``None`` for a
+            # 4xx that was never a gate refusal (a protocol
+            # mismatch, say — those keep the pre-existing handling).
+            #
+            # ``on_denied`` is consulted HERE and only here, behind
+            # ``category is DENIED``. That single guard is the whole
+            # safety property: no arrangement of the flag turns a
+            # budget, halt, or infra refusal into a message a model
+            # can read and act on.
+            category = response.get("category")
+            if category is DecisionCategory.DENIED and self.on_denied == "message":
+                raise NullRunDeniedError(
+                    workflow_id=workflow_id,
+                    reason="; ".join(reasons),
+                    action="block",
+                    decision_source=response.get("decision_source"),
+                    reasons="; ".join(reasons),
+                    agent_message=response.get("agent_message"),
+                )
             # Bump ``cost_limit_exceeded`` when the pre-flight
             # blocks the workflow. The counter is the operator's
             # primary signal for "the budget cap is biting" --
