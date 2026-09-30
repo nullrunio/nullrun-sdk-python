@@ -2107,7 +2107,37 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 except Exception:  # noqa: BLE001
                     pass
                 return
-            logger.debug("check_workflow_budget: skipped via NULLRUN_SKIP_BUDGET_CHECK=1")
+            # Non-production. Pre-fix this was `logger.debug`, which
+            # means a test suite running the whole budget path with
+            # the bypass on leaves no trace anywhere: the tests go
+            # green, the dashboard shows the org as spending nothing,
+            # and the only evidence the gate was never consulted is
+            # the absence of a block. CLAUDE.md's rule is explicit
+            # that a test which only passes with this flag set is
+            # evidence of a broken gate -- so the flag setting must be
+            # loud enough to find.
+            # Non-production. Pre-fix this was `logger.debug`, which
+            # means a test suite running the whole budget path with
+            # the bypass on leaves no trace anywhere: the tests go
+            # green, the dashboard shows the org as spending nothing,
+            # and the only evidence the gate was never consulted is
+            # the absence of a block. CLAUDE.md's rule is explicit
+            # that a test which only passes with this flag set is
+            # evidence of a broken gate -- so the flag setting must be
+            # loud enough to find.
+            logger.warning(
+                "check_workflow_budget: budget gate BYPASSED via "
+                "NULLRUN_SKIP_BUDGET_CHECK=1 (non-production api_url=%r). "
+                "No budget check, no rate-limit check, and no tool-block "
+                "check ran for this call -- a test passing in this state "
+                "proves nothing about enforcement. Unset the var unless "
+                "you are deliberately exercising a non-budget path.",
+                self.api_url,
+            )
+            try:
+                metrics.inc_runtime("skip_budget_used_non_prod")
+            except Exception:  # noqa: BLE001 — metrics never gate
+                pass
             return
 
         # Bump the ``check_calls`` counter so the dashboard can show

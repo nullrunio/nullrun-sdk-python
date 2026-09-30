@@ -29,12 +29,8 @@ import respx
 
 BASE_URL = "https://api.test.nullrun.io"
 EXECUTE_URL = f"{BASE_URL}/api/v1/execute"
-PROD_URL = "https://api.nullrun.io"
-# A non-prod-looking host that is NOT one of the hosts
-# `_is_production_environment` treats as a dev/staging escape hatch
-# (localhost / 127.0.0.1 / staging / test), so `NULLRUN_ENV=production`
-# is the only thing marking it production.
-CUSTOM_URL = "https://nullrun.internal.example.com"
+from tests.conftest import CUSTOM_NONPROD_URL as CUSTOM_URL  # noqa: E402
+from tests.conftest import PROD_URL  # noqa: E402
 
 _FLAG = "NULLRUN_SENSITIVE_FAIL_OPEN"
 _ACK = "NULLRUN_ALLOW_SENSITIVE_FAIL_OPEN"
@@ -50,90 +46,46 @@ def _clean_flag_env(monkeypatch):
     monkeypatch.delenv("NULLRUN_API_URL", raising=False)
 
 
-@pytest.fixture
-def mock_prod_api(mock_api):
-    """Mirror the conftest auth route onto the non-test hosts used here.
-
-    `mock_api` only mocks `BASE_URL`, so a runtime built with any other
-    `api_url` authenticates against an unmocked host and respx fails the
-    test before the guard is ever consulted. Depends on `mock_api` so
-    it registers inside that fixture's `with respx.mock:` context
-    rather than opening a second one.
-
-    Deliberately registers `/execute` for NO host: each test below
-    needs `/execute` to fail, and a permissive default here would
-    shadow the failure they are asserting on.
-    """
-    def _verify(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={
-                "organization_id": "ws-test",
-                "workflow_id": "00000000-0000-0000-0000-000000000001",
-                "plan": "pro",
-                "features": [],
-                "limits": {"max_cost_cents": 10000},
-                "secret_key": "test-secret-deterministic",
-            },
-        )
-
-    respx.post(f"{PROD_URL}/api/v1/auth/verify").mock(side_effect=_verify)
-    respx.post(f"{CUSTOM_URL}/api/v1/auth/verify").mock(side_effect=_verify)
-    return mock_api
-
-
 class TestProductionGuard:
     """The flag alone must not open the gate against production."""
 
-    def test_flag_ignored_in_prod_without_ack(self, make_runtime, mock_prod_api):
+    def test_flag_ignored_in_prod_without_ack(self, make_runtime, mock_prod_api, monkeypatch):
         monkey_api = make_runtime(api_url=PROD_URL)
-        import os
-
-        os.environ[_FLAG] = "1"
+        monkeypatch.setenv(_FLAG, "1")
         assert monkey_api.sensitive_fail_open_enabled() is False
 
-    def test_flag_honoured_in_prod_with_ack(self, make_runtime, mock_prod_api):
+    def test_flag_honoured_in_prod_with_ack(self, make_runtime, mock_prod_api, monkeypatch):
         rt = make_runtime(api_url=PROD_URL)
-        import os
-
-        os.environ[_FLAG] = "1"
-        os.environ[_ACK] = "1"
+        monkeypatch.setenv(_FLAG, "1")
+        monkeypatch.setenv(_ACK, "1")
         assert rt.sensitive_fail_open_enabled() is True
 
-    def test_ack_alone_does_nothing(self, make_runtime, mock_prod_api):
+    def test_ack_alone_does_nothing(self, make_runtime, mock_prod_api, monkeypatch):
         """The ack is a second signature, not a substitute."""
         rt = make_runtime(api_url=PROD_URL)
-        import os
-
-        os.environ[_ACK] = "1"
+        monkeypatch.setenv(_ACK, "1")
         assert rt.sensitive_fail_open_enabled() is False
 
-    def test_flag_ignored_when_nullrun_env_is_production(self, make_runtime, mock_prod_api):
+    def test_flag_ignored_when_nullrun_env_is_production(self, make_runtime, mock_prod_api, monkeypatch):
         """`NULLRUN_ENV=production` marks prod even on a custom host."""
         rt = make_runtime(api_url=CUSTOM_URL)
-        import os
-
-        os.environ["NULLRUN_ENV"] = "production"
-        os.environ[_FLAG] = "1"
+        monkeypatch.setenv("NULLRUN_ENV", "production")
+        monkeypatch.setenv(_FLAG, "1")
         assert rt.sensitive_fail_open_enabled() is False
 
-    def test_flag_honoured_outside_prod(self, make_runtime):
+    def test_flag_honoured_outside_prod(self, make_runtime, monkeypatch):
         """The documented dev / test use keeps working."""
         rt = make_runtime(api_url=BASE_URL)
-        import os
-
-        os.environ[_FLAG] = "1"
+        monkeypatch.setenv(_FLAG, "1")
         assert rt.sensitive_fail_open_enabled() is True
 
-    def test_absent_flag_is_false(self, make_runtime):
+    def test_absent_flag_is_false(self, make_runtime, monkeypatch):
         assert make_runtime(api_url=BASE_URL).sensitive_fail_open_enabled() is False
 
-    def test_blank_flag_is_false(self, make_runtime):
+    def test_blank_flag_is_false(self, make_runtime, monkeypatch):
         """Whitespace is not a yes. The `.strip()` matters."""
         rt = make_runtime(api_url=BASE_URL)
-        import os
-
-        os.environ[_FLAG] = "  "
+        monkeypatch.setenv(_FLAG, "  ")
         assert rt.sensitive_fail_open_enabled() is False
 
 
@@ -145,15 +97,13 @@ class TestEndToEndAgainstProductionUrl:
     helper can be right while the caller still reads the raw env var.
     """
 
-    def test_sensitive_body_does_not_run_in_prod(self, make_runtime, mock_prod_api):
+    def test_sensitive_body_does_not_run_in_prod(self, make_runtime, mock_prod_api, monkeypatch):
         """With /execute unreachable, the body must NOT run in prod
         even though the operator set the flag."""
         from nullrun.decorators import protect
 
         rt = make_runtime(api_url=PROD_URL)
-        import os
-
-        os.environ[_FLAG] = "1"
+        monkeypatch.setenv(_FLAG, "1")
 
         respx.post(f"{PROD_URL}/api/v1/execute").mock(
             side_effect=httpx.ConnectError("connection refused")
@@ -174,15 +124,13 @@ class TestEndToEndAgainstProductionUrl:
             "with NULLRUN_SENSITIVE_FAIL_OPEN=1 set against production"
         )
 
-    def test_sensitive_body_runs_in_dev_with_flag(self, make_runtime, mock_api):
+    def test_sensitive_body_runs_in_dev_with_flag(self, make_runtime, mock_api, monkeypatch):
         """The documented bypass still works off production."""
         from nullrun.breaker.exceptions import NullRunBlockedException
         from nullrun.decorators import protect
 
         rt = make_runtime(api_url=BASE_URL)
-        import os
-
-        os.environ[_FLAG] = "1"
+        monkeypatch.setenv(_FLAG, "1")
 
         respx.post(EXECUTE_URL).mock(
             side_effect=httpx.ConnectError("connection refused")
