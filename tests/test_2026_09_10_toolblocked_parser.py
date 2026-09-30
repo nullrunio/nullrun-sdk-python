@@ -195,15 +195,32 @@ class TestDefNrToolblockedParserSourcePin:
         )
 
     def test_branch_comment_tag_present(self):
-        """The fix introduced a long comment naming
+        """The fix introduced a comment naming
         DEF-NR-TOOLBLOCKED-PARSER. Pin so a future maintainer who
         deletes the comment is forced to read the code's
-        history."""
+        history.
+
+        The tag must live in ``_parse_v3_error_envelope``, the
+        function that holds the branch. It used to sit in
+        ``Transport.check``, which never had a parser branch at all —
+        so the comment named a fix the reader could not find. The
+        pin now asserts the tag is attached to the right function,
+        which is the property that was actually broken.
+        """
         src = _read(TRANSPORT_PY)
         assert "DEF-NR-TOOLBLOCKED-PARSER" in src, (
             "DEF-NR-TOOLBLOCKED-PARSER: the explainer comment "
             "block must name the fix tag so future readers can "
             "grep for it."
+        )
+        body = src.split("def _parse_v3_error_envelope(")[1]
+        head = body[: body.find('"""', body.find('"""') + 3)]
+        assert "DEF-NR-TOOLBLOCKED-PARSER" in head, (
+            "DEF-NR-TOOLBLOCKED-PARSER: the tag must be documented on "
+            "_parse_v3_error_envelope, which is where the dedicated "
+            "NullRunToolBlockedError branch actually lives. Filing it "
+            "against Transport.check pointed readers at a branch that "
+            "was never there."
         )
 
     def test_branch_uses_correct_constructor_signature(self):

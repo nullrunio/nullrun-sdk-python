@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, cast
 import httpx
 
 from nullrun.actions import handle_action
+from nullrun.breaker.categories import is_gate_refusal, resolve_refusal_category
 from nullrun.breaker.circuit_breaker import CircuitBreaker
 from nullrun.breaker.exceptions import (
     BreakerTransportError,
@@ -1624,15 +1625,54 @@ class Transport:
             # ``details`` are preserved so the catalogue formatter
             # can produce an actionable message.
             #
-            # DEF-NR-TOOLBLOCKED-PARSER: the dedicated parser
-            # branch below translates the typed v3 envelope into a
-            # `NullRunToolBlockedError` (catalog code NR-T001)
-            # instead of the generic NR-X001 fallback.
-            if 400 <= response.status_code < 500:
-                try:
-                    wire_body = response.json()
-                except Exception:
-                    wire_body = {}
+            # A gate refusal is a refusal whatever the status.
+            # ADR-063 §4.7 (product decision: option 2) — the
+            # backend's 503s split into two groups and the split is
+            # what the category records:
+            #
+            #   * "the answer is not available right now"
+            #     (BUDGET_DATA_UNAVAILABLE, is_fail_closed=false)
+            #   * "the CHECK could not be performed"
+            #     (CIRCUIT_BREAKER_STATE_LOOKUP_FAILED,
+            #      WORKFLOW_INACTIVE_LOOKUP_FAILED,
+            #      RATE_LIMIT_PLAN_LOOKUP_FAILED, is_fail_closed=true)
+            #
+            # Both arrive as 503 with decision="block", and the gate
+            # already refuses either way (fail-CLOSED, CLAUDE.md §4).
+            # Pre-fix the entire 5xx band fell through to the
+            # synthetic FALLBACK block below, which the runtime
+            # reads as a transport error and fails OPEN — so a
+            # fail-CLOSED 503 refusal was silently converted into
+            # "allowed". That is DEF-MP-TS12-ENF-01's exact shape
+            # with a different trigger, and it is why a 5xx body
+            # that is a genuine refusal is handled here instead.
+            #
+            # Old SDKs are unaffected by definition: they never
+            # looked at `category`, and they read the 503 as a
+            # transport error. They keep failing open, which is the
+            # documented pre-0.19.0 behaviour.
+            try:
+                wire_body = response.json()
+            except Exception:
+                wire_body = {}
+            # ADR-062 §2.2. Classify the refusal BEFORE building
+            # the synthetic response dict, and let an
+            # unclassifiable one escape as
+            # ``NullRunUnclassifiedRefusalError`` rather than
+            # being flattened into the generic block below.
+            #
+            # The dict this branch returns hardcodes
+            # ``decision="block"`` for every 4xx, including ones
+            # that were never gate refusals (a 400 protocol
+            # mismatch has no ``decision`` field at all).
+            # ``resolve_refusal_category`` discriminates on the
+            # WIRE body, not on the status, so those return
+            # ``None`` and keep their pre-existing handling.
+            is_refusal = is_gate_refusal(wire_body)
+            if 400 <= response.status_code < 500 or (
+                response.status_code >= 500 and is_refusal
+            ):
+                category = resolve_refusal_category(wire_body)
                 explanations = wire_body.get("explanations") or []
                 if not explanations:
                     single = (
@@ -1648,6 +1688,19 @@ class Transport:
                     "decision_source": DecisionSource.GATEWAY,
                     "explanation": explanations[0],
                     "explanations": explanations,
+                    # ADR-062 §2.2 — ``None`` for a 4xx that was
+                    # never a gate refusal, a real
+                    # ``DecisionCategory`` for one that was. Carried
+                    # rather than re-derived so the runtime's raise
+                    # site branches on the server's own classification
+                    # instead of inferring one from the status code.
+                    "category": category,
+                    # Server-authored text. ``agent_message`` is
+                    # populated by the backend only for ``denied``;
+                    # its absence on the other three is the server
+                    # stating "this is not the model's to read".
+                    "agent_message": wire_body.get("agent_message"),
+                    "user_message": wire_body.get("user_message"),
                     "reservation_id": wire_body.get("reservation_id"),
                     "remaining_budget_cents": wire_body.get("remaining_budget_cents") or 0,
                     "projected_cost_cents": wire_body.get("projected_cost_cents") or 0,
@@ -2707,6 +2760,14 @@ def _parse_v3_error_envelope(
 
     Mapping table lives at ``_V3_ERROR_CODE_MAP`` below — keep the
     helper as a thin dispatcher.
+
+    DEF-NR-TOOLBLOCKED-PARSER: the ``catalog is
+    NullRunToolBlockedError or catalog is NullRunBlockedException``
+    arm further down is the dedicated branch for the typed v3
+    envelope. It used to be documented by a comment inside
+    ``Transport.check``, which never had such a branch — the tag was
+    filed against the wrong function for as long as it existed.
+    Re-filed here, on the function that actually holds the code.
     """
     # Lazy imports: the exception classes import the transport
     # types (TransportErrorSource), so a top-level import here

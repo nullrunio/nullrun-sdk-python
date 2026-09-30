@@ -104,6 +104,13 @@ class TestAuthFailClosed:
                     "decision_source": "gateway",
                     "explanation": "BUDGET_WORKFLOW_BLOCKED",
                     "error_code": "BUDGET_WORKFLOW_BLOCKED",
+                    # ADR-062 §2.2 — a real refusal always carries a
+                    # category; the backend classifies this one
+                    # ``budget``. Omitting it made the SDK raise
+                    # NullRunUnclassifiedRefusalError instead of
+                    # reaching the budget arm this test pins.
+                    "category": "budget",
+                    "user_message": "raise the workflow budget",
                     "details": {"max_budget_cents": 100},
                 },
             )

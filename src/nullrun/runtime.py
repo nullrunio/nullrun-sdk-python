@@ -96,6 +96,7 @@ from nullrun.audit import (  # ADR-009 P1 — governance audit surface
     AuditQuery,
     AuditVerifyResult,
 )
+from nullrun.breaker.categories import NullRunUnclassifiedRefusalError
 from nullrun.breaker.exceptions import (
     NullRunApprovalDeniedError,
     NullRunApprovalExpiredError,
@@ -557,7 +558,6 @@ class AuditProxy:
 # before.
 from nullrun._singleton import _NullRunRuntimeMeta
 
-
 class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
     """
     Central runtime for NullRun SDK.
@@ -627,7 +627,6 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                      control-plane listener (WS or HTTP poll). Defaults True
                      in production. Set False when the test environment
                      cannot tolerate a background thread opening sockets.
-
         Note:
             - `organization_id` is set from `_authenticate ` after init; it is
               NOT a public init parameter and not read from env.
@@ -2321,6 +2320,15 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                     # refused. Classification is by TYPE here, never by
                     # inspecting the message.
                     raise
+                except NullRunUnclassifiedRefusalError:
+                    # ADR-062 §2.2. The gate DID answer — it refused —
+                    # and the SDK cannot tell a policy decision from a
+                    # backend fault. That is not "gate unavailable":
+                    # failing OPEN here would read an unclassifiable
+                    # refusal as "allowed", which is the exact hole the
+                    # category work closes. Must precede the arm below
+                    # (a `NullRunError` superset).
+                    raise
                 except (httpx.HTTPError, NullRunError) as exc:
                     # Narrow catch: fail-OPEN only on transport +
                     # classified SDK errors. Internal bugs
@@ -2359,6 +2367,13 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 # broad `except Exception` below, which is a superset
                 # of this arm.
                 self._raise_malformed_gate_response(exc)
+            except NullRunUnclassifiedRefusalError:
+                # ADR-062 §2.2 — same rationale as the cached branch.
+                # This is a refusal the SDK cannot classify, not an
+                # unreachable gate, so it must not fail open. It is
+                # listed explicitly because the arm below is a bare
+                # ``except Exception``.
+                raise
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"check_workflow_budget: /gate unavailable, failing open: {exc}")
                 metrics.inc_runtime("gate_fail_open_total")
