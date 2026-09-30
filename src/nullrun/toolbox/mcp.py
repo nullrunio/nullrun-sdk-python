@@ -234,7 +234,8 @@ class MCPAdapter:
         """
         if self._runtime is not None:
             return self._runtime
-        from nullrun.runtime import NullRunRuntime, get_active_runtime
+        from nullrun._registry import get_active_runtime
+        from nullrun.runtime import NullRunRuntime
 
         active = get_active_runtime()
         if active is not None:
