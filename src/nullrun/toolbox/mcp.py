@@ -145,7 +145,11 @@ class MCPAdapter:
         adapter = MCPAdapter(server_name="github", mcp_client=conn)
 
         # Now every `adapter.call_tool` stamps the gate with
-        # the canonical class + the cached annotations.
+        # the canonical class + the cached annotations AND is
+        # gated by /api/v1/execute before the MCP server is
+        # called. The runtime is resolved from the global
+        # registry (or NULLRUN_API_KEY) on the same terms
+        # `@protect` resolves it — pass `runtime=` to override.
         result = adapter.call_tool("create_issue", {"repo": "acme/api"})
     """
 
@@ -162,20 +166,27 @@ class MCPAdapter:
         # calls just like they do to local functions decorated with
         # ``@protect``.
         #
-        # When ``runtime`` is None the adapter falls back to the legacy
-        # contextvar-only path (``set_mcp_tool_context``) so callers
-        # who already wrap their agentic loop in ``@protect`` continue
-        # to work — but those callers MUST verify that their
-        # ``@protect``-decorated wrapper actually invokes
-        # ``check_workflow_budget`` BEFORE the MCP call returns,
-        # otherwise the gate is a post-hoc advisory only.
+        # When ``runtime`` is None the adapter resolves the global
+        # runtime itself, on the same terms ``@protect`` does
+        # (``get_active_runtime()`` then ``NullRunRuntime.get_instance()``).
+        # B2 (2026-09-30 / ADR-061) removed the previous behaviour,
+        # which was: ``runtime=None`` meant "no /execute round-trip at
+        # all". The MCP call went straight through and the only thing
+        # the operator got was a contextvar that a *later* ``@protect``
+        # wrapper might or might not read — a post-hoc annotation, not
+        # enforcement, and the module's own documented example
+        # (``MCPAdapter(server_name=..., mcp_client=conn)``) took
+        # exactly that ungated path.
         #
-        # Why the runtime is opt-in rather than auto-discovered:
-        # ``MCPAdapter`` is intentionally decoupled from the runtime
-        # singleton so it stays importable in test fixtures and
-        # documentation snippets without forcing ``nullrun.init()``.
-        # The audit-grade fix is to give callers a one-line way to
-        # wire enforcement without breaking the toolbox-only pattern.
+        # Resolution is lazy (at ``call_tool``, not at construction)
+        # so the adapter stays importable and constructible in test
+        # fixtures and documentation snippets without forcing
+        # ``nullrun.init()`` — that was the original reason for the
+        # decoupling, and it is preserved. A configuration error at
+        # call time (no API key) propagates loudly rather than
+        # degrading to an ungated call, matching ``@protect``'s
+        # fail-loud invariant: a missing API key is a hard error, not
+        # a silent allow-all.
         runtime: Any | None = None,
     ) -> None:
         if not server_name:
@@ -203,10 +214,35 @@ class MCPAdapter:
         # every ``call_tool``. When provided, ``call_tool`` blocks on
         # ``runtime.execute(...)`` returning decision="block" so a
         # permissive MCP server cannot bypass the operator's
-        # tool-block / budget / approval policies. See the constructor
-        # docstring for the trade-off between the gate path and the
-        # contextvar-only path.
+        # tool-block / budget / approval policies. When None, the
+        # global runtime is resolved lazily at ``call_tool`` time —
+        # see the constructor docstring.
         self._runtime = runtime
+
+    def _resolve_runtime(self) -> Any:
+        """The runtime this adapter gates through.
+
+        B2 (2026-09-30): the explicit ``runtime=`` wins; otherwise the
+        global runtime is resolved on the same terms ``@protect``
+        resolves it. Never returns None — there is no ungated path.
+
+        ``@protect``'s own resolver is not imported: it also triggers
+        ``auto_instrument()``, which is the decorator's job and would
+        be a surprising side effect for a caller who handed us an MCP
+        client. The two lines of resolution order are what matter, and
+        they are pinned by a test.
+        """
+        if self._runtime is not None:
+            return self._runtime
+        from nullrun._registry import get_active_runtime
+        from nullrun.runtime import NullRunRuntime
+
+        active = get_active_runtime()
+        if active is not None:
+            return active
+        # Propagates NullRunAuthenticationError when NULLRUN_API_KEY is
+        # unset. Deliberate — see the constructor docstring.
+        return NullRunRuntime.get_instance()
 
     def _default_list_tools(self) -> Iterable[Any]:
         tools = self._mcp_client.list_tools()
@@ -299,10 +335,11 @@ class MCPAdapter:
         client-specific kwargs without changing the public
         surface.
 
-        Gate enforcement: when an MCPAdapter is constructed with
-        ``runtime=`` set, ``call_tool`` routes the invocation through
-        ``runtime.execute(...)`` (the /api/v1/execute gate endpoint)
-        BEFORE the underlying MCP client is called.
+        Gate enforcement: ``call_tool`` ALWAYS routes the invocation
+        through ``runtime.execute(...)`` (the /api/v1/execute gate
+        endpoint) BEFORE the underlying MCP client is called. The
+        runtime is the one passed to the constructor, or the global
+        runtime resolved on the same terms ``@protect`` resolves it.
         ``decision="block"`` raises ``NullRunBlockedException`` and the
         MCP client is NOT called. ``decision="allow"`` proceeds to the
         MCP client. ``decision="require_approval"`` raises
@@ -310,10 +347,11 @@ class MCPAdapter:
         caller can route the user through the approval flow and retry
         with ``approval_id=``.
 
-        When ``runtime`` is None, ``call_tool`` falls through to the
-        contextvar-only path — the call proceeds without any
-        /api/v1/execute round-trip and the next ``@protect``-decorated
-        wrapper picks up the contextvar on its next ``/check`` request.
+        B2 (2026-09-30): there is no ungated path. ``runtime=None``
+        used to mean "skip the round-trip entirely"; it now means
+        "resolve the global runtime". A configuration error at this
+        point (no API key) propagates rather than degrading to an
+        ungated call.
 
         Returns the underlying client's result (when allowed).
         Raises ``NullRunBlockedException`` on gate block; raises the
@@ -366,61 +404,62 @@ class MCPAdapter:
         # unless an ``approval_id`` is supplied) — both short-circuit
         # to the call site without touching ``self._mcp_client``.
         #
-        # who relied on the contextvar-only path continue to work.
-        # New integrations should pass ``runtime=`` so the
-        # tool-block / budget / approval policies actually apply.
-        if self._runtime is not None:
-            execute_input = arguments if arguments is not None else {}
-            # Every MCP tool call routed through the runtime contacts
-            # /api/v1/execute unconditionally — there is no
-            # ``mode=`` opt-out for audit bypass.
-            execute_result = self._runtime.execute(
+        # B2 (2026-09-30): this is no longer conditional. The previous
+        # ``if self._runtime is not None:`` meant a default-constructed
+        # adapter — including the one in this module's own docstring —
+        # called the MCP server with no gate at all.
+        runtime = self._resolve_runtime()
+        execute_input = arguments if arguments is not None else {}
+        # Every MCP tool call routed through the runtime contacts
+        # /api/v1/execute unconditionally — there is no
+        # ``mode=`` opt-out for audit bypass.
+        execute_result = runtime.execute(
+            tool_name=tool_name,
+            input_data=execute_input,
+        )
+        decision = execute_result.get("decision")
+        if decision == "block":
+            # ``NullRunBlockedException`` is raised by
+            # ``runtime.execute`` internally; this guard is for
+            # defense-in-depth in case the runtime returns a
+            # synthetic block (e.g. PERMISSIVE fallback in
+            # tests) and the exception path was bypassed.
+            from nullrun.breaker.exceptions import NullRunBlockedException
+
+            raise NullRunBlockedException(
+                workflow_id=execute_result.get("workflow_id") or "unknown",
+                reason=execute_result.get(
+                    "explanation",
+                    "MCP gate blocked call",
+                ),
                 tool_name=tool_name,
-                input_data=execute_input,
+                error_code="NR-T003",
+                user_action=(
+                    f"MCPAdapter.call_tool({tool_name!r}) was blocked "
+                    "by the NullRun gate. The MCP client was NOT "
+                    "invoked. Inspect the operator's tool-block / "
+                    "budget / approval policy to allow this call."
+                ),
             )
-            decision = execute_result.get("decision")
-            if decision == "block":
-                # ``NullRunBlockedException`` is raised by
-                # ``runtime.execute`` internally; this guard is for
-                # defense-in-depth in case the runtime returns a
-                # synthetic block (e.g. PERMISSIVE fallback in
-                # tests) and the exception path was bypassed.
-                from nullrun.breaker.exceptions import NullRunBlockedException
+        if decision == "require_approval":
+            from nullrun.breaker.exceptions import NullRunBlockedException
 
-                raise NullRunBlockedException(
-                    workflow_id=execute_result.get("workflow_id") or "unknown",
-                    reason=execute_result.get(
-                        "explanation",
-                        "MCP gate blocked call",
-                    ),
-                    tool_name=tool_name,
-                    error_code="NR-T003",
-                    user_action=(
-                        f"MCPAdapter.call_tool({tool_name!r}) was blocked "
-                        "by the NullRun gate. The MCP client was NOT "
-                        "invoked. Inspect the operator's tool-block / "
-                        "budget / approval policy to allow this call."
-                    ),
-                )
-            if decision == "require_approval":
-                from nullrun.breaker.exceptions import NullRunBlockedException
-
-                approval_id = execute_result.get("approval_id") or ""
-                raise NullRunBlockedException(
-                    workflow_id=execute_result.get("workflow_id") or "unknown",
-                    reason=execute_result.get(
-                        "explanation",
-                        "MCP gate requires operator approval",
-                    ),
-                    tool_name=tool_name,
-                    error_code="NR-A010" if not approval_id else "NR-A001",
-                    user_action=(
-                        f"MCPAdapter.call_tool({tool_name!r}) requires "
-                        "operator approval before the MCP client is "
-                        "invoked. Route the user through the approval "
-                        f"flow and retry with approval_id={approval_id!r}."
-                    ),
-                )
+            approval_id = execute_result.get("approval_id") or ""
+            raise NullRunBlockedException(
+                workflow_id=execute_result.get("workflow_id") or "unknown",
+                reason=execute_result.get(
+                    "explanation",
+                    "MCP gate requires operator approval",
+                ),
+                tool_name=tool_name,
+                error_code="NR-A010" if not approval_id else "NR-A001",
+                user_action=(
+                    f"MCPAdapter.call_tool({tool_name!r}) requires "
+                    "operator approval before the MCP client is "
+                    "invoked. Route the user through the approval "
+                    f"flow and retry with approval_id={approval_id!r}."
+                ),
+            )
 
         # Call through. We deliberately do NOT catch the
         # underlying client's exceptions — the SDK caller

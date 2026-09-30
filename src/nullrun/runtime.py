@@ -17,7 +17,7 @@ the authoritative table; deviations require an ADR amendment (Rule 5).
 
 | Gate | Transport-error behavior | Recovery behavior | Opt-out |
 |---|---|---|---|
-| `check_workflow_budget` | OPEN (skip check, log warning) | silent post-hoc correction in `/track` events via `cost_correction_applied=true` | `NULLRUN_SKIP_BUDGET_CHECK=1` -- **full billing bypass**, not just check bypass (see docstring WARNING) |
+| `check_workflow_budget` | OPEN (skip check, log warning) for TRANSPORT errors; **CLOSED for authentication errors** (401 raises `NullRunAuthError` — see below) | silent post-hoc correction in `/track` events via `cost_correction_applied=true` | `NULLRUN_SKIP_BUDGET_CHECK=1` -- **full billing bypass**, not just check bypass (see docstring WARNING) |
 | `check_control_plane` | OPEN (treat state as `Normal`) | deferred enforcement -- next WS-push or `/status` poll sees the true state | none |
 | `_enforce_sensitive_tool` (default `_fallback_mode=strict` since v3.53) | CLOSED -- transport returns `decision=block, decision_source=FALLBACK_*` | n/a | none for the strict path; `NULLRUN_SENSITIVE_FAIL_OPEN=1` opts into the legacy permissive override |
 | `_enforce_sensitive_tool` (`_fallback_mode=permissive`, opt-in) | CLOSED -- body MUST NOT run when `decision_source` is any `FALLBACK_*` | n/a (body did not run) | `NULLRUN_SENSITIVE_FAIL_OPEN=1` -- explicitly documented as "OPEN-when-engine-unavailable" |
@@ -42,6 +42,14 @@ fall-OPEN on a wire 4xx/5xx that names an enforcement failure.
 * **SDK-side transport failure** (network timeout, 5xx, breaker open)
   → fail-OPEN on the *check* path so a dead backend doesn't freeze
   the user's agent loop (this is what the README describes).
+* **Authentication failure (401)** → fail-CLOSED.
+  ``NullRunAuthError`` propagates. A 401 is a CREDENTIAL/CONFIG
+  failure, not a transient transport condition: no retry can fix a
+  revoked key, and there is no post-hoc correction path in ``/track``
+  that can retroactively authorise a call the backend refused. Failing
+  OPEN here means the agent proceeds on a request the backend never
+  approved. Added 2026-09-29 (DEF-MP-TS12-ENF-01) — this NARROWS the
+  fail-OPEN set, it does not widen enforcement.
 * **Backend-side budget-enforcement failure** (the /gate or /track
   handler actually returned a wire response, just one indicating a
   Redis outage or aggregate rate-limit Redis unavailable) → the
@@ -123,6 +131,7 @@ from nullrun.transport import (
     _emit_for_transport_error,
     _protocol_header_value,
     _safe_json,
+    is_fallback_decision_source,
 )
 from nullrun.uuid7 import uuid7_str
 
@@ -191,10 +200,6 @@ def _invalidate_gate_cache_for_chain(workflow_id: str | None, chain_id: str | No
     for k in keys_to_drop:
         _GATE_CACHE.pop(k, None)
     return len(keys_to_drop)
-
-# Tracks which runtime instances have already forced strict mode,
-# preventing re-initialization from regressing back to permissive.
-_STRICT_MODE_FORCED: set[str] = set()
 
 
 # Production-environment detection for security opt-out
@@ -272,28 +277,27 @@ def _is_production_environment(api_url: str | None = None) -> bool:
     return False
 
 
-def register_strict_mode_forced(tool_name: str) -> None:
-    """Mark ``tool_name`` as needing strict mode.
-
-    Called by ``@sensitive(impact=...)`` at decoration time. The
-    name stays in the module-level set until process exit; it
-    is intentionally not cleared by ``shutdown()`` so a
-    second-runtime reinit does not silently drop a tool out of
-    strict mode.
-    """
-    _STRICT_MODE_FORCED.add(tool_name)
-
-
-def is_strict_mode_forced(tool_name: str) -> bool:
-    """Return True if ``tool_name`` was decorated with ``@sensitive``.
-
-    Complements ``runtime.is_sensitive_tool(tool_name)`` which
-    reads the per-runtime registry. The two are OR'd in
-    ``runtime.execute`` so that a tool whose registration is
-    lost to runtime reinit still gets the strict /execute
-    round-trip it asked for.
-    """
-    return tool_name in _STRICT_MODE_FORCED
+# B1 (2026-09-30): `register_strict_mode_forced`, `is_strict_mode_forced`
+# and the module-level `_STRICT_MODE_FORCED` set are REMOVED.
+#
+# They existed for exactly one purpose: to force a tool through
+# /execute even when the caller had asked for `mode="inline"`. With
+# the inline bypass gone, every call is a round-trip unconditionally
+# and there is nothing left to force.
+#
+# The set was already orphaned before this change — its only
+# documented writer, a `@sensitive(impact=...)` decorator, no longer
+# exists in the SDK, so `register_strict_mode_forced` had zero
+# callers and `is_strict_mode_forced` was reachable only from the
+# inline branch. Left in place they would read as a live mechanism
+# and invite someone to wire them back up.
+#
+# NOT removed: the per-runtime sensitivity registry
+# (`add_sensitive_tool`, `register_sensitive_tools`,
+# `remove_sensitive_tool`, `is_sensitive_tool`,
+# `get_sensitive_tools`). That is a documented public surface, and
+# whether it should outlive the inline bypass is a separate
+# decision — flagged, not taken here.
 
 
 SERVER_MINTED_RESERVATION_MAX_AGE_SECONDS: float = 295.0
@@ -1808,6 +1812,28 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # there's no workflow to check, so we no-op.
         resolved = self._resolve_workflow_id(workflow_id or None)
         if not resolved:
+            # F5/F6 (2026-09-30): the no-op is correct — a never-bound
+            # API key has no control-plane state to poll — but it was
+            # completely silent, which makes a BROKEN binding
+            # indistinguishable from a working one. If the key's
+            # 1:1 workflow binding is lost (bad migration, restored
+            # backup, wrong key), the kill/pause gate stops running
+            # and the only symptom is an agent that ignores the
+            # dashboard.
+            #
+            # Counted, not raised: raising here would break the
+            # documented never-bound-key configuration. Debug-level
+            # logging, because for a legitimately unbound key this
+            # fires on every call.
+            logger.debug(
+                "check_control_plane: no workflow resolved "
+                "(contextvar and API-key binding both empty) — "
+                "kill/pause gate skipped for this call."
+            )
+            try:
+                metrics.inc_runtime("control_plane_no_workflow_total")
+            except Exception:  # noqa: BLE001 — metrics never gate
+                pass
             return
         workflow_id = resolved
 
@@ -1986,6 +2012,22 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # /gate intentionally keeps the wire minimal.
         workflow_id = self._resolve_workflow_id(get_workflow_id())
         if not workflow_id:
+            # F5/F6 (2026-09-30): counted rather than silent. See the
+            # matching note in `check_control_plane` — a lost key
+            # binding must not look like normal operation. `check_calls`
+            # above proves the pre-flight was ENTERED; this proves it
+            # was skipped for want of a workflow, which together are
+            # what an operator needs to tell "gate ran and allowed"
+            # from "gate never ran".
+            logger.debug(
+                "check_workflow_budget: no workflow resolved "
+                "(contextvar and API-key binding both empty) — "
+                "budget pre-flight skipped for this call."
+            )
+            try:
+                metrics.inc_runtime("budget_preflight_no_workflow_total")
+            except Exception:  # noqa: BLE001 — metrics never gate
+                pass
             return
 
         # Use the real model name from the call context if the user set
@@ -2077,6 +2119,20 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 # Cache miss or expired — go to the server, then store.
                 try:
                     response = self._transport.check(check_req)
+                except NullRunAuthenticationError:
+                    # DEF-MP-TS12-ENF-01 (RUN_ID 20260929T1338, 2026-09-29):
+                    # a 401 is a CREDENTIAL failure, not a transport
+                    # failure, and must NOT be read as "allowed".
+                    #
+                    # `_retry_with_backoff` raises `NullRunAuthError` (a
+                    # `NullRunAuthenticationError`) on any 401 and
+                    # re-raises it WITHOUT retrying. Pre-fix the
+                    # `except` clauses below swallowed it and returned
+                    # None, which the caller reads as "no block" — the
+                    # agent proceeded on a request the backend had
+                    # refused. Classification is by TYPE here, never by
+                    # inspecting the message.
+                    raise
                 except (httpx.HTTPError, NullRunError) as exc:
                     # Narrow catch: fail-OPEN only on transport +
                     # classified SDK errors. Internal bugs
@@ -2090,6 +2146,11 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         else:
             try:
                 response = self._transport.check(check_req)
+            except NullRunAuthenticationError:
+                # Same rationale as the cached branch above. Ordering
+                # matters: this arm precedes the broad `except
+                # Exception`, which is a superset.
+                raise
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"check_workflow_budget: /gate unavailable, failing open: {exc}")
                 metrics.inc_runtime("gate_fail_open_total")
@@ -2099,16 +2160,18 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
 
         decision = response.get("decision", "allow")
         decision_source = response.get("decision_source", DecisionSource.GATEWAY)
-        # Only fail-OPEN on EXPLICIT synthetic responses
-        # (decision_source starts with "fallback" or is one of the
-        # classified TransportErrorSource values). Real backend
+        # Only fail-OPEN on EXPLICIT synthetic responses. Real backend
         # decisions (decision_source="gateway") are honoured.
-        if decision_source.startswith("fallback") or decision_source in {
-            TransportErrorSource.NETWORK_ERROR,
-            TransportErrorSource.GATEWAY_ERROR,
-            TransportErrorSource.BREAKER_OPEN,
-            TransportErrorSource.AUTH_ERROR,
-        }:
+        #
+        # DEF-MP-TS12-ENF-01: this was the copy that got `AUTH_ERROR`
+        # removed (Fix D) — a credential failure must not be
+        # reinterpreted as "transport error, carry on". The same
+        # predicate was ALSO written out in
+        # `decorators._run_tool_policy_gate`, and that copy still had
+        # `AUTH_ERROR` and tested an uppercase `"FALLBACK_"` prefix
+        # that no transport code path produces. Both now call the
+        # single definition, `transport.is_fallback_decision_source`.
+        if is_fallback_decision_source(decision_source):
             logger.warning(
                 f"check_workflow_budget: synthetic decision_source="
                 f"{decision_source!r}, treating as transport error"
@@ -2894,8 +2957,8 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         Args:
             tool_name: Name of the tool to execute
             input_data: Tool input parameters
-            mode: Execution mode ("auto", "inline", "strict")
-                - "auto": auto-select based on tool risk
+            mode: Execution mode ("auto", "strict"). "inline" was
+                removed in 0.19.0 and now raises.
             on_transport_error: Optional callback for transport-error
                 handling; prefer the typed exception path.
             business_impact: Typed action payload (Money impact for
@@ -2930,21 +2993,67 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                   omitting ``mode``. Earlier SDKs silently switched
                   to "inline" for non-sensitive tools, which was
                   the source of the DEF-TS12-01 audit cycle.
-                - "inline": explicit opt-out of /execute. Skips ALL
-                  enforcement (budget / rate / tool-block); returns
-                  a synthetic local allow. Use only when the caller
-                  knows the tool is safe and wants to skip the
-                  gateway round-trip. Cannot be combined with
-                  sensitive tools — sensitive tools always go to
-                  /execute even when "inline" is requested.
                 - "strict": explicit gateway round-trip (same wire
                   behaviour as "auto", but useful for audit clarity
                   when the caller wants the intent on the wire).
 
+                "inline" was removed in 0.19.0 (B1 / ADR-061) and
+                now raises `NullRunConfigError`. It skipped /execute
+                entirely — budget, rate-limit and tool-block all
+                bypassed — and its only guard was a sensitivity
+                check, so whether a call was enforced depended on
+                whether someone had remembered to mark the tool
+                sensitive. Both remaining values contact the gateway
+                unconditionally.
+
         Raises:
             NullRunBlockedException: If decision is "block"
+            NullRunConfigError: If mode="inline" (removed, see above)
         """
         from nullrun.context import get_trace_id, get_workflow_id
+
+        # B1 (2026-09-30): `mode="inline"` is GONE.
+        #
+        # It returned a synthesised local `allow` without contacting
+        # the gateway, so budget, rate limit and tool_block were all
+        # skipped — the SDK's own explanation said so, and it was the
+        # single largest hole in "the gate decides". The only guard
+        # was a sensitivity check, which meant the safety of a tool
+        # call depended on whether someone had remembered to mark it
+        # sensitive.
+        #
+        # It is also vestigial in the other direction: `mode` is sent
+        # on the wire but the backend does not read it
+        # (`transport.py:1223`, "Wire-present but unused by backend").
+        # So the parameter's ONLY real function was deciding whether
+        # to skip enforcement.
+        #
+        # This raises rather than silently coercing to "strict". A
+        # caller who asked for inline believes they have a fast local
+        # path; quietly giving them a round-trip is a semantic change
+        # they cannot see, and a silent coercion is how a bypass gets
+        # reintroduced later. A loud, named error is the honest
+        # version of the same change.
+        #
+        # It sits at the very TOP of the method, before any context
+        # resolution or setup: a removed argument is a caller-side
+        # programming error, and refusing it before doing any work is
+        # what makes the refusal a guarantee rather than an
+        # incidental ordering.
+        if mode == "inline":
+            from nullrun.breaker.exceptions import NullRunConfigError
+
+            raise NullRunConfigError(
+                'mode="inline" has been removed. It skipped /execute '
+                "entirely, so budget, rate-limit and tool-block policies "
+                "were all bypassed — a synthesised local `allow` the "
+                "gateway never made. There is no replacement: every "
+                "call now goes through /execute. If you were using "
+                'inline to avoid a round-trip, use mode="auto" (the '
+                "default) and treat the extra latency as the cost of "
+                "actually being enforced. See ADR-061.",
+                error_code="NR-S001",
+            )
 
         organization_id = self.organization_id or "local"
         workflow_id = get_workflow_id()
@@ -2958,42 +3067,12 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # cannot be silently bypassed because the SDK caller used the
         # default ``mode="auto"``.
         #
-        # Explicit opt-out paths:
-        #   1. ``mode="inline"`` (explicit opt-in by the caller) —
-        #      returns the local allow WITHOUT contacting the gateway.
-        #      Documented as the only way to skip /execute. Use
-        #      sparingly: skips ALL enforcement, not just budget.
-        #   2. ``mode="strict"`` (explicit opt-in by the caller) —
-        #      forces /execute round-trip regardless of tool
-        #      sensitivity. Identical wire behaviour to ``"auto"``,
-        #      but useful when the caller wants the intent on the
-        #      wire for audit clarity.
-        #
-        # The two sensitivity checks below still gate the inline
-        # fast-path — sensitive tools cannot be silently skipped
-        # even if the caller explicitly asks for ``mode="inline"``.
-        # They also gate the /execute round-trip when ``mode="auto"``
-        # resolved to ``"strict"`` (no behavioural change there).
+        # ``mode="strict"`` is the only other accepted value. It is
+        # identical to ``"auto"`` on the wire and exists so a caller
+        # can put the intent on the wire for audit clarity. There is
+        # no opt-out: every call is a /execute round-trip.
         if mode == "auto":
             mode = "strict"
-
-        # For inline mode with non-sensitive tools, skip execute and use local enforcement.
-        # Sensitive tools always go through /execute even when the
-        # caller asked for ``mode="inline"`` — fail-CLOSED stance per
-        # memory `sensitive-tool-fail-closed`.
-        if mode == "inline" and not (
-            self.is_sensitive_tool(tool_name) or is_strict_mode_forced(tool_name)
-        ):
-            return {
-                "decision": "allow",
-                "decision_source": DecisionSource.LOCAL,
-                "explanation": (
-                    "Inline mode: local enforcement only. Caller explicitly opted "
-                    "out of /execute — budget / rate / tool-block policies bypassed."
-                ),
-                "policy_hash": None,
-                "allow_execution": True,
-            }
 
         # Strict mode or sensitive tool: call /execute endpoint
         # (no local_mode branch -- api_key is now required, see T3-S2).

@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "nullrun"
 # Full release history lives in CHANGELOG.md; only the current version
 # is pinned here.
-version = "0.18.5"
+version = "0.19.0"
 # Kept under the 200-char preview threshold so the full line is visible
 # without an "expand" click. The headline is the canonical §1 statement
 # from positioning.md — "runtime decision layer for tool-using AI agents"
@@ -103,15 +103,30 @@ dev = [
     # their data. Wrapping ``pytest -n auto`` in ``coverage run`` only
     # traces the coordinator process and produces a false 0% report.
     "pytest-cov>=5.0",
-    # The SDK eagerly imports `nullrun.instrumentation.langgraph`
-    # (from `nullrun.decorators`, imported by `nullrun.__init__` at
-    # collection time), which itself does `from langchain_core.callbacks
-    # import BaseCallbackHandler`. Without this dep, *every* test in
-    # the suite errors at pytest collection, not at a specific test.
-    # CI installs `[dev]` only, so the test extras need to cover the
-    # import chain. `langchain-core` is the smallest dep that makes
-    # the import succeed; the `langgraph` and `langchain` extras pull
-    # in heavier stacks that the unit tests don't need.
+    # `langchain-core` is a dev dep so CI exercises the REAL LangChain
+    # path, not the SDK's `object` fallback.
+    #
+    # It was originally here for a different reason, and that reason
+    # stopped being true: the SDK used to import
+    # `nullrun.instrumentation.langgraph` eagerly (reached from
+    # `nullrun.__init__` at collection time), which did an unguarded
+    # `from langchain_core.callbacks import BaseCallbackHandler`. With
+    # no such dep, *every* test in the suite errored at pytest
+    # collection. That import is now guarded — DEF-MP-TS12-SDK-05
+    # (RUN_ID 20260929T1338) made it degrade to an `object` base
+    # instead, and collection without langchain-core now succeeds
+    # (verified: 1449 tests collected, exit 0, with `langchain_core`,
+    # `langchain` and `langgraph` all blocked at import).
+    #
+    # The dep is still required, because the guarded fallback is a
+    # DEGRADED mode: with langchain-core absent, the tests that pin
+    # `BaseCallbackHandler is the real BaseCallbackHandler`
+    # (`test_langgraph_optional`) and that pin LangChain's
+    # swallow-exceptions contract (`test_langchain_enforcement`) would
+    # SKIP rather than run, and the real integration would go untested.
+    # `langchain-core` is the smallest dep that covers both; the
+    # `langgraph` and `langchain` extras pull in heavier stacks the
+    # unit tests don't need.
     "langchain-core>=0.3,<1.0",
     # `tests/test_integrations_fastapi.py` does `from fastapi import ...`
     # at module top-level, so pytest collection aborts the entire suite
