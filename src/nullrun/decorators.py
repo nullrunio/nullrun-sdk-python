@@ -38,7 +38,6 @@ import contextlib
 import functools
 import inspect
 import logging
-import os
 import threading
 from collections.abc import Callable
 from contextvars import Token
@@ -851,7 +850,7 @@ def _run_tool_policy_gate(
         TransportErrorSource,
     )
 
-    fail_open = os.environ.get("NULLRUN_SENSITIVE_FAIL_OPEN", "").strip() == "1"
+    fail_open = runtime.sensitive_fail_open_enabled()
     # *display* workflow_id via the runtime's precedence chain
     # (contextvar → self.workflow_id → None). Sentinel stays as the
     # last resort for never-bound keys (no workflow context).

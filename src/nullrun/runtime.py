@@ -1949,6 +1949,85 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             f"/gate returned a non-JSON body: {exc}"
         ) from exc
 
+    def sensitive_fail_open_enabled(self) -> bool:
+        """Resolve ``NULLRUN_SENSITIVE_FAIL_OPEN``, honouring the prod guard.
+
+        The raw env var is a documented bypass, and before this method
+        it was read straight into the enforcement path with no
+        environment check:
+
+            fail_open = os.environ.get("NULLRUN_SENSITIVE_FAIL_OPEN", "") == "1"
+
+        Its sibling ``NULLRUN_SKIP_BUDGET_CHECK`` has been
+        production-guarded since it was found doing exactly this
+        (``check_workflow_budget``). The asymmetry was an oversight,
+        and it is the more dangerous of the two: the budget opt-out
+        skips a *pre-flight*, while this one lets the body of a
+        sensitive tool run while the policy engine is unreachable --
+        an unblocked ``charge_card`` during an outage, which ADR-008
+        calls a security regression rather than an availability
+        trade-off.
+
+        In production the flag alone is refused: it is ignored, an
+        ERROR is logged, and a metric is emitted, so the attempt is
+        visible rather than silent. Enforcement then proceeds
+        fail-CLOSED, which is the policy the flag was trying to
+        disable -- refusing the bypass does not break the agent, it
+        restores the safe default. An operator who genuinely needs it
+        in prod (an incident-response runbook) acknowledges with
+        ``NULLRUN_ALLOW_SENSITIVE_FAIL_OPEN=1``, mirroring
+        ``NULLRUN_ALLOW_SKIP_BUDGET_CHECK``.
+
+        Lives here rather than in ``decorators`` so the environment
+        policy stays in one module with
+        :func:`_is_production_environment`, and so the two opt-outs
+        cannot drift apart again the way their predicates did under
+        DEF-MP-TS12-ENF-01.
+        """
+        if os.environ.get("NULLRUN_SENSITIVE_FAIL_OPEN", "").strip() != "1":
+            return False
+
+        if _is_production_environment(self.api_url):
+            allow_ack = (
+                os.environ.get("NULLRUN_ALLOW_SENSITIVE_FAIL_OPEN", "").strip() == "1"
+            )
+            if not allow_ack:
+                logger.error(
+                    "NULLRUN_SENSITIVE_FAIL_OPEN=1 is set but the SDK is "
+                    "configured for production (api_url=%r). Refusing the "
+                    "bypass: sensitive tools stay fail-CLOSED, so their "
+                    "bodies do NOT run while the policy engine is "
+                    "unreachable. Unset the var, or — only for "
+                    "incident-response scenarios — also set "
+                    "NULLRUN_ALLOW_SENSITIVE_FAIL_OPEN=1 to acknowledge "
+                    "the risk.",
+                    self.api_url,
+                )
+                try:
+                    metrics.inc_runtime("sensitive_fail_open_blocked_in_prod")
+                except Exception:  # noqa: BLE001 — metrics never gate
+                    pass
+                return False
+            logger.warning(
+                "sensitive tool gate: failing OPEN via "
+                "NULLRUN_SENSITIVE_FAIL_OPEN=1 in production "
+                "(NULLRUN_ALLOW_SENSITIVE_FAIL_OPEN=1 also set). This is an "
+                "explicit operator ack — ensure the incident-response runbook "
+                "drove it, and unset both vars when the incident closes."
+            )
+            try:
+                metrics.inc_runtime("sensitive_fail_open_allowed_in_prod")
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+
+        logger.debug(
+            "sensitive tool gate: failing OPEN via NULLRUN_SENSITIVE_FAIL_OPEN=1 "
+            "(non-production api_url=%r).",
+            self.api_url,
+        )
+        return True
+
     def check_workflow_budget(self) -> None:
         """
         Pre-flight budget check via /api/v1/gate. Called from @protect
