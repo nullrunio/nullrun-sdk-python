@@ -1817,6 +1817,28 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # there's no workflow to check, so we no-op.
         resolved = self._resolve_workflow_id(workflow_id or None)
         if not resolved:
+            # F5/F6 (2026-09-30): the no-op is correct — a never-bound
+            # API key has no control-plane state to poll — but it was
+            # completely silent, which makes a BROKEN binding
+            # indistinguishable from a working one. If the key's
+            # 1:1 workflow binding is lost (bad migration, restored
+            # backup, wrong key), the kill/pause gate stops running
+            # and the only symptom is an agent that ignores the
+            # dashboard.
+            #
+            # Counted, not raised: raising here would break the
+            # documented never-bound-key configuration. Debug-level
+            # logging, because for a legitimately unbound key this
+            # fires on every call.
+            logger.debug(
+                "check_control_plane: no workflow resolved "
+                "(contextvar and API-key binding both empty) — "
+                "kill/pause gate skipped for this call."
+            )
+            try:
+                metrics.inc_runtime("control_plane_no_workflow_total")
+            except Exception:  # noqa: BLE001 — metrics never gate
+                pass
             return
         workflow_id = resolved
 
@@ -1995,6 +2017,22 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # /gate intentionally keeps the wire minimal.
         workflow_id = self._resolve_workflow_id(get_workflow_id())
         if not workflow_id:
+            # F5/F6 (2026-09-30): counted rather than silent. See the
+            # matching note in `check_control_plane` — a lost key
+            # binding must not look like normal operation. `check_calls`
+            # above proves the pre-flight was ENTERED; this proves it
+            # was skipped for want of a workflow, which together are
+            # what an operator needs to tell "gate ran and allowed"
+            # from "gate never ran".
+            logger.debug(
+                "check_workflow_budget: no workflow resolved "
+                "(contextvar and API-key binding both empty) — "
+                "budget pre-flight skipped for this call."
+            )
+            try:
+                metrics.inc_runtime("budget_preflight_no_workflow_total")
+            except Exception:  # noqa: BLE001 — metrics never gate
+                pass
             return
 
         # Use the real model name from the call context if the user set
