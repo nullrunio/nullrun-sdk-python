@@ -37,6 +37,85 @@ from nullrun.tracing import (
     get_current_span,
 )
 
+# Exceptions that represent a REAL enforcement decision from the gate,
+# as opposed to a failure to reach the gate. `NullRunBudgetError` is
+# the budget-exhausted block, `WorkflowKilledInterrupt` /
+# `WorkflowPausedException` are the dashboard KILL/PAUSE switches. All
+# three derive from `Exception`, so an ordering-sensitive `except`
+# clause is required: this tuple must be caught BEFORE the broad
+# transport arm, or the block is silently downgraded to a fail-OPEN
+# transport error.
+#
+# ADR-008's fail-OPEN policy covers "the policy engine could not be
+# reached". It explicitly does NOT cover "the policy engine returned
+# `block`" — conflating the two is what let a real budget block
+# through as a debug log line.
+try:  # pragma: no cover - import shape, not behaviour
+    from nullrun.breaker.exceptions import (
+        NullRunBudgetError,
+        WorkflowKilledInterrupt,
+        WorkflowPausedException,
+    )
+
+    _ENFORCEMENT_EXCEPTIONS: tuple[type[BaseException], ...] = (
+        NullRunBudgetError,
+        WorkflowKilledInterrupt,
+        WorkflowPausedException,
+    )
+except ImportError:  # pragma: no cover
+    # The SDK is unusable without its own exception types, but never
+    # let their absence break `import nullrun` for a consumer who
+    # does not use LangChain. Empty tuple => every raise is treated
+    # as a transport error, i.e. the pre-a626bbd behaviour.
+    _ENFORCEMENT_EXCEPTIONS = ()  # type: ignore[assignment]
+
+
+# Deferred-enforcement handoff. LangChain swallows exceptions raised
+# from a callback, so a block discovered in `on_llm_start` cannot abort
+# the LLM call from here. The decision is stashed per-thread; the
+# `@protect` boundary (which CAN abort) drains it and raises.
+#
+# Thread-local, not global: LangGraph runs concurrent chains in a
+# thread pool, and one chain's budget block must not abort another's.
+import threading as _threading
+
+_deferred_enforcement: "_threading.local" = _threading.local()
+
+
+def record_deferred_enforcement(exc: BaseException) -> None:
+    """Stash a real gate decision for the ``@protect`` boundary.
+
+    Called from the LangChain callback path, where the framework
+    discards exceptions raised by handlers. Returns nothing and never
+    raises — a stashing failure must not make enforcement worse.
+    """
+    try:
+        pending = getattr(_deferred_enforcement, "pending", None)
+        if pending is None:
+            pending = []
+            _deferred_enforcement.pending = pending
+        pending.append(exc)
+    except Exception:  # noqa: BLE001 — best-effort by construction
+        pass
+
+
+def drain_deferred_enforcement() -> BaseException | None:
+    """Return and clear the first stashed decision, if any.
+
+    Called at the ``@protect`` boundary on the same thread, after the
+    gates have run. Returns the oldest unraised decision so the caller
+    can fail CLOSED on it.
+    """
+    try:
+        pending = getattr(_deferred_enforcement, "pending", None)
+        if not pending:
+            return None
+        first = pending[0]
+        del pending[0]
+        return first
+    except Exception:  # noqa: BLE001 — best-effort by construction
+        return None
+
 # DEF-MP-TS12-SDK-05 (2026-09-29): `langchain-core` is a `dev` extra,
 # NOT a core dependency (`pyproject.toml` core deps are httpx only).
 # This module used to import it unconditionally at module scope, and
@@ -583,7 +662,41 @@ class NullRunCallback(BaseCallbackHandler):
         # scope, so the wire-call cost is amortised across the chain.
         try:
             self.runtime.check_workflow_budget()
-        except BaseException as exc:  # noqa: BLE001 — never raise out of callback
+        except _ENFORCEMENT_EXCEPTIONS as exc:
+            # A REAL gate decision — budget exhausted, workflow killed,
+            # workflow paused. NOT a transport failure, so the ADR-008
+            # fail-OPEN policy does not apply: that policy covers
+            # "the gate could not be reached", never "the gate said no".
+            #
+            # The pre-fix `except BaseException` lumped these together
+            # with transport errors and dropped them to `logger.debug`,
+            # so a genuine budget block became an invisible debug line
+            # and the LLM call proceeded anyway.
+            #
+            # Re-raising here would NOT work: LangChain swallows
+            # exceptions raised from a callback handler (verified
+            # against langchain-core 1.5.6 — `on_llm_start` logs
+            # "Error in <handler> callback" and continues). So the
+            # honest options are (a) record the decision so the
+            # enforcement surface can act on it, and (b) make it
+            # loud. We do both: the decision is stashed on the
+            # runtime for `@protect` to raise at a point that CAN
+            # abort, and it is logged at ERROR rather than debug.
+            logger.error(
+                "NullRunCallback.on_llm_start: gate returned a real "
+                "decision (%s: %s). This LLM call has no reservation; "
+                "its cost event will be dropped by runtime._route_track. "
+                "Enforcement of this decision happens at the @protect "
+                "boundary, which CAN abort.",
+                type(exc).__name__,
+                exc,
+            )
+            record_deferred_enforcement(exc)
+        except Exception as exc:  # noqa: BLE001 — never raise out of callback
+            # Genuine transport failure (backend unreachable, timeout,
+            # 5xx). Fail-OPEN is the DOCUMENTED ADR-008 policy for
+            # this class: a dead backend must not freeze the agent,
+            # and `/track` reconciles the cost afterwards. Unchanged.
             logger.debug(
                 "NullRunCallback.on_llm_start: check_workflow_budget "
                 "raised %s — proceeding without reservation (llm_call "

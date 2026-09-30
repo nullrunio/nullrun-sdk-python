@@ -634,6 +634,16 @@ def protect(fn: F | None = None) -> F | Callable[[F], F]:
             # backend decides allow/block/require-approval.
             _run_tool_policy_gate(runtime, fn, args, kwargs)
 
+            # 5. Drain any enforcement decision that a framework
+            # callback could not enforce. LangChain swallows
+            # exceptions raised from a callback handler, so a real
+            # block discovered in `on_llm_start` (budget exhausted,
+            # workflow KILL/PAUSE) cannot abort the LLM call from
+            # inside the callback. The callback stashes it instead;
+            # this boundary — which CAN abort — raises it. Runs after
+            # the gates so the primary decision always wins.
+            _raise_deferred_enforcement(fn.__name__)
+
             yield runtime
         except BaseException as exc:  # noqa: BLE001
             error = exc
@@ -735,6 +745,48 @@ def protect(fn: F | None = None) -> F | Callable[[F], F]:
             raise
 
     return sync_wrapper  # type: ignore[return-value]
+
+
+def _raise_deferred_enforcement(tool_name: str) -> None:
+    """Raise a gate decision a framework callback could not enforce.
+
+    LangChain discards exceptions raised from a callback handler — it
+    logs ``Error in <handler> callback`` and continues. So when
+    ``NullRunCallback.on_llm_start`` calls ``check_workflow_budget``
+    and gets a real block (budget exhausted, workflow KILL/PAUSE), it
+    cannot abort the LLM call from inside the callback.
+
+    The callback stashes the decision instead; this runs at the
+    ``@protect`` boundary, which can abort, and re-raises the oldest
+    unraised one.
+
+    The import is deliberately LAZY and failure-tolerant. The stashing
+    side lives in ``instrumentation.langgraph``, which is only imported
+    when LangChain instrumentation is in play; importing it here would
+    couple the core decorator path to the LangChain adapter. A missing
+    module simply means nothing was stashed.
+
+    Never invoked on the transport-fail-OPEN path: only REAL gate
+    decisions are stashed (see ``record_deferred_enforcement``).
+    """
+    try:
+        from nullrun.instrumentation.langgraph import (
+            drain_deferred_enforcement,
+        )
+    except Exception:  # noqa: BLE001 — optional adapter, never a hard dep
+        return
+    deferred = drain_deferred_enforcement()
+    if deferred is None:
+        return
+    logger.error(
+        "@protect for %r: raising enforcement decision deferred from a "
+        "framework callback (%s: %s) — the callback itself could not "
+        "abort the call.",
+        tool_name,
+        type(deferred).__name__,
+        deferred,
+    )
+    raise deferred
 
 
 def _run_tool_policy_gate(
