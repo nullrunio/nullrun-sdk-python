@@ -26,6 +26,23 @@ Closes the SDK-side bypasses found auditing `DEF-MP-TS12-ENF-01`
   docstring referenced no longer exists in the SDK); dead security
   machinery reads as a live mechanism and invites a bypass being
   wired back up.
+- `MCPAdapter(runtime=None)` no longer means "do not gate".
+  `call_tool` was conditional on `self._runtime is not None`, and
+  `runtime` defaulted to `None` — so a default-constructed adapter
+  (which is what the module's own documented example builds) called
+  the MCP server with no `/execute` round-trip at all. The operator
+  got a contextvar that a *later* `@protect` wrapper might read on
+  its *next* `/check`: post-hoc annotation, not enforcement. The
+  umbrella `mcp_destructive_policy` / `mcp_readonly_policy`
+  therefore applied to a locally-declared function but not to a
+  remote MCP call, on the same agent, in the same loop.
+  `runtime=None` now means "resolve the global runtime", on the
+  same terms `@protect` resolves it. Resolution is lazy — at
+  `call_tool`, not at construction — so the adapter stays
+  constructible in fixtures and doc snippets without
+  `nullrun.init()`. A missing API key raises rather than degrading
+  to an ungated call, matching `@protect`'s fail-loud invariant.
+  Passing `runtime=` explicitly still works and still wins.
 
 `mode` itself is unchanged on the wire — it is still sent, and the
 backend still ignores it (`transport.py`: "Wire-present but unused

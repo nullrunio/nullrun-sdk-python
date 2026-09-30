@@ -86,6 +86,37 @@ def _isolate_mcp_context():
     _clean_context()
 
 
+@pytest.fixture(autouse=True)
+def _default_gate_runtime():
+    """Give every test in this module a working, allow-all gate.
+
+    B2 (2026-09-30): ``MCPAdapter(runtime=None)`` no longer means
+    "skip the gate" — it means "resolve the global runtime". Without
+    this fixture, every test here that constructs an adapter without
+    an explicit ``runtime=`` would try to build a real
+    ``NullRunRuntime`` from the environment and die on a missing
+    ``NULLRUN_API_KEY`` — which would say nothing about the behaviour
+    under test (contextvar stamping, cache refresh, kwarg
+    pass-through) and everything about the test's environment.
+
+    Tests that care about the gate pass their own ``_StubRuntime``
+    explicitly; the explicit argument wins over this one. The B2
+    resolution-order tests live in
+    ``tests/test_mcp_adapter_gate_closed.py``, which deliberately has
+    no such fixture so it can observe the real resolution.
+
+    ``_StubRuntime`` is resolved at fixture-call time, not import
+    time — the name is defined ~450 lines below this point.
+    """
+    from nullrun._registry import get_registry
+
+    registry = get_registry()
+    previous = registry.get()
+    registry.set(_StubRuntime())
+    yield
+    registry.set(previous) if previous is not None else registry.clear()
+
+
 # A representative `github`-shaped inventory -----------------------------
 
 
@@ -524,14 +555,18 @@ ran the underlying MCP call with NO gate enforcement — the
 tool-block / budget / approval policies did NOT apply to MCP
 invocations, only to local functions.
 
-These tests pin the post-v3.53 behavior: when an MCPAdapter is
-constructed with ``runtime=`` set, ``call_tool`` invokes
+These tests pin the post-v3.53 behavior: ``call_tool`` invokes
 ``runtime.execute(...)`` synchronously BEFORE the MCP client.
 ``decision="block"`` raises ``NullRunBlockedException`` and the
 MCP client is NOT called. ``decision="require_approval"`` raises
-``NullRunBlockedException`` with the approval_id attached. The
-legacy contextvar-only path stays reachable for back-compat
-when ``runtime`` is not provided.
+``NullRunBlockedException`` with the approval_id attached.
+
+B2 (2026-09-30): this is no longer conditional on ``runtime=``
+being passed. The post-v3.53 shape kept a "legacy contextvar-only
+path" for adapters constructed without one — the remaining half of
+the hole v3.53 opened. ``runtime=None`` now means "resolve the
+global runtime"; the autouse ``_default_gate_runtime`` fixture
+supplies one for this module.
 """
 
 
@@ -661,21 +696,31 @@ def test_call_tool_with_runtime_require_approval_raises_with_approval_id():
     assert excinfo.value.tool_name == "delete_repo"
 
 
-def test_call_tool_without_runtime_uses_legacy_contextvar_path():
-    """v3.53 audit #5 — back-compat: callers that omit ``runtime=``
-    get the legacy contextvar-only path. No /api/v1/execute call
-    is made; the next ``@protect``-wrapped function picks up the
-    contextvar on its next ``/check`` request.
+def test_call_tool_without_runtime_still_consults_the_gate():
+    """B2 (2026-09-30) — ``runtime=None`` means "resolve the global
+    runtime", not "skip the gate".
 
-    Pins that introducing the runtime parameter did not break
-    existing integrations that rely on the contextvar pattern.
+    This test previously asserted the opposite: that an adapter
+    constructed without ``runtime=`` called the MCP client directly,
+    with no /api/v1/execute round-trip at all. That was the bypass.
+    It was introduced as a deliberate back-compat accommodation
+    ("callers who omit runtime= get the legacy contextvar-only
+    path") — and it is exactly the hole: the operator's tool-block,
+    budget and approval policies applied to a locally-declared
+    function but not to a remote MCP call, on the same agent, in the
+    same loop.
+
+    Resolution-order tests are in
+    ``tests/test_mcp_adapter_gate_closed.py``; this one only pins
+    that the default-constructed adapter is gated and that the
+    contextvar stamping survived.
     """
     client = _MockMcpClient(_github_inventory())
     adapter = MCPAdapter(server_name="github", mcp_client=client)
-    # No runtime was passed. The MCP client is called directly.
     adapter.call_tool("get_file_contents", {"path": "README.md"})
     assert client.calls == [("get_file_contents", {"path": "README.md"})]
-    # The contextvar was still stamped — legacy behavior preserved.
+    # The contextvar stamping is unchanged — it is the /execute
+    # round-trip that is now unconditional.
     assert get_call_mcp_class() == "mcp"
     ann = get_call_mcp_annotations()
     assert ann["read_only"] is True
