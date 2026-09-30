@@ -1870,6 +1870,85 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 kill_source="remote_state",
             )
 
+    #: Every decision value the SDK knows how to act on. The backend's
+    #: `GateDecision` (`gate/internal.rs:574`) supplies allow / block /
+    #: require_approval / soft_pass / deny; ``throttle`` is an
+    #: SDK-side shape that maps to `WorkflowPausedException`. Anything
+    #: outside this set is a wire contract the SDK does not implement,
+    #: and guessing "allow" for it is the fail-OPEN ADR-008 assigns
+    #: only to transport failures.
+    _KNOWN_GATE_DECISIONS = frozenset(
+        {"allow", "block", "throttle", "soft_pass", "require_approval", "deny"}
+    )
+
+    def _require_gate_decision(self, response: Any) -> str:
+        """Extract ``decision`` from a ``/gate`` body, or raise.
+
+        Pre-fix this was ``response.get("decision", "allow")``. That
+        default converted three distinct failures into "allowed":
+
+        * a body that is not a JSON object at all (``.get`` on a list
+          raised AttributeError *outside* the try, so it surfaced as an
+          untyped crash rather than a decision);
+        * an object from a non-NULLRUN responder — proxy error page,
+          captive portal, TLS interception box;
+        * a real NULLRUN response missing the field, which cannot
+          happen: ``decision`` is a non-``Option`` field with no
+          ``skip_serializing_if`` (``gate/internal.rs:637``), so every
+          real backend serialises it on every answer.
+
+        The last point is what makes the default unsafe rather than
+        merely redundant. ADR-008 grants fail-OPEN to *transport*
+        failures, where the gate never got to rule. A body without a
+        decision is the opposite case: something answered, and what it
+        said was not a verdict. Reading that as "allowed" lets a
+        non-NULLRUN responder authorise a call no policy engine
+        evaluated.
+        """
+        from nullrun.breaker.exceptions import NullRunMalformedGateResponseError
+
+        if not isinstance(response, dict):
+            raise NullRunMalformedGateResponseError(
+                f"/gate returned {type(response).__name__}, expected a JSON "
+                f"object. Body was not a gate decision."
+            )
+
+        decision = response.get("decision")
+        if not isinstance(decision, str):
+            raise NullRunMalformedGateResponseError(
+                f"/gate response has no usable 'decision' field "
+                f"(got {type(decision).__name__})."
+            )
+        if decision not in self._KNOWN_GATE_DECISIONS:
+            raise NullRunMalformedGateResponseError(
+                f"/gate returned unknown decision {decision!r}; this SDK "
+                f"implements {sorted(self._KNOWN_GATE_DECISIONS)}."
+            )
+        return decision
+
+    def _raise_malformed_gate_response(self, exc: BaseException) -> None:
+        """Raise ``NullRunMalformedGateResponseError`` for `exc`.
+
+        Shared by the cached and uncached ``/gate`` call sites so the
+        two cannot drift into different behaviours — the same drift
+        that produced the duplicated ``AUTH_ERROR`` predicate fixed
+        under DEF-MP-TS12-ENF-01. Always raises; the ``-> None``
+        return type is so call sites can use it as the tail of an
+        ``except`` arm without a bare ``raise``.
+        """
+        from nullrun.breaker.exceptions import NullRunMalformedGateResponseError
+
+        logger.error(
+            "check_workflow_budget: /gate returned a body that is not JSON "
+            "(%s). Treating as a malformed answer, not an outage — failing "
+            "CLOSED.",
+            exc,
+        )
+        metrics.inc_runtime("gate_malformed_response_total")
+        raise NullRunMalformedGateResponseError(
+            f"/gate returned a non-JSON body: {exc}"
+        ) from exc
+
     def check_workflow_budget(self) -> None:
         """
         Pre-flight budget check via /api/v1/gate. Called from @protect
@@ -2141,6 +2220,20 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                     logger.warning(f"check_workflow_budget: /gate unavailable, failing open: {exc}")
                     metrics.inc_runtime("gate_fail_open_total")
                     return
+                except ValueError as exc:
+                    # `Transport.check` ends in `response.json()`. A
+                    # body that is not JSON — proxy error page,
+                    # captive portal, TLS interception box — raises
+                    # JSONDecodeError, a ValueError. Pre-fix this
+                    # matched neither arm above and escaped as an
+                    # untyped crash; and had it matched the
+                    # fail-OPEN arm, a non-NULLRUN responder would
+                    # have been read as "gate unavailable, carry on",
+                    # which is precisely the authorisation-without-
+                    # policy hole the missing `decision` default
+                    # shares. It is a malformed ANSWER, not an
+                    # unreachable gate, so it raises.
+                    self._raise_malformed_gate_response(exc)
                 assert cache_key is not None  # narrowed by cache_enabled above
                 _GATE_CACHE[cache_key] = (time.monotonic(), response)
         else:
@@ -2151,6 +2244,12 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 # matters: this arm precedes the broad `except
                 # Exception`, which is a superset.
                 raise
+            except ValueError as exc:
+                # Same rationale as the cached branch: a body that is
+                # not JSON is a malformed answer, and must precede the
+                # broad `except Exception` below, which is a superset
+                # of this arm.
+                self._raise_malformed_gate_response(exc)
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"check_workflow_budget: /gate unavailable, failing open: {exc}")
                 metrics.inc_runtime("gate_fail_open_total")
@@ -2158,7 +2257,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
 
         _capture_server_minted_execution_id(response)
 
-        decision = response.get("decision", "allow")
+        decision = self._require_gate_decision(response)
         decision_source = response.get("decision_source", DecisionSource.GATEWAY)
         # Only fail-OPEN on EXPLICIT synthetic responses. Real backend
         # decisions (decision_source="gateway") are honoured.
@@ -2348,6 +2447,33 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 timeout_seconds=self._approval_timeout_seconds,
                 local_timeout=True,
             )
+
+        if decision == "deny":
+            # `Deny` is a live `GateDecision` variant
+            # (`gate/internal.rs:579`), reserved by ADR-046 — no
+            # production construction site emits it yet, but it is on
+            # the wire contract. Pre-fix it had no arm here and fell
+            # off the end of the method, which reads to the caller as
+            # "no block raised, proceed". A reserved refusal must not
+            # be the one refusal that executes. Raising it now means
+            # the day ADR-046 ships its producer, the SDK already
+            # fails-CLOSED instead of silently allowing.
+            reasons = response.get("explanations") or (
+                [response["explanation"]] if response.get("explanation") else ["deny"]
+            )
+            raise NullRunBlockedException(
+                workflow_id=workflow_id,
+                reason="; ".join(reasons),
+                tool_name=response.get("tool_name"),
+                error_code="NR-B006",
+            )
+
+        # `decision == "allow"` — the only `_KNOWN_GATE_DECISIONS`
+        # value left unhandled above. Stated explicitly rather than
+        # relying on fall-off-the-end, so that adding a variant to the
+        # known set without adding an arm is a visible no-op here
+        # rather than an implicit allow.
+        return
 
     # =============================================================================
     # v3 wire-protocol helpers

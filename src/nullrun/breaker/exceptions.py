@@ -385,6 +385,41 @@ class NullRunProtocolError(NullRunInfrastructureError):
     retryable = False
 
 
+class NullRunMalformedGateResponseError(NullRunProtocolError):
+    """The ``/gate`` response is not a decision the SDK can act on.
+
+    Raised when the body is not a JSON object, or when it is an object
+    whose ``decision`` field is absent, not a string, or names a value
+    outside the known decision set.
+
+    This is a subclass of :class:`NullRunProtocolError` rather than a
+    new root so that existing ``except NullRunProtocolError`` handlers
+    keep catching it, and so it shares the NR-P* error-code family
+    (wire-contract violations) without overloading NR-P001, whose
+    ``user_action`` is specifically "upgrade the SDK".
+
+    Why it raises instead of defaulting to ``allow``: ``decision`` is
+    a non-optional, non-``skip_serializing_if`` field on the backend's
+    ``GateResponse`` (``gate/internal.rs:637``), so every real
+    NULLRUN backend sends it on every answer. A body without it did
+    not come from NULLRUN — a proxy error page, a captive portal, an
+    expired TLS interception box. Reading that as "allowed" is the
+    fail-OPEN that ADR-008's table assigns only to *transport*
+    failures, and it is the one case where a non-NULLRUN responder can
+    authorise a call no policy engine ever saw.
+    """
+
+    error_code = "NR-P002"
+    user_action = (
+        "The NullRun API returned a response the SDK could not read as "
+        "a decision. This usually means a proxy, VPN, or corporate TLS "
+        "box intercepted the connection and returned its own body "
+        "instead of the gate's JSON. Check that the API host is "
+        "reachable directly, then retry."
+    )
+    retryable = True
+
+
 class NullRunChainError(NullRunDecision):
     """Chain-related failure.
 
