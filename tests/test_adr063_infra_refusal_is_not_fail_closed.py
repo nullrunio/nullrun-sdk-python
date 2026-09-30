@@ -1,5 +1,26 @@
 """ADR-063 §1.3(f): what the SDK does with an `infra` refusal.
 
+SUPERSEDED IN PART — ADR-063 §4.7 (product decision, option 2).
+
+The first version of this file pinned an asymmetry that was, on
+inspection, not a property of the categories but an accident of the
+status code: a 403 refusal stopped the agent and a 503 refusal did
+not, purely because ``400 <= status < 500`` happened to be the branch
+that produced a gateway decision. The product owner ruled on
+2026-09-30 that the split should follow the failure's MEANING, not
+its number:
+
+    ordinary unavailability stays fail-open; a failure OF THE CHECK
+    ITSELF gets a marker the new SDK treats as a block. SDKs predating
+    the category work keep failing open.
+
+The marker already exists — it is ``category: "infra"``, and the
+backend already distinguishes the two 503 groups internally via
+``GateErrorCode::is_fail_closed()``. So this was a client-side
+mapping change, not a re-architecture: a 5xx body that is a genuine
+gate refusal (``decision == "block"``) is now classified and blocks,
+while a 5xx that is a real outage still fails open.
+
 The backend now answers a failed workflow-state read with **503**
 (`WORKFLOW_INACTIVE_LOOKUP_FAILED` / `CIRCUIT_BREAKER_STATE_LOOKUP_FAILED`,
 category `infra`) rather than the 500 it used to ship, and answers a
@@ -13,23 +34,24 @@ differs, and the difference is the whole reason this file exists:
   becomes a real `decision="block"` with `decision_source=GATEWAY`.
   `check_workflow_budget` honours it and raises. The agent stops.
 * **503** is `>= 500`, so `_retry_with_backoff` retries it
-  (`retry_on_5xx=True`, `max_retries=3`), then the transport
-  synthesises `decision="block"` with `decision_source=FALLBACK`.
-  `check_workflow_budget` calls `is_fallback_decision_source(...)` on
-  that and **returns without raising** — a fail-OPEN, per ADR-008's
+  (`retry_on_5xx=True`, `max_retries=3`). The transport then asks
+  whether the body is a genuine refusal. If it is, the refusal is
+  classified and returned with `decision_source=GATEWAY`, and the
+  agent stops. If it is not — a proxy 502, a gateway that never
+  reached the gate — the synthetic `decision_source=FALLBACK` block
+  still applies and `check_workflow_budget` fails OPEN, per ADR-008's
   documented "dead backend must not freeze the agent" rule.
 
-So on the current SDK a tripped breaker stops the agent and a failed
-state read does not. Both are correct *for their category*: the
-breaker genuinely stopped the workflow, the read failure did not stop
-anything. But it means the pause work must NOT rely on a 5xx to halt
-an agent — a `WORKFLOW_PAUSED` shipped as 503 would be an allow on
-every SDK released to date.
+So a tripped breaker stops the agent, a failed state read stops the
+agent, and an outage does not. The last one is the load-bearing
+distinction: the gate's own answer is always honoured, and only the
+absence of an answer fails open.
 
-These tests pin that asymmetry so it cannot change silently, in either
-direction. If a future SDK makes 5xx fail-CLOSED, the 503 tests go
-red and the ADR gets amended; if one accidentally lets a 403 through
-as a fallback, the 403 test goes red.
+These tests pin that so it cannot change silently, in either
+direction. If a future SDK fails open on a 503 refusal, the 503 tests
+go red; if one lets a 403 through as a fallback, the 403 test goes
+red; if the fail-OPEN on a genuine outage is lost, the outage test
+goes red.
 """
 
 from __future__ import annotations
@@ -38,7 +60,8 @@ import httpx
 import pytest
 import respx
 
-from nullrun.breaker.exceptions import NullRunBudgetError
+from nullrun.breaker.categories import NullRunUnclassifiedRefusalError
+from nullrun.breaker.exceptions import NullRunBudgetError, NullRunError
 
 BASE_URL = "https://api.test.nullrun.io"
 GATE_URL = f"{BASE_URL}/api/v1/gate"
@@ -62,9 +85,9 @@ def _infra_503() -> httpx.Response:
     ADR-064 §Correction records an earlier version of these fixtures
     that put `error_code` at the top level; they were built from a
     hand-assembled sample rather than a captured response. The mistake
-    is load-bearing, not cosmetic: ADR-064's SDK-side plan reads this
-    body, and a client written against the wrong nesting classifies
-    every refusal as unparseable -- which is fail-OPEN.
+    is load-bearing, not cosmetic: a client written against the wrong
+    nesting classifies every refusal as unparseable -- which is
+    fail-OPEN.
     """
     return httpx.Response(
         503,
@@ -115,39 +138,56 @@ def _breaker_trip_403() -> httpx.Response:
 
 
 class TestInfraRefusalIsNotFailClosed:
-    """503 must NOT be read as "allowed" — but it currently is.
+    """A 503 the GATE answered is not an outage.
 
-    The test asserts the *actual* behaviour, fail-OPEN included, and
-    says so in the failure message. Asserting the desired behaviour
-    here would ship a red test; asserting "it raises" would be a lie.
-    The point is that the asymmetry is now a pinned, visible fact
-    rather than something discovered during an incident.
+    ADR-063 §4.7 option 2. The distinction is whether an answer
+    exists: a refusal body means the gate made a decision and it
+    stands; a body-less 5xx means it never got to one, and ADR-008's
+    fail-OPEN applies.
     """
 
-    def test_503_state_read_failure_fails_open_today(self, make_runtime, mock_api):
-        """A failed state read currently lets the call through.
+    def test_503_state_read_failure_blocks(self, make_runtime, mock_api):
+        """A failed state read is the gate's own answer — honour it.
 
-        Pinned deliberately. ADR-008's fail-OPEN on transport error is
-        the documented policy and is not being changed here, but the
-        consequence — `infra` refusals do not stop an agent — must be
-        a known quantity before the pause work builds on 5xx.
+        Before §4.7 this returned without raising, so a fail-CLOSED
+        503 from the backend was converted into "allowed" by the
+        status code alone. The gate blocks in both 503 groups
+        (fail-CLOSED, CLAUDE.md §4); the SDK now stops too.
         """
         respx.post(GATE_URL).mock(return_value=_infra_503())
         rt = make_runtime()
 
-        # Must NOT raise. If a future release makes this fail-CLOSED
-        # this test goes red, and ADR-008 + ADR-063 §1.3(f) get
-        # amended in the same commit.
-        rt.check_workflow_budget()  # noqa: B018 - the absence of a raise IS the assertion
+        with pytest.raises(NullRunError) as exc_info:
+            rt.check_workflow_budget()
+        assert not isinstance(exc_info.value, NullRunUnclassifiedRefusalError), (
+            "the body carries category=infra, so it is classifiable — an "
+            "unclassified-refusal here would mean the category was not read"
+        )
 
-    def test_503_is_retried_before_failing_open(self, make_runtime, mock_api):
-        """The 503 is not a first-try fail-open.
+    def test_503_outage_with_no_refusal_still_fails_open(self, make_runtime, mock_api):
+        """The counter-test, and the reason the rule is narrow.
+
+        A 5xx that is NOT a gate refusal — no `decision` field, the
+        shape a proxy or an unreachable gateway produces — must still
+        fail open. Widening "honour the answer" to "raise on any
+        5xx" would freeze every agent on every deploy.
+        """
+        respx.post(GATE_URL).mock(
+            return_value=httpx.Response(502, text="<html>Bad Gateway</html>")
+        )
+        rt = make_runtime()
+        assert rt.check_workflow_budget() is None
+
+    def test_503_is_retried_before_the_decision(self, make_runtime, mock_api):
+        """The 503 is not answered on the first try.
 
         `_retry_with_backoff(retry_on_5xx=True, max_retries=3)` means a
-        transient 503 gets three more attempts, which is what makes the
+        transient 503 gets three more attempts, which is what makes
         fail-OPEN tolerable for a rolling deploy. Pinning the attempt
         count stops a future "reduce retries on 5xx" change from
-        quietly making gate calls flakier under load.
+        quietly making gate calls flakier under load — and stops a
+        "skip the retry, block immediately" change from turning a blip
+        into a stopped agent.
         """
         calls: list[httpx.Request] = []
 
@@ -157,11 +197,12 @@ class TestInfraRefusalIsNotFailClosed:
 
         respx.post(GATE_URL).mock(side_effect=_count)
         rt = make_runtime()
-        rt.check_workflow_budget()
+        with pytest.raises(NullRunError):
+            rt.check_workflow_budget()
 
         assert len(calls) > 1, (
-            "a 503 must be retried, not failed open on the first "
-            f"response — only {len(calls)} attempt(s) were made"
+            f"a 503 must be retried before the block stands — only "
+            f"{len(calls)} attempt(s) were made"
         )
 
     def test_403_breaker_trip_stops_the_agent(self, make_runtime, mock_api):
