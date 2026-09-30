@@ -45,22 +45,47 @@ GATE_URL = f"{BASE_URL}/api/v1/gate"
 
 
 def _infra_503() -> httpx.Response:
-    """The exact shape the backend ships for a failed state read."""
+    """The exact shape the backend ships for a failed state read.
+
+    Captured from a live gate run, not hand-assembled: the top-level
+    keys are `category` / `decision` / `decision_source` / `details` /
+    `explanation` / `policy_id` / `policy_version` /
+    `projected_cost_cents` / `remaining_budget_cents` / `reservation_id`
+    / `staleness_ms` / `user_message`.
+
+    **`error_code` is NOT top-level.** It lives at `details.error_code`
+    (`internal.rs:716`), which is where the backend's own status mapper
+    reads it from (`gate.rs:88-90`). `category` and `user_message` are
+    top-level fields on `GateResponse`, set by `attach_refusal_surface`
+    (`gate.rs:163-172`).
+
+    ADR-064 §Correction records an earlier version of these fixtures
+    that put `error_code` at the top level; they were built from a
+    hand-assembled sample rather than a captured response. The mistake
+    is load-bearing, not cosmetic: ADR-064's SDK-side plan reads this
+    body, and a client written against the wrong nesting classifies
+    every refusal as unparseable -- which is fail-OPEN.
+    """
     return httpx.Response(
         503,
         json={
             "decision": "block",
             "decision_source": "gateway",
-            "error_code": "WORKFLOW_INACTIVE_LOOKUP_FAILED",
             "category": "infra",
             "user_message": "The gate could not read this workflow's state ...",
+            "details": {"error_code": "WORKFLOW_INACTIVE_LOOKUP_FAILED"},
             "explanation": (
                 "The authorization check could not read this workflow's "
                 "state, so it failed closed. The workflow was not stopped. "
                 "Wait briefly and try again."
             ),
             "explanations": [],
+            "policy_id": None,
             "policy_version": 0,
+            "projected_cost_cents": None,
+            "remaining_budget_cents": None,
+            "reservation_id": None,
+            "staleness_ms": None,
         },
     )
 
@@ -71,15 +96,20 @@ def _breaker_trip_403() -> httpx.Response:
         json={
             "decision": "block",
             "decision_source": "gateway",
-            "error_code": "CIRCUIT_BREAKER_TRIPPED",
             "category": "halt",
+            "details": {"error_code": "CIRCUIT_BREAKER_TRIPPED"},
             "explanation": (
                 "This workflow was stopped by its circuit breaker and will "
                 "not run again on its own. Do not retry this call and do not "
                 "try a different tool or approach."
             ),
             "explanations": [],
+            "policy_id": None,
             "policy_version": 0,
+            "projected_cost_cents": None,
+            "remaining_budget_cents": None,
+            "reservation_id": None,
+            "staleness_ms": None,
         },
     )
 
