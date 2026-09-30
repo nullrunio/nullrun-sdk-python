@@ -29,8 +29,6 @@ import logging
 import threading
 from typing import Any
 
-from langchain_core.callbacks import BaseCallbackHandler
-
 from nullrun.runtime import get_runtime
 from nullrun.tracing import (
     SpanContext,
@@ -38,6 +36,34 @@ from nullrun.tracing import (
     create_root_span,
     get_current_span,
 )
+
+# DEF-MP-TS12-SDK-05 (2026-09-29): `langchain-core` is a `dev` extra,
+# NOT a core dependency (`pyproject.toml` core deps are httpx only).
+# This module used to import it unconditionally at module scope, and
+# the import chain is:
+#
+#     NullRunRuntime.__init__ -> instrumentation.auto (make_dedup_state)
+#         -> instrumentation.langgraph -> langchain_core.callbacks
+#
+# so a clean `pip install nullrun` + `init()` died with
+# `ModuleNotFoundError: No module named 'langchain_core'` — the SDK was
+# unusable for every consumer who does not use LangChain, which is the
+# majority.
+#
+# Fix: import the base class defensively and fall back to a bare
+# object base. `NullRunCallback` does not call `super().__init__()` and
+# defines every method it needs, so it remains fully functional when
+# langchain-core IS installed; when it is absent the class still
+# imports, and the LangGraph instrumentation that actually requires
+# LangChain raises its own clear error at the point of use rather than
+# at `import nullrun`.
+#
+# `langchain-core` is deliberately NOT added to core dependencies — that
+# would impose a heavy framework dependency on every consumer.
+try:  # pragma: no cover - exercised by the absence test
+    from langchain_core.callbacks import BaseCallbackHandler
+except ModuleNotFoundError:  # pragma: no cover
+    BaseCallbackHandler = object  # type: ignore[assignment, misc]
 
 logger = logging.getLogger(__name__)
 
