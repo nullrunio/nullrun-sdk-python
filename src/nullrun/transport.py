@@ -57,8 +57,8 @@ try:
     _OTEL_AVAILABLE = True
 except ImportError:
     _OTEL_AVAILABLE = False
-    trace = None  # type: ignore[assignment]
-    TraceContextTextMapPropagator = None  # type: ignore[assignment]
+    trace = None  # type: ignore[assignment, misc]
+    TraceContextTextMapPropagator = None  # type: ignore[assignment, misc]
 
 logger = logging.getLogger(__name__)
 
