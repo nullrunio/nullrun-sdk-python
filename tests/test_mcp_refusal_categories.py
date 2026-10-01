@@ -278,7 +278,7 @@ class TestOnDeniedReachesMcp:
 
         `infra` is deliberately NOT in this set — see
         `test_infra_refusal_is_a_gateway_error_not_a_message`. There is
-        no 4xx infra refusal to put here: ADR-063 §4.7 sends infra
+        no 4xx infra refusal to put here: the backend sends infra
         refusals as 503, and 503 never reaches the envelope parser on
         this endpoint.
         """
@@ -301,7 +301,7 @@ class TestOnDeniedReachesMcp:
     def test_infra_refusal_is_a_gateway_fallback_not_a_message(self, mock_api):
         """`infra` is covered by a different mechanism, so say which.
 
-        An infra-category refusal arrives as a 503 (ADR-063 §4.7).
+        An infra-category refusal arrives as a 503 (ADR-064).
         `_retry_with_backoff` maps the whole 5xx band on `/execute` to
         `NullRunTransportError` / GATEWAY_ERROR before
         `_parse_v3_error_envelope` is ever called, so the `category`

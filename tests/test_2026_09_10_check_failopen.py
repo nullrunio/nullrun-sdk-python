@@ -188,7 +188,7 @@ class TestDefNrCheckFailopenSourcePin:
         assert idx != -1, (
             "DEF-NR-CHECK-FAIL-OPEN: 4xx branch anchor "
             "`if 400 <= response.status_code < 500 or (` not found in "
-            "Transport.check. ADR-063 §4.7 widened the condition to "
+            "Transport.check. ADR-064 widened the condition to "
             "cover 5xx bodies that are genuine gate refusals, so the "
             "anchor moved with it."
         )

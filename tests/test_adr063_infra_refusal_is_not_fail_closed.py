@@ -1,6 +1,7 @@
 """ADR-063 §1.3(f): what the SDK does with an `infra` refusal.
 
-SUPERSEDED IN PART — ADR-063 §4.7 (product decision, option 2).
+SUPERSEDED IN PART — the rule now lives in ADR-064. ADR-063 §4.7
+records the correction and points at it.
 
 The first version of this file pinned an asymmetry that was, on
 inspection, not a property of the categories but an accident of the
@@ -14,9 +15,15 @@ its number:
     ITSELF gets a marker the new SDK treats as a block. SDKs predating
     the category work keep failing open.
 
-The marker already exists — it is ``category: "infra"``, and the
-backend already distinguishes the two 503 groups internally via
-``GateErrorCode::is_fail_closed()``. So this was a client-side
+The marker is on the wire: ``category: "infra"`` alongside
+``decision: "block"``, both always serialised by ``GateResponse``.
+An earlier draft of this docstring said the backend "distinguishes the
+two 503 groups internally via ``GateErrorCode::is_fail_closed()``" —
+that was wrong. ``is_fail_closed`` is an ordinary Rust method and is
+never serialised; ``GateErrorCode`` has no flag field and no response
+struct carries one, so a client had nothing to read. The discriminator
+that does survive the wire is ``decision``, which is what the code
+below and ``categories.py:168`` actually use. This was a client-side
 mapping change, not a re-architecture: a 5xx body that is a genuine
 gate refusal (``decision == "block"``) is now classified and blocks,
 while a 5xx that is a real outage still fails open.
@@ -140,16 +147,15 @@ def _breaker_trip_403() -> httpx.Response:
 class TestInfraRefusalIsNotFailClosed:
     """A 503 the GATE answered is not an outage.
 
-    ADR-063 §4.7 option 2. The distinction is whether an answer
-    exists: a refusal body means the gate made a decision and it
-    stands; a body-less 5xx means it never got to one, and ADR-008's
-    fail-OPEN applies.
+    ADR-064. The distinction is whether an answer exists: a refusal
+    body means the gate made a decision and it stands; a body-less 5xx
+    means it never got to one, and ADR-008's fail-OPEN applies.
     """
 
     def test_503_state_read_failure_blocks(self, make_runtime, mock_api):
         """A failed state read is the gate's own answer — honour it.
 
-        Before §4.7 this returned without raising, so a fail-CLOSED
+        Before ADR-064 this returned without raising, so a fail-CLOSED
         503 from the backend was converted into "allowed" by the
         status code alone. The gate blocks in both 503 groups
         (fail-CLOSED, CLAUDE.md §4); the SDK now stops too.

@@ -1626,26 +1626,41 @@ class Transport:
             # can produce an actionable message.
             #
             # A gate refusal is a refusal whatever the status.
-            # ADR-063 §4.7 (product decision: option 2) — the
-            # backend's 503s split into two groups and the split is
-            # what the category records:
+            # ADR-064 owns this rule; §4.7 of ADR-063 records the
+            # correction and points here.
             #
-            #   * "the answer is not available right now"
-            #     (BUDGET_DATA_UNAVAILABLE, is_fail_closed=false)
-            #   * "the CHECK could not be performed"
-            #     (CIRCUIT_BREAKER_STATE_LOOKUP_FAILED,
-            #      WORKFLOW_INACTIVE_LOOKUP_FAILED,
-            #      RATE_LIMIT_PLAN_LOOKUP_FAILED, is_fail_closed=true)
+            # The distinction is not the status and not a store
+            # name — it is whether the gate produced an ANSWER:
             #
-            # Both arrive as 503 with decision="block", and the gate
-            # already refuses either way (fail-CLOSED, CLAUDE.md §4).
+            #   * the check could not be performed, and the gate
+            #     said so (CIRCUIT_BREAKER_STATE_LOOKUP_FAILED,
+            #     WORKFLOW_INACTIVE_LOOKUP_FAILED,
+            #     RATE_LIMIT_PLAN_LOOKUP_FAILED — category "infra",
+            #     status 503) — arrives as 503 WITH
+            #     decision="block", and the decision stands.
+            #   * nothing reached the gate — a proxy 502, a gateway
+            #     that never answered, `/budget/approximate`'s
+            #     `BudgetUnavailableResponse` (budget.rs:246, which
+            #     carries no `decision` field at all) — arrives 5xx
+            #     with no refusal body, and ADR-008's fail-OPEN
+            #     applies.
+            #
+            # So the discriminator below is `decision == "block"`,
+            # which `GateResponse` always serialises. Do not look
+            # for a fail-closed marker: `GateErrorCode::is_fail_closed`
+            # is an in-process Rust method that is never written to
+            # the wire, and a client written against it could not
+            # have found it. ADR-064 §Correction is the full
+            # history.
+            #
             # Pre-fix the entire 5xx band fell through to the
             # synthetic FALLBACK block below, which the runtime
-            # reads as a transport error and fails OPEN — so a
-            # fail-CLOSED 503 refusal was silently converted into
-            # "allowed". That is DEF-MP-TS12-ENF-01's exact shape
-            # with a different trigger, and it is why a 5xx body
-            # that is a genuine refusal is handled here instead.
+            # reads as a transport error and fails OPEN — so a 503
+            # refusal the gate had actually made was silently
+            # converted into "allowed". That is DEF-MP-TS12-ENF-01's
+            # exact shape with a different trigger, and it is why a
+            # 5xx body that is a genuine refusal is handled here
+            # instead.
             #
             # Old SDKs are unaffected by definition: they never
             # looked at `category`, and they read the 503 as a

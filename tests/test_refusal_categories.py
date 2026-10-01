@@ -72,8 +72,9 @@ REAL_REFUSALS = {
     "WORKFLOW_PAUSED": ("halt", 403),
     "WORKFLOW_INACTIVE": ("halt", 403),
     "CIRCUIT_BREAKER_TRIPPED": ("halt", 403),
-    # The two ADR-063 §4.7 503 groups. Both arrive as 503 with
-    # decision="block"; the category is what separates them.
+    # The two 503 groups of ADR-064. The gate's own answer arrives as
+    # 503 with decision="block"; a real outage arrives 5xx with no
+    # refusal body at all and fails open.
     "BUDGET_DATA_UNAVAILABLE": ("infra", 503),
     "CIRCUIT_BREAKER_STATE_LOOKUP_FAILED": ("infra", 503),
 }
