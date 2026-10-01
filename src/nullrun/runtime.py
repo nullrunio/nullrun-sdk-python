@@ -1927,8 +1927,45 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         {"allow", "block", "throttle", "soft_pass", "require_approval", "deny"}
     )
 
+    #: Provenance values a ``/gate`` answer may carry. ``gateway`` is
+    #: the only one the backend writes (`GateResponse.decision_source`
+    #: is a non-``Option`` ``String``, `gate/internal.rs:638`, and
+    #: every producer sets ``"gateway"``). ``fallback`` is the
+    #: synthetic block the transport synthesises when the 5xx band
+    #: falls through, and ``cached`` / ``local`` are the SDK's own
+    #: shapes. A value outside this set means the body did not come
+    #: from either party, whatever it claims.
+    _KNOWN_DECISION_SOURCES = frozenset(
+        {"gateway", "cached", "fallback", "local"}
+    )
+
     def _require_gate_decision(self, response: Any) -> str:
         """Extract ``decision`` from a ``/gate`` body, or raise.
+
+        **Provenance first.** A verdict is permission only if the body
+        says WHO produced it, and this check runs before the decision
+        is even looked at. Without it ``{"decision": "allow"}`` — a
+        body with no ``decision_source`` at all — passes every other
+        check in this method and is honoured as a gateway decision,
+        because the runtime's rule reads a missing ``decision_source``
+        as "not ``fallback``" and therefore as authoritative.
+
+        That is reachable by anyone on the network path. A captive
+        portal on a hotel or airport WLAN, or a corporate
+        TLS-interception proxy, returns JSON on ``/api/v1/gate``
+        without needing the API key and without needing to defeat
+        HMAC — it only has to answer before the real backend does.
+        The call is authorised, ``/track`` books its cost against a
+        policy that was never consulted, and the audit trail records
+        an allow. There is no later point at which it can be caught.
+
+        ``decision_source`` is the right field to require because it
+        cannot be absent from a real answer: it is a non-``Option``
+        ``String`` with no ``skip_serializing_if``, so serde always
+        emits it. ``GateResponseBody`` in ``gate/schemas.rs`` does
+        declare it optional, but that struct is referenced only from
+        ``openapi.rs`` — it is the documentation schema, not the wire
+        — so it is not a case where a real backend omits it.
 
         Pre-fix this was ``response.get("decision", "allow")``. That
         default converted three distinct failures into "allowed":
@@ -1957,6 +1994,19 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             raise NullRunMalformedGateResponseError(
                 f"/gate returned {type(response).__name__}, expected a JSON "
                 f"object. Body was not a gate decision."
+            )
+
+        source = response.get("decision_source")
+        if not isinstance(source, str) or source not in self._KNOWN_DECISION_SOURCES:
+            raise NullRunMalformedGateResponseError(
+                f"/gate response carries no usable 'decision_source' "
+                f"(got {source!r}). A real answer always states who decided — "
+                f"`GateResponse.decision_source` is a non-Option String on the "
+                f"wire — so a body without one did not come from the gate. "
+                f"This SDK knows {sorted(self._KNOWN_DECISION_SOURCES)}. "
+                f"Treating it as a verdict would let an on-path responder "
+                f"(captive portal, TLS-interception proxy) authorise a call no "
+                f"policy engine evaluated."
             )
 
         decision = response.get("decision")
