@@ -489,6 +489,32 @@ def _safe_cancel_active_execution(reason: str | None = None) -> None:
         return
 
 
+def _langchain_tool_attr(obj: object) -> str | None:
+    """Return ``"coroutine"`` / ``"func"`` if ``obj`` is a LangChain tool.
+
+    Duck-typed on purpose: `langchain_core` is an OPTIONAL dependency, so
+    an ``isinstance`` check against its `BaseTool` would make this module
+    import it. The three attributes below are what `BaseTool.run()` /
+    `arun()` actually dispatch through (`base.py:864` and `:895` in
+    0.3.86), so matching them is both cheaper and harder to get wrong than
+    a version-specific base class.
+
+    Async is checked first: an async tool sets BOTH, with ``func`` as a
+    sync fallback that raises if called. Wrapping the wrong one would
+    leave the async path ungated.
+
+    Returns None for a plain function, so the caller falls through to the
+    normal wrapping path with no behaviour change.
+    """
+    if not hasattr(obj, "invoke") or not hasattr(obj, "name"):
+        return None
+    for attr in ("coroutine", "func"):
+        candidate = getattr(obj, attr, None)
+        if callable(candidate):
+            return attr
+    return None
+
+
 def protect(fn: F | None = None) -> F | Callable[[F], F]:
     """
         Decorator that wraps a function in a NullRun span.
@@ -687,6 +713,28 @@ def protect(fn: F | None = None) -> F | Callable[[F], F]:
                 span,
                 error=_safe_error_str(error),
             )
+
+    # A LangChain `BaseTool` is an OBJECT, not a function. Decorating it
+    # with `functools.wraps`-based wrapping above produces a plain function
+    # that has lost `.invoke`, `.name`, `.args_schema` and `.description` --
+    # so an agent loop cannot bind it and enforcement silently disappears.
+    # Measured 2026-10-01 on langchain-core 0.3.86:
+    #
+    #     @protect            # outer
+    #     @tool               # inner -> StructuredTool
+    #     def f(...): ...
+    #     # f is now a plain function; bind_tools() rejects it
+    #
+    # Rather than document "put @tool outside", wrap the tool IN PLACE and
+    # return the same object, so both orders enforce. `BaseTool` holds the
+    # callable in `.func` (sync) or `.coroutine` (async); we wrap whichever
+    # is present and leave every other attribute untouched, so the agent
+    # loop sees exactly the tool it saw before.
+    _tool_attr = _langchain_tool_attr(fn)
+    if _tool_attr is not None:
+        _original = getattr(fn, _tool_attr)
+        setattr(fn, _tool_attr, protect(_original))
+        return fn
 
     if inspect.iscoroutinefunction(fn):
 

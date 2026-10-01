@@ -311,3 +311,153 @@ class TestAsyncProtectIsNotASeparatePath:
             "without it, 'body did not run' passes against an async "
             "wrapper that refuses everything"
         )
+
+
+class TestOnDeniedThroughRealLangChainTool:
+    """`on_denied="message"` must work INSIDE a real `@tool`.
+
+    `TestOnDeniedReachesProtect` above proves the flag reaches
+    `@protect`. It does not prove it survives the framework layer an
+    agent actually calls through — and that layer is where the mode is
+    most likely to break:
+
+      * LangChain's `ToolException` arm is its own error path, and
+        `handle_tool_error=True` stringifies whatever it catches;
+      * `@tool`/`@protect` ordering determines whether the wrapper is
+        even in the call chain;
+      * async and sync are separate wrappers.
+
+    `NullRunDeniedError` is what an operator uses to hand an agent a
+    written "you may not do this" without ending the run. If the tool
+    layer turns it into a string or drops it, the agent either loops or
+    crashes, and both are worse than the refusal.
+    """
+
+    def test_denied_message_reaches_the_agent_through_a_sync_tool(
+        self, make_runtime, mock_api, ran
+    ):
+        pytest.importorskip("langchain_core")
+        from langchain_core.tools import tool
+
+        respx.post(GATE_URL).mock(
+            return_value=_gate_refusal("TOOL_BLOCKED", "denied", status=403)
+        )
+        make_runtime(on_denied="message")
+
+        @protect
+        @tool
+        def charge(amount: int) -> str:
+            """Charge a card."""
+            ran.append("body")
+            return f"charged:{amount}"
+
+        with pytest.raises(NullRunDeniedError) as exc:
+            charge.invoke({"amount": 100})
+        assert exc.value.model_safe_text() == "The operator has not allowed this tool."
+        assert ran == []
+
+    def test_denied_message_reaches_the_agent_through_the_other_order(
+        self, make_runtime, mock_api, ran
+    ):
+        """`@tool` inside `@protect` — both orders must behave the same."""
+        pytest.importorskip("langchain_core")
+        from langchain_core.tools import tool
+
+        respx.post(GATE_URL).mock(
+            return_value=_gate_refusal("TOOL_BLOCKED", "denied", status=403)
+        )
+        make_runtime(on_denied="message")
+
+        @tool
+        @protect
+        def charge(amount: int) -> str:
+            """Charge a card."""
+            ran.append("body")
+            return f"charged:{amount}"
+
+        with pytest.raises(NullRunDeniedError):
+            charge.invoke({"amount": 100})
+        assert ran == []
+
+    @pytest.mark.asyncio
+    async def test_denied_message_reaches_the_agent_through_an_async_tool(
+        self, make_runtime, mock_api, ran
+    ):
+        pytest.importorskip("langchain_core")
+        from langchain_core.tools import tool
+
+        respx.post(GATE_URL).mock(
+            return_value=_gate_refusal("TOOL_BLOCKED", "denied", status=403)
+        )
+        make_runtime(on_denied="message")
+
+        @protect
+        @tool
+        async def charge(amount: int) -> str:
+            """Charge a card."""
+            ran.append("body")
+            return f"charged:{amount}"
+
+        with pytest.raises(NullRunDeniedError) as exc:
+            await charge.ainvoke({"amount": 100})
+        assert exc.value.model_safe_text() == "The operator has not allowed this tool."
+        assert ran == []
+
+    @pytest.mark.parametrize(
+        "code,category,status,expected",
+        [
+            ("BUDGET_HARD_BLOCKED", "budget", 402, NullRunBudgetError),
+            ("WORKFLOW_PAUSED", "halt", 403, NullRunBlockedException),
+        ],
+    )
+    def test_budget_and_halt_still_stop_the_tool_under_the_flag(
+        self, make_runtime, mock_api, ran, code, category, status, expected
+    ):
+        """The safety half, at the framework layer.
+
+        `on_denied="message"` is an operator convenience for a POLICY
+        denial. Letting it also stringify a budget wall would tell the
+        agent "that tool is not allowed" when the truth is "you are out
+        of money" — and its obvious next move is to find another way to
+        spend.
+        """
+        pytest.importorskip("langchain_core")
+        from langchain_core.tools import tool
+
+        respx.post(GATE_URL).mock(
+            return_value=_gate_refusal(code, category, status=status)
+        )
+        make_runtime(on_denied="message")
+
+        @protect
+        @tool
+        def charge(amount: int) -> str:
+            """Charge a card."""
+            ran.append("body")
+            return f"charged:{amount}"
+
+        with pytest.raises(expected) as exc:
+            charge.invoke({"amount": 100})
+        assert not isinstance(exc.value, NullRunDeniedError)
+        assert ran == []
+
+    def test_allow_still_runs_the_tool_body(
+        self, make_runtime, mock_api, ran
+    ):
+        """Counter-test: the tool layer is not simply refusing everything."""
+        pytest.importorskip("langchain_core")
+        from langchain_core.tools import tool
+
+        respx.post(GATE_URL).mock(return_value=_gate_allow())
+        respx.post(EXECUTE_URL).mock(return_value=httpx.Response(200, json={}))
+        make_runtime(on_denied="message")
+
+        @protect
+        @tool
+        def charge(amount: int) -> str:
+            """Charge a card."""
+            ran.append("body")
+            return f"charged:{amount}"
+
+        assert charge.invoke({"amount": 100}) == "charged:100"
+        assert ran == ["body"]
