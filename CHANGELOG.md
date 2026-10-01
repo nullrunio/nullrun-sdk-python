@@ -1,3 +1,95 @@
+## [Unreleased]
+
+The remaining half of `DEF-MP-TS12-ENF-01` (QA cycle RUN_ID
+20260929T1338). 0.19.0 closed the paths it found by reading; these
+close the ones that only showed up when the properties were asserted
+end-to-end. **Not yet released, and the version number is not chosen** —
+the behaviour change below is the reason that is worth a decision
+rather than a default: an unclassifiable refusal now raises where
+0.19.0 let the call proceed, so anyone who was relying on that has a
+migration to make and should be told so in the release note.
+
+### Security
+
+- **A `/gate` body must state who decided before it counts as a
+  verdict.** `_require_gate_decision` rejects a body whose
+  `decision_source` is absent or unrecognised, raising
+  `NullRunMalformedGateResponseError`. The runtime's rule was
+  `decision_source != fallback → honour the wire decision`, which
+  read a *missing* `decision_source` as more trustworthy than
+  `fallback`. So `{"decision": "allow"}` — a captive portal's login
+  JSON, an intercepting proxy's stub, anything on-path — was enough to
+  authorise a call no policy engine evaluated. The field is a
+  non-`Option` `String` on the backend's `GateResponse`
+  (`gate/internal.rs:638`) and every producer sets `"gateway"`, so a
+  real answer always carries one; there is no legitimate body this
+  rejects. **This is a behaviour change on the `/gate` path**: a
+  hand-rolled `/gate` response in an existing test double must now
+  include `decision_source`.
+- **`NULLRUN_SENSITIVE_FAIL_OPEN` is refused against production.** It
+  was read straight into the enforcement path, letting a sensitive
+  tool's body run with no policy evaluation at all. Its sibling
+  `NULLRUN_SKIP_BUDGET_CHECK` has been production-guarded since it
+  was caught doing the same; the asymmetry was an oversight, and this
+  half is the more dangerous one — that one skips a pre-flight, this
+  one skips the gate. The guard *refuses* the bypass rather than
+  raising, so enforcement falls back to its own fail-CLOSED default
+  and the attempt is logged at ERROR with a metric. Requires both
+  `NULLRUN_SENSITIVE_FAIL_OPEN=1` and `NULLRUN_ALLOW_SENSITIVE_FAIL_OPEN=1`;
+  the documented dev/test use is unchanged.
+- **The non-prod budget bypass is visible.** When
+  `NULLRUN_SKIP_BUDGET_CHECK=1` skips the check, it now logs and
+  increments a metric instead of being indistinguishable from a normal
+  call.
+
+### Changed
+
+- **Every gate refusal is classified, and an unclassifiable one
+  raises.** `NullRunUnclassifiedRefusalError` (an
+  `NullRunInfrastructureError`) is raised when a refusal carries no
+  `category` or one the SDK does not know. ADR-062 §2.2: absent or
+  unrecognised means *ask*, never *guess*. The exception hierarchy is
+  what makes this safe — `NullRunUnclassifiedRefusalError` and
+  `NullRunTransportError` are **siblings**, not parent and child, so
+  the fail-OPEN `except NullRunTransportError` arms cannot swallow it.
+- **`on_denied` selects the shape of a `denied` refusal and nothing
+  else.** `on_denied="message"` turns a `category="denied"` refusal
+  into a `NullRunDeniedError` carrying the server-authored
+  `agent_message` — the only text the SDK guarantees is safe to relay
+  to a model. `budget` and `halt` keep their own exceptions even with
+  the flag set: an agent told "that tool is not allowed" has an
+  obvious next move, and that move walks into a budget wall or an
+  operator's stop. `infra` is not reached by this flag at all — a
+  503 is converted by the 5xx band and the STRICT fallback, which is
+  the correct outcome (an outage is not a denial).
+- **`/execute` refusals carry `category` and `agent_message`.** The
+  MCP path (`MCPAdapter.call_tool`) is a different enforcement path
+  from `/gate`, so anything the category work added to the `/gate`
+  block site was absent there by default. Both properties are now
+  proven on the real adapter rather than inferred from
+  `runtime.execute`'s lack of a fail-OPEN `except`.
+
+### Documentation
+
+- README "Known limitations" states the trust boundary precisely:
+  the SDK trusts the channel and says so. Certificate verification
+  cannot be switched off by configuration, plain `http` is refused,
+  and the residual risk is named — an on-path responder that can
+  present a certificate the OS already trusts for `api.nullrun.io`,
+  which is not an exotic thing to find on a managed network. NullRun's
+  responses are not signed, so there is no after-the-fact detection.
+- README names the **second** version skew beside the first: an SDK
+  older than the `decision_source` check accepts a forged allow. Both
+  skews point the same way — on an older SDK a real refusal *and* a
+  fabricated permission are both read permissively, and neither is
+  visible in the SDK's output. Pin the version if either matters.
+- The `transport.py` comment that claimed `is_fail_closed` marks a
+  fail-closed response on the wire is corrected. It does not:
+  `GateErrorCode::is_fail_closed` is an in-process Rust method that is
+  never serialised, and a client written against it could not have
+  found it. ADR-064 owns the actual discriminator (ADR-063 §4.7
+  option 2, which pointed at the same non-existent marker).
+
 ## [0.19.0] - 2026-09-30
 
 Closes the SDK-side bypasses found auditing `DEF-MP-TS12-ENF-01`
