@@ -69,6 +69,63 @@ migration to make and should be told so in the release note.
   proven on the real adapter rather than inferred from
   `runtime.execute`'s lack of a fail-OPEN `except`.
 
+### Migration
+
+Six things differ from 0.19.0. Only the first three can surprise you
+at runtime, and the third is the one worth reading twice.
+
+1. **A `/gate` test double must carry `decision_source`.** Real
+   backend answers always do — it is a non-`Option` `String` on
+   `GateResponse`. A hand-written fixture that omits it now raises
+   `NullRunMalformedGateResponseError`. Fix: add
+   `"decision_source": "gateway"` next to `"decision": "allow"`.
+2. **`NULLRUN_SENSITIVE_FAIL_OPEN` against production now needs a
+   second variable.** `NULLRUN_ALLOW_SENSITIVE_FAIL_OPEN=1` must be
+   set too, otherwise the opt-out is refused, enforcement falls back
+   to its own fail-CLOSED default, and the attempt is logged at ERROR
+   with a metric. Non-production behaviour is unchanged.
+3. **An unclassifiable refusal now raises where 0.19.0 let the call
+   proceed.** This is the intended fix, and it is the one that can
+   turn a working loop into a throwing one.
+   `NullRunUnclassifiedRefusalError` is importable from
+   `nullrun.breaker.categories` (it is *not* re-exported at the top
+   level) and carries `error_code="NR-P003"` and `retryable=True`.
+   It is a **`NullRunInfrastructureError` and a sibling of
+   `NullRunTransportError`** — deliberately *not* a subclass of it.
+   So an existing `except NullRunTransportError:` arm, which in
+   0.19.0 caught everything the gate could not classify and failed
+   open, **will not catch this one**. That is the point: it is what
+   stops a failed-open arm from swallowing a refusal. If you have
+   such an arm, you have three options and they are not equivalent:
+
+   ```python
+   from nullrun.breaker.categories import NullRunUnclassifiedRefusalError
+   from nullrun.breaker.exceptions import NullRunError, NullRunTransportError
+
+   try:
+       ...
+   except NullRunUnclassifiedRefusalError:
+       raise                      # recommended: the SDK was right
+   except NullRunTransportError:
+       ...                        # still fails open, as before
+   ```
+
+   Catching it alongside `NullRunTransportError` restores 0.19.0's
+   behaviour exactly — which means it restores the bypass. Do not
+   widen the arm to `NullRunError`: that also swallows real policy
+   refusals, which is a larger hole than the one this closes.
+4. **`on_denied` is new.** Default `"raise"`, which is 0.19.0's
+   behaviour. Set `"message"` to get a `NullRunDeniedError` carrying
+   the server-authored `agent_message` for `category="denied"` only.
+   Any other value raises `ValueError` at construction rather than
+   at first refusal.
+5. **`NULLRUN_SKIP_BUDGET_CHECK` outside production now logs and
+   increments a metric** when it skips the check. Enforcement
+   behaviour is unchanged.
+6. **`/execute` refusal bodies carry `category` and
+   `agent_message`.** Additive on the wire. If you parse that body
+   yourself and reject unknown keys, relax that.
+
 ### Documentation
 
 - README "Known limitations" states the trust boundary precisely:
