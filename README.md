@@ -354,6 +354,24 @@ require tests for new public API, and run `ruff` + `mypy` in CI.
 
 ---
 
+## Known limitations
+
+Three things this SDK does not do. All three are enforcement-relevant, so they are stated here rather than left to be discovered during an incident. Each was verified against the code before being written down.
+
+**1. A failed security check arrives as a 503, and only this version of the SDK stops on it.** When the backend cannot evaluate the security check itself, it refuses with a 503 carrying a `category` field. This SDK reads that field and fails **closed** — the call is refused. An SDK older than the category work has nothing to read: the 503 is turned into a synthetic `FALLBACK` decision, and `check_workflow_budget` fails **open** on a `FALLBACK` source — the call proceeds. So during a partial backend outage, enforcement differs by SDK version. A genuine outage (not a failed check) still fails open on every version, which is deliberate: a dead backend must not freeze your agent loop.
+
+If you need this guarantee today, pin the SDK version. Do not assume a refused call implies the backend rejected the call.
+
+**2. The gate circuit-breaker's trip mode is a server-side setting, and `LogOnly` does not block.** When the gate's circuit breaker trips, what happens is decided by `NULLRUN_GATE_CB_TRIP_ENFORCEMENT_MODE` on the server, not by anything in this SDK. In `LogOnly` the trip is recorded and alerted on, but tripped workflows still pass `/check`. The production boot check refuses to start unless the variable is explicitly set to `Enforce` or `LogOnly`, so a deploy cannot inherit the dev default (`detect_mode()` still falls back to `LogOnly` when unset outside production) — but an operator who chooses `LogOnly` is choosing non-enforcement, knowingly. If your compliance story depends on breaker trips being enforced, confirm that value with whoever operates the deployment.
+
+**3. Pause and kill both reach the agent as a 403.** There is no separate status to branch on. `WORKFLOW_PAUSED` and `WORKFLOW_INACTIVE` are served as the same 403 from the same key; the only thing distinguishing them is the operator-facing text, which the backend deliberately keeps distinct because they mean opposite things about whether the run will resume. If you write support tooling, key off the error code, not the status. Separately, the SDK can observe pause/kill ahead of the next gate call via `check_control_plane` (WebSocket push, or a `/status` poll), which raises `WorkflowPausedException` / `NullRunWorkflowKilledError` locally.
+
+### What does fail open
+
+Fail-open here is narrow and deliberate, and the authoritative table lives in `runtime.py` (ADR-008). In short: a **transport** failure on the check path is open, so an unreachable backend cannot freeze your agent; a **wire response that names an enforcement failure** is closed, because the backend made a decision and the SDK will not overrule it; a **401** is closed, because no retry fixes a revoked key; and the `/execute` path is closed by default (`FallbackMode.STRICT`).
+
+---
+
 ## Security
 
 NullRun does **not** store or proxy your LLM provider keys — it sits beside your existing clients and observes the calls. The gate is **server-authoritative** for cost: even a malicious SDK cannot inflate spend by sending a fake `cost_cents` to `/track`.
