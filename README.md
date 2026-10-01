@@ -221,6 +221,52 @@ exits with code 1 instead of raising. `nullrun.shutdown()` is
 auto-registered via `atexit` inside `init()`, so a clean WS close on
 process exit happens without any explicit call.
 
+### Decorator order with LangChain tools
+
+Both orders gate. `@protect` recognises a LangChain tool, wraps the
+tool's `func`/`coroutine` in place, and returns the same object, so this
+is not a rule you have to remember:
+
+```python
+from langchain_core.tools import tool
+from nullrun import protect
+
+@tool                  # fine
+@protect
+def charge(amount: int) -> str: ...
+
+@protect               # also fine
+@tool
+def charge(amount: int) -> str: ...
+```
+
+Before 0.20.0 the second form silently produced a plain function. The
+agent loop could not bind it, and a tool the loop cannot bind cannot
+refuse — so the gate was not running. If you saw
+`NameError: name 'Annotated' is not defined` from
+`convert_to_openai_tool`, that was this.
+
+### Handing an agent a reason instead of a crash
+
+By default a refusal raises, which is right for most code: the caller
+decides what happens next. `on_denied="message"` is the operator-facing
+alternative for a **policy** denial — the agent gets the
+server-authored explanation and the run continues:
+
+```python
+rt = nullrun.init(on_denied="message")
+```
+
+The text is authored by the backend, never assembled by the SDK, and it
+applies to `category="denied"` only. Budget and halt refusals keep their
+own exceptions under the same flag: an agent told "that tool is not
+allowed" when the truth is "you are out of money" will go looking for
+another way to spend.
+
+LangChain's own `handle_tool_error=True` is **not** an equivalent. It
+catches `ToolException` and stringifies it, and it does not know which
+exceptions are refusals — use `on_denied="message"`.
+
 ---
 
 ## How NullRun compares

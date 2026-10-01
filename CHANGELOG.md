@@ -1,73 +1,14 @@
-## [Unreleased]
+## [0.20.0] - 2026-10-01
 
 The remaining half of `DEF-MP-TS12-ENF-01` (QA cycle RUN_ID
 20260929T1338). 0.19.0 closed the paths it found by reading; these
 close the ones that only showed up when the properties were asserted
-end-to-end. **Not yet released, and the version number is not chosen** —
-the behaviour change below is the reason that is worth a decision
-rather than a default: an unclassifiable refusal now raises where
-0.19.0 let the call proceed, so anyone who was relying on that has a
-migration to make and should be told so in the release note.
+end-to-end.
 
-### Security
-
-- **A `/gate` body must state who decided before it counts as a
-  verdict.** `_require_gate_decision` rejects a body whose
-  `decision_source` is absent or unrecognised, raising
-  `NullRunMalformedGateResponseError`. The runtime's rule was
-  `decision_source != fallback → honour the wire decision`, which
-  read a *missing* `decision_source` as more trustworthy than
-  `fallback`. So `{"decision": "allow"}` — a captive portal's login
-  JSON, an intercepting proxy's stub, anything on-path — was enough to
-  authorise a call no policy engine evaluated. The field is a
-  non-`Option` `String` on the backend's `GateResponse`
-  (`gate/internal.rs:638`) and every producer sets `"gateway"`, so a
-  real answer always carries one; there is no legitimate body this
-  rejects. **This is a behaviour change on the `/gate` path**: a
-  hand-rolled `/gate` response in an existing test double must now
-  include `decision_source`.
-- **`NULLRUN_SENSITIVE_FAIL_OPEN` is refused against production.** It
-  was read straight into the enforcement path, letting a sensitive
-  tool's body run with no policy evaluation at all. Its sibling
-  `NULLRUN_SKIP_BUDGET_CHECK` has been production-guarded since it
-  was caught doing the same; the asymmetry was an oversight, and this
-  half is the more dangerous one — that one skips a pre-flight, this
-  one skips the gate. The guard *refuses* the bypass rather than
-  raising, so enforcement falls back to its own fail-CLOSED default
-  and the attempt is logged at ERROR with a metric. Requires both
-  `NULLRUN_SENSITIVE_FAIL_OPEN=1` and `NULLRUN_ALLOW_SENSITIVE_FAIL_OPEN=1`;
-  the documented dev/test use is unchanged.
-- **The non-prod budget bypass is visible.** When
-  `NULLRUN_SKIP_BUDGET_CHECK=1` skips the check, it now logs and
-  increments a metric instead of being indistinguishable from a normal
-  call.
-
-### Changed
-
-- **Every gate refusal is classified, and an unclassifiable one
-  raises.** `NullRunUnclassifiedRefusalError` (an
-  `NullRunInfrastructureError`) is raised when a refusal carries no
-  `category` or one the SDK does not know. ADR-062 §2.2: absent or
-  unrecognised means *ask*, never *guess*. The exception hierarchy is
-  what makes this safe — `NullRunUnclassifiedRefusalError` and
-  `NullRunTransportError` are **siblings**, not parent and child, so
-  the fail-OPEN `except NullRunTransportError` arms cannot swallow it.
-- **`on_denied` selects the shape of a `denied` refusal and nothing
-  else.** `on_denied="message"` turns a `category="denied"` refusal
-  into a `NullRunDeniedError` carrying the server-authored
-  `agent_message` — the only text the SDK guarantees is safe to relay
-  to a model. `budget` and `halt` keep their own exceptions even with
-  the flag set: an agent told "that tool is not allowed" has an
-  obvious next move, and that move walks into a budget wall or an
-  operator's stop. `infra` is not reached by this flag at all — a
-  503 is converted by the 5xx band and the STRICT fallback, which is
-  the correct outcome (an outage is not a denial).
-- **`/execute` refusals carry `category` and `agent_message`.** The
-  MCP path (`MCPAdapter.call_tool`) is a different enforcement path
-  from `/gate`, so anything the category work added to the `/gate`
-  block site was absent there by default. Both properties are now
-  proven on the real adapter rather than inferred from
-  `runtime.execute`'s lack of a fail-OPEN `except`.
+Minor, not patch: an unclassifiable refusal now **raises** where 0.19.0
+let the call proceed. That is a working loop becoming a throwing one,
+which is a behavioural break and not a bug fix — read
+[Migration](#migration) before upgrading.
 
 ### Migration
 
@@ -126,8 +67,114 @@ at runtime, and the third is the one worth reading twice.
    `agent_message`.** Additive on the wire. If you parse that body
    yourself and reject unknown keys, relax that.
 
+Carried over from 0.19.0 and still true on 0.20.0, because it is the
+same class of break and the same shape of fix:
+
+- **`NullRunRuntime.execute(..., mode="inline")` is gone** and has no
+  replacement — every call goes through `/execute`. Drop the argument;
+  `mode="auto"` (the default) already always contacts the gateway.
+- **`nullrun.runtime.register_strict_mode_forced` /
+  `is_strict_mode_forced`** are gone, along with `@guarded`,
+  `nullrun.handle` (renamed `nullrun.guard` in 0.18.5),
+  `nullrun.status()`, and `nullrun.auto_instrument`.
+
+### Security
+
+- **A `/gate` body must state who decided before it counts as a
+  verdict.** `_require_gate_decision` rejects a body whose
+  `decision_source` is absent or unrecognised, raising
+  `NullRunMalformedGateResponseError`. The runtime's rule was
+  `decision_source != fallback → honour the wire decision`, which
+  read a *missing* `decision_source` as more trustworthy than
+  `fallback`. So `{"decision": "allow"}` — a captive portal's login
+  JSON, an intercepting proxy's stub, anything on-path — was enough to
+  authorise a call no policy engine evaluated. The field is a
+  non-`Option` `String` on the backend's `GateResponse`
+  (`gate/internal.rs:638`) and every producer sets `"gateway"`, so a
+  real answer always carries one; there is no legitimate body this
+  rejects. **This is a behaviour change on the `/gate` path**: a
+  hand-rolled `/gate` response in an existing test double must now
+  include `decision_source`.
+- **`NULLRUN_SENSITIVE_FAIL_OPEN` is refused against production.** It
+  was read straight into the enforcement path, letting a sensitive
+  tool's body run with no policy evaluation at all. Its sibling
+  `NULLRUN_SKIP_BUDGET_CHECK` has been production-guarded since it
+  was caught doing the same; the asymmetry was an oversight, and this
+  half is the more dangerous one — that one skips a pre-flight, this
+  one skips the gate. The guard *refuses* the bypass rather than
+  raising, so enforcement falls back to its own fail-CLOSED default
+  and the attempt is logged at ERROR with a metric. Requires both
+  `NULLRUN_SENSITIVE_FAIL_OPEN=1` and `NULLRUN_ALLOW_SENSITIVE_FAIL_OPEN=1`;
+  the documented dev/test use is unchanged.
+- **The non-prod budget bypass is visible.** When
+  `NULLRUN_SKIP_BUDGET_CHECK=1` skips the check, it now logs and
+  increments a metric instead of being indistinguishable from a normal
+  call.
+
+### Fixed
+
+- **`@protect` no longer loses a LangChain tool when it is the outer
+  decorator.** Applied to a `@tool` result, `@protect` wrapped the
+  object with `functools.wraps` and returned a plain function — so
+  `.invoke`, `.name`, `.args_schema` and `.description` were gone, an
+  agent loop could not bind the tool, and a tool the loop cannot see
+  raises no refusal. **Enforcement was silently absent in that
+  ordering.** The reported symptom was not even about NullRun:
+  `convert_to_openai_tool` on the result raises
+  `NameError: name 'Annotated' is not defined`, which reads as a
+  LangChain type bug rather than "your tool is not a tool any more".
+
+  ```python
+  @nullrun.protect      # now fine
+  @tool
+  def charge(amount: int) -> str: ...
+
+  @tool                # was already fine
+  @nullrun.protect
+  def charge(amount: int) -> str: ...
+  ```
+
+  `protect` wraps the tool's `func`/`coroutine` in place and returns the
+  same object, so both orderings gate identically. Duck-typed on
+  `.invoke` + `.name` rather than `isinstance(BaseTool)`, because
+  `langchain_core` is an optional dependency. `handle_tool_error=True`
+  remains safe: it catches only `ToolException`, so an enforcement
+  refusal still aborts rather than becoming model-visible text.
+
+### Changed
+
+- **Every gate refusal is classified, and an unclassifiable one
+  raises.** `NullRunUnclassifiedRefusalError` (an
+  `NullRunInfrastructureError`) is raised when a refusal carries no
+  `category` or one the SDK does not know. ADR-062 §2.2: absent or
+  unrecognised means *ask*, never *guess*. The exception hierarchy is
+  what makes this safe — `NullRunUnclassifiedRefusalError` and
+  `NullRunTransportError` are **siblings**, not parent and child, so
+  the fail-OPEN `except NullRunTransportError` arms cannot swallow it.
+- **`on_denied` selects the shape of a `denied` refusal and nothing
+  else.** `on_denied="message"` turns a `category="denied"` refusal
+  into a `NullRunDeniedError` carrying the server-authored
+  `agent_message` — the only text the SDK guarantees is safe to relay
+  to a model. `budget` and `halt` keep their own exceptions even with
+  the flag set: an agent told "that tool is not allowed" has an
+  obvious next move, and that move walks into a budget wall or an
+  operator's stop. `infra` is not reached by this flag at all — a
+  503 is converted by the 5xx band and the STRICT fallback, which is
+  the correct outcome (an outage is not a denial).
+- **`/execute` refusals carry `category` and `agent_message`.** The
+  MCP path (`MCPAdapter.call_tool`) is a different enforcement path
+  from `/gate`, so anything the category work added to the `/gate`
+  block site was absent there by default. Both properties are now
+  proven on the real adapter rather than inferred from
+  `runtime.execute`'s lack of a fail-OPEN `except`.
+
 ### Documentation
 
+- README states the decorator ordering for LangChain tools and shows it
+  in both directions, with the reason (an unbound tool cannot refuse).
+  `on_denied="message"` is documented as the operator-facing "explain,
+  don't crash" mode, including that `handle_tool_error=True` does not
+  provide the same thing and would not be safe if it did.
 - README "Known limitations" states the trust boundary precisely:
   the SDK trusts the channel and says so. Certificate verification
   cannot be switched off by configuration, plain `http` is refused,
