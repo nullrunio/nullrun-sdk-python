@@ -3046,11 +3046,23 @@ class TestCheckWorkflowBudgetConsumeOnApproved:
         rt = make_runtime()
 
         # /gate returns require_approval — SDK must block on WS.
+        #
+        # `decision_source` / `explanation` / `policy_version` are the
+        # three non-`Option` fields on the backend's `GateResponse`
+        # (`gate/internal.rs:637-641`), so a real answer always
+        # carries them. This fixture omitted all three, which the
+        # provenance guard in `runtime.py::_require_gate_decision`
+        # correctly rejects as "not a gate answer" — a test body is
+        # not evidence of what the wire looks like, and this one had
+        # drifted from it.
         respx.post(f"{BASE_URL}/api/v1/gate").mock(
             return_value=Response(
                 200,
                 json={
                     "decision": "require_approval",
+                    "decision_source": "gateway",
+                    "explanation": "operator approval required",
+                    "policy_version": 1,
                     "approval_id": "apr-success",
                     "execution_id": "exec-success-1",
                     "approval_timeout_seconds": 60,

@@ -262,6 +262,18 @@ class _StubRuntime:
     def _emit_sdk_error(self, *a, **k):
         return None
 
+    def sensitive_fail_open_enabled(self, *a, **k):
+        """The real runtime refuses this bypass in production.
+
+        The stub keeps the "every gate passes" contract these tests
+        assert against, so it reports the flag OFF -- the default for
+        an operator who has set nothing. If the decorator ever reads
+        the env var directly again, the production-guard tests in
+        `test_sensitive_fail_open_guard.py` are what catch it; this
+        stub must not paper over that by mirroring the raw read.
+        """
+        return False
+
 
 @pytest.fixture
 def stub_runtime(monkeypatch):

@@ -221,6 +221,52 @@ exits with code 1 instead of raising. `nullrun.shutdown()` is
 auto-registered via `atexit` inside `init()`, so a clean WS close on
 process exit happens without any explicit call.
 
+### Decorator order with LangChain tools
+
+Both orders gate. `@protect` recognises a LangChain tool, wraps the
+tool's `func`/`coroutine` in place, and returns the same object, so this
+is not a rule you have to remember:
+
+```python
+from langchain_core.tools import tool
+from nullrun import protect
+
+@tool                  # fine
+@protect
+def charge(amount: int) -> str: ...
+
+@protect               # also fine
+@tool
+def charge(amount: int) -> str: ...
+```
+
+Before 0.20.0 the second form silently produced a plain function. The
+agent loop could not bind it, and a tool the loop cannot bind cannot
+refuse — so the gate was not running. If you saw
+`NameError: name 'Annotated' is not defined` from
+`convert_to_openai_tool`, that was this.
+
+### Handing an agent a reason instead of a crash
+
+By default a refusal raises, which is right for most code: the caller
+decides what happens next. `on_denied="message"` is the operator-facing
+alternative for a **policy** denial — the agent gets the
+server-authored explanation and the run continues:
+
+```python
+rt = nullrun.init(on_denied="message")
+```
+
+The text is authored by the backend, never assembled by the SDK, and it
+applies to `category="denied"` only. Budget and halt refusals keep their
+own exceptions under the same flag: an agent told "that tool is not
+allowed" when the truth is "you are out of money" will go looking for
+another way to spend.
+
+LangChain's own `handle_tool_error=True` is **not** an equivalent. It
+catches `ToolException` and stringifies it, and it does not know which
+exceptions are refusals — use `on_denied="message"`.
+
 ---
 
 ## How NullRun compares
@@ -351,6 +397,34 @@ pytest -q
 
 We follow [Conventional Commits](https://www.conventionalcommits.org/),
 require tests for new public API, and run `ruff` + `mypy` in CI.
+
+---
+
+## Known limitations
+
+Four things this SDK does not do. All four are enforcement-relevant, so they are stated here rather than left to be discovered during an incident. Each was verified against the code before being written down.
+
+**1. A failed security check arrives as a 503, and only this version of the SDK stops on it.** When the backend cannot evaluate the security check itself, it refuses with a 503 carrying a `category` field. This SDK reads that field and fails **closed** — the call is refused. An SDK older than the category work has nothing to read: the 503 is turned into a synthetic `FALLBACK` decision, and `check_workflow_budget` fails **open** on a `FALLBACK` source — the call proceeds. So during a partial backend outage, enforcement differs by SDK version. A genuine outage (not a failed check) still fails open on every version, which is deliberate: a dead backend must not freeze your agent loop.
+
+If you need this guarantee today, pin the SDK version. Do not assume a refused call implies the backend rejected the call.
+
+**Older SDKs fail open on a forged allow, too — and this is the second version-skewed behaviour, so pin for it too.** The `decision_source` check described in limitation 4 arrived with the same release. An SDK older than it accepts `{"decision": "allow"}` from any responder, because it reads a missing `decision_source` as "not `fallback`" and therefore as authoritative. The two skews point the same way and are worth knowing together: on an older SDK, both a real backend refusal *and* a fabricated permission are read the permissive way, and neither is visible in the SDK's own output — the call simply proceeds. Pin the version if either matters to you.
+
+**2. The gate circuit-breaker's trip mode is a server-side setting, and `LogOnly` does not block.** When the gate's circuit breaker trips, what happens is decided by `NULLRUN_GATE_CB_TRIP_ENFORCEMENT_MODE` on the server, not by anything in this SDK. In `LogOnly` the trip is recorded and alerted on, but tripped workflows still pass `/check`. The production boot check refuses to start unless the variable is explicitly set to `Enforce` or `LogOnly`, so a deploy cannot inherit the dev default (`detect_mode()` still falls back to `LogOnly` when unset outside production) — but an operator who chooses `LogOnly` is choosing non-enforcement, knowingly. If your compliance story depends on breaker trips being enforced, confirm that value with whoever operates the deployment.
+
+**3. Pause and kill both reach the agent as a 403.** There is no separate status to branch on. `WORKFLOW_PAUSED` and `WORKFLOW_INACTIVE` are served as the same 403 from the same key; the only thing distinguishing them is the operator-facing text, which the backend deliberately keeps distinct because they mean opposite things about whether the run will resume. If you write support tooling, key off the error code, not the status. Separately, the SDK can observe pause/kill ahead of the next gate call via `check_control_plane` (WebSocket push, or a `/status` poll), which raises `WorkflowPausedException` / `NullRunWorkflowKilledError` locally.
+
+**4. The SDK trusts the channel, and says so rather than pretending otherwise.** Everything above rests on one premise: that the JSON arriving on the SDK's HTTPS connection was written by NullRun. The SDK checks for it — a `/gate` body with no usable `decision_source` is rejected as `NullRunMalformedGateResponseError` rather than acted on — but that is a *field in the body*, not a signature, and a field is only as trustworthy as the channel carrying it.
+
+What the channel does give you, verified in `transport.py`: certificate verification is **on and cannot be switched off by configuration** — `verify_cert` is `True` (`:572`) and there is no env var that sets it to `False`; the only override, `NULLRUN_TLS_CA_CERT` (`:568`), replaces the trust anchor with one you chose explicitly and is still verification. Plain `http://` is refused outright (`InsecureTransportError`, `:526`). So a passive network observer cannot pose as NullRun, and the ordinary captive portal — which returns a login page, or JSON without a `decision` — is rejected.
+
+What remains is specific, and it is not "use https". It is: **an on-path responder that can present a certificate the operating system already trusts for `api.nullrun.io`.** That is what corporate TLS interception installs, and it is not exotic — it is a normal thing to find on a managed network. Such a responder can return a perfectly well-formed body *including* `decision_source: "gateway"`; it needs neither your API key nor an HMAC bypass, only to answer before the real backend. NullRun's responses are **not signed**, so there is no after-the-fact detection either — the audit trail would faithfully record an allow that the gate never gave.
+
+So the honest boundary is: server-authoritative enforcement is authoritative against a *client* and against a *network observer*, not against an attacker who terminates TLS inside your trust store. If you operate on such a network, exclude `api.nullrun.io` from interception and check that it stays excluded — that is an operational control, not something the SDK can do for you.
+
+### What does fail open
+
+Fail-open here is narrow and deliberate, and the authoritative table lives in `runtime.py` (ADR-008). In short: a **transport** failure on the check path is open, so an unreachable backend cannot freeze your agent; a **wire response that names an enforcement failure** is closed, because the backend made a decision and the SDK will not overrule it; a **body that is not a verdict at all** — no `decision`, no `decision_source`, or an unrecognised value in either — is closed, because something answered and what it said was not a decision, and reading that as permission would let a non-NullRun responder authorise a call no policy engine evaluated; a **401** is closed, because no retry fixes a revoked key; and the `/execute` path is closed by default (`FallbackMode.STRICT`).
 
 ---
 

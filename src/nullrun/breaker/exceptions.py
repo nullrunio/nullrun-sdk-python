@@ -385,6 +385,41 @@ class NullRunProtocolError(NullRunInfrastructureError):
     retryable = False
 
 
+class NullRunMalformedGateResponseError(NullRunProtocolError):
+    """The ``/gate`` response is not a decision the SDK can act on.
+
+    Raised when the body is not a JSON object, or when it is an object
+    whose ``decision`` field is absent, not a string, or names a value
+    outside the known decision set.
+
+    This is a subclass of :class:`NullRunProtocolError` rather than a
+    new root so that existing ``except NullRunProtocolError`` handlers
+    keep catching it, and so it shares the NR-P* error-code family
+    (wire-contract violations) without overloading NR-P001, whose
+    ``user_action`` is specifically "upgrade the SDK".
+
+    Why it raises instead of defaulting to ``allow``: ``decision`` is
+    a non-optional, non-``skip_serializing_if`` field on the backend's
+    ``GateResponse`` (``gate/internal.rs:637``), so every real
+    NULLRUN backend sends it on every answer. A body without it did
+    not come from NULLRUN — a proxy error page, a captive portal, an
+    expired TLS interception box. Reading that as "allowed" is the
+    fail-OPEN that ADR-008's table assigns only to *transport*
+    failures, and it is the one case where a non-NULLRUN responder can
+    authorise a call no policy engine ever saw.
+    """
+
+    error_code = "NR-P002"
+    user_action = (
+        "The NullRun API returned a response the SDK could not read as "
+        "a decision. This usually means a proxy, VPN, or corporate TLS "
+        "box intercepted the connection and returned its own body "
+        "instead of the gate's JSON. Check that the API host is "
+        "reachable directly, then retry."
+    )
+    retryable = True
+
+
 class NullRunChainError(NullRunDecision):
     """Chain-related failure.
 
@@ -765,6 +800,60 @@ class NullRunBlockedException(NullRunDecision):
             user_action=user_action,
             retryable=retryable,
         )
+
+
+class NullRunDeniedError(NullRunBlockedException):
+    """ADR-062 ``denied``: an operator refused **this call** on policy.
+
+    Raised only when the host opted in with
+    ``nullrun.init(on_denied="message")`` and the gate answered with
+    ``category == "denied"``. That is the single condition: a
+    ``budget``, ``halt``, or ``infra`` refusal never becomes this
+    class no matter what the flag says, because those three describe
+    walls the model cannot climb, and a model handed a friendly
+    sentence about one will tool-shop and retry.
+
+    The distinction this class buys the host is
+    :attr:`agent_message` — server-authored text the backend
+    guarantees is safe to place in the model's context. It is
+    populated from the wire field of the same name, which the
+    backend sets **only** for ``denied``
+    (``gate.rs::attach_refusal_surface``). When the server sent no
+    such text the attribute is ``None`` and the host must not
+    substitute its own wording.
+
+    With the default ``on_denied="raise"`` a denial surfaces as the
+    ordinary code-specific exception (``NullRunToolBlockedError`` and
+    friends) and this class is never raised — the opt-in is what
+    changes the shape of the refusal, not the enforcement.
+    """
+
+    error_code = "NR-D001"
+    user_action = (
+        "The operator's policy refused this specific call. Adjust the call "
+        "(different tool, different arguments) or ask them to widen the "
+        "policy — no other call is affected by this refusal."
+    )
+    retryable = False
+
+    def __init__(
+        self,
+        *args: Any,
+        agent_message: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        self.agent_message = agent_message
+        super().__init__(*args, **kwargs)
+
+    def model_safe_text(self) -> str | None:
+        """The server's model-safe text, or ``None`` if it sent none.
+
+        The single accessor, so a host cannot reach for
+        ``str(exc)`` — which mixes in the endpoint, the HTTP status
+        and the error code, none of which are model-safe — and get
+        operator internals into the model's context by accident.
+        """
+        return self.agent_message
 
 
 class NullRunBudgetError(NullRunBlockedException):

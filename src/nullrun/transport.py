@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, cast
 import httpx
 
 from nullrun.actions import handle_action
+from nullrun.breaker.categories import is_gate_refusal, resolve_refusal_category
 from nullrun.breaker.circuit_breaker import CircuitBreaker
 from nullrun.breaker.exceptions import (
     BreakerTransportError,
@@ -1624,15 +1625,69 @@ class Transport:
             # ``details`` are preserved so the catalogue formatter
             # can produce an actionable message.
             #
-            # DEF-NR-TOOLBLOCKED-PARSER: the dedicated parser
-            # branch below translates the typed v3 envelope into a
-            # `NullRunToolBlockedError` (catalog code NR-T001)
-            # instead of the generic NR-X001 fallback.
-            if 400 <= response.status_code < 500:
-                try:
-                    wire_body = response.json()
-                except Exception:
-                    wire_body = {}
+            # A gate refusal is a refusal whatever the status.
+            # ADR-064 owns this rule; §4.7 of ADR-063 records the
+            # correction and points here.
+            #
+            # The distinction is not the status and not a store
+            # name — it is whether the gate produced an ANSWER:
+            #
+            #   * the check could not be performed, and the gate
+            #     said so (CIRCUIT_BREAKER_STATE_LOOKUP_FAILED,
+            #     WORKFLOW_INACTIVE_LOOKUP_FAILED,
+            #     RATE_LIMIT_PLAN_LOOKUP_FAILED — category "infra",
+            #     status 503) — arrives as 503 WITH
+            #     decision="block", and the decision stands.
+            #   * nothing reached the gate — a proxy 502, a gateway
+            #     that never answered, `/budget/approximate`'s
+            #     `BudgetUnavailableResponse` (budget.rs:246, which
+            #     carries no `decision` field at all) — arrives 5xx
+            #     with no refusal body, and ADR-008's fail-OPEN
+            #     applies.
+            #
+            # So the discriminator below is `decision == "block"`,
+            # which `GateResponse` always serialises. Do not look
+            # for a fail-closed marker: `GateErrorCode::is_fail_closed`
+            # is an in-process Rust method that is never written to
+            # the wire, and a client written against it could not
+            # have found it. ADR-064 §Correction is the full
+            # history.
+            #
+            # Pre-fix the entire 5xx band fell through to the
+            # synthetic FALLBACK block below, which the runtime
+            # reads as a transport error and fails OPEN — so a 503
+            # refusal the gate had actually made was silently
+            # converted into "allowed". That is DEF-MP-TS12-ENF-01's
+            # exact shape with a different trigger, and it is why a
+            # 5xx body that is a genuine refusal is handled here
+            # instead.
+            #
+            # Old SDKs are unaffected by definition: they never
+            # looked at `category`, and they read the 503 as a
+            # transport error. They keep failing open, which is the
+            # documented pre-0.19.0 behaviour.
+            try:
+                wire_body = response.json()
+            except Exception:
+                wire_body = {}
+            # ADR-062 §2.2. Classify the refusal BEFORE building
+            # the synthetic response dict, and let an
+            # unclassifiable one escape as
+            # ``NullRunUnclassifiedRefusalError`` rather than
+            # being flattened into the generic block below.
+            #
+            # The dict this branch returns hardcodes
+            # ``decision="block"`` for every 4xx, including ones
+            # that were never gate refusals (a 400 protocol
+            # mismatch has no ``decision`` field at all).
+            # ``resolve_refusal_category`` discriminates on the
+            # WIRE body, not on the status, so those return
+            # ``None`` and keep their pre-existing handling.
+            is_refusal = is_gate_refusal(wire_body)
+            if 400 <= response.status_code < 500 or (
+                response.status_code >= 500 and is_refusal
+            ):
+                category = resolve_refusal_category(wire_body)
                 explanations = wire_body.get("explanations") or []
                 if not explanations:
                     single = (
@@ -1648,6 +1703,19 @@ class Transport:
                     "decision_source": DecisionSource.GATEWAY,
                     "explanation": explanations[0],
                     "explanations": explanations,
+                    # ADR-062 §2.2 — ``None`` for a 4xx that was
+                    # never a gate refusal, a real
+                    # ``DecisionCategory`` for one that was. Carried
+                    # rather than re-derived so the runtime's raise
+                    # site branches on the server's own classification
+                    # instead of inferring one from the status code.
+                    "category": category,
+                    # Server-authored text. ``agent_message`` is
+                    # populated by the backend only for ``denied``;
+                    # its absence on the other three is the server
+                    # stating "this is not the model's to read".
+                    "agent_message": wire_body.get("agent_message"),
+                    "user_message": wire_body.get("user_message"),
                     "reservation_id": wire_body.get("reservation_id"),
                     "remaining_budget_cents": wire_body.get("remaining_budget_cents") or 0,
                     "projected_cost_cents": wire_body.get("projected_cost_cents") or 0,
@@ -2616,6 +2684,26 @@ def _extract_error_envelope(
         return ("", raw_text or "", {})
 
     # Shape 1: v3 envelope.
+    #
+    # ``error_code`` is read from the TOP LEVEL first and from
+    # ``details.error_code`` second. The second is not a fallback for
+    # a malformed envelope — it is where a real gate refusal puts it.
+    # ``GateResponse`` serialises ``error_code`` inside
+    # ``details`` (``internal.rs:716``) and the backend's own status
+    # mapper reads it from there (``gate.rs:88-90``), so every
+    # refusal that reaches ``/execute`` or ``/gate`` carries it at
+    # that nesting. Reading only the top level left ``code`` empty
+    # for the whole refusal family, and the dispatcher then fell
+    # through to its status-only branch — where a 403 becomes
+    # ``NullRunAuthenticationError``. The observable effect was a
+    # ``TOOL_BLOCKED`` policy refusal on the MCP path reported to the
+    # host as a bad API key: wrong exception class, wrong
+    # ``format_user_message``, and an operator action ("check your
+    # credentials") that cannot possibly fix a policy decision.
+    #
+    # This is the same class of defect as DEF-MP-TS12-ENF-01 — a
+    # decision the backend made being reported as something else —
+    # and it is why ADR-064 records the nesting as load-bearing.
     if "error_code" in body:
         code = str(body.get("error_code", "") or "")
         # The 503 budget path uses "message" instead of
@@ -2640,7 +2728,37 @@ def _extract_error_envelope(
             details.setdefault(key, value)
         return (code, message, details)
 
-    # Shape 2: legacy slug. ``error`` is the slug,
+    # Shape 2: a gate refusal envelope. Same fields as the v3
+    # envelope, but ``error_code`` nested under ``details`` — see the
+    # note on shape 1 for why that nesting is the norm rather than an
+    # edge case. Handled BEFORE the legacy slug because a refusal body
+    # carries no ``error`` key, so the two cannot collide; it is
+    # ordered here so a refusal is never misread as a legacy slug.
+    details_raw = body.get("details")
+    if isinstance(details_raw, dict) and "error_code" in details_raw:
+        code = str(details_raw.get("error_code", "") or "")
+        message = str(
+            body.get("explanation")
+            or body.get("error_message")
+            or body.get("message")
+            or raw_text
+            or ""
+        )
+        details = dict(details_raw)
+        for key, value in body.items():
+            if key in (
+                "error_code",
+                "error_message",
+                "explanation",
+                "message",
+                "details",
+                "retry_after_ms",
+            ):
+                continue
+            details.setdefault(key, value)
+        return (code, message, details)
+
+    # Shape 3: legacy slug. ``error`` is the slug,
     # ``message`` is the human-readable string.
     if "error" in body:
         slug = str(body.get("error", "") or "")
@@ -2695,6 +2813,54 @@ def _parse_v3_error_envelope(
     response: httpx.Response,
     endpoint: str,
 ) -> Exception:
+    """Translate a non-2xx response, stamping the refusal category on.
+
+    Thin wrapper around [`_parse_v3_error_envelope_uncategorised`]
+    that attaches ``wire_category`` to whatever exception comes back.
+    The wrapper exists because the function has ~15 return points and
+    threading the attribute through each one would be a change with
+    no behaviour in it — the property being added is "every exception
+    built from a gate refusal knows what kind of refusal it was".
+    """
+    exc = _parse_v3_error_envelope_uncategorised(response, endpoint)
+    try:
+        body = response.json()
+    except Exception:
+        body = None
+    if isinstance(body, dict):
+        # ADR-062 §2.2. A refusal whose category is ABSENT is left
+        # absent, not defaulted: the runtime's strict rule reads the
+        # missing value as unclassifiable, which is the honest
+        # reading. Defaulting to `infra` here would quietly convert a
+        # missing field into a confident answer.
+        category = body.get("category")
+        if category is not None:
+            exc.wire_category = category  # type: ignore[attr-defined]
+        exc.wire_error_code = (  # type: ignore[attr-defined]
+            (body.get("details") or {}).get("error_code")
+            if isinstance(body.get("details"), dict)
+            else body.get("error_code")
+        )
+        # Server-authored text, carried the same way ``check()``
+        # carries it on the dict it returns. ADR-063 §1.3(e):
+        # ``agent_message`` is the ONLY text the backend certifies
+        # as safe for a model — no store name, no schema, no wire
+        # code, no policy vocabulary. Inventing a substitute when it
+        # is absent would put exactly the content the leak guard
+        # exists to keep off the model's plate onto it, so an
+        # absent ``agent_message`` is left absent and the raise
+        # site's own catalogue text applies.
+        exc.agent_message = (  # type: ignore[attr-defined]
+            body.get("agent_message")
+        )
+        exc.user_message = body.get("user_message")  # type: ignore[attr-defined]
+    return exc
+
+
+def _parse_v3_error_envelope_uncategorised(
+    response: httpx.Response,
+    endpoint: str,
+) -> Exception:
     """Translate a non-2xx ``httpx.Response`` into the right v3
     SDK exception.
 
@@ -2707,6 +2873,14 @@ def _parse_v3_error_envelope(
 
     Mapping table lives at ``_V3_ERROR_CODE_MAP`` below — keep the
     helper as a thin dispatcher.
+
+    DEF-NR-TOOLBLOCKED-PARSER: the ``catalog is
+    NullRunToolBlockedError or catalog is NullRunBlockedException``
+    arm further down is the dedicated branch for the typed v3
+    envelope. It used to be documented by a comment inside
+    ``Transport.check``, which never had such a branch — the tag was
+    filed against the wrong function for as long as it existed.
+    Re-filed here, on the function that actually holds the code.
     """
     # Lazy imports: the exception classes import the transport
     # types (TransportErrorSource), so a top-level import here

@@ -96,6 +96,10 @@ from nullrun.audit import (  # ADR-009 P1 — governance audit surface
     AuditQuery,
     AuditVerifyResult,
 )
+from nullrun.breaker.categories import (
+    DecisionCategory,
+    NullRunUnclassifiedRefusalError,
+)
 from nullrun.breaker.exceptions import (
     NullRunApprovalDeniedError,
     NullRunApprovalExpiredError,
@@ -105,6 +109,7 @@ from nullrun.breaker.exceptions import (
     NullRunBackendError,
     NullRunBlockedException,
     NullRunBudgetError,
+    NullRunDeniedError,
     NullRunError,
     NullRunInfrastructureError,
     NullRunTransportError,
@@ -557,6 +562,11 @@ class AuditProxy:
 # before.
 from nullrun._singleton import _NullRunRuntimeMeta
 
+#: The two accepted ``on_denied`` values. A frozenset rather than a
+#: literal ``in`` chain so the constructor's error message and any
+#: future call site cannot drift apart on the vocabulary.
+_ON_DENIED_VALUES = frozenset({"raise", "message"})
+
 
 class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
     """
@@ -612,6 +622,8 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # Tune the httpx read timeout for slow-network scenarios.
         # Precedence: kwarg > NULLRUN_REQUEST_TIMEOUT env var > 30.0.
         request_timeout: float | None = None,
+        # ADR-062 §2.2. "raise" (default) | "message".
+        on_denied: str = "raise",
     ):
         """
         Initialize NullRun Runtime.
@@ -627,6 +639,25 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                      control-plane listener (WS or HTTP poll). Defaults True
                      in production. Set False when the test environment
                      cannot tolerate a background thread opening sockets.
+            on_denied: What to do with a ``category="denied"`` refusal.
+                     ``"raise"`` (default) keeps current behaviour — the
+                     code-specific exception propagates and the host
+                     decides what to show. ``"message"`` raises
+                     ``NullRunDeniedError``, whose ``agent_message`` is
+                     server-authored text the backend guarantees is safe
+                     to place in the model's context.
+
+                     This flag acts on ``denied`` and on NOTHING else.
+                     A ``budget`` / ``halt`` / ``infra`` refusal raises
+                     its own typed exception whatever this is set to:
+                     a model told "your budget is exhausted" tool-shops
+                     and retries, a model told about a pause tries to
+                     route around a stop an operator deliberately
+                     placed, and a backend fault is not the model's
+                     problem to solve at all. An unclassifiable refusal
+                     (absent or unrecognised ``category``) raises
+                     ``NullRunUnclassifiedRefusalError`` under both
+                     values.
 
         Note:
             - `organization_id` is set from `_authenticate ` after init; it is
@@ -639,6 +670,10 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             - `timeout`/`max_retries` are fixed at 30s / 3 (no public override).
 
         Raises:
+            ValueError: if ``on_denied`` is neither ``"raise"`` nor
+                ``"message"``. Rejected at construction rather than
+                silently treated as ``"raise"``, so a typo cannot
+                quietly disable the message path a host asked for.
             NullRunAuthenticationError: if neither `api_key` nor
                 `NULLRUN_API_KEY` is set. The public `init ` surface
                 performs the same check first and produces a clearer
@@ -655,6 +690,17 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         self.api_key = raw_key.strip() if isinstance(raw_key, str) else None
         self.secret_key = secret_key or os.getenv("NULLRUN_SECRET_KEY")
         self.api_url = api_url or os.getenv("NULLRUN_API_URL", "https://api.nullrun.io")
+
+        if on_denied not in _ON_DENIED_VALUES:
+            raise ValueError(
+                f"on_denied must be one of {sorted(_ON_DENIED_VALUES)!r}, got {on_denied!r}. "
+                "It selects the shape of a category='denied' refusal only — a budget / "
+                "halt / infra refusal raises its own exception either way."
+            )
+        #: See the ``on_denied`` argument. Read only at the block
+        #: site in ``check_workflow_budget``, and only reached for
+        #: ``DecisionCategory.DENIED``.
+        self.on_denied = on_denied
 
         # api_key is required — there is no fallback.
         if not self.api_key:
@@ -1870,6 +1916,214 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 kill_source="remote_state",
             )
 
+    #: Every decision value the SDK knows how to act on. The backend's
+    #: `GateDecision` (`gate/internal.rs:574`) supplies allow / block /
+    #: require_approval / soft_pass / deny; ``throttle`` is an
+    #: SDK-side shape that maps to `WorkflowPausedException`. Anything
+    #: outside this set is a wire contract the SDK does not implement,
+    #: and guessing "allow" for it is the fail-OPEN ADR-008 assigns
+    #: only to transport failures.
+    _KNOWN_GATE_DECISIONS = frozenset(
+        {"allow", "block", "throttle", "soft_pass", "require_approval", "deny"}
+    )
+
+    #: Provenance values a ``/gate`` answer may carry. ``gateway`` is
+    #: the only one the backend writes (`GateResponse.decision_source`
+    #: is a non-``Option`` ``String``, `gate/internal.rs:638`, and
+    #: every producer sets ``"gateway"``). ``fallback`` is the
+    #: synthetic block the transport synthesises when the 5xx band
+    #: falls through, and ``cached`` / ``local`` are the SDK's own
+    #: shapes. A value outside this set means the body did not come
+    #: from either party, whatever it claims.
+    _KNOWN_DECISION_SOURCES = frozenset(
+        {"gateway", "cached", "fallback", "local"}
+    )
+
+    def _require_gate_decision(self, response: Any) -> str:
+        """Extract ``decision`` from a ``/gate`` body, or raise.
+
+        **Provenance first.** A verdict is permission only if the body
+        says WHO produced it, and this check runs before the decision
+        is even looked at. Without it ``{"decision": "allow"}`` — a
+        body with no ``decision_source`` at all — passes every other
+        check in this method and is honoured as a gateway decision,
+        because the runtime's rule reads a missing ``decision_source``
+        as "not ``fallback``" and therefore as authoritative.
+
+        That is reachable by anyone on the network path. A captive
+        portal on a hotel or airport WLAN, or a corporate
+        TLS-interception proxy, returns JSON on ``/api/v1/gate``
+        without needing the API key and without needing to defeat
+        HMAC — it only has to answer before the real backend does.
+        The call is authorised, ``/track`` books its cost against a
+        policy that was never consulted, and the audit trail records
+        an allow. There is no later point at which it can be caught.
+
+        ``decision_source`` is the right field to require because it
+        cannot be absent from a real answer: it is a non-``Option``
+        ``String`` with no ``skip_serializing_if``, so serde always
+        emits it. ``GateResponseBody`` in ``gate/schemas.rs`` does
+        declare it optional, but that struct is referenced only from
+        ``openapi.rs`` — it is the documentation schema, not the wire
+        — so it is not a case where a real backend omits it.
+
+        Pre-fix this was ``response.get("decision", "allow")``. That
+        default converted three distinct failures into "allowed":
+
+        * a body that is not a JSON object at all (``.get`` on a list
+          raised AttributeError *outside* the try, so it surfaced as an
+          untyped crash rather than a decision);
+        * an object from a non-NULLRUN responder — proxy error page,
+          captive portal, TLS interception box;
+        * a real NULLRUN response missing the field, which cannot
+          happen: ``decision`` is a non-``Option`` field with no
+          ``skip_serializing_if`` (``gate/internal.rs:637``), so every
+          real backend serialises it on every answer.
+
+        The last point is what makes the default unsafe rather than
+        merely redundant. ADR-008 grants fail-OPEN to *transport*
+        failures, where the gate never got to rule. A body without a
+        decision is the opposite case: something answered, and what it
+        said was not a verdict. Reading that as "allowed" lets a
+        non-NULLRUN responder authorise a call no policy engine
+        evaluated.
+        """
+        from nullrun.breaker.exceptions import NullRunMalformedGateResponseError
+
+        if not isinstance(response, dict):
+            raise NullRunMalformedGateResponseError(
+                f"/gate returned {type(response).__name__}, expected a JSON "
+                f"object. Body was not a gate decision."
+            )
+
+        source = response.get("decision_source")
+        if not isinstance(source, str) or source not in self._KNOWN_DECISION_SOURCES:
+            raise NullRunMalformedGateResponseError(
+                f"/gate response carries no usable 'decision_source' "
+                f"(got {source!r}). A real answer always states who decided — "
+                f"`GateResponse.decision_source` is a non-Option String on the "
+                f"wire — so a body without one did not come from the gate. "
+                f"This SDK knows {sorted(self._KNOWN_DECISION_SOURCES)}. "
+                f"Treating it as a verdict would let an on-path responder "
+                f"(captive portal, TLS-interception proxy) authorise a call no "
+                f"policy engine evaluated."
+            )
+
+        decision = response.get("decision")
+        if not isinstance(decision, str):
+            raise NullRunMalformedGateResponseError(
+                f"/gate response has no usable 'decision' field "
+                f"(got {type(decision).__name__})."
+            )
+        if decision not in self._KNOWN_GATE_DECISIONS:
+            raise NullRunMalformedGateResponseError(
+                f"/gate returned unknown decision {decision!r}; this SDK "
+                f"implements {sorted(self._KNOWN_GATE_DECISIONS)}."
+            )
+        return decision
+
+    def _raise_malformed_gate_response(self, exc: BaseException) -> None:
+        """Raise ``NullRunMalformedGateResponseError`` for `exc`.
+
+        Shared by the cached and uncached ``/gate`` call sites so the
+        two cannot drift into different behaviours — the same drift
+        that produced the duplicated ``AUTH_ERROR`` predicate fixed
+        under DEF-MP-TS12-ENF-01. Always raises; the ``-> None``
+        return type is so call sites can use it as the tail of an
+        ``except`` arm without a bare ``raise``.
+        """
+        from nullrun.breaker.exceptions import NullRunMalformedGateResponseError
+
+        logger.error(
+            "check_workflow_budget: /gate returned a body that is not JSON "
+            "(%s). Treating as a malformed answer, not an outage — failing "
+            "CLOSED.",
+            exc,
+        )
+        metrics.inc_runtime("gate_malformed_response_total")
+        raise NullRunMalformedGateResponseError(
+            f"/gate returned a non-JSON body: {exc}"
+        ) from exc
+
+    def sensitive_fail_open_enabled(self) -> bool:
+        """Resolve ``NULLRUN_SENSITIVE_FAIL_OPEN``, honouring the prod guard.
+
+        The raw env var is a documented bypass, and before this method
+        it was read straight into the enforcement path with no
+        environment check:
+
+            fail_open = os.environ.get("NULLRUN_SENSITIVE_FAIL_OPEN", "") == "1"
+
+        Its sibling ``NULLRUN_SKIP_BUDGET_CHECK`` has been
+        production-guarded since it was found doing exactly this
+        (``check_workflow_budget``). The asymmetry was an oversight,
+        and it is the more dangerous of the two: the budget opt-out
+        skips a *pre-flight*, while this one lets the body of a
+        sensitive tool run while the policy engine is unreachable --
+        an unblocked ``charge_card`` during an outage, which ADR-008
+        calls a security regression rather than an availability
+        trade-off.
+
+        In production the flag alone is refused: it is ignored, an
+        ERROR is logged, and a metric is emitted, so the attempt is
+        visible rather than silent. Enforcement then proceeds
+        fail-CLOSED, which is the policy the flag was trying to
+        disable -- refusing the bypass does not break the agent, it
+        restores the safe default. An operator who genuinely needs it
+        in prod (an incident-response runbook) acknowledges with
+        ``NULLRUN_ALLOW_SENSITIVE_FAIL_OPEN=1``, mirroring
+        ``NULLRUN_ALLOW_SKIP_BUDGET_CHECK``.
+
+        Lives here rather than in ``decorators`` so the environment
+        policy stays in one module with
+        :func:`_is_production_environment`, and so the two opt-outs
+        cannot drift apart again the way their predicates did under
+        DEF-MP-TS12-ENF-01.
+        """
+        if os.environ.get("NULLRUN_SENSITIVE_FAIL_OPEN", "").strip() != "1":
+            return False
+
+        if _is_production_environment(self.api_url):
+            allow_ack = (
+                os.environ.get("NULLRUN_ALLOW_SENSITIVE_FAIL_OPEN", "").strip() == "1"
+            )
+            if not allow_ack:
+                logger.error(
+                    "NULLRUN_SENSITIVE_FAIL_OPEN=1 is set but the SDK is "
+                    "configured for production (api_url=%r). Refusing the "
+                    "bypass: sensitive tools stay fail-CLOSED, so their "
+                    "bodies do NOT run while the policy engine is "
+                    "unreachable. Unset the var, or — only for "
+                    "incident-response scenarios — also set "
+                    "NULLRUN_ALLOW_SENSITIVE_FAIL_OPEN=1 to acknowledge "
+                    "the risk.",
+                    self.api_url,
+                )
+                try:
+                    metrics.inc_runtime("sensitive_fail_open_blocked_in_prod")
+                except Exception:  # noqa: BLE001 — metrics never gate
+                    pass
+                return False
+            logger.warning(
+                "sensitive tool gate: failing OPEN via "
+                "NULLRUN_SENSITIVE_FAIL_OPEN=1 in production "
+                "(NULLRUN_ALLOW_SENSITIVE_FAIL_OPEN=1 also set). This is an "
+                "explicit operator ack — ensure the incident-response runbook "
+                "drove it, and unset both vars when the incident closes."
+            )
+            try:
+                metrics.inc_runtime("sensitive_fail_open_allowed_in_prod")
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+
+        logger.debug(
+            "sensitive tool gate: failing OPEN via NULLRUN_SENSITIVE_FAIL_OPEN=1 "
+            "(non-production api_url=%r).",
+            self.api_url,
+        )
+        return True
+
     def check_workflow_budget(self) -> None:
         """
         Pre-flight budget check via /api/v1/gate. Called from @protect
@@ -1949,7 +2203,37 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 except Exception:  # noqa: BLE001
                     pass
                 return
-            logger.debug("check_workflow_budget: skipped via NULLRUN_SKIP_BUDGET_CHECK=1")
+            # Non-production. Pre-fix this was `logger.debug`, which
+            # means a test suite running the whole budget path with
+            # the bypass on leaves no trace anywhere: the tests go
+            # green, the dashboard shows the org as spending nothing,
+            # and the only evidence the gate was never consulted is
+            # the absence of a block. CLAUDE.md's rule is explicit
+            # that a test which only passes with this flag set is
+            # evidence of a broken gate -- so the flag setting must be
+            # loud enough to find.
+            # Non-production. Pre-fix this was `logger.debug`, which
+            # means a test suite running the whole budget path with
+            # the bypass on leaves no trace anywhere: the tests go
+            # green, the dashboard shows the org as spending nothing,
+            # and the only evidence the gate was never consulted is
+            # the absence of a block. CLAUDE.md's rule is explicit
+            # that a test which only passes with this flag set is
+            # evidence of a broken gate -- so the flag setting must be
+            # loud enough to find.
+            logger.warning(
+                "check_workflow_budget: budget gate BYPASSED via "
+                "NULLRUN_SKIP_BUDGET_CHECK=1 (non-production api_url=%r). "
+                "No budget check, no rate-limit check, and no tool-block "
+                "check ran for this call -- a test passing in this state "
+                "proves nothing about enforcement. Unset the var unless "
+                "you are deliberately exercising a non-budget path.",
+                self.api_url,
+            )
+            try:
+                metrics.inc_runtime("skip_budget_used_non_prod")
+            except Exception:  # noqa: BLE001 — metrics never gate
+                pass
             return
 
         # Bump the ``check_calls`` counter so the dashboard can show
@@ -2133,6 +2417,15 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                     # refused. Classification is by TYPE here, never by
                     # inspecting the message.
                     raise
+                except NullRunUnclassifiedRefusalError:
+                    # ADR-062 §2.2. The gate DID answer — it refused —
+                    # and the SDK cannot tell a policy decision from a
+                    # backend fault. That is not "gate unavailable":
+                    # failing OPEN here would read an unclassifiable
+                    # refusal as "allowed", which is the exact hole the
+                    # category work closes. Must precede the arm below
+                    # (a `NullRunError` superset).
+                    raise
                 except (httpx.HTTPError, NullRunError) as exc:
                     # Narrow catch: fail-OPEN only on transport +
                     # classified SDK errors. Internal bugs
@@ -2141,6 +2434,20 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                     logger.warning(f"check_workflow_budget: /gate unavailable, failing open: {exc}")
                     metrics.inc_runtime("gate_fail_open_total")
                     return
+                except ValueError as exc:
+                    # `Transport.check` ends in `response.json()`. A
+                    # body that is not JSON — proxy error page,
+                    # captive portal, TLS interception box — raises
+                    # JSONDecodeError, a ValueError. Pre-fix this
+                    # matched neither arm above and escaped as an
+                    # untyped crash; and had it matched the
+                    # fail-OPEN arm, a non-NULLRUN responder would
+                    # have been read as "gate unavailable, carry on",
+                    # which is precisely the authorisation-without-
+                    # policy hole the missing `decision` default
+                    # shares. It is a malformed ANSWER, not an
+                    # unreachable gate, so it raises.
+                    self._raise_malformed_gate_response(exc)
                 assert cache_key is not None  # narrowed by cache_enabled above
                 _GATE_CACHE[cache_key] = (time.monotonic(), response)
         else:
@@ -2151,6 +2458,19 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 # matters: this arm precedes the broad `except
                 # Exception`, which is a superset.
                 raise
+            except ValueError as exc:
+                # Same rationale as the cached branch: a body that is
+                # not JSON is a malformed answer, and must precede the
+                # broad `except Exception` below, which is a superset
+                # of this arm.
+                self._raise_malformed_gate_response(exc)
+            except NullRunUnclassifiedRefusalError:
+                # ADR-062 §2.2 — same rationale as the cached branch.
+                # This is a refusal the SDK cannot classify, not an
+                # unreachable gate, so it must not fail open. It is
+                # listed explicitly because the arm below is a bare
+                # ``except Exception``.
+                raise
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"check_workflow_budget: /gate unavailable, failing open: {exc}")
                 metrics.inc_runtime("gate_fail_open_total")
@@ -2158,7 +2478,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
 
         _capture_server_minted_execution_id(response)
 
-        decision = response.get("decision", "allow")
+        decision = self._require_gate_decision(response)
         decision_source = response.get("decision_source", DecisionSource.GATEWAY)
         # Only fail-OPEN on EXPLICIT synthetic responses. Real backend
         # decisions (decision_source="gateway") are honoured.
@@ -2182,6 +2502,28 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             reasons = response.get("explanations") or (
                 [response["explanation"]] if response.get("explanation") else ["block"]
             )
+            # ADR-062 §2.2. ``Transport.check`` resolved the category
+            # at the wire boundary and already raised if it could
+            # not, so by the time a block reaches here ``category``
+            # is either a real ``DecisionCategory`` or ``None`` for a
+            # 4xx that was never a gate refusal (a protocol
+            # mismatch, say — those keep the pre-existing handling).
+            #
+            # ``on_denied`` is consulted HERE and only here, behind
+            # ``category is DENIED``. That single guard is the whole
+            # safety property: no arrangement of the flag turns a
+            # budget, halt, or infra refusal into a message a model
+            # can read and act on.
+            category = response.get("category")
+            if category is DecisionCategory.DENIED and self.on_denied == "message":
+                raise NullRunDeniedError(
+                    workflow_id=workflow_id,
+                    reason="; ".join(reasons),
+                    action="block",
+                    decision_source=response.get("decision_source"),
+                    reasons="; ".join(reasons),
+                    agent_message=response.get("agent_message"),
+                )
             # Bump ``cost_limit_exceeded`` when the pre-flight
             # blocks the workflow. The counter is the operator's
             # primary signal for "the budget cap is biting" --
@@ -2348,6 +2690,33 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 timeout_seconds=self._approval_timeout_seconds,
                 local_timeout=True,
             )
+
+        if decision == "deny":
+            # `Deny` is a live `GateDecision` variant
+            # (`gate/internal.rs:579`), reserved by ADR-046 — no
+            # production construction site emits it yet, but it is on
+            # the wire contract. Pre-fix it had no arm here and fell
+            # off the end of the method, which reads to the caller as
+            # "no block raised, proceed". A reserved refusal must not
+            # be the one refusal that executes. Raising it now means
+            # the day ADR-046 ships its producer, the SDK already
+            # fails-CLOSED instead of silently allowing.
+            reasons = response.get("explanations") or (
+                [response["explanation"]] if response.get("explanation") else ["deny"]
+            )
+            raise NullRunBlockedException(
+                workflow_id=workflow_id,
+                reason="; ".join(reasons),
+                tool_name=response.get("tool_name"),
+                error_code="NR-B006",
+            )
+
+        # `decision == "allow"` — the only `_KNOWN_GATE_DECISIONS`
+        # value left unhandled above. Stated explicitly rather than
+        # relying on fall-off-the-end, so that adding a variant to the
+        # known set without adding an arm is a visible no-op here
+        # rather than an implicit allow.
+        return
 
     # =============================================================================
     # v3 wire-protocol helpers
@@ -3165,7 +3534,42 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             execute_kwargs["business_impact"] = business_impact
         if action_digest is not None:
             execute_kwargs["action_digest"] = action_digest
-        result = self._transport.execute(**execute_kwargs)
+        try:
+            result = self._transport.execute(**execute_kwargs)
+        except NullRunBlockedException as exc:
+            # ADR-062 §2.2 / ``on_denied``. ``/execute`` is the OTHER
+            # enforcement path — the one every MCP tool call goes
+            # through — and it raises its exception inside
+            # ``Transport.execute`` rather than returning a decision
+            # dict, so the ``on_denied`` branch that lives at
+            # ``check_workflow_budget``'s block site never sees it.
+            # Without this, a host that set ``on_denied="message"``
+            # gets a promise it does not keep for MCP tools, and the
+            # server-authored ``agent_message`` never reaches it.
+            #
+            # The guard is identical to the ``/gate`` one and for the
+            # same reason: it is consulted ONLY for
+            # ``DecisionCategory.DENIED``, read from
+            # ``exc.wire_category`` (stamped by
+            # ``_parse_v3_error_envelope``). A ``budget`` / ``halt`` /
+            # ``infra`` refusal keeps its own exception whatever the
+            # flag is set to, and an ABSENT category is left absent
+            # and raises as before — never guessed.
+            if (
+                getattr(exc, "wire_category", None) == DecisionCategory.DENIED
+                and self.on_denied == "message"
+            ):
+                raise NullRunDeniedError(
+                    workflow_id=workflow_id or UNKNOWN_WORKFLOW_ID,
+                    reason=exc.reason if hasattr(exc, "reason") else str(exc),
+                    action="block",
+                    decision_source=DecisionSource.GATEWAY,
+                    reasons=(
+                        exc.reason if hasattr(exc, "reason") else str(exc)
+                    ),
+                    agent_message=getattr(exc, "agent_message", None),
+                ) from exc
+            raise
 
         # The /execute require_approval arm mints a fresh execution_id
         # server-side for the approval row + writes the binding,

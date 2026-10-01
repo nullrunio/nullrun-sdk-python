@@ -74,6 +74,28 @@ def _check_body() -> str:
     return src[start:end]
 
 
+# Mirrors ``GateErrorCode::category()`` on the backend
+# (``backend/src/proxy/http/gate/error_codes.rs``). Only the codes
+# this file's fixtures use are listed; an unlisted code resolves to
+# no ``category`` at all, which the SDK treats as unclassifiable —
+# that is the honest outcome for a code the fixture does not model.
+_CATEGORY_FOR_CODE = {
+    "BUDGET_HARD_BLOCKED": "budget",
+    "BUDGET_WORKFLOW_BLOCKED": "budget",
+    "BUDGET_CACHE_EXCEEDED": "budget",
+    "BUDGET_OVERDRAFT_EXCEEDED": "budget",
+    "RATE_LIMIT_EXCEEDED": "budget",
+    "TOOL_BLOCKED": "denied",
+    "APPROVAL_DENIED": "denied",
+    "LOOP_DETECTED": "denied",
+    "WORKFLOW_INACTIVE": "halt",
+    "WORKFLOW_PAUSED": "halt",
+    "CIRCUIT_BREAKER_TRIPPED": "halt",
+    "BUDGET_DATA_UNAVAILABLE": "infra",
+    "CIRCUIT_BREAKER_STATE_LOOKUP_FAILED": "infra",
+}
+
+
 def _v3_envelope(
     error_code: str,
     status: int = 402,
@@ -85,10 +107,22 @@ def _v3_envelope(
     reservation_id: str | None = None,
     operation_id: str | None = None,
     policy_version: int | None = None,
+    category: str | None = None,
     **details,
 ) -> httpx.Response:
     """Build a v3-shaped 4xx response envelope mirroring the real
-    backend's wire contract."""
+    backend's wire contract.
+
+    ADR-062 §2.2: a real gate refusal always carries ``category``,
+    and ``agent_message`` only when the category is ``denied``
+    (``gate.rs::attach_refusal_surface``). The fixture reproduces
+    that so these tests exercise the wire the backend actually
+    sends — an earlier version omitted it, which the SDK now
+    correctly refuses to classify. ``_CATEGORY_FOR_CODE`` mirrors
+    the backend's own classification
+    (``error_codes.rs::DecisionCategory``).
+    """
+    resolved = category if category is not None else _CATEGORY_FOR_CODE.get(error_code)
     body = {
         "decision": "block",
         "decision_source": DecisionSource.GATEWAY,
@@ -103,6 +137,11 @@ def _v3_envelope(
         "projected_cost_cents": projected_cost_cents,
         "details": details,
     }
+    if resolved is not None:
+        body["category"] = resolved
+        body["user_message"] = f"operator note for {error_code}"
+        if resolved == "denied":
+            body["agent_message"] = f"That tool is not permitted ({error_code})."
     return httpx.Response(status, json=body)
 
 
@@ -145,11 +184,13 @@ class TestDefNrCheckFailopenSourcePin:
         fallback and the runtime fail-OPENed."""
         body = _check_body()
         # Locate the 4xx branch by its comment marker
-        idx = body.find("if 400 <= response.status_code < 500:")
+        idx = body.find("if 400 <= response.status_code < 500 or (")
         assert idx != -1, (
             "DEF-NR-CHECK-FAIL-OPEN: 4xx branch anchor "
-            "`if 400 <= response.status_code < 500:` not found in "
-            "Transport.check"
+            "`if 400 <= response.status_code < 500 or (` not found in "
+            "Transport.check. ADR-064 widened the condition to "
+            "cover 5xx bodies that are genuine gate refusals, so the "
+            "anchor moved with it."
         )
         # Slice only the 4xx branch (stop at the next sibling `if`
         # for the 5xx fallthrough).
@@ -179,7 +220,7 @@ class TestDefNrCheckFailopenSourcePin:
         ``remaining_budget_cents``, ``details``) so the runtime's
         catalog dispatcher can build an actionable exception."""
         body = _check_body()
-        idx = body.find("if 400 <= response.status_code < 500:")
+        idx = body.find("if 400 <= response.status_code < 500 or (")
         assert idx != -1
         five_xx_marker = body.find("if response.status_code >= 500", idx)
         assert five_xx_marker != -1

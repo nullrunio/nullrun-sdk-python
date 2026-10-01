@@ -251,3 +251,58 @@ def _isolated_wal(monkeypatch, tmp_path):
     # and NullRunAuthError propagates back into the test fixture setup.
     monkeypatch.setenv("NULLRUN_WAL_PATH", str(tmp_path / "sdk.wal"))
     yield
+
+
+# ---------------------------------------------------------------------------
+# Production-host mocks
+#
+# `mock_api` only mocks BASE_URL, so a runtime built with any other
+# `api_url` authenticates against an unmocked host and respx fails the
+# test before the environment guard under test is ever consulted. Tests
+# covering the production guards (NULLRUN_SKIP_BUDGET_CHECK,
+# NULLRUN_SENSITIVE_FAIL_OPEN) need a runtime that genuinely looks like
+# production, so they need this.
+#
+# Lives here rather than in either test module because both need it, and
+# two copies of "what does a prod auth response look like" is exactly the
+# duplication that let the AUTH_ERROR predicate drift between
+# `check_workflow_budget` and `_run_tool_policy_gate` under
+# DEF-MP-TS12-ENF-01.
+# ---------------------------------------------------------------------------
+
+PROD_URL = "https://api.nullrun.io"
+
+# A host that is NOT one of the ones `_is_production_environment` treats as
+# a dev/staging escape hatch (localhost / 127.0.0.1 / staging / test), so
+# `NULLRUN_ENV=production` is the only thing marking it production.
+CUSTOM_NONPROD_URL = "https://nullrun.internal.example.com"
+
+
+@pytest.fixture
+def mock_prod_api(mock_api):
+    """Mirror the auth route onto the production hosts.
+
+    Depends on `mock_api` so it registers inside that fixture's
+    `with respx.mock:` context rather than opening a second one.
+
+    Deliberately registers `/execute` for NO host: every caller needs
+    `/execute` to fail, and a permissive default here would shadow the
+    failure they are asserting on.
+    """
+
+    def _verify(request) -> Response:
+        return Response(
+            200,
+            json={
+                "organization_id": "ws-test",
+                "workflow_id": "00000000-0000-0000-0000-000000000001",
+                "plan": "pro",
+                "features": [],
+                "limits": {"max_cost_cents": 10000},
+                "secret_key": "test-secret-deterministic",
+            },
+        )
+
+    respx.post(f"{PROD_URL}/api/v1/auth/verify").mock(side_effect=_verify)
+    respx.post(f"{CUSTOM_NONPROD_URL}/api/v1/auth/verify").mock(side_effect=_verify)
+    return mock_api
