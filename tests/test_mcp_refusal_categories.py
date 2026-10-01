@@ -41,14 +41,13 @@ import httpx
 import pytest
 import respx
 
-
 from nullrun.breaker.exceptions import (
     NullRunBlockedException,
     NullRunDeniedError,
     NullRunError,
 )
-from nullrun.toolbox.mcp import MCPAdapter
 from nullrun.runtime import NullRunRuntime
+from nullrun.toolbox.mcp import MCPAdapter
 
 EXECUTE_URL = "https://api.test.nullrun.io/api/v1/execute"
 

@@ -102,7 +102,9 @@ class TestEndToEndAgainstProductionUrl:
         even though the operator set the flag."""
         from nullrun.decorators import protect
 
-        rt = make_runtime(api_url=PROD_URL)
+        # Not bound: `@protect` resolves the runtime from the context,
+        # so the constructor call is the load-bearing part here.
+        make_runtime(api_url=PROD_URL)
         monkeypatch.setenv(_FLAG, "1")
 
         respx.post(f"{PROD_URL}/api/v1/execute").mock(
@@ -129,7 +131,8 @@ class TestEndToEndAgainstProductionUrl:
         from nullrun.breaker.exceptions import NullRunBlockedException
         from nullrun.decorators import protect
 
-        rt = make_runtime(api_url=BASE_URL)
+        # Not bound, for the same reason as the prod case above.
+        make_runtime(api_url=BASE_URL)
         monkeypatch.setenv(_FLAG, "1")
 
         respx.post(EXECUTE_URL).mock(
