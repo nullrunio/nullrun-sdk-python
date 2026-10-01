@@ -66,9 +66,56 @@ from nullrun.transport import FallbackMode, Transport, _parse_v3_error_envelope
 SDK_ROOT = Path(__file__).resolve().parent.parent
 TRANSPORT_PY = SDK_ROOT / "src" / "nullrun" / "transport.py"
 
+# The dedicated dispatch branch DEF-NR-TOOLBLOCKED-PARSER added. Used as
+# the content needle for locating the dispatching parser — see
+# ``_parser_fn_containing``.
+_BRANCH_NEEDLE = "catalog is NullRunToolBlockedError"
+
 
 def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8")
+
+
+def _parser_fn_containing(src: str, needle: str) -> str:
+    """Return the body of the v3-envelope parser function that
+    actually contains ``needle``.
+
+    The parser was split (ADR-062 §2.2 category work) into a thin
+    categorising wrapper ``_parse_v3_error_envelope`` and the real
+    implementation ``_parse_v3_error_envelope_uncategorised``. The
+    name-scoped pins in this file used to resolve
+    ``def _parse_v3_error_envelope(`` and read the body from there.
+    After the split that resolves to the WRAPPER, which contains
+    neither the dispatch branch nor the function-local import block
+    nor the DEF-NR-TOOLBLOCKED-PARSER tag — so all three went red for
+    a rename, and would equally have gone green against a parser
+    whose dispatch branch had been deleted outright. A pin that
+    cannot fail for the reason it claims to guard is worse than no
+    pin: it reads as coverage.
+
+    Resolving by CONTENT instead of by name keeps the property each
+    test was written to assert — "the dedicated branch lives in the
+    function that does the dispatch, not somewhere else where it
+    cannot intercept the TypeError" — and survives both the split and
+    a future rename. The assertion that exactly one parser function
+    matches is deliberate: if a second one ever also contains the
+    needle, the pin has genuinely become ambiguous and must be
+    re-pointed by hand rather than silently matching the first.
+    """
+    bodies = re.findall(
+        r"def _parse_v3_error_envelope\w*\(.*?(?=\ndef |\nclass |\Z)",
+        src,
+        re.DOTALL,
+    )
+    matches = [b for b in bodies if needle in b]
+    assert len(matches) == 1, (
+        f"expected exactly one _parse_v3_error_envelope* function "
+        f"containing {needle!r}, found {len(matches)} of {len(bodies)} "
+        f"parser functions. The parser was split into a wrapper plus an "
+        f"implementation; if that split changed again, re-point this pin "
+        f"at the function that does the dispatch."
+    )
+    return matches[0]
 
 
 def _v3_envelope(error_code: str, status: int = 400, **details) -> httpx.Response:
@@ -134,42 +181,35 @@ class TestDefNrToolblockedParserSourcePin:
         )
 
     def test_branch_in_parser(self):
-        """Pin that the fix lives in ``_parse_v3_error_envelope``,
-        not somewhere else (defense against a refactor that moves
-        it to a different layer where it can't intercept the
+        """Pin that the fix lives in the function that does the
+        dispatch, not somewhere else (defense against a refactor that
+        moves it to a different layer where it can't intercept the
         TypeError)."""
         src = _read(TRANSPORT_PY)
-        # Locate the _parse_v3_error_envelope function body and
-        # confirm the dedicated branch lives inside it.
-        fn_match = re.search(
-            r"def _parse_v3_error_envelope\(.*?(?=\ndef |\nclass |\Z)",
-            src,
-            re.DOTALL,
-        )
-        assert fn_match, "could not locate _parse_v3_error_envelope"
-        fn_body = fn_match.group(0)
-        assert "NullRunToolBlockedError" in fn_body, (
+        # Locate the parser function body that holds the dedicated
+        # branch. Resolved by the BRANCH, not by the exception name:
+        # resolving on ``NullRunToolBlockedError`` is self-satisfying,
+        # because the function-local import block names it even after
+        # the branch is deleted. Verified — deleting the branch left
+        # this pin green that way. The branch text is the only needle
+        # that is actually absent when the branch is gone.
+        fn_body = _parser_fn_containing(src, _BRANCH_NEEDLE)
+        assert _BRANCH_NEEDLE in fn_body, (
             "DEF-NR-TOOLBLOCKED-PARSER: NullRunToolBlockedError "
-            "must be referenced inside _parse_v3_error_envelope "
-            "(the dedicated dispatch branch lives there)."
+            "must be referenced inside the v3-envelope parser that "
+            "performs the dispatch (the dedicated dispatch branch "
+            "lives there)."
         )
 
     def test_import_includes_blocked_exception_classes(self):
-        """The function-local import block in
-        ``_parse_v3_error_envelope`` must include both
-        ``NullRunToolBlockedError`` and
+        """The function-local import block in the dispatching parser
+        must include both ``NullRunToolBlockedError`` and
         ``NullRunBlockedException`` — otherwise NameError at
         runtime even though the branch is present."""
         src = _read(TRANSPORT_PY)
-        # Locate the function-local import block (the one inside
-        # _parse_v3_error_envelope, NOT the module-level one).
-        fn_match = re.search(
-            r"def _parse_v3_error_envelope\(.*?(?=\ndef |\nclass |\Z)",
-            src,
-            re.DOTALL,
-        )
-        assert fn_match
-        fn_body = fn_match.group(0)
+        # Locate the function-local import block (the one inside the
+        # function that holds the branch, NOT the module-level one).
+        fn_body = _parser_fn_containing(src, _BRANCH_NEEDLE)
         # Find the first ``from nullrun.breaker.exceptions import``
         # inside the function body.
         import_block = re.search(
@@ -179,8 +219,8 @@ class TestDefNrToolblockedParserSourcePin:
         )
         assert import_block, (
             "DEF-NR-TOOLBLOCKED-PARSER: could not locate "
-            "function-local import block inside "
-            "_parse_v3_error_envelope"
+            "function-local import block inside the dispatching "
+            "v3-envelope parser"
         )
         imported = import_block.group(1)
         assert "NullRunToolBlockedError" in imported, (
@@ -200,12 +240,13 @@ class TestDefNrToolblockedParserSourcePin:
         deletes the comment is forced to read the code's
         history.
 
-        The tag must live in ``_parse_v3_error_envelope``, the
-        function that holds the branch. It used to sit in
-        ``Transport.check``, which never had a parser branch at all —
-        so the comment named a fix the reader could not find. The
-        pin now asserts the tag is attached to the right function,
-        which is the property that was actually broken.
+        The tag must live in the parser function that holds the
+        branch. It used to sit in ``Transport.check``, which never had
+        a parser branch at all — so the comment named a fix the
+        reader could not find. The pin now asserts the tag is
+        attached to the right function, which is the property that
+        was actually broken. Resolved by content, not by name, so the
+        wrapper/implementation split does not blind it.
         """
         src = _read(TRANSPORT_PY)
         assert "DEF-NR-TOOLBLOCKED-PARSER" in src, (
@@ -213,14 +254,14 @@ class TestDefNrToolblockedParserSourcePin:
             "block must name the fix tag so future readers can "
             "grep for it."
         )
-        body = src.split("def _parse_v3_error_envelope(")[1]
-        head = body[: body.find('"""', body.find('"""') + 3)]
+        fn_body = _parser_fn_containing(src, "DEF-NR-TOOLBLOCKED-PARSER")
+        head = fn_body[: fn_body.find('"""', fn_body.find('"""') + 3)]
         assert "DEF-NR-TOOLBLOCKED-PARSER" in head, (
             "DEF-NR-TOOLBLOCKED-PARSER: the tag must be documented on "
-            "_parse_v3_error_envelope, which is where the dedicated "
-            "NullRunToolBlockedError branch actually lives. Filing it "
-            "against Transport.check pointed readers at a branch that "
-            "was never there."
+            "the v3-envelope parser that does the dispatch, which is "
+            "where the dedicated NullRunToolBlockedError branch "
+            "actually lives. Filing it against Transport.check "
+            "pointed readers at a branch that was never there."
         )
 
     def test_branch_uses_correct_constructor_signature(self):

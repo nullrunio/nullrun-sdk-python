@@ -2669,6 +2669,26 @@ def _extract_error_envelope(
         return ("", raw_text or "", {})
 
     # Shape 1: v3 envelope.
+    #
+    # ``error_code`` is read from the TOP LEVEL first and from
+    # ``details.error_code`` second. The second is not a fallback for
+    # a malformed envelope — it is where a real gate refusal puts it.
+    # ``GateResponse`` serialises ``error_code`` inside
+    # ``details`` (``internal.rs:716``) and the backend's own status
+    # mapper reads it from there (``gate.rs:88-90``), so every
+    # refusal that reaches ``/execute`` or ``/gate`` carries it at
+    # that nesting. Reading only the top level left ``code`` empty
+    # for the whole refusal family, and the dispatcher then fell
+    # through to its status-only branch — where a 403 becomes
+    # ``NullRunAuthenticationError``. The observable effect was a
+    # ``TOOL_BLOCKED`` policy refusal on the MCP path reported to the
+    # host as a bad API key: wrong exception class, wrong
+    # ``format_user_message``, and an operator action ("check your
+    # credentials") that cannot possibly fix a policy decision.
+    #
+    # This is the same class of defect as DEF-MP-TS12-ENF-01 — a
+    # decision the backend made being reported as something else —
+    # and it is why ADR-064 records the nesting as load-bearing.
     if "error_code" in body:
         code = str(body.get("error_code", "") or "")
         # The 503 budget path uses "message" instead of
@@ -2693,7 +2713,37 @@ def _extract_error_envelope(
             details.setdefault(key, value)
         return (code, message, details)
 
-    # Shape 2: legacy slug. ``error`` is the slug,
+    # Shape 2: a gate refusal envelope. Same fields as the v3
+    # envelope, but ``error_code`` nested under ``details`` — see the
+    # note on shape 1 for why that nesting is the norm rather than an
+    # edge case. Handled BEFORE the legacy slug because a refusal body
+    # carries no ``error`` key, so the two cannot collide; it is
+    # ordered here so a refusal is never misread as a legacy slug.
+    details_raw = body.get("details")
+    if isinstance(details_raw, dict) and "error_code" in details_raw:
+        code = str(details_raw.get("error_code", "") or "")
+        message = str(
+            body.get("explanation")
+            or body.get("error_message")
+            or body.get("message")
+            or raw_text
+            or ""
+        )
+        details = dict(details_raw)
+        for key, value in body.items():
+            if key in (
+                "error_code",
+                "error_message",
+                "explanation",
+                "message",
+                "details",
+                "retry_after_ms",
+            ):
+                continue
+            details.setdefault(key, value)
+        return (code, message, details)
+
+    # Shape 3: legacy slug. ``error`` is the slug,
     # ``message`` is the human-readable string.
     if "error" in body:
         slug = str(body.get("error", "") or "")
@@ -2745,6 +2795,54 @@ def _safe_json(response: httpx.Response, endpoint: str) -> Any:
 
 
 def _parse_v3_error_envelope(
+    response: httpx.Response,
+    endpoint: str,
+) -> Exception:
+    """Translate a non-2xx response, stamping the refusal category on.
+
+    Thin wrapper around [`_parse_v3_error_envelope_uncategorised`]
+    that attaches ``wire_category`` to whatever exception comes back.
+    The wrapper exists because the function has ~15 return points and
+    threading the attribute through each one would be a change with
+    no behaviour in it — the property being added is "every exception
+    built from a gate refusal knows what kind of refusal it was".
+    """
+    exc = _parse_v3_error_envelope_uncategorised(response, endpoint)
+    try:
+        body = response.json()
+    except Exception:
+        body = None
+    if isinstance(body, dict):
+        # ADR-062 §2.2. A refusal whose category is ABSENT is left
+        # absent, not defaulted: the runtime's strict rule reads the
+        # missing value as unclassifiable, which is the honest
+        # reading. Defaulting to `infra` here would quietly convert a
+        # missing field into a confident answer.
+        category = body.get("category")
+        if category is not None:
+            exc.wire_category = category  # type: ignore[attr-defined]
+        exc.wire_error_code = (  # type: ignore[attr-defined]
+            (body.get("details") or {}).get("error_code")
+            if isinstance(body.get("details"), dict)
+            else body.get("error_code")
+        )
+        # Server-authored text, carried the same way ``check()``
+        # carries it on the dict it returns. ADR-063 §1.3(e):
+        # ``agent_message`` is the ONLY text the backend certifies
+        # as safe for a model — no store name, no schema, no wire
+        # code, no policy vocabulary. Inventing a substitute when it
+        # is absent would put exactly the content the leak guard
+        # exists to keep off the model's plate onto it, so an
+        # absent ``agent_message`` is left absent and the raise
+        # site's own catalogue text applies.
+        exc.agent_message = (  # type: ignore[attr-defined]
+            body.get("agent_message")
+        )
+        exc.user_message = body.get("user_message")  # type: ignore[attr-defined]
+    return exc
+
+
+def _parse_v3_error_envelope_uncategorised(
     response: httpx.Response,
     endpoint: str,
 ) -> Exception:

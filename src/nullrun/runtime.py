@@ -3484,7 +3484,42 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             execute_kwargs["business_impact"] = business_impact
         if action_digest is not None:
             execute_kwargs["action_digest"] = action_digest
-        result = self._transport.execute(**execute_kwargs)
+        try:
+            result = self._transport.execute(**execute_kwargs)
+        except NullRunBlockedException as exc:
+            # ADR-062 §2.2 / ``on_denied``. ``/execute`` is the OTHER
+            # enforcement path — the one every MCP tool call goes
+            # through — and it raises its exception inside
+            # ``Transport.execute`` rather than returning a decision
+            # dict, so the ``on_denied`` branch that lives at
+            # ``check_workflow_budget``'s block site never sees it.
+            # Without this, a host that set ``on_denied="message"``
+            # gets a promise it does not keep for MCP tools, and the
+            # server-authored ``agent_message`` never reaches it.
+            #
+            # The guard is identical to the ``/gate`` one and for the
+            # same reason: it is consulted ONLY for
+            # ``DecisionCategory.DENIED``, read from
+            # ``exc.wire_category`` (stamped by
+            # ``_parse_v3_error_envelope``). A ``budget`` / ``halt`` /
+            # ``infra`` refusal keeps its own exception whatever the
+            # flag is set to, and an ABSENT category is left absent
+            # and raises as before — never guessed.
+            if (
+                getattr(exc, "wire_category", None) == DecisionCategory.DENIED
+                and self.on_denied == "message"
+            ):
+                raise NullRunDeniedError(
+                    workflow_id=workflow_id or UNKNOWN_WORKFLOW_ID,
+                    reason=exc.reason if hasattr(exc, "reason") else str(exc),
+                    action="block",
+                    decision_source=DecisionSource.GATEWAY,
+                    reasons=(
+                        exc.reason if hasattr(exc, "reason") else str(exc)
+                    ),
+                    agent_message=getattr(exc, "agent_message", None),
+                ) from exc
+            raise
 
         # The /execute require_approval arm mints a fresh execution_id
         # server-side for the approval row + writes the binding,
