@@ -1054,10 +1054,23 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
 
         ws_connected: bool | None = None
         if self._ws_connection is not None:
-            # ``is_open`` is the underlying websockets flag
-            # None when the connection has never been
-            # successfully established.
-            ws_connected = getattr(self._ws_connection, "is_open", None)
+            # DEF-TC6-005 (2026-10-02): this read `is_open`, an
+            # attribute `WebSocketConnection` has never had. Its
+            # liveness flag is `_running` — set True in `_connect`
+            # (transport_websocket.py:243) and cleared by the receive
+            # loop's `finally` (`:283`). The `getattr` default fired
+            # on every call, so the field was structurally pinned to
+            # `None`: a live push channel and a dead one were
+            # indistinguishable, and TC-12 could not observe the
+            # control plane at all.
+            #
+            # `_running` is instance state, and the `getattr` default
+            # is kept so a connection object that does not carry the
+            # flag degrades to `None` rather than raising. Note the
+            # three states are distinct and all still reported:
+            # never-established `None`, established-and-live `True`,
+            # established-then-dropped / explicit shutdown `False`.
+            ws_connected = getattr(self._ws_connection, "_running", None)
         elif self._ws_stop_event.is_set():
             ws_connected = False  # explicit shutdown
 
