@@ -52,11 +52,14 @@ from nullrun.breaker.exceptions import (
 from nullrun.business_impact import BusinessImpact, compute_action_digest
 from nullrun.context import (
     _call_tools_var,
+    get_call_impact,
     get_call_tools,
     get_server_minted_execution_id,  # for cancel-on-exception helper
     get_workflow_id,
+    reset_call_impact,
     reset_span_id,
     reset_trace_id,
+    set_call_impact,
     set_span_id,
     set_trace_id,
 )
@@ -152,6 +155,55 @@ def _safe_repr(value: object, max_len: int = 50) -> str:
     if len(r) > max_len:
         return r[:max_len] + "...<truncated>"
     return r
+
+
+def _build_call_impact(
+    fn: Callable[..., Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> BusinessImpact:
+    """Build the BusinessImpact envelope for one protected call.
+
+    The envelope is ``{"kind": "tool_call", "tool_name": fn.__name__,
+    "params": {"args": [...], "kwargs": {...}}}``. Two deliberate
+    choices:
+
+    * **`params` is the MASKED argument bag**, and it is keyed the same
+      way the ``/execute`` request body keys its ``input``. The
+      operator's approval card shows the masked values, so a digest
+      computed over anything else — the unmasked arguments, or only
+      the kwargs — would bind the grant to arguments nobody approved.
+      A tool called purely positionally still gets both keys, so
+      ``charge_card("4111...", 50)`` is not indistinguishable from
+      ``charge_card("4111...", 5000)``.
+
+    * **The tool name is inside the hashed bytes** (it is the
+      envelope's ``tool_name``), so a grant for ``refund_customer``
+      does not validate a replay of ``charge_card``.
+
+    Falls back to ``no_impact()`` when the envelope cannot be built
+    (an unprintable tool name, a parameter value the digest layer
+    cannot round-trip). That is a fail-OPEN posture and is
+    deliberately loud: the backend will store a digest that binds
+    nothing, so the re-entry is refused. The alternative — raising out
+    of the decorator before the gate — would take down a tool call
+    over a metadata field, which is a worse failure than a refused
+    approval. See ADR-065 "Consequences".
+    """
+    try:
+        return BusinessImpact.tool_call(
+            fn.__name__,
+            {"args": _safe_args(fn, args), "kwargs": _safe_kwargs(kwargs)},
+        )
+    except (ValueError, TypeError) as exc:
+        logger.warning(
+            "@protect for %r: could not build a tool_call BusinessImpact (%s); "
+            "falling back to no_impact(), which binds the approval to nothing. "
+            "The post-approval /execute re-entry will be refused.",
+            fn.__name__,
+            exc,
+        )
+        return BusinessImpact.no_impact()
 
 
 def _safe_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -628,6 +680,20 @@ def protect(fn: F | None = None) -> F | Callable[[F], F]:
             )
         else:
             call_tools_token = None
+        # The BusinessImpact envelope for THIS protected call, set
+        # BEFORE the /gate pre-flight below. The backend stores the
+        # digest it derives from the /gate body's envelope and, at
+        # /execute, recomputes it from the /execute body's envelope
+        # and compares (payload_binding.rs:163, orchestrator.rs:1511),
+        # so the two have to be the same envelope — which means it has
+        # to exist before step 2, not be minted during step 4.
+        #
+        # Token-based, like the tools contextvar above: a nested
+        # @protect restores the outer envelope on exit, and a bare
+        # @protect leaves the contextvar empty again.
+        call_impact_token: Token[Any] | None = set_call_impact(
+            _build_call_impact(fn, args, kwargs)
+        )
         error: BaseException | None = None
         try:
             # the runtime can warn when @protect fires often but no
@@ -708,6 +774,11 @@ def protect(fn: F | None = None) -> F | Callable[[F], F]:
             # contextvar empty again (the default).
             if call_tools_token is not None:
                 _call_tools_var.reset(call_tools_token)
+            # The envelope is scoped to this protected call. Leaving
+            # it set would make an unrelated LLM check that happens
+            # later report a tool_call impact for a call that has no
+            # tool in it.
+            reset_call_impact(call_impact_token)
             _emit_span_end(
                 runtime,
                 span,
@@ -868,25 +939,39 @@ def _run_tool_policy_gate(
     ## Wire contract
 
     Same fields on /execute as before: ``tool_name``,
-    ``{"args": masked_args, "kwargs": masked}``, ``business_impact``
-    (now always ``{"kind": "none"}``), ``action_digest`` (SHA-256
-    over the canonical NoImpact envelope; pinned, deterministic),
-    ``tools``. Backend unchanged — only the SDK's interpretation of
-    what to put in ``business_impact`` simplified.
+    ``{"args": masked_args, "kwargs": masked}``, ``business_impact``,
+    ``action_digest`` (SHA-256 over that same envelope; pinned and
+    deterministic), ``tools``.
+
+    ``business_impact`` is a ``{"kind": "tool_call", ...}`` envelope
+    naming this tool and its masked argument bag, built once by
+    ``_build_call_impact`` before the /gate pre-flight and read
+    unchanged here. It was ``{"kind": "none"}`` on every call until
+    ADR-065; a constant hashes to a constant, so the digest the
+    backend stored bound the approval to nothing at all. Backend
+    unchanged.
     """
     masked = _safe_kwargs(kwargs)
     masked_args = _safe_args(fn, args)
 
-    # Wire-shape compatibility: ``business_impact`` stays None
-    # on /execute when no per-tool typed impact is extracted
-    # (the bare @protect shape — backend reads only
-    # ``action_digest`` + ``kwargs`` for ToolParameters Approval
-    # Rules). The ``action_digest`` is still computed against
-    # the canonical NoImpact envelope so the Phase-1+ wire-shape
-    # ``tests/test_business_impact.py``.
-    no_impact = BusinessImpact.no_impact()
-    business_impact_dict: dict[str, Any] | None = None
-    action_digest_hex: str = compute_action_digest(no_impact)
+    # The envelope for this logical action, built ONCE by
+    # `_build_call_impact` before the /gate pre-flight and put on the
+    # call context. Reading it here — rather than minting a second one
+    # — is the whole point: the backend stores the digest it derived
+    # from the /gate body's envelope and recomputes it from this
+    # request's envelope, so the two must be the same object.
+    #
+    # A context with no envelope (a direct `runtime.execute(...)`
+    # call that never went through @protect) falls back to
+    # no_impact(). The backend then has no envelope to recompute
+    # against and refuses the re-entry — fail-CLOSED on an unbound
+    # approval, which is the correct posture for an approval whose
+    # trust binding the SDK could not reproduce.
+    call_impact = get_call_impact()
+    if call_impact is None:
+        call_impact = BusinessImpact.no_impact()
+    business_impact_dict: dict[str, Any] | None = call_impact.to_wire_dict()
+    action_digest_hex: str = compute_action_digest(call_impact)
 
     from nullrun.breaker.exceptions import (
         NullRunBlockedException,
