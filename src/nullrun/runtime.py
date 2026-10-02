@@ -77,13 +77,14 @@ from __future__ import annotations
 
 import asyncio
 import builtins
+import inspect
 import logging
 import os
 import threading
 import time
 import uuid
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 
 import httpx
 
@@ -2524,23 +2525,93 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                     reasons="; ".join(reasons),
                     agent_message=response.get("agent_message"),
                 )
-            # Bump ``cost_limit_exceeded`` when the pre-flight
-            # blocks the workflow. The counter is the operator's
-            # primary signal for "the budget cap is biting" --
-            # distinct from loop / retry / rate which have their
-            # own counters.
-            metrics.inc_runtime("cost_limit_exceeded")
+            # ``cost_limit_exceeded`` (the operator's "budget cap is
+            # biting" counter) is bumped further down, ONLY for a
+            # budget-class refusal — see DEF-TC4-001 below.
+            #
             # ``NullRunBudgetError`` carries structured
             # ``error_code``, ``user_action``, ``retryable`` so the
             # LLM gets an actionable hint instead of "Something went
             # wrong". ``reasons`` preserved in details for telemetry.
-            raise NullRunBudgetError(
+            #
+            # DEF-TC4-001 (QA RUN_ID 20261002T0826, 2026-10-02):
+            # this raise site hardcoded NullRunBudgetError for EVERY
+            # refusal, so a rate-limit block, a policy tool-block and
+            # a workflow-inactive all reached the caller as NR-B004
+            # "budget exhausted". Observed on production: an
+            # `RATE_LIMIT_EXCEEDED` 429 surfaced as
+            # NullRunBudgetError. An operator reading that code goes
+            # to raise a cap when the actual cause is a throttle
+            # policy, and a caller that catches NullRunBudgetError to
+            # mean "stop spending" stops for the wrong reason.
+            #
+            # The typed dispatcher already exists and is wired into
+            # `Runtime.execute`; the pre-flight just never called it.
+            # Routing through it here makes the `/gate` and
+            # `/execute` paths agree on one classification.
+            #
+            # `cost_limit_exceeded` is NOT bumped for a non-budget
+            # refusal — it is the operator's "budget cap is biting"
+            # counter, and the CLAUDE.md notes treat rate / loop /
+            # tool as separately-owned signals. Bumping it for a
+            # rate-limit block is the second half of the same
+            # mislabelling.
+            block_error = self._build_block_exception(
+                result=response,
                 workflow_id=workflow_id,
-                reason="; ".join(reasons),
-                action="block",
-                decision_source=response.get("decision_source"),
-                reasons="; ".join(reasons),
+                tool_name=get_call_tools()[0] if call_tools else None,
             )
+            # The dispatcher builds the reason from `explanation` and
+            # carries the whole wire `details` verbatim, which is
+            # where `decision_source` already lives. The pre-flight
+            # additionally surfaces the JOINED `explanations` — a
+            # multi-reason block reads better as one string here than
+            # as the dispatcher's single `explanation`.
+            if not getattr(block_error, "reasons", None):
+                # `reasons` is declared per-class, not on a shared
+                # base, so the attribute assignment is typed through
+                # a cast rather than `setattr` — the dispatcher
+                # genuinely returns one of several families and
+                # `NullRunBlockedException` is the widest type it
+                # can be typed as here.
+                _ReasonsCarrier = cast("Any", block_error)
+                _ReasonsCarrier.reasons = "; ".join(reasons)
+            if (
+                type(block_error) is NullRunBlockedException
+                and getattr(block_error, "error_code", None) == "NR-B004"
+            ):
+                # The legacy keyword tier: the wire sent no
+                # machine-readable code, so the dispatcher GUESSED
+                # "budget" from the explanation text and — by contract
+                # (`test_legacy_keyword_path_budget`) — returned the
+                # base class rather than claiming a typed guess.
+                #
+                # The pre-flight is a BUDGET pre-flight, and its
+                # caller contract is `NullRunBudgetError` (pinned by
+                # `test_real_block_still_honored`,
+                # `test_enforcement_4xx_still_raises_budget_error`,
+                # `test_block_response_does_not_infect_subsequent_track`).
+                # The two callers want different things from the same
+                # dispatcher output, so the widening happens HERE, at
+                # the caller that promises it — not by teaching the
+                # shared dispatcher to over-confident guesses that
+                # `/execute` callers would then inherit.
+                #
+                # Only the base class is upgraded, and only when the
+                # keyword tier guessed budget; a guess at loop / rate
+                # / tool stays on the base class, so the pre-flight
+                # never invents a typed claim the wire did not make.
+                block_error = NullRunBudgetError(
+                    workflow_id=workflow_id,
+                    reason="; ".join(reasons),
+                    action="block",
+                    decision_source=response.get("decision_source"),
+                    reasons="; ".join(reasons),
+                    details=block_error.details,
+                )
+            if isinstance(block_error, NullRunBudgetError):
+                metrics.inc_runtime("cost_limit_exceeded")
+            raise block_error
         if decision == "throttle":
             reasons = response.get("explanations") or (
                 [response["explanation"]] if response.get("explanation") else ["throttle"]
@@ -3774,7 +3845,42 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         wire_details = result.get("details") or {}
         if not isinstance(wire_details, dict):
             wire_details = {}
-        wire_error_code = wire_details.get("error_code")
+        # DEF-TC4-001: resolve the wire code the way the BACKEND
+        # resolves the HTTP status for the same body — an ordered
+        # candidate list, first registered hit wins. See
+        # `backend/src/proxy/http/gate/gate.rs::gate_response_to_response`,
+        # which reads `details["error_code"]` and then
+        # `response.explanation` (the Block dispatcher binds
+        # `reason_code` into that slot). Two things were missing here
+        # and both showed up as a budget error on production:
+        #
+        #   * the top-level `error_code` field, which `Transport.check`
+        #     already copies onto its 4xx return dict
+        #     (`transport.py` — `"error_code": wire_body.get("error_code")`)
+        #     and which several real refusal bodies carry;
+        #   * `explanation`, which is the fallback the backend itself
+        #     relies on, so a body the gate could classify was
+        #     classified as NR-B004 by the SDK.
+        #
+        # Candidate order matches the backend exactly so the status
+        # and the exception class can never disagree about which code
+        # a refusal is.
+        wire_error_code = (
+            wire_details.get("error_code")
+            or result.get("error_code")
+            or explanation
+        )
+        # An UNREGISTERED code must keep flowing to the base-class
+        # tier, which preserves it verbatim on `error_code` — that is
+        # the backend/SDK drift signal operators branch on
+        # (`test_unknown_wire_code_falls_back_to_base`). So do not
+        # null it out. What must not happen is dispatching on
+        # `explanation` as if it were a code: an English sentence
+        # that happens to be absent from the catalog must take the
+        # keyword tier, not claim to be drift.
+        _code_is_explicit = bool(
+            wire_details.get("error_code") or result.get("error_code")
+        )
 
         # Catalog classes with a custom ``__init__`` that promotes
         # a wire field to a first-class attribute (e.g.
@@ -3826,7 +3932,17 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             return payload
 
         # Priority 1: typed catalog dispatch via _V3_ERROR_CODE_MAP.
-        if wire_error_code and isinstance(wire_error_code, str):
+        #
+        # An explicitly-sent code reaches this tier even when the
+        # catalog has never heard of it — that is the drift path, and
+        # the base-class arm below preserves the literal string. The
+        # `explanation` candidate only enters when it IS registered;
+        # an English sentence that happens to miss the catalog belongs
+        # to the keyword tier, which reports a synthetic NR-* rather
+        # than presenting prose as if it were a wire code.
+        if wire_error_code and isinstance(wire_error_code, str) and (
+            _code_is_explicit or wire_error_code in _V3_ERROR_CODE_MAP
+        ):
             typed_cls = _V3_ERROR_CODE_MAP.get(wire_error_code)
             if typed_cls is not None:
                 # 1a: typed SUBCLASS (e.g.
@@ -3848,6 +3964,66 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                         for k in typed_kwarg_names
                         if k in wire_details
                     }
+                    # DEF-TC4-001: the catalog is not one family.
+                    # The decision-shaped kwargs below
+                    # (`workflow_id` / `reason` / `action` /
+                    # `tool_name` / `details`) only fit the
+                    # `NullRunBlockedException` hierarchy. The other
+                    # two families take different signatures, and
+                    # passing the wrong ones raises `TypeError`, so a
+                    # refusal escapes untyped instead of being
+                    # classified:
+                    #
+                    #   * transport — `(message, source, endpoint, …)`.
+                    #     `source` must NOT be forwarded through
+                    #     `**details` (it collides with the keyword
+                    #     the class passes down itself).
+                    #   * infra (not transport) — the bare
+                    #     `NullRunError(message, error_code=…)` shape
+                    #     that `NullRunRateLimitRedisError` uses.
+                    #
+                    # This arm was unreachable before DEF-TC4-001:
+                    # the only caller was `Runtime.execute`, whose
+                    # blocks are approval codes, all
+                    # `NullRunBlockedException`-family. The `/gate`
+                    # pre-flight now calls this dispatcher and
+                    # reaches the rate-limit and infra codes, so the
+                    # constructor shapes have to be told apart here
+                    # rather than at each raise site.
+                    if issubclass(typed_cls, NullRunTransportError):
+                        params = inspect.signature(
+                            typed_cls.__init__
+                        ).parameters
+                        kwargs: dict[str, Any] = {}
+                        if "source" in params:
+                            kwargs["source"] = (
+                                TransportErrorSource.GATEWAY_ERROR
+                            )
+                        if "endpoint" in params:
+                            kwargs["endpoint"] = "gate"
+                        if "retry_after" in params:
+                            retry_after_ms = wire_details.get(
+                                "retry_after_ms"
+                            )
+                            kwargs["retry_after"] = (
+                                retry_after_ms / 1000.0
+                                if isinstance(
+                                    retry_after_ms, (int, float)
+                                )
+                                else None
+                            )
+                        if "status_code" in params:
+                            kwargs["status_code"] = result.get(
+                                "status_code"
+                            )
+                        return typed_cls(explanation, **kwargs)
+                    if issubclass(typed_cls, NullRunInfrastructureError):
+                        # `error_code` is deliberately NOT passed —
+                        # the class attribute owns it, and
+                        # overriding it with the wire code would
+                        # defeat `format_user_message`'s catalog
+                        # lookup.
+                        return typed_cls(explanation)
                     return typed_cls(
                         workflow_id=workflow_id,
                         reason=explanation,
@@ -3908,6 +4084,16 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             block_code = "NR-X001"
             mapped = "NullRunBlockedException"
         payload = _build_payload(wire_details, mapped)
+        # NOTE: the branch table computes `mapped` but the base class
+        # is returned. That is deliberate and pinned by
+        # ``tests/test_2026_09_10_runtime_block_typed_dispatch.py::
+        # test_legacy_keyword_path_budget`` — the legacy tier
+        # (no wire `error_code`) reports what it GUESSED from an
+        # English substring, and a guessed typed class would claim
+        # more confidence than the wire gave. The guess is still
+        # visible: `error_code` is the synthetic `NR-*` and
+        # `details["mapped_class"]` names the class it would have
+        # been. Only the wire-code tier above dispatches on type.
         return NullRunBlockedException(
             workflow_id=workflow_id,
             reason=explanation,
