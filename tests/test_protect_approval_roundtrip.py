@@ -31,7 +31,7 @@ import pytest
 import respx
 
 import nullrun
-from nullrun.business_impact import BusinessImpact, DIGEST_PREFIX
+from nullrun.business_impact import DIGEST_PREFIX, BusinessImpact
 
 BASE_URL = "https://api.test.nullrun.io"
 
@@ -224,7 +224,7 @@ class TestTheBindingActuallyBinds:
         def refund_customer(amount: int) -> str:
             return "ok"
 
-        rt = make_runtime()
+        make_runtime()
         refund_customer(amount=500)
         approved = _last(captured, "gate")["action_digest"]
         refund_customer(amount=500_000)

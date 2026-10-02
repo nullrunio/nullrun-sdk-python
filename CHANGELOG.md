@@ -1,3 +1,218 @@
+## [0.21.0] - 2026-10-02
+
+Closes the round-trip `DEF-TC14-002` (QA cycle RUN_ID 20261002T0826)
+on the SDK side. Two QA cycles in a row found the same defect from
+two angles: 0.20.0's audit said "operator approves an action and the
+agent still cannot run it", and this cycle's TC-4 said "/gate blocks
+on a rate limit but the SDK raises `NullRunBudgetError` so callers
+branch on the wrong cause". Both were the same root: the SDK was
+sending a constant sentinel instead of the business impact envelope
+the backend was looking for, and was classifying refusals by what
+the SDK's wrapper assumed rather than by what the wire said.
+
+Minor, not patch: 0.18.5's deprecation sweep deleted the
+`BusinessImpact.tool_call()` constructor along with the curated
+surface, and 0.21.0 restores it. The class shape is unchanged, but
+the re-export path is — see Migration #1. The /track path now raises
+typed enforcement rejections where it dropped them silently (see
+Migration #2), and the /gate pre-flight now routes through the typed
+dispatcher so a rate-limit refusal does not present as
+`NullRunBudgetError` (see Migration #3).
+
+### Migration
+
+Three things differ from 0.20.0. None are silent on a healthy
+configuration, but each can be a working loop becoming a throwing
+one for code that suppressed the failure before.
+
+1. **`BusinessImpact.tool_call()` is back.** Importable from
+   `nullrun.business_impact`. The 0.18.5 deprecation sweep
+   (aee8110) deleted it along with the curated surface reduction
+   while the module docstring kept claiming it was there — the
+   same prose/code disagreement that made the round-trip
+   audit-difference read as a backend bug. The constructor emits
+   exactly what the backend's internally-tagged serde produces,
+   including `extractor_id` and `extractor_version` (the backend
+   has no `skip_serializing_if` on these, so they are inside the
+   hashed bytes and must be present here too). If you imported it
+   from a private path, the import no longer needs to be private.
+2. **The v3 `/track` single path raises typed enforcement
+   rejections instead of dropping them.** A 422 `CONSUME_OVERBUDGET`
+   used to be a WARNING log line and a return value of
+   `TRACK_OK={'allowed': True, 'actions': [], 'local_cost_cents': 0}`
+   — the call was treated as successful at the agent layer. It now
+   raises `NullRunConsumeOverbudgetError` carrying `reserved_cents`,
+   `actual_cost_cents`, `max_allowed_cents` and `epsilon_cents`.
+   Network errors and 5xx that name no enforcement failure still
+   drop and log; widening the raise to those would freeze the agent
+   loop on a dead backend, which is the failure mode the fail-OPEN
+   rows exist to prevent.
+3. **The /gate pre-flight now types its refusal instead of
+   assuming budget.** A rate-limit block, a tool-block and a
+   circuit-breaker trip used to reach the caller as
+   `NullRunBudgetError` (NR-B004). The dispatcher routes by wire
+   code: `RATE_LIMIT_EXCEEDED` → `NullRunRateLimitError`,
+   `TOOL_BLOCKED` → `NullRunToolBlockedError`, `CIRCUIT_BREAKER_TRIPPED`
+   → typed breaker class. A response with no machine-readable code
+   still raises `NullRunBudgetError` (the legacy tier is pinned).
+   `cost_limit_exceeded` is bumped only for `NullRunBudgetError`,
+   so a rate-limit block no longer over-counts the spend cap.
+
+Carried over from 0.20.0 and still true on 0.21.0 — the same class
+of break and the same shape of fix:
+
+- **An unclassifiable refusal now raises where 0.19.0 let the call
+  proceed.** `NullRunUnclassifiedRefusalError` is a sibling of
+  `NullRunTransportError` (not a subclass), so an existing
+  `except NullRunTransportError:` arm will not catch it.
+- **`NullRunRuntime.execute(..., mode="inline")` is gone.**
+- **`register_strict_mode_forced` / `is_strict_mode_forced` /
+  `@guarded` / `nullrun.handle` / `nullrun.status()` /
+  `nullrun.auto_instrument`** are all gone (last touched in
+  0.18.5–0.20.0).
+
+### Security
+
+- **ADR-065 (DEF-TC14-002)** — `@protect` binds approvals to
+  nothing. Since 0.18.5 every `@protect` call sent a constant
+  `{"kind":"none"}` sentinel; a constant hashes to a constant, so
+  the digest the backend stored on the approval row at `/gate`
+  matched the digest it recomputed at `/execute` for every tool —
+  while binding the approval to nothing at all. The backend's
+  refuse-the-reentry check therefore had no data to refuse
+  *against*, and the operator's approval card did not correspond
+  to any particular action. The fix is in five steps:
+  (1) `BusinessImpact.tool_call()` is restored with
+  `extractor_id` / `extractor_version`; (2) the envelope is
+  carried on the call context as a contextvar, the same home
+  `set_call_context` uses for the model and the tool list;
+  (3) `Transport.check` reads the envelope and sends it alongside
+  the digest (the allowlist builder was dropping it before);
+  (4) `@protect` builds the envelope before the `/gate`
+  pre-flight — building it after means the two calls would carry
+  different envelopes, and the backend would refuse every
+  re-entry as a side effect; (5) a build failure (non-ASCII tool
+  name, > 128 bytes) degrades to `no_impact()` and logs, so the
+  tool still runs while the approval carries no trust binding and
+  the server refuses the re-entry. That is a deliberate fail-OPEN
+  on metadata — raising out of the decorator would take down a
+  tool call over a metadata field. A `compute_action_digest`
+  refactor exposes the canonical bytes for direct assertion; the
+  shared fixture digest is byte-identical to the backend's
+  `DIGEST_FIXTURE_HEX_TOOL_CALL` (`9975a8b7…6ed0526966a6`).
+- **DEF-TC29-001** — `Transport.check` was dropping `tool_class`
+  and `mcp_annotations` from the `/gate` body. The MCP integration
+  had been computing them for the call context since it landed,
+  but the transport's explicit allowlist builder did not include
+  them, so a destructive MCP tool arrived at the gate as
+  `tool_class=None, mcp_annotations=None` — the negative case the
+  backend pins, not the positive case the public
+  `set_mcp_tool_context` API implied. `effective_tool_class()`
+  falls back to name-based classification on the negative case,
+  so this is a dead feature with a misleading API today — but the
+  day the server-side flag flips, destructive MCP tools will
+  silently degrade without a wire-level signal. Now sent
+  unconditionally when set; absent means "unknown", not "false".
+- **DEF-TC4-001** — `/gate` pre-flight was raising
+  `NullRunBudgetError` for every refusal. A rate-limit block
+  (NR-R002), a tool-block (NR-T003) and a circuit-breaker trip
+  (NR-B010) all reached the caller as NR-B004 "budget exhausted",
+  which sends the operator looking for a spend-cap misconfiguration
+  when the actual cause is a throttle policy. The pre-flight now
+  routes through `_build_block_exception` and resolves the wire
+  code in the same order the backend resolves the HTTP status:
+  `details["error_code"]`, then the top-level `error_code` that
+  `Transport.check` already copies onto its 4xx dict, then
+  `explanation`. The dispatcher handles all three catalog families
+  (decision / transport / infra), not just the
+  `NullRunBlockedException` one — `source` is never forwarded
+  through `**details` because it collides with the keyword the
+  class passes down itself. Two backend codes that had drifted
+  out of the SDK catalog (`BUDGET_WORKFLOW_BLOCKED`, `402`;
+  `BUDGET_CACHE_EXCEEDED`, `402`) are registered in the
+  companion commit; the backend logged `BUDGET_WORKFLOW_BLOCKED`
+  x389 in production before that registration, so the wire had
+  been answering questions the SDK could not classify.
+- **DEF-TC6-006** — `_route_track` was wrapping `transport.track_single`
+  in a bare `except Exception` that logged at WARNING and
+  returned. The transport layer had already classified the
+  response — a 422 `CONSUME_OVERBUDGET` becomes a typed
+  `NullRunConsumeOverbudgetError` — and the catch discarded it.
+  The drop-and-log policy the catch implements is the one the
+  ADR-008 table states for the `/track` batch path, a NETWORK
+  error; the v3 single path has no such row. The fix re-raises
+  `NullRunDecision` after the existing cache invalidation and
+  telemetry, so the blast-radius mitigation
+  (`DEF-CACHE-STALE-ALLOW-AFTER-OVERBUDGET`) is not traded away
+  for the reporting fix.
+
+### Fixed
+
+- **DEF-TC21-001** — `WorkflowKilledInterrupt` was documented as
+  `BaseException`-only in three places (`docs/errors/NR-W002.md`,
+  `src/nullrun/breaker/exceptions.py`'s class catalog, the
+  `NullRunError` docstring), but the class has been an `Exception`
+  subclass since 0.16.6's `BreakerError` reparenting
+  (`9877c34`). The behaviour is correct and deliberate — agent
+  recovery is meant to catch a kill and surface the structured
+  `error_code` / `user_action`; `tests/test_decision_split.py`
+  documents the override. Only the prose was wrong, and it was
+  wrong in the direction that would lead the next maintainer to
+  revert working code. `docs/errors/NR-W002.md` also pointed at
+  `docs/kill-contract.md` §6, a file that does not exist.
+  `tests/test_exception_hierarchy.py` had the same disease: the
+  test was named `test_killed_interrupt_does_not_inherit_from_exception`
+  while asserting `issubclass(WorkflowKilledInterrupt, Exception)`.
+  Renamed.
+- **DEF-TC6-005** — `status().ws_connected` was structurally pinned
+  to `None`. `WebSocketConnection` has an `_running` flag (set in
+  `_connect`, cleared by the receive loop's `finally`); the SDK
+  was reading `is_open` via `getattr(..., None)`. `is_open`
+  appears exactly once in the SDK: on the reading side, with no
+  writer, no test and no producer — so the `getattr` default
+  fired on every call and the three states (never-established /
+  live / dropped) collapsed to one. The fourth test in the new
+  file asserts that the attribute `status()` reads exists on a
+  really-constructed `WebSocketConnection` AND that `is_open`
+  does not — a stubbed connection cannot catch it, because the
+  stub would carry whatever attribute the test author assumed.
+
+### Documentation
+
+- ADR-065: the five-step restoration of the `BusinessImpact`
+  envelope is recorded in the SDK-side commit chain; the
+  backend-side companion is in the NULLRUN repo. The shared
+  fixture digest is pinned at byte-identity
+  (`9975a8b7…6ed0526966a6`) so a future serializer change in
+  either repo flips a test rather than degrading silently.
+
+### Verification
+
+| Check | Result |
+|---|---|
+| `ruff check src tests` | All checks passed |
+| `mypy src/nullrun` | Success: no issues found in 37 source files (the 6 errors in `instrumentation/auto.py` reproduce identically without these changes) |
+| `pytest -q` | **1694 passed, 1 skipped** (~ baseline 1597 / 1 — **+97 new tests**; 5 from the gate-block typed-dispatch file alone, 5 from the track-propagation file, 4 from the WS-status file, 1+3 from the approval-roundtrip file, 1 from the gate-business-impact-wire file, 4 from the business-impact-tool-call file, 1 from the call-impact-context file) |
+| Scratch diff | clean |
+| `nullrun.__version__` | `0.21.0` |
+| Wire-format | additive on `/gate` (carries `business_impact`, `tool_class`, `mcp_annotations` when set; absent means "unknown", not "false"); non-additive on `/track` (the v3 single path now raises typed enforcement rejections where it dropped them — caller-observable) |
+
+### Commits included
+
+```
+d11eb78 test(protect): pin the unbuildable-envelope degradation
+88ddec8 fix(protect): build the tool_call envelope before the /gate pre-flight
+015407b feat(gate): send the context envelope at /gate instead of a sentinel
+e3176d9 feat(sdk): carry one BusinessImpact envelope per logical action
+4320ac0 feat(sdk): restore the tool_call BusinessImpact constructor
+6108308 docs(kill): stop claiming the kill signal is BaseException-only
+b64dc8a fix(mcp): forward tool class and annotations to /gate
+ea7c9ee fix(track): propagate enforcement rejections from the v3 /track path
+9ccf168 fix(sdk): read the attribute the WS connection actually has
+76efa7b fix(sdk): type the /gate pre-flight refusal instead of assuming budget
+4ec5460 fix(sdk): register the two backend budget codes in the SDK catalog
+```
+
 ## [0.20.0] - 2026-10-01
 
 The remaining half of `DEF-MP-TS12-ENF-01` (QA cycle RUN_ID

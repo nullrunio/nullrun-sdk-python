@@ -26,7 +26,7 @@ import httpx
 import pytest
 import respx
 
-from nullrun.business_impact import BusinessImpact, DIGEST_PREFIX
+from nullrun.business_impact import DIGEST_PREFIX, BusinessImpact
 from nullrun.context import set_call_impact
 from nullrun.transport import Transport
 
