@@ -307,3 +307,60 @@ class TestEnvelopeIsScopedToTheCall:
         assert get_call_impact() is None
         envelopes = [b["business_impact"]["tool_name"] for b in captured["execute"]]
         assert envelopes == ["outer", "inner"]
+
+
+class TestUnbuildableEnvelopeDegradesLoudly:
+    """`_build_call_impact` can fall back to no_impact().
+
+    ADR-065 retires the `none` sentinel FROM THE TOOL PATH, which is
+    only true modulo this branch: a tool name the backend's validator
+    rejects (non-ASCII, over 128 bytes) or an argument the digest layer
+    cannot round-trip falls back to `no_impact()` and logs. The
+    backend then stores a digest that binds nothing and refuses the
+    re-entry — fail-CLOSED on the server, fail-OPEN in the SDK's own
+    metadata. That trade is deliberate and is pinned here so it stays
+    deliberate rather than becoming an unnoticed hole.
+    """
+
+    def test_non_ascii_tool_name_degrades_instead_of_raising(self, make_runtime, mock_api, captured):
+        # The backend's `ToolCallParams::validate` requires printable
+        # ASCII (business_impact.rs:320-323). A tool named in Cyrillic
+        # cannot be described by a valid envelope at all.
+        from nullrun.decorators import _build_call_impact
+
+        def refund_клиент():
+            pass
+
+        impact = _build_call_impact(refund_клиент, (), {})
+        assert impact.kind == "none"
+
+    def test_overlong_tool_name_degrades(self, make_runtime, mock_api, captured):
+        from nullrun.decorators import _build_call_impact
+
+        def tool():
+            pass
+
+        tool.__name__ = "t" * 129
+        assert _build_call_impact(tool, (), {}).kind == "none"
+
+    def test_a_valid_tool_never_degrades(self, make_runtime, mock_api, captured):
+        from nullrun.decorators import _build_call_impact
+
+        def refund_customer(amount: int):
+            pass
+
+        assert _build_call_impact(refund_customer, (), {"amount": 500}).kind == "tool_call"
+
+    def test_degraded_tool_still_runs_but_binds_nothing(self, make_runtime, mock_api, captured):
+        # Documented consequence: the body is NOT blocked, the approval
+        # simply carries no trust binding, so /execute is refused.
+        @nullrun.protect
+        def refund_клиент(amount: int) -> str:
+            return "ok"
+
+        make_runtime()
+        assert refund_клиент(amount=500) == "ok"
+        from nullrun.business_impact import compute_action_digest
+
+        sentinel = compute_action_digest(BusinessImpact.no_impact())
+        assert _last(captured, "gate")["action_digest"] == sentinel
