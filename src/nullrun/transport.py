@@ -1570,6 +1570,37 @@ class Transport:
         # fingerprint.
         if "tool_arguments" in check_request and check_request["tool_arguments"] is not None:
             gate_request["tool_arguments"] = check_request["tool_arguments"]
+        # DEF-TC29-001 (2026-10-02, QA RUN_ID 20261002T0826): forward
+        # the MCP tool class + per-tool annotations.
+        #
+        # `check_workflow_budget` has computed both since the MCP
+        # integration landed — it reads `get_call_mcp_class()` /
+        # `get_call_mcp_annotations()` off the call context and sets
+        # them on `check_req` (`runtime.py:2383-2388`) — but this
+        # method never sent `check_req`. It rebuilds the body from the
+        # allowlist above, and neither key was on it, so both values
+        # were discarded here without a word. Confirmed on the wire
+        # against prod: `set_mcp_tool_context(tool_class="mcp",
+        # annotations={"read_only": False, "destructive": True,
+        # "open_world": False})` produced a `/gate` body with
+        # neither field. The public `set_mcp_tool_context` API and the
+        # `toolbox.mcp` auto-classification path were dead end to end.
+        #
+        # The backend already accepts and honours both
+        # (`gate/internal.rs:318-341` states the forwarding contract;
+        # `gate/tool_canonical.rs:229-249` defines `McpAnnotations` as
+        # `read_only` / `destructive` / `open_world`).
+        #
+        # Guarded on `is not None`, NOT on key presence. The backend
+        # pins the negative case too — `internal.rs:8291-8295` asserts
+        # `tool_class=None` / `mcp_annotations=None` must not appear in
+        # the JSON — and an absent annotation means "unknown", not
+        # "false" (`internal.rs:334-339`). Serialising `null` would be a
+        # different value carrying a different meaning.
+        if check_request.get("tool_class") is not None:
+            gate_request["tool_class"] = check_request["tool_class"]
+        if check_request.get("mcp_annotations") is not None:
+            gate_request["mcp_annotations"] = check_request["mcp_annotations"]
         _parent_execution_id = check_request.get("parent_execution_id", parent_execution_id)
         if _parent_execution_id is not None:
             gate_request["parent_execution_id"] = _parent_execution_id
