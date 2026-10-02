@@ -3221,6 +3221,24 @@ def _build_v3_error_code_map() -> dict[str, type[Exception]]:
         "BUDGET_SOFT_BLOCKED": NullRunBudgetError,
         "BUDGET_OVERDRAFT_EXCEEDED": NullRunBudgetError,
         "BUDGET_PERIOD_NOT_STARTED": NullRunBudgetError,
+        # DEF-TC4-001 (2026-10-02). These two are registered in the
+        # backend's `GateErrorCode::all()` (error_codes.rs:666-667,
+        # `BudgetWorkflowBlocked` / `BudgetCacheExceeded`, both 402)
+        # and the backend logged `BUDGET_WORKFLOW_BLOCKED` ×389 in
+        # production before they were registered at all. The SDK
+        # catalog was never updated to match, so the typed dispatcher
+        # could not classify them: `BUDGET_WORKFLOW_BLOCKED` fell to
+        # the base-class drift tier and a caller branching on
+        # `NullRunBudgetError` to mean "stop spending" saw an
+        # untyped block instead.
+        #
+        # Drift between the two registries is exactly what
+        # `test_unknown_wire_code_falls_back_to_base` exists to
+        # surface — this pair is the reason that test matters, and
+        # the reason the catalog has to be checked when a code is
+        # registered backend-side.
+        "BUDGET_WORKFLOW_BLOCKED": NullRunBudgetError,
+        "BUDGET_CACHE_EXCEEDED": NullRunBudgetError,
         # Note: BUDGET_REDIS_UNAVAILABLE and RATE_LIMIT_REDIS_UNAVAILABLE
         # because the backend never emits it (it is absent from
         # ``GateErrorCode::all()`` in error_codes.rs). A cookbook that
