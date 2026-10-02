@@ -9,6 +9,8 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 
+from .business_impact import BusinessImpact
+
 # SpanContext that models the parent/child hierarchy a trace timeline
 # ``_span_id`` contextvars and now keeps them in lockstep via the
 # ``_mirror_to_span_context`` / ``_mirror_to_legacy_span`` helpers
@@ -51,6 +53,25 @@ _call_tools_var: ContextVar[tuple[str, ...]] = ContextVar("call_tools", default=
 _call_mcp_class_var: ContextVar[str | None] = ContextVar("call_mcp_class", default=None)
 _call_mcp_annotations_var: ContextVar[dict[str, bool | None] | None] = ContextVar(
     "call_mcp_annotations", default=None
+)
+# The BusinessImpact envelope for the logical action in scope — ONE
+# envelope per action, built once and read by both the /gate
+# pre-flight and the /execute re-entry.
+#
+# It is a contextvar and not a per-call argument because the two HTTP
+# calls are made from different places (`check_workflow_budget` and
+# `@protect`) at different times, and the backend compares the digest
+# it RECOMPUTES at /execute against the one it STORED at /gate
+# (`payload_binding.rs:163`, `orchestrator.rs:1511`). Two separately
+# constructed envelopes are two different hashes whenever the inputs
+# differ by anything at all — which is why the SDK shipped a constant
+# sentinel instead: see DEF-TC14-002 and ADR-065.
+#
+# `None` means "no envelope in scope" — the /gate pre-flight falls
+# back to `no_impact()`, which is correct for an LLM check with no
+# tool to name and wrong for a tool call.
+_call_impact_var: ContextVar["BusinessImpact | None"] = ContextVar(
+    "call_impact", default=None
 )
 
 # .
@@ -142,6 +163,25 @@ def get_call_mcp_annotations() -> dict[str, bool | None] | None:
     opinion" — the gate treats the value as unknown.
     """
     return _call_mcp_annotations_var.get()
+
+
+def get_call_impact() -> "BusinessImpact | None":
+    """The BusinessImpact envelope for the logical action in scope.
+
+    Read by BOTH ``check_workflow_budget`` (the ``/gate`` pre-flight,
+    which decides the digest that gets stored on the approval row)
+    and ``@protect`` (the ``/execute`` re-entry, where the backend
+    recomputes the digest from the request body and compares it to
+    that stored value). They must read the same object — see
+    :func:`set_call_impact` and ADR-065.
+
+    ``None`` means no envelope has been set for this action. For an
+    LLM check that is correct and the pre-flight sends ``no_impact()``.
+    For a tool call it means the approval will be stored with a digest
+    the server cannot reproduce, so the re-entry fails CLOSED with
+    ``APPROVAL_DIGEST_MISMATCH``.
+    """
+    return _call_impact_var.get()
 
 
 # ---------------------------------------------------------------------------
@@ -813,6 +853,30 @@ def set_mcp_tool_context(
         _call_mcp_class_var.set(tool_class)
     if annotations is not None:
         _call_mcp_annotations_var.set(annotations)
+
+
+def set_call_impact(impact: "BusinessImpact | None") -> Token["BusinessImpact | None"]:
+    """Set the BusinessImpact envelope for the logical action in scope.
+
+    ONE envelope per logical action, set before the ``/gate``
+    pre-flight runs and read unchanged by the ``/execute`` re-entry.
+    Rebuilding it per HTTP call is the failure ADR-065 documents: the
+    backend stores the digest computed from the ``/gate`` body's
+    envelope and recomputes it from the ``/execute`` body's envelope,
+    so any difference between the two is a refused re-entry.
+
+    ``@protect`` sets this itself for tool calls. Set it by hand only
+    for a custom integration that makes its own ``/gate`` and
+    ``/execute`` calls.
+
+    Returns the ``Token`` for :func:`reset_call_impact`.
+    """
+    return _call_impact_var.set(impact)
+
+
+def reset_call_impact(token: "Token[BusinessImpact | None]") -> None:
+    """Restore the previous envelope. Pair with :func:`set_call_impact`."""
+    _call_impact_var.reset(token)
 
 
 def generate_trace_id() -> str:
