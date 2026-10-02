@@ -68,7 +68,11 @@ import pytest
 import respx
 
 from nullrun.breaker.categories import NullRunUnclassifiedRefusalError
-from nullrun.breaker.exceptions import NullRunBudgetError, NullRunError
+from nullrun.breaker.exceptions import (
+    NullRunBlockedException,
+    NullRunBudgetError,
+    NullRunError,
+)
 
 BASE_URL = "https://api.test.nullrun.io"
 GATE_URL = f"{BASE_URL}/api/v1/gate"
@@ -219,13 +223,28 @@ class TestInfraRefusalIsNotFailClosed:
         500, which is also `>= 500` — so it took the same retry-then-
         fail-OPEN path and the agent was told to retry a workflow an
         operator had just stopped.
+
+        DEF-TC4-001 (2026-10-02) changed the expected CLASS, not the
+        behaviour. The pre-flight used to raise `NullRunBudgetError`
+        for every refusal, so this test passed on the budget type by
+        accident. `CIRCUIT_BREAKER_TRIPPED` is category `halt`, is
+        absent from the SDK catalog, and correctly resolves to the
+        base `NullRunBlockedException` with the wire code preserved on
+        `error_code` — a breaker trip is not budget exhaustion, and an
+        operator reading NR-B004 would go look at spend caps.
         """
         respx.post(GATE_URL).mock(return_value=_breaker_trip_403())
         rt = make_runtime()
 
-        with pytest.raises(NullRunBudgetError) as exc_info:
+        with pytest.raises(NullRunBlockedException) as exc_info:
             rt.check_workflow_budget()
 
+        assert not isinstance(exc_info.value, NullRunBudgetError), (
+            "a circuit-breaker trip must not surface as budget "
+            "exhaustion — it is a `halt`, and the two send an operator "
+            "to completely different screens"
+        )
+        assert exc_info.value.error_code == "CIRCUIT_BREAKER_TRIPPED"
         assert "stopped by its circuit breaker" in exc_info.value.reason
         assert "Do not retry" in exc_info.value.reason, (
             "the agent-facing instruction must survive the round trip — "
@@ -249,7 +268,7 @@ class TestInfraRefusalIsNotFailClosed:
 
         respx.post(GATE_URL).mock(side_effect=_count)
         rt = make_runtime()
-        with pytest.raises(NullRunBudgetError):
+        with pytest.raises(NullRunBlockedException):
             rt.check_workflow_budget()
 
         assert len(calls) == 1, (

@@ -38,7 +38,7 @@ class BreakerError(Exception):
 #
 # Existing ``except`` clauses keep working: every existing public class
 # (``NullRunAuthenticationError``, ``NullRunBlockedException``
-# ``NullRunTransportError``, ``WorkflowKilledException``
+# ``NullRunTransportError``, ``WorkflowKilledInterrupt``
 # ``WorkflowPausedException``) inherits from ``NullRunError`` now, so
 # ``except NullRunError:`` catches them all — but the narrower clauses
 # keep matching too.
@@ -74,9 +74,12 @@ class NullRunError(BreakerError):
     Both inherit from:class:`NullRunError`, so existing
     ``except NullRunError:`` clauses keep matching — the split is a
     strict refinement, not a breaking change. ``WorkflowKilledInterrupt``
-    is **not** in either category: it remains a ``BaseException``
-    subclass so kill signals bypass any ``except Exception:`` that
-    might otherwise swallow them.
+    is **not** in either category: it inherits directly from
+    ``NullRunError`` because a kill is a control-plane signal, not a
+    policy decision and not a transport failure. It *is* an
+    ``Exception`` subclass, so a broad ``except Exception:`` in host
+    code will swallow it — catch ``WorkflowKilledInterrupt`` (or
+    ``NullRunWorkflowKilledError``) first. See ``docs/errors/NR-W002.md``.
     """
 
     # Default error code when a subclass does not override it.

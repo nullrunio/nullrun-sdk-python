@@ -73,7 +73,7 @@ class TestHierarchyRoots:
                 f"SDK failure."
             )
 
-    def test_killed_interrupt_does_not_inherit_from_exception(self):
+    def test_killed_interrupt_is_an_exception_subclass(self):
         # 2026-09-08 migration: WorkflowKilledInterrupt is now an
         # Exception subclass (``NullRunError`` parent) — formerly a
         # BaseException subclass. The user override: agent recovery
@@ -86,6 +86,14 @@ class TestHierarchyRoots:
         # kill contract" would break cookbook recovery and this
         # test would fail loudly, forcing them to either keep the
         # migration or justify the revert in a comment.
+        #
+        # The test used to be named
+        # ``test_killed_interrupt_does_not_inherit_from_exception``
+        # while asserting the exact opposite (DEF-TC21-001). The
+        # assertion was right — 0.16.6 (``9877c34``) reparented the
+        # class deliberately so agent recovery can catch a kill. Only
+        # the name lied, and a maintainer trusting the name would
+        # have reverted working code.
         assert issubclass(WorkflowKilledInterrupt, Exception)
         assert issubclass(WorkflowKilledInterrupt, NullRunError)
 

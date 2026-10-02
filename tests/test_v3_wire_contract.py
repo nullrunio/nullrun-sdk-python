@@ -2134,15 +2134,23 @@ class TestRouteTrack:
                 {"reservation_id": SERVER_MINTED_V1}
             )
 
-            rt.track_llm(
-                input_tokens=60,
-                output_tokens=40,
-                model="claude-sonnet-4-6",
-            )
+            # DEF-TC6-006 (2026-10-02): the 422 CONSUME_OVERBUDGET
+            # now PROPAGATES to the caller as a typed
+            # NullRunConsumeOverbudgetError instead of being logged
+            # and swallowed. The invalidation this test was written
+            # to pin is unchanged -- it runs above the re-raise in
+            # the same handler -- so the assertion is strengthened,
+            # not relaxed: the blast radius is still closed, and the
+            # agent additionally learns its consume was refused.
+            from nullrun.breaker.exceptions import NullRunConsumeOverbudgetError
 
-            # track_llm buffers then flushes — the cache key should
-            # be dropped by the except handler once track_single
-            # raises on 422.
+            with pytest.raises(NullRunConsumeOverbudgetError):
+                rt.track_llm(
+                    input_tokens=60,
+                    output_tokens=40,
+                    model="claude-sonnet-4-6",
+                )
+
             assert cache_key not in _rt_mod._GATE_CACHE, (
                 "422 from /track must invalidate the matching chain's "
                 "cache entry (DEF-CACHE-STALE-ALLOW-AFTER-OVERBUDGET)"
@@ -2202,11 +2210,18 @@ class TestRouteTrack:
                 {"reservation_id": SERVER_MINTED_V1}
             )
 
-            rt.track_llm(
-                input_tokens=10,
-                output_tokens=10,
-                model="claude-sonnet-4-6",
-            )
+            # DEF-TC6-006: same shape as the 422 test above --
+            # NullRunBudgetError is a NullRunBlockedException, which
+            # is a NullRunDecision, so the 402 propagates too. The
+            # cache invalidation still runs before the raise.
+            from nullrun.breaker.exceptions import NullRunBudgetError
+
+            with pytest.raises(NullRunBudgetError):
+                rt.track_llm(
+                    input_tokens=10,
+                    output_tokens=10,
+                    model="claude-sonnet-4-6",
+                )
 
             assert cache_key not in _rt_mod._GATE_CACHE, (
                 "402 from /track must invalidate the matching chain's "

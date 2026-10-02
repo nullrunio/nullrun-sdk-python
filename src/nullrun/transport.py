@@ -1558,6 +1558,24 @@ class Transport:
         # but None" wire-shape drift.
         if check_request.get("action_digest"):
             gate_request["action_digest"] = check_request["action_digest"]
+        # The BusinessImpact envelope the digest was computed over.
+        # The backend stores `action_digest` on the approval row and,
+        # at /execute, recomputes it from the envelope in THAT request
+        # and compares (payload_binding.rs:163, orchestrator.rs:1511),
+        # so both endpoints have to carry the same envelope. Sending
+        # the digest without the envelope leaves the server unable to
+        # reproduce what it stored -- the /execute re-entry then fails
+        # CLOSED with APPROVAL_DIGEST_MISMATCH.
+        #
+        # `internal.rs:216` declares it on GateRequest and
+        # `internal.rs:6947` round-trips it through serde.
+        #
+        # Forwarded whenever present. `{"kind": "none"}` is a real
+        # value here, not an absence: it is what an LLM check with no
+        # tool to name sends, and the backend distinguishes it from
+        # an omitted envelope.
+        if check_request.get("business_impact") is not None:
+            gate_request["business_impact"] = check_request["business_impact"]
         # Forward the `tool_arguments` bag alongside `tool` so
         # the gate can hash it via `signature::compute_schema_hash`
         # and write the fingerprint into `mcp_tool_signatures`.
@@ -1570,6 +1588,37 @@ class Transport:
         # fingerprint.
         if "tool_arguments" in check_request and check_request["tool_arguments"] is not None:
             gate_request["tool_arguments"] = check_request["tool_arguments"]
+        # DEF-TC29-001 (2026-10-02, QA RUN_ID 20261002T0826): forward
+        # the MCP tool class + per-tool annotations.
+        #
+        # `check_workflow_budget` has computed both since the MCP
+        # integration landed — it reads `get_call_mcp_class()` /
+        # `get_call_mcp_annotations()` off the call context and sets
+        # them on `check_req` (`runtime.py:2383-2388`) — but this
+        # method never sent `check_req`. It rebuilds the body from the
+        # allowlist above, and neither key was on it, so both values
+        # were discarded here without a word. Confirmed on the wire
+        # against prod: `set_mcp_tool_context(tool_class="mcp",
+        # annotations={"read_only": False, "destructive": True,
+        # "open_world": False})` produced a `/gate` body with
+        # neither field. The public `set_mcp_tool_context` API and the
+        # `toolbox.mcp` auto-classification path were dead end to end.
+        #
+        # The backend already accepts and honours both
+        # (`gate/internal.rs:318-341` states the forwarding contract;
+        # `gate/tool_canonical.rs:229-249` defines `McpAnnotations` as
+        # `read_only` / `destructive` / `open_world`).
+        #
+        # Guarded on `is not None`, NOT on key presence. The backend
+        # pins the negative case too — `internal.rs:8291-8295` asserts
+        # `tool_class=None` / `mcp_annotations=None` must not appear in
+        # the JSON — and an absent annotation means "unknown", not
+        # "false" (`internal.rs:334-339`). Serialising `null` would be a
+        # different value carrying a different meaning.
+        if check_request.get("tool_class") is not None:
+            gate_request["tool_class"] = check_request["tool_class"]
+        if check_request.get("mcp_annotations") is not None:
+            gate_request["mcp_annotations"] = check_request["mcp_annotations"]
         _parent_execution_id = check_request.get("parent_execution_id", parent_execution_id)
         if _parent_execution_id is not None:
             gate_request["parent_execution_id"] = _parent_execution_id
@@ -3221,6 +3270,24 @@ def _build_v3_error_code_map() -> dict[str, type[Exception]]:
         "BUDGET_SOFT_BLOCKED": NullRunBudgetError,
         "BUDGET_OVERDRAFT_EXCEEDED": NullRunBudgetError,
         "BUDGET_PERIOD_NOT_STARTED": NullRunBudgetError,
+        # DEF-TC4-001 (2026-10-02). These two are registered in the
+        # backend's `GateErrorCode::all()` (error_codes.rs:666-667,
+        # `BudgetWorkflowBlocked` / `BudgetCacheExceeded`, both 402)
+        # and the backend logged `BUDGET_WORKFLOW_BLOCKED` ×389 in
+        # production before they were registered at all. The SDK
+        # catalog was never updated to match, so the typed dispatcher
+        # could not classify them: `BUDGET_WORKFLOW_BLOCKED` fell to
+        # the base-class drift tier and a caller branching on
+        # `NullRunBudgetError` to mean "stop spending" saw an
+        # untyped block instead.
+        #
+        # Drift between the two registries is exactly what
+        # `test_unknown_wire_code_falls_back_to_base` exists to
+        # surface — this pair is the reason that test matters, and
+        # the reason the catalog has to be checked when a code is
+        # registered backend-side.
+        "BUDGET_WORKFLOW_BLOCKED": NullRunBudgetError,
+        "BUDGET_CACHE_EXCEEDED": NullRunBudgetError,
         # Note: BUDGET_REDIS_UNAVAILABLE and RATE_LIMIT_REDIS_UNAVAILABLE
         # because the backend never emits it (it is absent from
         # ``GateErrorCode::all()`` in error_codes.rs). A cookbook that
