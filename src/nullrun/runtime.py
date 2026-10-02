@@ -23,6 +23,7 @@ the authoritative table; deviations require an ADR amendment (Rule 5).
 | `_enforce_sensitive_tool` (`_fallback_mode=permissive`, opt-in) | CLOSED -- body MUST NOT run when `decision_source` is any `FALLBACK_*` | n/a (body did not run) | `NULLRUN_SENSITIVE_FAIL_OPEN=1` -- explicitly documented as "OPEN-when-engine-unavailable" |
 | `_emit_span_start` / `_emit_span_end` | n/a -- never blocks | n/a | n/a |
 | `/track` batch path (legacy) | OPEN-on-network-error (event dropped, no retry) | n/a -- circuit breaker backoff applies | none |
+| `/track` v3 single path (`track_single`) | OPEN-on-network-error and OPEN-on-5xx (event dropped, no retry); **CLOSED for enforcement rejections** — a typed `NullRunDecision` (`CONSUME_OVERBUDGET` 422, budget block 402) propagates to the caller | caller reconciles the delta from the exception's `reserved_cents` / `actual_cost_cents` / `epsilon_cents`; ADR-005 forbids implicit re-reserve, so there is nothing for the SDK to retry | none |
 
 **Fail-OPEN policy** — SDK-side transport failure (network timeout,
 5xx, breaker open) is fail-OPEN on the *check* path so a dead
@@ -110,6 +111,7 @@ from nullrun.breaker.exceptions import (
     NullRunBackendError,
     NullRunBlockedException,
     NullRunBudgetError,
+    NullRunDecision,
     NullRunDeniedError,
     NullRunError,
     NullRunInfrastructureError,
@@ -4324,6 +4326,47 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 correlation_id=smid,
                 status_code=status_code,
             )
+            # DEF-TC6-006 (2026-10-02, QA RUN_ID 20261002T0826):
+            # a bare `except Exception` here laundered an ADR-005
+            # enforcement rejection into a transport warning. The
+            # transport layer had ALREADY classified it — a 422
+            # CONSUME_OVERBUDGET body becomes a typed
+            # NullRunConsumeOverbudgetError carrying reserved /
+            # actual / epsilon cents (transport.py:2939) — and
+            # throwing that away made `track_llm` return
+            # `{"allowed": True}` to an agent whose consume the
+            # backend had just refused. Observed in TC-15:
+            # a 422 on the wire, "event dropped" in the log, and
+            # TRACK_OK={'allowed': True, ...} in the probe.
+            #
+            # The drop-and-log policy this catch implements is the
+            # one the ADR-008 table states for the `/track batch
+            # path (legacy)` (line 25) — a NETWORK error, where a
+            # dead backend must not freeze the agent loop. The v3
+            # single path has no such row, and the same docstring
+            # says the SDK "does NOT silently fail-OPEN on a wire
+            # 4xx/5xx that names an enforcement failure", naming
+            # /track among the handlers that raise. A refused
+            # consume names one.
+            #
+            # Scope is deliberately `NullRunDecision` and not
+            # `Exception`: protocol errors, rate-limit-Redis and
+            # plain 5xx stay in the transport class and keep
+            # dropping, because they name no enforcement failure
+            # and raising on them would be the over-correction.
+            # The invalidation above runs first either way — the
+            # cached-allow blast radius (DEF-CACHE-STALE-ALLOW-
+            # AFTER-OVERBUDGET) is closed before the raise, not
+            # traded away for it.
+            if isinstance(exc, NullRunDecision):
+                logger.warning(
+                    "_route_track: /track refused the consume for "
+                    "execution_id=%s (%s) — propagating (ADR-008: an "
+                    "enforcement rejection is not a transport error)",
+                    smid,
+                    exc,
+                )
+                raise
             logger.warning(
                 "_route_track: track_single failed for execution_id=%s (%s) — event dropped",
                 smid,
