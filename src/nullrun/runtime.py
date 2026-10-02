@@ -2286,6 +2286,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             compute_action_digest as _compute_action_digest,
         )
         from nullrun.context import (
+            get_call_impact,
             get_call_mcp_annotations,
             get_call_mcp_class,
             get_call_model,
@@ -2355,13 +2356,26 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # `action_digest` is required on every /gate call. Per
         # `backend/src/proxy/http/gate/gate.rs:56` (ADR-023 P1-6)
         # the gate fail-CLOSED-rejects any proto>=3 client that
-        # omits the digest. We always emit a NoImpact sentinel here
-        # — typed Money/ToolCall impacts are forwarded by
-        # `runtime.execute(...)` directly (see `transport.py::execute`)
-        # and do not pass through this pre-flight gate. Computing
-        # once per call (not cached) is fine: compute_action_digest
-        # is ~5µs of pure stdlib.
-        check_req["action_digest"] = _compute_action_digest(_BusinessImpact.no_impact())
+        # omits the digest. Computing once per call (not cached) is
+        # fine: compute_action_digest is ~5µs of pure stdlib.
+        #
+        # The envelope is the one the CONTEXT already holds, not a
+        # fresh one. This pre-flight decides the digest the backend
+        # stores on the approval row, and `runtime.execute(...)`
+        # later re-derives it from the request body and compares.
+        # Two separately built envelopes differ whenever the inputs
+        # differ by anything, which is why the SDK shipped a constant
+        # `no_impact()` here for a full release cycle and every
+        # post-approval re-entry failed (DEF-TC14-002, ADR-065).
+        #
+        # A context with no envelope is an LLM check with no tool to
+        # name, for which `no_impact()` is the correct and honest
+        # answer — it is NOT a stand-in for a tool call.
+        call_impact = get_call_impact()
+        if call_impact is None:
+            call_impact = _BusinessImpact.no_impact()
+        check_req["action_digest"] = _compute_action_digest(call_impact)
+        check_req["business_impact"] = call_impact.to_wire_dict()
 
         # Forward the tool list so backend (T3) can match each tool
         # against the workflow's effective `blocked_tools` aggregate.

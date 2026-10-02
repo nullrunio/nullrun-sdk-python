@@ -1558,6 +1558,24 @@ class Transport:
         # but None" wire-shape drift.
         if check_request.get("action_digest"):
             gate_request["action_digest"] = check_request["action_digest"]
+        # The BusinessImpact envelope the digest was computed over.
+        # The backend stores `action_digest` on the approval row and,
+        # at /execute, recomputes it from the envelope in THAT request
+        # and compares (payload_binding.rs:163, orchestrator.rs:1511),
+        # so both endpoints have to carry the same envelope. Sending
+        # the digest without the envelope leaves the server unable to
+        # reproduce what it stored -- the /execute re-entry then fails
+        # CLOSED with APPROVAL_DIGEST_MISMATCH.
+        #
+        # `internal.rs:216` declares it on GateRequest and
+        # `internal.rs:6947` round-trips it through serde.
+        #
+        # Forwarded whenever present. `{"kind": "none"}` is a real
+        # value here, not an absence: it is what an LLM check with no
+        # tool to name sends, and the backend distinguishes it from
+        # an omitted envelope.
+        if check_request.get("business_impact") is not None:
+            gate_request["business_impact"] = check_request["business_impact"]
         # Forward the `tool_arguments` bag alongside `tool` so
         # the gate can hash it via `signature::compute_schema_hash`
         # and write the fingerprint into `mcp_tool_signatures`.
