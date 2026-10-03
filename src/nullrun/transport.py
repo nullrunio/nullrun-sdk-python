@@ -17,7 +17,7 @@ import time
 import uuid
 import weakref
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 
 import httpx
@@ -239,6 +239,88 @@ _DETERMINISTIC_ERROR_CODES = frozenset(
         "CONSUME_OVERBUDGET",
     }
 )
+
+# Per-item reasons on a 200 response that retrying cannot fix.
+#
+# `/track/batch` answers 200 even when it refuses individual events, naming
+# each one in `rejection_details`. Those reasons split three ways, and the
+# wire tells us which: the backend sends `retry_after_ms` on a refusal it
+# expects to be retried, and omits it on one it does not.
+#
+# The set below is the "omits it AND we have checked" list — reasons we have
+# looked at and know are permanent:
+#
+#   reservation_not_found — the reservation the consume needed is gone.
+#     Reservations are minted by /api/v1/gate and live under a TTL; nothing
+#     the client can send re-mints one for a past event. The agent would have
+#     to re-issue /gate, which produces a NEW execution and would double-count
+#     against the budget. Same class as EXECUTION_NOT_BOUND one layer down.
+#
+# `budget_exceeded` is NOT here even though the spend has already happened,
+# because the period-bound counter will not clear until the period rolls —
+# retrying within the period is provably pointless — but the decision of
+# whether such a row belongs in the ledger at all (spend as fact, enforcement
+# separately) is open, and parking the event in the DLQ is the only response
+# that preserves the fact without asserting one.
+#
+# The compatibility rule matters more than the list. Absence of
+# `retry_after_ms` alone is NOT enough to call something terminal: an older
+# backend omits the field entirely, so "no retry hint" would silently mean
+# "drop" for every reason a pre-field backend can produce. Unknown reasons
+# therefore take the bounded-retry path and land in the DLQ afterwards —
+# a delay, never a silent drop. Adding a reason here is safe; forgetting one
+# is not.
+_TERMINAL_REJECTION_REASONS = frozenset(
+    {
+        "reservation_not_found",
+    }
+)
+
+# DLQ row schema version. Bump when the record gains or changes a field.
+#
+# v1 (implicit — the field did not exist): `{"error": str, "event": {...}}`
+# v2: adds `reason` (machine-readable, distinct from the v1 `error` string),
+# `first_failed_at` (epoch seconds — an operator replaying a DLQ needs to
+# know whether the refusal is still current or whether the world moved on),
+# `attempts` (how many send cycles this event survived), and `event_type` so
+# a DLQ can be triaged without opening every payload.
+#
+# Readers must accept v1 rows: a DLQ written before an upgrade stays on disk
+# across it, and a reader that requires `v == 2` would make the whole file
+# unreadable — turning a data-recovery file into data loss.
+_DLQ_ROW_VERSION = 2
+
+
+class UnconfirmedBatchResponse(Exception):
+    """A 2xx whose body did not say which events landed.
+
+    Status said success; the body said nothing we can read — a proxy HTML
+    page, an empty response, or a backend predating ``accepted_event_ids``.
+    The request may well have been fully processed, and it may not have been
+    delivered at all, and the difference decides whether the caller retries
+    or stops. Guessing either way loses something, so the batch keeps its
+    attempt budget and only reaches the DLQ once that budget is spent.
+    """
+
+    def __init__(self, event_count: int) -> None:
+        self.event_count = event_count
+        super().__init__(f"{event_count} events got a 2xx with no readable batch confirmation")
+
+
+class UnknownRejectionReason(Exception):
+    """The backend refused one event and named a reason we have no rule for.
+
+    Not a reason to drop it. An SDK built before a reason existed would
+    otherwise be the only fleet that discards those events, and the discard
+    is invisible — the operator sees a shorter ledger and no error. So the
+    event keeps its attempt budget and lands in the DLQ when it runs out,
+    with the reason preserved verbatim for whoever triages it.
+    """
+
+    def __init__(self, reason: str, event_id: str | None) -> None:
+        self.reason = reason
+        self.event_id = event_id
+        super().__init__(f"unhandled rejection reason {reason!r} for event {event_id}")
 
 
 class DeterministicBackendRefusal(Exception):
@@ -654,6 +736,14 @@ class Transport:
         # identically on every cycle and would pin the batch ahead of the whole
         # buffer forever. Count attempts, and dead-letter once spent.
         self._batch_attempts: dict[str, int] = {}  # batch signature -> attempts
+        # event_id -> epoch seconds of its first observed failure, so a DLQ
+        # record says how long the event was failing rather than only that it
+        # was. In-memory only: after a restart the clock restarts, and the
+        # durable history is the DLQ file's own row order (each re-park
+        # appends). That is a deliberate trade — reading the whole DLQ to
+        # recover a timestamp would make the write path O(file), and the
+        # value is diagnostic, not load-bearing for recovery.
+        self._first_failed_at: dict[str, float] = {}
         self._max_batch_attempts = int(os.environ.get("NULLRUN_MAX_BATCH_ATTEMPTS", "10"))
         self._bisect_depth = 0  # recursion guard for 400/422 batch splitting
         # RLock so re-entrant acquisition (e.g. test fixtures that hold the
@@ -1157,7 +1247,7 @@ class Transport:
             return result
 
         try:
-            self._circuit_breaker.call(send_batch)
+            result = self._circuit_breaker.call(send_batch)
         except BreakerTransportError:
             logger.warning(f"Circuit breaker OPEN. Batch of {len(batch)} events will be re-queued.")
             # Drop NEWEST non-critical (state_change etc.) so oldest events
@@ -1182,8 +1272,105 @@ class Transport:
             self._route_deferred(batch, deferred[0])
             return
 
+        # The batch was on the wire and came back 2xx. A 2xx is not
+        # delivery: settle each event against the per-item answer before
+        # clearing `.inflight`.
+        if not self._settle_batch_outcome(batch, result):
+            # Something is still live. `.inflight` stays — it is the durable
+            # copy of those events, and a crash before the next
+            # `_persist_to_wal` would otherwise lose them.
+            return
+
         self._batch_attempts.pop(self._failure_signature(batch), None)  # landed
-        self._clear_inflight()  # accepted — the batch is on the server now
+        self._clear_inflight()  # every event is durably accounted for
+
+    def _settle_batch_outcome(self, batch: list[dict[str, Any]], result: Any) -> bool:
+        """Apply a 2xx per-item outcome. Returns True when nothing is still live.
+
+        The load-bearing property is the ORDER, not the classification. Every
+        event must be durable — written to the DLQ, or still covered by a
+        retained ``.inflight`` — BEFORE ``.inflight`` is cleared. Cleared in
+        between and a crash loses whatever was only in memory. The other order
+        (durable first, crash after) costs a duplicate, which is safe: the
+        backend dedups on ``event_id`` and an ``IdempotentReplay`` consume
+        comes back accepted, so the replay lands instead of looping. A
+        duplicate is recoverable; a silent gap is not.
+
+        That is also why this method writes the DLQ itself and returns rather
+        than calling ``_quarantine_to_dlq``: the latter clears ``.inflight``,
+        which would be wrong whenever anything in the same batch is being
+        re-queued rather than parked.
+        """
+        if not getattr(result, "body_confirmed", True):
+            # We cannot read the answer. Bounded retry, then the DLQ — the
+            # budget is what stops an unreadable 200 from looping forever,
+            # and the DLQ is what stops it from ending in a silent drop.
+            #
+            # Negated on the way out: `_retry_or_dlq` answers "is it live",
+            # this method answers "is anything settled". Getting that backwards
+            # pops the attempt counter on every cycle, so the budget never
+            # depletes and the event retries forever.
+            return not self._retry_or_dlq(
+                batch, UnconfirmedBatchResponse(len(batch)), dead_letter=True
+            )
+
+        rejected_by_id = {
+            item["event_id"]: item for item in getattr(result, "rejected_items", []) or []
+        }
+        accepted = set(getattr(result, "accepted_event_ids", []) or [])
+
+        still_live = False
+        requeue: list[dict[str, Any]] = []
+        unknown: list[tuple[dict[str, Any], str]] = []
+        refused = 0
+
+        for event in batch:
+            eid = event.get("event_id")
+            if eid in accepted:
+                self._in_flight.pop(eid, None)
+                continue
+            refused += 1
+            detail = rejected_by_id.get(eid)
+            if detail is None:
+                # In neither list. The server's answer does not account for
+                # this event at all, so we cannot claim it landed. Treated as
+                # an unknown refusal: bounded retry, then the DLQ. Guessing
+                # "accepted" here is how a partition bug turns into silent
+                # data loss, and guessing "rejected" is how a partition bug
+                # turns into an infinite retry.
+                unknown.append((event, "unaccounted_in_response"))
+                continue
+            reason = detail.get("reason") or "unspecified"
+            if reason in _TERMINAL_REJECTION_REASONS:
+                # Durably parked by the time this returns, so it does not keep
+                # `.inflight` alive — but the write had to happen first, which
+                # is why the DLQ row is written here rather than in the tail.
+                if self._dead_letter_row(event, reason):
+                    still_live = True
+
+            elif detail.get("retry_after_ms") is not None:
+                # The backend gave a retry hint: it expects this to succeed
+                # later. Bounded by the per-event attempt counter anyway, so
+                # a hint that never materialises cannot pin the buffer.
+                requeue.append(event)
+                still_live = True
+            else:
+                unknown.append((event, reason))
+
+        for event, reason in unknown:
+            if self._retry_or_dlq(
+                [event], UnknownRejectionReason(reason, event.get("event_id")), dead_letter=True
+            ):
+                still_live = True
+
+        if requeue:
+            # Head, not tail: a refusal the backend expects to clear should
+            # not sit behind a steady stream of new events until the buffer
+            # drains.
+            self._requeue_at_head(requeue)
+        if refused:
+            metrics.inc_transport("events_partial_refused", refused)
+        return not still_live
 
     # 4xx classes that MUST NOT be quarantined. Quarantining these would
     # discard good data at exactly the moment it is recoverable.
@@ -1351,7 +1538,7 @@ class Transport:
 
     def _retry_or_dlq(
         self, batch: list[dict[str, Any]], error: Exception, *, dead_letter: bool
-    ) -> None:
+    ) -> bool:
         """Re-queue a possibly-transient failure, with a bounded attempt budget.
 
         Deterministic failures (a payload that will never serialize) repeat
@@ -1363,6 +1550,11 @@ class Transport:
         ``dead_letter=False`` is for genuinely transient statuses (408/429).
         Those are counted for observability but NEVER quarantined: the batch is
         valid data and the server is merely busy, so it waits in the WAL.
+
+        Returns True when the batch is back on the retry path, False when it
+        was quarantined. The caller needs the distinction to decide whether
+        anything from this send is still live, which is what governs whether
+        ``.inflight`` may be cleared.
         """
         key = self._failure_signature(batch)
         attempts = self._batch_attempts.get(key, 0) + 1
@@ -1382,7 +1574,7 @@ class Transport:
                 f"Quarantining {len(batch)} events."
             )
             self._quarantine_to_dlq(batch, error)
-            return
+            return False
 
         if not dead_letter:
             logger.warning(
@@ -1394,11 +1586,96 @@ class Transport:
             )
         self._buffer.extend(batch)
         metrics.inc_transport("batches_retried")
+        return True
 
     def _failure_signature(self, batch: list[dict[str, Any]]) -> str:
         """Stable identity for a batch, used as the attempt-counter key."""
         ids = sorted(str(e.get("event_id", "")) for e in batch)
         return hashlib.sha256("|".join(ids).encode()).hexdigest()[:16]
+
+    def _dlq_reason(self, error: Exception) -> str:
+        """The machine-readable reason a batch is being parked.
+
+        Prefers what the wire named over how it was wrapped. Several
+        deterministic refusals arrive as 5xx (see
+        ``_DETERMINISTIC_ERROR_CODES``), and a DLQ row that only says "503"
+        tells an operator replaying it nothing about why the event was
+        parked. The two reasons this transport raises itself carry their
+        reason as a field rather than in a formatted message, for the same
+        reason — a message is for a log, a field is for a record.
+        """
+        if isinstance(error, DeterministicBackendRefusal):
+            return f"{error.error_code}:{error.status_code}"
+        if isinstance(error, UnknownRejectionReason):
+            return f"{error.reason}:unknown"
+        if isinstance(error, UnconfirmedBatchResponse):
+            return "unconfirmed_response:no_accepted_event_ids"
+        status = getattr(getattr(error, "response", None), "status_code", None)
+        return f"{type(error).__name__}:{status}"
+
+    def _dlq_row(self, event: dict[str, Any], reason: str) -> dict[str, Any]:
+        """Build one versioned DLQ record. See ``_DLQ_ROW_VERSION`` for the schema.
+
+        ``error`` is kept alongside ``reason`` so a v1 reader — anything
+        written before this field existed and still on disk across an
+        upgrade — keeps working. Dropping it would make a recovery file
+        unreadable, which is the one thing a recovery file must not be.
+        """
+        eid = str(event.get("event_id") or "")
+        first_failed = self._first_failed_at.get(eid)
+        if first_failed is None:
+            first_failed = time.time()
+            if eid:
+                self._first_failed_at[eid] = first_failed
+        signature = self._failure_signature([event])
+        return {
+            "v": _DLQ_ROW_VERSION,
+            "event": event,
+            "error": reason,
+            "reason": reason,
+            "event_type": event.get("type"),
+            "first_failed_at": first_failed,
+            # Sends this event took to end up here, including the current one.
+            # A terminal refusal is parked on its first response and never
+            # touches `_retry_or_dlq`, so reading the counter alone would record
+            # 0 — "never attempted" — for an event that was in fact refused on
+            # the first send. The two are different stories for whoever triages
+            # the DLQ, and only this one is true.
+            "attempts": self._batch_attempts.get(signature, 0) + 1,
+        }
+
+    def _write_dlq_rows(self, rows: list[dict[str, Any]]) -> bool:
+        """Append DLQ records durably. Does NOT touch ``.inflight``.
+
+        Kept separate from ``_quarantine_to_dlq`` because that method clears
+        ``.inflight``, which is only correct when the WHOLE batch is parked.
+        A partial refusal parks some events and re-queues others from the same
+        send, and clearing there would drop the re-queued ones on the next
+        crash.
+        """
+        if not rows:
+            return True
+        return self._write_events_atomic(self._wal_dlq_path(), rows, mode="a")
+
+    def _dead_letter_row(self, event: dict[str, Any], reason: str) -> bool:
+        """Park one event, durably, before anything clears ``.inflight``.
+
+        Returns True when the event is back on the retry path because the DLQ
+        write failed — i.e. it is still live and `.inflight` must be retained.
+        """
+        if not self._write_dlq_rows([self._dlq_row(event, reason)]):
+            # The write failed. Re-queue rather than pretend it is parked:
+            # an event that is only in memory is one crash from gone, and the
+            # next send will simply produce the same terminal refusal.
+            logger.error(
+                f"DLQ write failed for event {event.get('event_id')!r} ({reason}) — "
+                f"holding it on the retry path instead of dropping it"
+            )
+            self._requeue_at_head([event])
+            return True
+        metrics.inc_transport("events_dead_lettered")
+        metrics.set_transport("last_dlq_error", reason)
+        return False
 
     def _quarantine_to_dlq(self, batch: list[dict[str, Any]], error: Exception) -> None:
         """Move a permanently-rejected batch out of the retry path.
@@ -1409,22 +1686,17 @@ class Transport:
         poison pill blocks the whole WAL. Nothing is silently discarded: the
         file is inspectable and re-submittable after the caller is fixed.
 
-        The reason is the backend ``error_code`` when there is one, not the HTTP
-        status: several deterministic refusals arrive as 5xx (see
-        ``_DETERMINISTIC_ERROR_CODES``), and a DLQ row that only says "503" tells
-        an operator replaying it nothing about why the event was parked.
+        The whole batch is parked here, so clearing ``.inflight`` afterwards
+        is correct. Partial refusals go through ``_settle_batch_outcome``,
+        which never clears it.
         """
-        if isinstance(error, DeterministicBackendRefusal):
-            reason = f"{error.error_code}:{error.status_code}"
-        else:
-            status = getattr(getattr(error, "response", None), "status_code", None)
-            reason = f"{type(error).__name__}:{status}"
+        reason = self._dlq_reason(error)
         logger.error(
             f"Permanent rejection ({reason}) on /track/batch — quarantining "
             f"{len(batch)} events to DLQ. They will NOT be retried."
         )
-        rows = [{"error": reason, "event": e} for e in batch]
-        self._write_events_atomic(self._wal_dlq_path(), rows, mode="a")
+        rows = [self._dlq_row(e, reason) for e in batch]
+        self._write_dlq_rows(rows)
         self._clear_inflight()
         metrics.inc_transport("events_dead_lettered", len(batch))
         metrics.set_transport("last_dlq_error", reason)
@@ -1483,6 +1755,16 @@ class Transport:
         accepted_event_ids: list[str]
         retry_after_ms: float | None = None
         is_policy_limit: bool = False
+        # Per-item refusals from a 200 body: `{"event_id", "reason",
+        # "retry_after_ms"}`. Absent `retry_after_ms` (None) means the backend
+        # gave no retry hint for that event.
+        rejected_items: list[dict[str, Any]] = field(default_factory=list)
+        # False when the response was a success status but the body could not
+        # be read as a confirmation (proxy HTML page, empty body, a backend
+        # that predates `accepted_event_ids`). A 200 we cannot interpret is
+        # NOT proof of delivery — treating it as one is the failure this
+        # field exists to prevent.
+        body_confirmed: bool = True
 
     def _add_hmac_headers(self, headers: dict[str, str], body: str | bytes) -> None:
         """Add X-Signature-Timestamp + X-Signature headers. No-op if secret_key/api_key missing."""
@@ -1631,19 +1913,85 @@ class Transport:
         # Check Retry-After header (may be seconds or HTTP-date)
         retry_after_seconds = self._extract_retry_after(response)
 
-        # Check response body for retry info
+        # Parse the body ONCE. Three consumers below need it — the batch-level
+        # `rejected` block, the per-item `rejection_details`, and the actions
+        # loop — and each used to call `response.json()` independently, so a
+        # non-JSON body was re-raised and re-caught once per consumer.
+        data: dict[str, Any] | None = None
         try:
-            data = response.json()
-            # Check for rejection info
-            if "rejected" in data and data["rejected"]:
-                rejected_info = data["rejected"]
-                if isinstance(rejected_info, dict):
-                    if "retry_after_ms" in rejected_info:
-                        retry_after_ms = rejected_info["retry_after_ms"]
-                    if "reason" in rejected_info and rejected_info["reason"] == "policy_limit":
-                        is_policy_limit = True
-        except Exception:  # noqa: S110
-            pass
+            parsed = response.json()
+            if isinstance(parsed, dict):
+                data = parsed
+        except Exception:  # noqa: S110 — non-JSON body; handled below per status
+            data = None
+
+        # Check response body for batch-level retry info
+        if data is not None:
+            rejected_info = data.get("rejected")
+            if isinstance(rejected_info, dict):
+                if "retry_after_ms" in rejected_info:
+                    retry_after_ms = rejected_info["retry_after_ms"]
+                if rejected_info.get("reason") == "policy_limit":
+                    is_policy_limit = True
+
+        # ---- Per-item outcome of a 200 ------------------------------------
+        # A 200 from /track/batch is NOT proof of delivery. The endpoint
+        # refuses individual events and still answers 200, naming the
+        # survivors in `accepted_event_ids` and the casualties in
+        # `rejection_details`. The pre-fix code read the status, saw 200,
+        # treated the whole batch as delivered, cleared `.inflight` and
+        # dropped the refused events with no trace in the buffer and none in
+        # the DLQ. That is the largest hole in the "data is not lost" claim,
+        # which until now held only for transport failures.
+        #
+        # `accepted_event_ids` is read as a partition, not a hint: anything
+        # absent from it is NOT delivered, whatever the status said. That is
+        # the only reading an SDK can act on, and it is why the backend has
+        # to report events it persisted through other paths (the span /
+        # org_action_catalog writes) — see the `accepted_event_ids` partition
+        # fix in backend handlers.rs.
+        accepted_event_ids: list[str] = []
+        rejected_items: list[dict[str, Any]] = []
+        body_confirmed = True
+        if response.status_code < 400:
+            raw_accepted = (data or {}).get("accepted_event_ids")
+            if data is None or not isinstance(raw_accepted, list):
+                # 200 we cannot read as a confirmation. Either something in
+                # front of the backend answered with an HTML error page and a
+                # 200 status, or the backend predates `accepted_event_ids`.
+                # Neither is evidence that anything landed. Treating this as
+                # delivery is precisely the loss we are preventing, so the
+                # batch stays on the retry path under a bounded budget.
+                body_confirmed = False
+                logger.error(
+                    f"/track/batch returned {response.status_code} with a body "
+                    f"that is not a batch confirmation (parseable dict with an "
+                    f"accepted_event_ids list: {data is not None}). Treating "
+                    f"{len(batch)} events as NOT delivered. A reverse proxy "
+                    f"answering 200, or a backend older than the "
+                    f"accepted_event_ids field, produces this."
+                )
+            else:
+                accepted_event_ids = [i for i in raw_accepted if isinstance(i, str)]
+                raw_details = (data or {}).get("rejection_details")
+                if isinstance(raw_details, list):
+                    for detail in raw_details:
+                        if not isinstance(detail, dict):
+                            continue
+                        eid = detail.get("event_id")
+                        reason = detail.get("reason")
+                        if not isinstance(eid, str) or not isinstance(reason, str):
+                            continue
+                        hint = detail.get("retry_after_ms")
+                        rejected_items.append(
+                            {
+                                "event_id": eid,
+                                "reason": reason,
+                                "retry_after_ms": (
+                                    float(hint) if isinstance(hint, (int, float)) else None
+                                ),
+                            }
+                        )
 
         # Store for next retry calculation (prefer header seconds, fallback to body ms)
         if retry_after_seconds is not None:
@@ -1666,8 +2014,7 @@ class Transport:
         # Process actions from server response. Per-element try/except so one
         # malformed entry doesn't abort the whole loop.
         try:
-            data = response.json()
-            actions = data.get("actions") or []
+            actions = (data or {}).get("actions") or []
             for action in actions:
                 try:
                     if not isinstance(action, dict):
@@ -1680,18 +2027,18 @@ class Transport:
                         handle_action(action_type, workflow_id, reason)
                 except Exception as item_err:
                     logger.warning("Skipping malformed action %r: %s", action, item_err)
-            for msg in data.get("messages", []) or []:
+            for msg in (data or {}).get("messages", []) or []:
                 logger.info("Backend message: %s", msg)
         except Exception as e:
             logger.warning(f"Failed to process actions: {e}")
 
-        # Return accepted event_ids for retry dedup
-        accepted_event_ids = data.get("accepted_event_ids", []) if "data" in locals() else []
         logger.debug(f"Batch track: sent {len(batch)} events")
         return self.SendResult(
             accepted_event_ids=accepted_event_ids,
             retry_after_ms=retry_after_ms,
             is_policy_limit=is_policy_limit,
+            rejected_items=rejected_items,
+            body_confirmed=body_confirmed,
         )
 
     def flush_now(self) -> None:

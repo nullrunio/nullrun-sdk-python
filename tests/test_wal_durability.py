@@ -322,6 +322,369 @@ def test_truncated_last_line_does_not_lose_earlier_events(transport):
 
 
 # ---------------------------------------------------------------------------
+# Partial failure INSIDE a 200 response.
+#
+# /track/batch does not answer 4xx when one event is the problem. It answers
+# 200 with `accepted_event_ids` naming what landed and `rejection_details`
+# naming what did not (backend handlers.rs, `BatchTrackResponse`):
+#
+#   per_key_policy_limit  -> check_key_policy       (retry hint: rate window rolls)
+#   budget_exceeded       -> v3 BudgetExceeded      (period counter, does not roll soon)
+#   reservation_not_found -> v3 ReservationNotFound (reservation TTL expired; terminal)
+#
+# So a 200 is NOT proof of delivery, and status-code classification never sees
+# any of it. The pre-fix code read the status, treated the whole batch as
+# delivered, cleared `.inflight` and dropped the refused events — out of the
+# buffer and out of the DLQ, with no trace anywhere. "Data is not lost" held
+# only for transport failures, which is a much weaker claim than it sounds.
+#
+# These tests drive the real HTTP path via `httpx.MockTransport` (see the
+# note on the 5xx block below for why mocking the outer method would test a
+# shape the real path cannot produce).
+# ---------------------------------------------------------------------------
+
+
+def _http_200(body: dict):
+    """An httpx handler that answers 200 with a JSON body."""
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=body)
+
+    return _handler
+
+
+def _detail(event_id: str, reason: str, retry_after_ms: int | None = None) -> dict:
+    detail = {"event_id": event_id, "reason": reason}
+    if retry_after_ms is not None:
+        detail["retry_after_ms"] = retry_after_ms
+    return detail
+
+
+def _flush_over(transport, handler, times: int = 1) -> None:
+    """Point the transport at `handler` and run `_do_flush` `times` times."""
+    transport._client = httpx.Client(transport=httpx.MockTransport(handler))
+    try:
+        for _ in range(times):
+            transport._do_flush()
+    finally:
+        transport._client.close()
+
+
+def test_only_accepted_event_ids_count_as_delivered(transport):
+    """Absence from `accepted_event_ids` means NOT delivered, whatever the status.
+
+    The partition reading is the only one an SDK can act on: a server that
+    accepted some events and refused others reports exactly which, and
+    treating the batch as a unit turns one refusal into a silent loss of every
+    other event in it.
+    """
+    transport.track(_event(1))
+    transport.track(_event(2))
+    transport.track(_event(3))
+    _flush_over(
+        transport,
+        _http_200(
+            {
+                "processed": 1,
+                "accepted_event_ids": ["evt-1", "evt-3"],
+                "rejection_details": [_detail("evt-2", "per_key_policy_limit", 1000)],
+                "rejected_count": 1,
+            }
+        ),
+    )
+
+    assert [e["event_id"] for e in transport._buffer] == ["evt-2"], (
+        "the refused event must be the only one still live"
+    )
+    assert not os.path.exists(transport._wal_dlq_path()), (
+        "a refusal the backend gave a retry hint for was quarantined instead of retried"
+    )
+    assert "evt-1" not in [e["event_id"] for e in transport._buffer]
+    assert "evt-3" not in [e["event_id"] for e in transport._buffer]
+
+
+def test_a_200_without_a_parseable_body_is_not_confirmation(transport):
+    """A 200 whose body cannot be read is not evidence that anything landed.
+
+    A reverse proxy answering 200 with an HTML page, an empty body from a
+    truncated response, or a backend predating `accepted_event_ids` all look
+    identical to the client: a success status. Reading that as delivery is
+    the loss this whole block exists to prevent, and it is the failure mode
+    that is hardest to notice — the events are simply gone and the logs say
+    everything worked.
+    """
+    transport.track(_event(1))
+
+    def _html(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="<html><body>200 OK</body></html>")
+
+    _flush_over(transport, _html)
+
+    assert [e["event_id"] for e in transport._buffer] == ["evt-1"], (
+        "a 200 we could not read was treated as confirmation and the event dropped"
+    )
+    assert not os.path.exists(transport._wal_dlq_path()), (
+        "an unreadable 200 must spend its attempt budget first, not be parked at once"
+    )
+
+
+def test_a_200_without_a_parseable_body_eventually_reaches_the_dlq(transport):
+    """The bounded-retry answer for an unreadable 200 is the DLQ, not a loop.
+
+    Retrying forever would pin the buffer head against a backend that is
+    answering perfectly and whose body we simply cannot read. Dropping at once
+    would lose the event. A bounded budget with a DLQ at the end is the only
+    option that does neither.
+    """
+    transport.track(_event(1))
+
+    def _html(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="<html></html>")
+
+    _flush_over(transport, _html, times=transport._max_batch_attempts + 2)
+
+    rows = _read_wal(transport._wal_dlq_path())
+    assert [r["event"]["event_id"] for r in rows] == ["evt-1"], (
+        "an unreadable 200 neither loops nor lands anywhere recoverable"
+    )
+    assert "unconfirmed" in rows[0]["reason"], (
+        f"the DLQ row must say the response was unreadable, got {rows[0]['reason']!r}"
+    )
+
+
+def test_a_terminal_refusal_is_parked_on_the_first_attempt(transport):
+    """`reservation_not_found` cannot be fixed by waiting — park it now.
+
+    Reservations are minted by /api/v1/gate and expire on a TTL. Nothing the
+    client can send re-mints one for a past event; re-issuing /gate would mint
+    a NEW execution and double-count against the budget. Retrying is not slow
+    here, it is pointless, and it holds the head of the buffer for a budget
+    number of cycles while a valid batch behind it waits.
+    """
+    transport.track(_event(1))
+    _flush_over(
+        transport,
+        _http_200(
+            {
+                "processed": 0,
+                "accepted_event_ids": [],
+                "rejection_details": [_detail("evt-1", "reservation_not_found")],
+                "rejected_count": 1,
+            }
+        ),
+    )
+
+    rows = _read_wal(transport._wal_dlq_path())
+    assert [r["event"]["event_id"] for r in rows] == ["evt-1"], (
+        "a terminal refusal was retried instead of parked"
+    )
+    assert transport._buffer == [], "a parked event must leave the retry path"
+    assert "reservation_not_found" in rows[0]["reason"]
+
+
+def test_an_unknown_refusal_reason_is_retried_then_parked_never_dropped(transport):
+    """A reason we have no rule for gets the attempt budget, then the DLQ.
+
+    Dropping it would be invisible: the operator sees a shorter ledger and no
+    error anywhere. Parking it immediately would make this SDK build the only
+    one that discards events the backend has started emitting. A bounded
+    delay is the answer that is wrong in neither direction.
+    """
+    transport.track(_event(1))
+    body = {
+        "processed": 0,
+        "accepted_event_ids": [],
+        "rejection_details": [_detail("evt-1", "some_reason_invented_next_year")],
+        "rejected_count": 1,
+    }
+    _flush_over(transport, _http_200(body))
+
+    assert not os.path.exists(transport._wal_dlq_path()), (
+        "an unknown reason was parked on the first response, before any retry"
+    )
+    assert [e["event_id"] for e in transport._buffer] == ["evt-1"]
+
+    _flush_over(transport, _http_200(body), times=transport._max_batch_attempts + 2)
+
+    rows = _read_wal(transport._wal_dlq_path())
+    assert [r["event"]["event_id"] for r in rows] == ["evt-1"]
+    assert "some_reason_invented_next_year" in rows[0]["reason"], (
+        "the DLQ must preserve the backend's reason verbatim, not a paraphrase"
+    )
+
+
+def test_a_partial_refusal_keeps_inflight_until_every_event_is_settled(transport):
+    """`.inflight` may only be cleared once nothing from the batch is still live.
+
+    `.inflight` IS the durable copy of a re-queued event — the re-queued event
+    is in memory only until the next `_persist_to_wal`. Clear the file while
+    anything is live and a crash before that write loses it with no record
+    that it ever existed.
+    """
+    transport.track(_event(1))
+    transport.track(_event(2))
+    _flush_over(
+        transport,
+        _http_200(
+            {
+                "processed": 1,
+                "accepted_event_ids": ["evt-1"],
+                "rejection_details": [_detail("evt-2", "per_key_policy_limit", 1000)],
+                "rejected_count": 1,
+            }
+        ),
+    )
+
+    assert os.path.exists(transport._wal_inflight_path()), (
+        "`.inflight` was cleared while evt-2 was still only in memory"
+    )
+
+
+def test_a_crash_between_the_dlq_write_and_the_inflight_clear_duplicates(transport):
+    """The dangerous window is ordered so it can only ever duplicate.
+
+    The rule is: every event is durable — in the DLQ, or still covered by a
+    retained `.inflight` — BEFORE `.inflight` is cleared. A crash before the
+    clear leaves the whole batch in `.inflight`, so the restart replays it and
+    the parked event is re-sent. A duplicate costs one re-delivery, which the
+    backend absorbs by deduping on `event_id`. A crash the other way round
+    would leave the event in neither file, and nothing in the system can
+    reconstruct it. This test pins that the file survives the window.
+    """
+    transport.track(_event(1))
+    transport._client = httpx.Client(
+        transport=httpx.MockTransport(
+            _http_200(
+                {
+                    "processed": 0,
+                    "accepted_event_ids": [],
+                    "rejection_details": [_detail("evt-1", "reservation_not_found")],
+                    "rejected_count": 1,
+                }
+            )
+        )
+    )
+
+    real_clear = transport._clear_inflight
+    crashed = {"done": False}
+
+    def _crash_on_clear() -> None:
+        if not crashed["done"]:
+            crashed["done"] = True
+            raise KeyboardInterrupt("process died between durable write and clear")
+
+    transport._clear_inflight = _crash_on_clear
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            transport._do_flush()
+    finally:
+        transport._clear_inflight = real_clear
+
+    assert os.path.exists(transport._wal_inflight_path()), (
+        "the batch was not recoverable after a crash before the clear"
+    )
+    replayed = _read_wal(transport._wal_inflight_path())
+    assert [e["event_id"] for e in replayed] == ["evt-1"], (
+        "the crash window lost the event instead of duplicating it"
+    )
+    # The DLQ write happened first and survived — so the operator sees the
+    # park even though the event is still on the wire.
+    assert _read_wal(transport._wal_dlq_path()), (
+        "the DLQ row was not durable before the crash window"
+    )
+
+
+def test_a_deduped_duplicate_comes_back_accepted(transport):
+    """A re-sent event the backend already has must be reported accepted.
+
+    The crash window above produces duplicates by design, so the duplicate
+    has to land rather than bounce. The backend already guarantees this:
+    `V3ConsumeOutcome::IdempotentReplay` maps to `V3ConsumeDecision::Ok`
+    (gate/internal.rs), the event goes back into `post_v3_indices`, and the
+    recomputed `accepted_event_ids` names it. If that ever regressed, every
+    duplicate would be refused, parked in the DLQ, and the crash-recovery
+    path would manufacture DLQ litter on every restart. This test pins the
+    contract from the SDK side so the dependency is visible.
+    """
+    transport.track(_event(1))
+    transport._client = httpx.Client(
+        transport=httpx.MockTransport(
+            _http_200(
+                {
+                    "processed": 1,
+                    # A first send accepted it; a replay of the same event_id
+                    # comes back accepted again rather than as a duplicate
+                    # rejection.
+                    "accepted_event_ids": ["evt-1"],
+                    "rejection_details": [],
+                    "rejected_count": 0,
+                }
+            )
+        )
+    )
+    try:
+        transport._do_flush()
+        transport._do_flush()  # the replay
+    finally:
+        transport._client.close()
+
+    assert transport._buffer == [], "a deduped duplicate stayed on the retry path"
+    assert not os.path.exists(transport._wal_dlq_path()), (
+        "a deduped duplicate was parked — recovery would litter the DLQ"
+    )
+    assert not os.path.exists(transport._wal_inflight_path())
+
+
+def test_dlq_rows_are_versioned_and_carry_what_a_replay_needs(transport):
+    """A DLQ record must survive being read by an older SDK and replayed later.
+
+    `v` marks the schema. `reason` is machine-readable, `first_failed_at`
+    says whether the refusal is still current, `attempts` says how long it
+    was failing, and the original payload is there because a replay needs it
+    and a triage needs to know what was lost. `error` is retained from v1 so
+    a file written before this change still reads after an upgrade.
+    """
+    transport.track(_event(1))
+    _flush_over(
+        transport,
+        _http_200(
+            {
+                "processed": 0,
+                "accepted_event_ids": [],
+                "rejection_details": [_detail("evt-1", "reservation_not_found")],
+                "rejected_count": 1,
+            }
+        ),
+    )
+
+    row = _read_wal(transport._wal_dlq_path())[0]
+    assert row["v"] == 2, f"DLQ row is unversioned: {row}"
+    assert row["reason"] == "reservation_not_found"
+    assert row["error"] == row["reason"], "the v1 `error` field must stay in sync"
+    assert row["event_type"] == "llm_call", "triage needs the type without opening the payload"
+    assert row["first_failed_at"] > 0, "a DLQ row must say when the event started failing"
+    assert row["attempts"] >= 1, "a DLQ row must say how many cycles it survived"
+    assert row["event"] == _event(1), "a replay needs the original payload"
+
+
+def test_a_v1_dlq_row_is_still_readable(transport):
+    """An unversioned row must not make the recovery file unreadable.
+
+    A DLQ written before this change stays on disk across the upgrade. A
+    reader that required `v == 2` would reject every row in it, and the one
+    file whose whole job is getting data back would be the thing that broke.
+    """
+    dlq = transport._wal_dlq_path()
+    os.makedirs(os.path.dirname(dlq) or ".", exist_ok=True)
+    with open(dlq, "w") as f:
+        f.write(json.dumps({"error": "old:400", "event": _event(9)}) + "\n")
+
+    rows = _read_wal(dlq)
+    assert len(rows) == 1 and rows[0]["event"]["event_id"] == "evt-9"
+    assert "v" not in rows[0], "the v1 fixture is not a v1 row"
+
+
+# ---------------------------------------------------------------------------
 # Deterministic 5xx.
 #
 # EXECUTION_NOT_BOUND is NOT a 4xx, and it is not a 5xx either. The backend
