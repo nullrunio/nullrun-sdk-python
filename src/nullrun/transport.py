@@ -16,7 +16,8 @@ import threading
 import time
 import uuid
 import weakref
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 
@@ -289,6 +290,64 @@ _TERMINAL_REJECTION_REASONS = frozenset(
 # across it, and a reader that requires `v == 2` would make the whole file
 # unreadable — turning a data-recovery file into data loss.
 _DLQ_ROW_VERSION = 2
+
+# ---------------------------------------------------------------------------
+# Durability primitives: what this platform can actually promise.
+#
+# The WAL is the SDK's only copy of an event between `track()` and the
+# backend accepting it. Three things protect it, and none of them is
+# available everywhere:
+#
+#   0600 on every file  — the WAL holds full event payloads, which for an
+#                         agent means prompts, completions and tool arguments.
+#                         Default umask 022 leaves them world-readable in
+#                         /tmp, on a shared volume, and in a container.
+#   advisory flock     — a WAL is a SHARED path by default (one per tempdir,
+#                         not one per process), so a second process appending
+#                         the read-copy-append of the DLQ can interleave a
+#                         line into the middle of another.
+#   directory fsync    — `os.replace` is atomic, but without fsyncing the
+#                         containing directory the new NAME can be absent
+#                         after a power cut even though the data blocks
+#                         landed.
+#
+# All three are probed, not imported. A platform lacking one is a supported
+# configuration, so the probe result becomes observable state (metrics
+# `wal_dir_fsync` / `wal_lock`) and a single warning, rather than an
+# ImportError at module load or a silent downgrade nobody can see.
+#
+# The absence of `flock` is the sharp one. It means a multi-process
+# deployment (gunicorn -w N) shares a WAL with no protection against
+# interleaved appends, and the correct configuration is a per-process
+# NULLRUN_WAL_PATH. The lock does not merge per-process buffers either way;
+# re-delivery is absorbed by the backend's dedup on `event_id`. What the
+# lock buys is that the FILES stay parseable.
+# ---------------------------------------------------------------------------
+
+try:  # POSIX only. Absence is a configuration, not an error.
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - exercised on Windows
+    _fcntl = None
+
+# Typed as `Any` deliberately. A bare `fcntl = None` makes the type of the
+# name depend on which platform the type checker is running on, and mypy
+# resolves `fcntl` to a stub without `flock` on win32 — so the same line is a
+# clean type on Linux CI and five errors on a Windows dev box.
+fcntl: Any = _fcntl
+# DLQ size cap (default 64 MB). Override via NULLRUN_DLQ_MAX_BYTES.
+_DLQ_MAX_BYTES_DEFAULT: int = 64 * 1024 * 1024
+
+# How long a writer waits for the cross-process WAL lock before skipping its
+# write. The critical section is a local file copy plus an fsync, so the
+# uncontended cost is microseconds; the timeout exists for a descheduled
+# holder, not for a busy one.
+_WAL_LOCK_TIMEOUT_DEFAULT: float = 5.0
+
+_DEGRADATION_WARNING = (
+    "WAL durability degraded on this platform: %s. The events are still "
+    "written and still replayed, but the guarantee they rest on is weaker. "
+    "See metrics `wal_dir_fsync` / `wal_lock` for the live state."
+)
 
 
 class UnconfirmedBatchResponse(Exception):
@@ -744,6 +803,11 @@ class Transport:
         # recover a timestamp would make the write path O(file), and the
         # value is diagnostic, not load-bearing for recovery.
         self._first_failed_at: dict[str, float] = {}
+        # Durability state. Probed on first use against the real filesystem,
+        # reported in metrics, warned about once. See the "Durability
+        # primitives" block above for why each of these is optional-but-named.
+        self._degradation_warned: set[str] = set()
+        self._dir_fsync_ok: bool | None = None
         self._max_batch_attempts = int(os.environ.get("NULLRUN_MAX_BATCH_ATTEMPTS", "10"))
         self._bisect_depth = 0  # recursion guard for 400/422 batch splitting
         # RLock so re-entrant acquisition (e.g. test fixtures that hold the
@@ -809,6 +873,14 @@ class Transport:
         if _OTEL_AVAILABLE:
             self._tracer = trace.get_tracer("nullrun.transport")
             self._propagator = TraceContextTextMapPropagator()
+
+        # Tighten anything a previous run left behind, BEFORE the replay
+        # path reads it. A file created by an older SDK, or by a run under a
+        # different umask, keeps its old mode through every `os.replace`,
+        # so hardening only new writes would leave the existing events — the
+        # ones most likely to hold full prompts and tool arguments — readable
+        # by everyone with access to the volume.
+        self._harden_wal_permissions()
 
         # Final-flush hook via weakref.finalize — only fires if this Transport
         self._finalizer = weakref.finalize(self, self._atexit_flush_safe)
@@ -876,6 +948,257 @@ class Transport:
         """Path of the dead-letter file for permanently-rejected batches."""
         return f"{self._wal_path()}.dlq"
 
+    def _wal_lock_path(self) -> str:
+        """Path of the advisory lock guarding mutations of the WAL files."""
+        return f"{self._wal_path()}.lock"
+
+    @property
+    def _dlq_max_bytes(self) -> int:
+        """Effective DLQ size cap. Same shape as ``_wal_max_bytes``."""
+        raw = os.environ.get("NULLRUN_DLQ_MAX_BYTES", "").strip()
+        if not raw:
+            return _DLQ_MAX_BYTES_DEFAULT
+        try:
+            value = int(raw)
+            return value if value > 0 else _DLQ_MAX_BYTES_DEFAULT
+        except ValueError:
+            return _DLQ_MAX_BYTES_DEFAULT
+
+    # -- durability probes ------------------------------------------------
+
+    def _warn_degraded_once(self, aspect: str, state: str, detail: str) -> None:
+        """Say it once per aspect per Transport, and record the state.
+
+        The metric gets a short enum value and the log gets the sentence.
+        A metric field an operator has to substring-match to alert on is a
+        metric field nobody alerts on.
+
+        Once, because a degraded platform is a standing condition, not an
+        event: warning on every flush would bury the log under a fact that
+        never changes and never resolves itself.
+        """
+        metrics.set_transport(f"wal_{aspect}", state)
+        if aspect in self._degradation_warned:
+            return
+        self._degradation_warned.add(aspect)
+        logger.warning(_DEGRADATION_WARNING % detail)
+
+    def _dir_fsync_supported(self, directory: str) -> bool:
+        """Whether this platform and filesystem can fsync a DIRECTORY.
+
+        Probed against the real directory rather than inferred from the OS:
+        Windows has no directory fsync at all, and on Linux some mounts
+        (overlayfs upper dirs, certain network and FUSE filesystems) accept
+        the open and then refuse the fsync. Both are indistinguishable from
+        the outside and both mean the same thing, so both report False.
+        """
+        if self._dir_fsync_ok is not None:
+            return self._dir_fsync_ok
+        ok = True
+        fd = -1
+        try:
+            fd = os.open(directory, os.O_RDONLY)
+            os.fsync(fd)
+        except OSError:
+            ok = False
+        finally:
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        self._dir_fsync_ok = ok
+        if ok:
+            metrics.set_transport("wal_dir_fsync", "enabled")
+        else:
+            self._warn_degraded_once(
+                "dir_fsync", "unavailable", f"directory fsync unavailable on {directory}"
+            )
+        return ok
+
+    @property
+    def _wal_lock_timeout(self) -> float:
+        """Seconds to wait for the cross-process WAL lock before giving up."""
+        raw = os.environ.get("NULLRUN_WAL_LOCK_TIMEOUT_MS", "").strip()
+        if not raw:
+            return _WAL_LOCK_TIMEOUT_DEFAULT
+        try:
+            value = float(raw) / 1000.0
+            return value if value > 0 else _WAL_LOCK_TIMEOUT_DEFAULT
+        except ValueError:
+            return _WAL_LOCK_TIMEOUT_DEFAULT
+
+    @contextmanager
+    def _wal_file_lock(self) -> Iterator[bool]:
+        """Hold the cross-process WAL lock. Yields False if it could not be had.
+
+        Advisory (`flock`), exclusive, and **bounded-wait, not
+        non-blocking**. Non-blocking is the obvious choice and it is wrong:
+        it was tried here, and on a 4-worker deployment the losing writer was
+        refused on every single attempt, forever, because the winner was
+        always mid-append. Its events were never lost — the caller re-queues
+        them — and never landed either, so a DLQ nobody could ever write to
+        while the other process was busy. A wait costs the losing writer
+        microseconds, because the critical section is a local file copy and
+        fsync; starvation is not a cheaper option than waiting.
+
+        Bounded, because "wait forever" turns a descheduled writer into a
+        hung flush thread. On expiry the caller skips its write and keeps the
+        events — the same fail-safe as any other reason the write did not
+        happen. The lock is released by the kernel if a holder dies, so a
+        crashed process cannot hold it.
+
+        The scope is the FILE MUTATION only — never the network send.
+        Holding it across a request would serialise every worker behind one
+        another's latency, which is the opposite of what it is for.
+        """
+        if fcntl is None:
+            # No flock here (Windows). The files still get 0600 and the
+            # platform's own sharing semantics; what is missing is the guard
+            # against two processes appending at once, which is a real
+            # multi-process hazard and is why the warning says so.
+            self._warn_degraded_once(
+                "lock",
+                "unavailable",
+                "no fcntl.flock — one writer per WAL path, set NULLRUN_WAL_PATH per worker",
+            )
+            yield True
+            return
+
+        lock_path = self._wal_lock_path()
+        directory = os.path.dirname(lock_path) or "."
+        try:
+            os.makedirs(directory, exist_ok=True)
+        except OSError as e:
+            logger.warning(f"Cannot create WAL directory {directory}: {e}")
+            yield False
+            return
+
+        try:
+            fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        except OSError as e:
+            # A lock we cannot open is a lock we do not have. Say so once
+            # and proceed unlocked rather than refusing to write at all —
+            # the alternative is losing every event on a permissions
+            # problem in a directory the WAL itself already lives in.
+            self._warn_degraded_once(
+                "lock", "unavailable", f"cannot open {lock_path}: {e}"
+            )
+            yield True
+            return
+
+        acquired = False
+        deadline_step = 0.02
+        # Measured, not counted. A budget expressed as "50 naps of 20ms" is
+        # a budget of 50 *naps*, and anything that returns from sleep early —
+        # a signal, a test harness that stubs sleep, a coarse scheduler —
+        # spends the whole 5s in milliseconds and gives up while the lock is
+        # still held. The timeout is a duration, so it is compared against a
+        # clock.
+        start = time.monotonic()
+        try:
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                    break
+                except OSError:
+                    if time.monotonic() - start >= self._wal_lock_timeout:
+                        break
+                    time.sleep(deadline_step)
+            waited = time.monotonic() - start
+            if not acquired:
+                metrics.set_transport("wal_lock", "contended")
+                metrics.inc_transport("wal_lock_timeouts_total")
+                logger.warning(
+                    f"WAL lock {lock_path} still held after {waited:.2f}s; "
+                    f"skipping this write. The events stay on the retry path."
+                )
+                yield False
+                return
+            if waited > deadline_step:
+                metrics.set_transport("wal_lock", "contended")
+                logger.debug(
+                    f"WAL lock {lock_path} waited {waited:.2f}s before being granted"
+                )
+            metrics.set_transport("wal_lock", "enabled")
+            yield True
+        finally:
+            if acquired:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def _harden_wal_permissions(self) -> None:
+        """Force 0600 on every WAL file, including ones a previous run left.
+
+        A file written by an older SDK, or by a run under a different umask,
+        keeps its old mode: `os.replace` carries the mode of the file it
+        renamed, so tightening only the tmp file tightens new writes and
+        leaves every existing file as it was. Events are payloads, so this is
+        a data-exposure fix, not a tidiness one.
+        """
+        base = self._wal_path()
+        for candidate in (
+            base,
+            f"{base}.1",
+            f"{base}.inflight",
+            f"{base}.dlq",
+            f"{base}.lock",
+        ):
+            try:
+                os.chmod(candidate, 0o600)
+            except FileNotFoundError:
+                continue
+            except OSError as e:
+                # Best-effort by design. Refusing to run because a mode
+                # could not be tightened would trade a permissions warning
+                # for total data loss.
+                logger.warning(f"Could not restrict permissions on {candidate}: {e}")
+
+    def _dlq_size(self) -> int:
+        try:
+            return os.path.getsize(self._wal_dlq_path())
+        except OSError:
+            return 0
+
+    def _dlq_over_cap(self, incoming_bytes: int) -> bool:
+        """True when appending would take the DLQ past its cap.
+
+        The cap NEVER deletes anything. The alternative — rotating or
+        trimming the oldest rows — destroys the only copy of an event the SDK
+        could not deliver, silently, with no trace beyond a short file. A
+        DLQ that has stopped growing is a visible, alertable condition; a
+        DLQ that quietly dropped the oldest refusals is neither. So the cap
+        stalls the write and the caller re-queues the event on the retry path
+        instead, where a further crash still holds it and the next attempt
+        reports the same refusal.
+
+        `incoming_bytes` is part of the test, not an optimisation: a cap
+        checked only against the current size admits any single write, so an
+        operator who set 1 GB would get a 40 GB file the first time a large
+        batch was quarantined.
+        """
+        size = self._dlq_size()
+        metrics.set_transport("dlq_bytes", size)
+        if size < self._dlq_max_bytes and size + incoming_bytes <= self._dlq_max_bytes:
+            return False
+        metrics.inc_transport("dlq_overflow_total")
+        metrics.set_transport("dlq_overflow_reason", "size_cap")
+        logger.error(
+            f"DLQ {self._wal_dlq_path()} would exceed its cap "
+            f"({size} bytes + {incoming_bytes} incoming > {self._dlq_max_bytes}). "
+            f"Refusing to append: the cap never deletes rows, so the event "
+            f"stays on the retry path. Raise NULLRUN_DLQ_MAX_BYTES, or triage "
+            f"and archive the file with `nullrun-wal`."
+        )
+        return True
+
     def _write_events_atomic(
         self, path: str, events: list[dict[str, Any]], mode: str = "w"
     ) -> bool:
@@ -900,6 +1223,18 @@ class Transport:
         The directory is fsynced after the rename: without it the new name can
         be absent after a power cut even though the data blocks landed.
 
+        The tmp file is created 0600 rather than through ``open(..., "w")``,
+        because the mode of the file that ``os.replace`` renames is the mode
+        the WAL ends up with, and ``open`` applies the process umask to
+        whatever 0666 it asks for. On a default umask that leaves every event
+        payload world-readable in the tempdir, on a shared volume, and inside
+        a container that several services mount.
+
+        The whole read-copy-append runs under the cross-process WAL lock:
+        it is a read followed by a write of the same file, and a second
+        process doing the same thing concurrently interleaves its lines into
+        the middle of the other's, which no reader can then parse.
+
         Returns True when the data is durably on disk.
         """
         wal_dir = os.path.dirname(path) or "."
@@ -909,49 +1244,64 @@ class Transport:
             logger.warning(f"Cannot create WAL directory {wal_dir}: {e}")
             return False
         tmp_path = f"{path}.tmp.{os.getpid()}"
-        try:
-            with open(tmp_path, "w") as f:
-                if mode == "a" and os.path.exists(path):
-                    # Existing contents FIRST, so the file stays in
-                    # chronological order. Writing the new rows first and
-                    # folding the old ones in after would reverse the DLQ.
-                    #
-                    # A crash can leave the last line unterminated. Copying it
-                    # verbatim would glue the next row onto truncated JSON and
-                    # corrupt an event that was perfectly valid, so the torn
-                    # tail is dropped — it was never durable anyway.
-                    with open(path) as prev:
-                        previous = prev.read()
-                    if previous and not previous.endswith("\n"):
-                        keep = previous.rfind("\n") + 1  # 0 when there is none
-                        logger.warning(
-                            f"Dropping {len(previous) - keep}B torn tail of {path} before append"
-                        )
-                        previous = previous[:keep]
-                    f.write(previous)
-                for event in events:
-                    f.write(json.dumps(event, default=str) + "\n")
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp_path, path)
-            self._fsync_dir(wal_dir)
-            return True
-        except OSError as e:
-            logger.warning(f"Failed to persist {len(events)} events to {path}: {e}")
+        with self._wal_file_lock() as acquired:
+            if not acquired:
+                # Another process owns these files. Our events are still in
+                # memory / still covered by `.inflight`, and the caller is
+                # told "not written" so it keeps the recovery file.
+                return False
             try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            return False
+                fd = os.open(
+                    tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+                )
+                with os.fdopen(fd, "w") as f:
+                    if mode == "a" and os.path.exists(path):
+                        # Existing contents FIRST, so the file stays in
+                        # chronological order. Writing the new rows first and
+                        # folding the old ones in after would reverse the DLQ.
+                        #
+                        # A crash can leave the last line unterminated. Copying it
+                        # verbatim would glue the next row onto truncated JSON and
+                        # corrupt an event that was perfectly valid, so the torn
+                        # tail is dropped — it was never durable anyway.
+                        with open(path) as prev:
+                            previous = prev.read()
+                        if previous and not previous.endswith("\n"):
+                            keep = previous.rfind("\n") + 1  # 0 when there is none
+                            logger.warning(
+                                f"Dropping {len(previous) - keep}B torn tail of {path} before append"
+                            )
+                            previous = previous[:keep]
+                        f.write(previous)
+                    for event in events:
+                        f.write(json.dumps(event, default=str) + "\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_path, path)
+                self._fsync_dir(wal_dir)
+                return True
+            except OSError as e:
+                logger.warning(
+                    f"Failed to persist {len(events)} events to {path}: {e}"
+                )
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                return False
 
-    @staticmethod
-    def _fsync_dir(path: str) -> None:
+    def _fsync_dir(self, path: str) -> None:
         """Flush a directory entry so a rename survives a power cut.
 
-        Best-effort: Windows has no directory fsync and some filesystems
-        refuse it. A failure here costs durability of the NAME, not the data,
-        which is already fsynced.
+        Best-effort: a failure here costs durability of the NAME, not the
+        data, which is already fsynced. What it must not cost is
+        *visibility* — a platform that cannot do this is probed once by
+        ``_dir_fsync_supported``, reported in metrics, and warned about, so
+        "we lose the rename on power cut here" is a known state rather than
+        an assumption nobody checked.
         """
+        if not self._dir_fsync_supported(path):
+            return
         try:
             fd = os.open(path, os.O_RDONLY)
         except OSError:
@@ -1021,39 +1371,56 @@ class Transport:
         events are provably safe, i.e. either accepted by the backend or
         rewritten into ``.wal`` by ``_persist_to_wal``. Recovery is
         at-least-once; the backend dedups on ``event_id``.
+
+        The read phase runs under the cross-process WAL lock; the send does
+        not. That leaves a window in which two processes have read the same
+        file and both replay it — a duplicate, absorbed by the backend's dedup
+        — and no window in which one of them can remove a file the other
+        still needs, because removal only ever happens after the events are
+        delivered or re-persisted. Holding the lock across the send instead
+        would serialise every worker in a multi-process deployment behind one
+        another's latency to remove a duplication the dedup key already
+        handles.
         """
         wal_path = self._wal_path()
         sources = [f"{wal_path}.1", wal_path, self._wal_inflight_path()]
         events: list[dict[str, Any]] = []
         found: list[str] = []
         empty: list[str] = []
-        for candidate in sources:
-            try:
-                with open(candidate) as f:
-                    lines = f.readlines()
-            except FileNotFoundError:
-                continue
-            except OSError as e:
-                logger.warning(f"Failed to read WAL {candidate}: {e}")
-                continue
-            if not lines:
-                empty.append(candidate)
-                continue
-            found.append(candidate)
-            for line in lines:
+        with self._wal_file_lock() as acquired:
+            if not acquired:
+                logger.warning(
+                    "WAL replay skipped: another process holds the WAL lock. "
+                    "Its replay covers the same files."
+                )
+                return
+            for candidate in sources:
                 try:
-                    events.append(json.loads(line.strip()))
-                except json.JSONDecodeError:
+                    with open(candidate) as f:
+                        lines = f.readlines()
+                except FileNotFoundError:
                     continue
-
-        if not events:
-            # Nothing recovered. Drop leftovers so the next flush starts clean.
-            for candidate in empty:
-                try:
-                    os.remove(candidate)
                 except OSError as e:
-                    logger.warning(f"Failed to remove empty WAL {candidate}: {e}")
-            return
+                    logger.warning(f"Failed to read WAL {candidate}: {e}")
+                    continue
+                if not lines:
+                    empty.append(candidate)
+                    continue
+                found.append(candidate)
+                for line in lines:
+                    try:
+                        events.append(json.loads(line.strip()))
+                    except json.JSONDecodeError:
+                        continue
+
+            if not events:
+                # Nothing recovered. Drop leftovers so the next flush starts clean.
+                for candidate in empty:
+                    try:
+                        os.remove(candidate)
+                    except OSError as e:
+                        logger.warning(f"Failed to remove empty WAL {candidate}: {e}")
+                return
 
         self._buffer.extend(events)
         try:
@@ -1652,10 +2019,27 @@ class Transport:
         A partial refusal parks some events and re-queues others from the same
         send, and clearing there would drop the re-queued ones on the next
         crash.
+
+        Returns False — and writes nothing — when the DLQ is at its size cap.
+        The caller treats False as "not parked", which re-queues the event on
+        the retry path. That is the whole design of the cap: a full DLQ
+        stalls parking rather than dropping the oldest rows, so the operator
+        gets a loud, alertable condition instead of a file that quietly lost
+        the events from three hours ago.
         """
         if not rows:
             return True
-        return self._write_events_atomic(self._wal_dlq_path(), rows, mode="a")
+        # Measured, not estimated from `len(row)`: `len` of a dict is its
+        # number of keys, which is off by a factor of an order of magnitude
+        # and would make the cap meaningless in the only direction that
+        # matters — under-counting.
+        incoming = sum(len(json.dumps(r, default=str)) + 1 for r in rows)
+        if self._dlq_over_cap(incoming):
+            return False
+        if not self._write_events_atomic(self._wal_dlq_path(), rows, mode="a"):
+            return False
+        metrics.set_transport("dlq_bytes", self._dlq_size())
+        return True
 
     def _dead_letter_row(self, event: dict[str, Any], reason: str) -> bool:
         """Park one event, durably, before anything clears ``.inflight``.
@@ -1687,8 +2071,12 @@ class Transport:
         file is inspectable and re-submittable after the caller is fixed.
 
         The whole batch is parked here, so clearing ``.inflight`` afterwards
-        is correct. Partial refusals go through ``_settle_batch_outcome``,
-        which never clears it.
+        is correct — but ONLY once the DLQ write is confirmed. A failed
+        write (full cap, read-only volume, lost lock) leaves the batch on the
+        retry path and retains ``.inflight``, because the alternative is
+        clearing the only durable copy of events that were not parked
+        anywhere. The events will be refused again on the next send, which is
+        the correct outcome for a permanent rejection we could not record.
         """
         reason = self._dlq_reason(error)
         logger.error(
@@ -1696,7 +2084,9 @@ class Transport:
             f"{len(batch)} events to DLQ. They will NOT be retried."
         )
         rows = [self._dlq_row(e, reason) for e in batch]
-        self._write_dlq_rows(rows)
+        if not self._write_dlq_rows(rows):
+            self._requeue_at_head(batch)
+            return
         self._clear_inflight()
         metrics.inc_transport("events_dead_lettered", len(batch))
         metrics.set_transport("last_dlq_error", reason)

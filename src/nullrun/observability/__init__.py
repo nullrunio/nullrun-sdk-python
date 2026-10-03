@@ -76,6 +76,33 @@ class TransportMetrics:
     # We split it from hmac_verify_failures_total so the two
     # alert paths can have different runbooks.
     hmac_verify_expired_total: int = 0
+    # --- WAL durability state (set by Transport, not incremented) ----------
+    # These answer "what can this deployment actually promise?", which the
+    # code cannot answer on your behalf across OSes and filesystems. A field
+    # that was never set and a field that says "no" are different facts, so
+    # they are declared here with an explicit unprobed value instead of
+    # defaulting through `getattr(..., 0)`.
+    #
+    #   "enabled"     — directory fsync works; a rename survives power cut
+    #   "unavailable" — probed, and the platform/filesystem refused
+    #   None          — never probed (no WAL write has happened yet)
+    wal_dir_fsync: str | None = None
+    #   "enabled"   — the advisory lock is taken around WAL mutations
+    #   "contended" — another process held it on the last attempt
+    #   "unavailable" — no fcntl.flock on this platform
+    wal_lock: str | None = None
+    # Writes skipped because the lock stayed held for the whole timeout. Zero
+    # is the healthy state; a sustained non-zero rate means the volume is
+    # contended enough that some DLQ rows are being re-queued rather than
+    # recorded.
+    wal_lock_timeouts_total: int = 0
+    # Dead-letter queue: current size, and how many appends the size cap
+    # refused. A non-zero `dlq_overflow_total` is the alertable signal — it
+    # means events are being refused a place to be recorded and are spinning
+    # on the retry path instead. The cap never deletes rows.
+    dlq_bytes: int = 0
+    dlq_overflow_total: int = 0
+    dlq_overflow_reason: str | None = None
 
 
 @dataclass
@@ -190,6 +217,12 @@ class MetricsRegistry:
                     "fallback_mode_activations": self.transport.fallback_mode_activations,
                     "hmac_verify_failures_total": self.transport.hmac_verify_failures_total,
                     "hmac_verify_expired_total": self.transport.hmac_verify_expired_total,
+                    "wal_dir_fsync": self.transport.wal_dir_fsync,
+                    "wal_lock": self.transport.wal_lock,
+                    "wal_lock_timeouts_total": self.transport.wal_lock_timeouts_total,
+                    "dlq_bytes": self.transport.dlq_bytes,
+                    "dlq_overflow_total": self.transport.dlq_overflow_total,
+                    "dlq_overflow_reason": self.transport.dlq_overflow_reason,
                 },
                 "runtime": {
                     "track_calls": self.runtime.track_calls,

@@ -137,6 +137,13 @@ dev = [
     "fastapi>=0.100,<1.0",
 ]
 
+[project.scripts]
+# `nullrun-wal` inspects and replays the local write-ahead log. It exists
+# because the DLQ holds events the SDK could not deliver and nothing else
+# ever reads them: without a supported path to re-submit or at least export
+# them, "quarantined" is a polite word for "lost, but on disk".
+nullrun-wal = "nullrun.wal_admin:main"
+
 [project.urls]
 # The homepage, docs and repository are the three links PyPI surfaces on
 # the project sidebar. The rest are convenience links that appear under
