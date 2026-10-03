@@ -337,6 +337,17 @@ fcntl: Any = _fcntl
 # DLQ size cap (default 64 MB). Override via NULLRUN_DLQ_MAX_BYTES.
 _DLQ_MAX_BYTES_DEFAULT: int = 64 * 1024 * 1024
 
+# Max refused events tracked in memory while the DLQ is full. Override via
+# NULLRUN_DLQ_HOLDOVER_MAX_EVENTS. The rows are durable in `<wal>.holdover`
+# either way; this bounds the index, not the data.
+_DLQ_HOLDOVER_INDEX_MAX_DEFAULT: int = 10_000
+
+# Longest server-stated `Retry-After` the SDK will sit through. Past this it
+# stops retrying for the cycle rather than retrying early — see
+# `_next_retry_delay` for why shortening the wait is the wrong cap.
+# Override via NULLRUN_RETRY_AFTER_CEILING.
+_RETRY_AFTER_CEILING_DEFAULT: float = 60.0
+
 # How long a writer waits for the cross-process WAL lock before skipping its
 # write. The critical section is a local file copy plus an fsync, so the
 # uncontended cost is microseconds; the timeout exists for a descheduled
@@ -500,8 +511,9 @@ def _next_retry_delay(
     max_delay: float,
     server_wait: float | None,
     error: Exception,
-) -> float:
-    """How long to wait before the next attempt, and the log line saying so.
+    retry_after_ceiling: float = _RETRY_AFTER_CEILING_DEFAULT,
+) -> float | None:
+    """How long to wait before the next attempt — or ``None`` to not retry.
 
     Two regimes, and the choice between them is the whole function.
 
@@ -514,9 +526,42 @@ def _next_retry_delay(
     Without one there is no floor, so jitter is symmetric around the
     exponential curve, which is the standard defence against a thundering
     herd on a shared failure.
+
+    Returns ``None`` when the server's floor is beyond ``retry_after_ceiling``.
+    This is the part that used to be wrong, and it was wrong in the
+    direction that looks like a safety feature.
+
+    The previous code clamped with ``min(server_wait, max_delay)``. That
+    bounds the wait, so ``Retry-After: 86400`` cannot hang a flush — and it
+    also retries 60 minutes early, which is precisely what the floor
+    semantics forbid. A server that says "not for an hour" and gets a client
+    back in 30 seconds gets the same 429, spends its whole retry budget
+    re-tripping the limit it was told to respect, and the operator sees a
+    client that ignores rate limits rather than one that honours a long one.
+
+    The fix is not a shorter wait, it is no wait. The events are already
+    durable — ``.inflight`` is retained and the WAL is the recovery path —
+    so declining to retry in this cycle costs nothing and loses nothing. The
+    flush ends, and the next cycle tries again. So the ceiling produces an
+    honest "not now" instead of a dishonest "yes, sooner".
     """
     if server_wait is not None and server_wait > 0:
-        base = min(server_wait, max_delay)
+        if server_wait > retry_after_ceiling:
+            metrics.inc_transport("retry_after_deferred")
+            logger.warning(
+                "Request failed (attempt %d/%d), Retry-After %.2fs exceeds the "
+                "%.2fs ceiling — not retrying in this cycle rather than "
+                "retrying before the server permits it. The events stay in the "
+                "WAL; the next flush cycle tries again. Raise "
+                "NULLRUN_RETRY_AFTER_CEILING to wait longer: %s",
+                attempt + 1,
+                max_retries + 1,
+                server_wait,
+                retry_after_ceiling,
+                type(error).__name__,
+            )
+            return None
+        base = server_wait
         delay = base * (1.0 + random.uniform(0.0, jitter))  # noqa: S311
         logger.warning(
             "Request failed (attempt %d/%d), honoring Retry-After %.2fs "
@@ -542,6 +587,55 @@ def _next_retry_delay(
     return delay
 
 
+def _retry_after_ceiling() -> float:
+    """Effective ``Retry-After`` ceiling. Non-positive env values are ignored."""
+    raw = os.environ.get("NULLRUN_RETRY_AFTER_CEILING", "").strip()
+    if not raw:
+        return _RETRY_AFTER_CEILING_DEFAULT
+    try:
+        value = float(raw)
+        return value if value > 0 else _RETRY_AFTER_CEILING_DEFAULT
+    except ValueError:
+        return _RETRY_AFTER_CEILING_DEFAULT
+
+
+def _wait_on(cancel: threading.Event, seconds: float) -> bool:
+    """Wait on ``cancel`` for up to ``seconds``. The clock seam for tests.
+
+    A module-level function, not an inline ``cancel.wait``, so the test
+    fixture can stub the CLOCK without stubbing the decision. The
+    alternative — patching ``threading.Event.wait`` globally — changes the
+    semantics of every other ``Event.wait`` in the suite, including the
+    approval-wait tests that legitimately assert on real elapsed time, and
+    turns them into load-sensitive flakes to make the retry path fast.
+    Stubbing the seam keeps the full retry path — the ceiling check, the
+    one-sided jitter, the shutdown branch — under test, and only removes
+    the wall clock from it.
+    """
+    return not cancel.wait(seconds)
+
+
+def _interruptible_sleep(seconds: float, cancel: threading.Event | None) -> bool:
+    """Sleep, but wake early when the SDK is shutting down.
+
+    Returns True if the full delay elapsed, False if it was cut short by
+    ``cancel``.
+
+    ``time.sleep`` is the wrong primitive on the flush path for one reason:
+    it cannot be woken. ``Transport.stop()`` sets an event that the flush
+    loop honours between cycles, but a retry sleeping on ``Retry-After:
+    45`` inside a cycle does not check that event, so a shutdown that arrives
+    during a rate-limit wait blocks for the remainder of the wait. For a
+    process that is exiting, that is the difference between a prompt stop
+    and one that appears hung — and it is worst exactly when the backend is
+    misbehaving, which is when someone is most likely to be killing it.
+    """
+    if cancel is None:
+        time.sleep(seconds)
+        return True
+    return _wait_on(cancel, seconds)
+
+
 def _retry_with_backoff(
     func: Callable[[], Any],
     max_retries: int = 10,
@@ -552,6 +646,8 @@ def _retry_with_backoff(
     last_retry_after_seconds: float = 0.0,
     on_transport_error: TransportErrorHandler | None = None,
     retry_on_5xx: bool = False,
+    cancel: threading.Event | None = None,
+    retry_after_ceiling: float | None = None,
 ) -> Any:
     """Retry with exponential backoff + jitter; honors Retry-After (429) header.
 
@@ -585,6 +681,9 @@ def _retry_with_backoff(
         NullRunAuthError,
         NullRunBackendError,
     )
+
+    if retry_after_ceiling is None:
+        retry_after_ceiling = _retry_after_ceiling()
 
     last_exc: Exception | None = None
 
@@ -689,7 +788,12 @@ def _retry_with_backoff(
                 max_delay=max_delay,
                 server_wait=_retry_after_seconds_from(exc.response),
                 error=exc,
+                retry_after_ceiling=retry_after_ceiling,
             )
+            if actual_delay is None:
+                # The server's floor is past our ceiling. Stop this cycle
+                # rather than retry early; the caller keeps the events.
+                break
 
         except Exception as exc:
             last_exc = exc
@@ -711,13 +815,22 @@ def _retry_with_backoff(
                 max_delay=max_delay,
                 server_wait=last_retry_after_seconds,
                 error=exc,
+                retry_after_ceiling=retry_after_ceiling,
             )
             last_retry_after_seconds = 0.0
+            if actual_delay is None:
+                break
 
         # Every path that reaches here has decided to retry. One sleep, one
         # place: the two except branches used to carry their own, and the
         # status branch had none, which is how the two drifted apart.
-        time.sleep(actual_delay)
+        if not _interruptible_sleep(actual_delay, cancel):
+            # Shutdown arrived mid-wait. Stop retrying now; the caller still
+            # holds the events, and `.inflight` is retained because the send
+            # did not complete.
+            logger.info("Retry wait interrupted by shutdown; stopping this cycle")
+            metrics.inc_transport("retries_interrupted_by_shutdown")
+            break
 
     # ``retry_on_5xx`` and the failure mode was 5xx, return the
     # last response so the caller can synthesize a fallback
@@ -1079,6 +1192,19 @@ class Transport:
         """Path of the dead-letter file for permanently-rejected batches."""
         return f"{self._wal_path()}.dlq"
 
+    def _wal_holdover_path(self) -> str:
+        """Path of the holdover file: refused events the DLQ had no room for.
+
+        Deliberately NOT `.wal` and NOT `.wal.inflight`. `.wal` is rewritten
+        wholesale by `_persist_to_wal` on every buffer persist, so held rows
+        appended there are erased by the next unsent event; `.inflight` is
+        overwritten with whatever batch is about to go on the wire, which is
+        precisely the loss this file exists to prevent. A separate file has
+        one writer (the hold) and one eraser (the drain), and nothing else
+        touches it.
+        """
+        return f"{self._wal_path()}.holdover"
+
     def _wal_lock_path(self) -> str:
         """Path of the advisory lock guarding mutations of the WAL files."""
         return f"{self._wal_path()}.lock"
@@ -1094,6 +1220,26 @@ class Transport:
             return value if value > 0 else _DLQ_MAX_BYTES_DEFAULT
         except ValueError:
             return _DLQ_MAX_BYTES_DEFAULT
+
+    @property
+    def _holdover_index_max(self) -> int:
+        """Max tracked holdover entries. Bounded on COUNT, not bytes.
+
+        Count is the unit the metric reports and the unit an operator alerts
+        on; a byte bound here would be a second cap for the same property and
+        would fail at a threshold nobody chose deliberately. The cap trims
+        the in-memory index only — the holdover file keeps every row, so a
+        saturated index under-reports `dlq_holdover` rather than losing an
+        event.
+        """
+        raw = os.environ.get("NULLRUN_DLQ_HOLDOVER_MAX_EVENTS", "").strip()
+        if not raw:
+            return _DLQ_HOLDOVER_INDEX_MAX_DEFAULT
+        try:
+            value = int(raw)
+            return value if value > 0 else _DLQ_HOLDOVER_INDEX_MAX_DEFAULT
+        except ValueError:
+            return _DLQ_HOLDOVER_INDEX_MAX_DEFAULT
 
     # -- durability probes ------------------------------------------------
 
@@ -1289,6 +1435,7 @@ class Transport:
             base,
             f"{base}.1",
             f"{base}.inflight",
+            f"{base}.holdover",
             f"{base}.dlq",
             f"{base}.lock",
         ):
@@ -1630,6 +1777,12 @@ class Transport:
             return
         # Replay any events from WAL that were persisted due to previous crash
         self._replay_from_wal()
+        # Held refusals are recovered separately and are NOT replayed onto the
+        # send path. `_replay_from_wal` recovers undelivered events, which is
+        # the right thing for them; these were already refused, so re-sending
+        # produces the same refusal while blocking everything queued behind
+        # them. They go to the DLQ on the first flush that finds room.
+        self._recover_holdover()
         self._running = True
         # Clear the stop latch so a previous stop() does not short-circuit
         # the new flush loop on its first sleep.
@@ -2275,7 +2428,7 @@ class Transport:
         return False
 
     def _hold_for_dlq(self, rows: list[dict[str, Any]], reason: str) -> None:
-        """Park refused events in memory until the DLQ has room.
+        """Park refused events durably until the DLQ has room.
 
         The alternative — leaving them on the send path — is what turns a full
         DLQ into an outage: the events are re-sent every cycle, they are
@@ -2283,19 +2436,133 @@ class Transport:
         time, so the healthy events queued behind them are never delivered.
         The refusal is terminal, so re-sending cannot help; only the recording
         can, and that is what the holdover defers.
+
+        They are written to `.wal.holdover`, not just kept in memory. A
+        memory-only holdover is a `kill -9` away from total loss: the next
+        `_persist_inflight` overwrites `.inflight` with the batch it is about
+        to send, so once the process restarts the events are in the DLQ
+        nowhere, in `.wal` nowhere, and in `.inflight` overwritten. Keeping
+        them in RAM looked like the fix and was a new loss path — the same
+        shape of bug as the one that put `replay` in the tree, where the
+        report described a durability the code did not have.
+
+        Recovery reads the holdover file back into `_dlq_overflow` at
+        startup, so the drain resumes without re-deriving the refusal by
+        re-sending. That matters for a terminal reason: re-sending is the one
+        thing the holdover exists to avoid, and a restart that recovers the
+        events by re-sending them would reintroduce the head-of-buffer
+        starvation the hold was built to stop.
+
+        The in-memory index is bounded, and the bound is on COUNT, not bytes.
+        Count is what the metric reports and what an operator alerts on; a
+        byte bound would need a second cap for the same property and would
+        fail silently on a different threshold. Past the bound the oldest
+        entries stop being *tracked* — they are not lost, they are in the
+        file and `_drain_dlq_overflow` reads the file as well as the index —
+        so the only cost is an under-reported `dlq_holdover`, which is loud
+        and named in the log rather than silent.
         """
         self._dlq_overflow.extend(rows)
         metrics.inc_transport("dlq_holdover_total", len(rows))
+        self._persist_holdover(rows)
+        self._trim_holdover_index()
         metrics.set_transport("dlq_holdover", len(self._dlq_overflow))
         metrics.set_transport("last_dlq_error", reason)
         logger.error(
             f"DLQ at its cap — holding {len(self._dlq_overflow)} refused event(s) "
-            f"in memory ({reason}). They are NOT being re-sent: a terminal "
-            f"refusal cannot succeed on retry, and re-sending would block every "
-            f"healthy event behind them. Raise NULLRUN_DLQ_MAX_BYTES, or triage "
-            f"and archive the file with `nullrun-wal`, and they drain on the "
-            f"next flush."
+            f"({reason}). They are NOT being re-sent: a terminal refusal cannot "
+            f"succeed on retry, and re-sending would block every healthy event "
+            f"behind them. They are durably in {self._wal_holdover_path()}, so a "
+            f"kill -9 does not lose them. Raise NULLRUN_DLQ_MAX_BYTES, or triage "
+            f"and archive the DLQ with `nullrun-wal`, and they drain on the next "
+            f"flush."
         )
+
+    def _trim_holdover_index(self) -> None:
+        """Bound the in-memory holdover index; the file is the record of truth.
+
+        Only the index is trimmed. Trimming the file would be the cap deleting
+        the only copy of an event the SDK could not deliver — the same thing
+        `_dlq_over_cap` refuses to do, for the same reason.
+        """
+        cap = self._holdover_index_max
+        if not cap or len(self._dlq_overflow) <= cap:
+            return
+        dropped = len(self._dlq_overflow) - cap
+        del self._dlq_overflow[:-cap]
+        metrics.inc_transport("dlq_holdover_index_truncated", dropped)
+        logger.error(
+            f"Holdover index passed NULLRUN_DLQ_HOLDOVER_MAX_EVENTS ({cap}); "
+            f"stopped tracking the {dropped} oldest held event(s). They are NOT "
+            f"lost — {self._wal_holdover_path()} still holds them and the drain "
+            f"reads it — but `dlq_holdover` now under-reports by {dropped}. Raise "
+            f"the env var to keep the count exact."
+        )
+
+    def _persist_holdover(self, rows: list[dict[str, Any]]) -> None:
+        """Append the held rows to `.wal.holdover`.
+
+        Append, and the rows are the same DLQ-shaped dicts the drain already
+        knows how to write — a `event_id` plus the `event` — so the drain does
+        not need a second format, and `nullrun-wal` can archive the holdover
+        file with the same reader it uses for the DLQ.
+
+        Failure to persist is loud but not fatal. The events remain in the
+        index and the caller has already been told the DLQ refused them, so
+        raising here would abort a flush over a bookkeeping failure on a path
+        whose whole purpose is to not lose the event. The log says the one
+        true thing: a kill before a later attempt loses them.
+        """
+        if not rows:
+            return
+        if not self._write_events_atomic(self._wal_holdover_path(), rows, mode="a"):
+            logger.error(
+                f"Could not persist {len(rows)} held refusal(s) to "
+                f"{self._wal_holdover_path()} (lock held elsewhere, or I/O "
+                f"failed). They are in memory only, and a kill before a later "
+                f"attempt loses them."
+            )
+            metrics.inc_transport("dlq_holdover_persist_failures", len(rows))
+
+    def _recover_holdover(self) -> None:
+        """Load rows from `.wal.holdover` into the index at startup.
+
+        Appends rather than replaces, so a second process that finds the file
+        already drained — or empty — does not erase an index it does not own.
+        The lock is not taken: read-only, and the only writer appends whole
+        lines atomically, so the worst case is one incomplete final line,
+        which is dropped exactly as `_replay_from_wal` drops it.
+        """
+        path = self._wal_holdover_path()
+        try:
+            with open(path) as f:
+                lines = f.readlines()
+        except FileNotFoundError:
+            return
+        except OSError as e:
+            logger.warning(f"Failed to read holdover file {path}: {e}")
+            return
+        recovered: list[dict[str, Any]] = []
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                # A torn tail from a kill mid-append. The event is not
+                # recoverable from this line, and the refusal will simply be
+                # re-derived if the event is still in another source.
+                continue
+            if isinstance(row, dict):
+                recovered.append(row)
+        if recovered:
+            self._dlq_overflow.extend(recovered)
+            logger.warning(
+                f"Recovered {len(recovered)} held refusal(s) from {path}. They "
+                f"were refused and the DLQ was full when the process died; they "
+                f"are NOT re-sent, they go to the DLQ as soon as it has room."
+            )
+        self._trim_holdover_index()
 
     def _drain_dlq_overflow(self) -> int:
         """Try to move held refusals into the DLQ now that space may exist.
@@ -2304,6 +2571,15 @@ class Transport:
         refused write is a no-op — the holdover is unchanged and the operator
         still sees the same alert — so this is safe to attempt unconditionally
         and cheap when there is nothing held.
+
+        The holdover FILE is released by `event_id`, not deleted wholesale.
+        The index can be shorter than the file: `_trim_holdover_index` drops
+        the oldest entries from memory to bound it, and those rows are still
+        owed a DLQ. Removing the file after a partial drain would delete them.
+        Deleting by id also means a crash between the DLQ write and the file
+        release replays into the DLQ a second time rather than losing
+        anything — at-least-once, which is the same trade the WAL already
+        makes and which the `event_id` dedup absorbs.
         """
         if not self._dlq_overflow:
             return 0
@@ -2312,10 +2588,74 @@ class Transport:
         if not written:
             self._dlq_overflow = pending  # unchanged; try again next cycle
             return 0
+        if not self._release_holdover(
+            {
+                str(r["event"]["event_id"])
+                for r in pending
+                if isinstance(r.get("event"), dict) and r["event"].get("event_id")
+            }
+        ):
+            # The rows are in the DLQ. The file still names them, so a restart
+            # re-drains them into the DLQ a second time — a duplicate the
+            # `event_id` dedup absorbs, which is strictly better than the
+            # alternative of not knowing whether the release happened.
+            logger.warning(
+                f"Could not release {self._wal_holdover_path()} after draining "
+                f"{len(pending)} refusal(s) into the DLQ. The rows are safely in "
+                f"the DLQ; the stale holdover file will re-drain them on the next "
+                f"start, which duplicates rather than loses."
+            )
         metrics.inc_transport("events_dead_lettered", len(pending))
-        metrics.set_transport("dlq_holdover", 0)
+        metrics.set_transport("dlq_holdover", len(self._dlq_overflow))
         logger.info(f"Drained {len(pending)} held refusal(s) into the DLQ")
         return len(pending)
+
+    def _release_holdover(self, event_ids: set[str]) -> bool:
+        """Rewrite `.wal.holdover` without the drained `event_id`s.
+
+        The id is read from ``row["event"]["event_id"]`` because that is where
+        `_dlq_row` puts it. Matching a top-level ``event_id`` — which the row
+        schema does not have — would release nothing while reporting success,
+        which is the failure mode this whole file exists to remove.
+
+        Returns True when the file now names none of them (including the
+        not-there case, which is success), False when the rewrite failed and
+        the caller must assume the rows are still listed.
+        """
+        if not event_ids:
+            return True
+        path = self._wal_holdover_path()
+        try:
+            with open(path) as f:
+                lines = f.readlines()
+        except FileNotFoundError:
+            return True
+        except OSError as e:
+            logger.warning(f"Failed to read holdover file {path} to release: {e}")
+            return False
+        kept: list[dict[str, Any]] = []
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                # Unparseable: we cannot prove which event it is, so it stays.
+                # Dropping it would be deleting the only copy of an unknown row.
+                kept.append({"raw": line})
+                continue
+            event = row.get("event") if isinstance(row, dict) else None
+            eid = str(event.get("event_id")) if isinstance(event, dict) else None
+            if eid not in event_ids:
+                kept.append(row)
+        try:
+            if not kept:
+                os.remove(path)
+                return True
+            return self._write_events_atomic(path, kept)
+        except OSError as e:
+            logger.warning(f"Failed to release holdover file {path}: {e}")
+            return False
 
     def _quarantine_to_dlq(self, batch: list[dict[str, Any]], error: Exception) -> None:
         """Move a permanently-rejected batch out of the retry path.
@@ -2530,6 +2870,7 @@ class Transport:
             max_delay=10.0,
             backoff_factor=2.0,
             jitter=0.1,
+            cancel=self._stop_event,
         )
 
         # P0: Extract retry_after from response headers or body
@@ -2816,6 +3157,7 @@ class Transport:
                 max_retries=max_execute_retries,
                 base_delay=0.5,
                 on_transport_error=on_transport_error,
+                cancel=self._stop_event,
             )
 
             if response.status_code == 200:
@@ -3206,6 +3548,7 @@ class Transport:
                 jitter=0.1,
                 retry_on_5xx=True,
                 on_transport_error=on_transport_error,
+                cancel=self._stop_event,
             )
 
             if response.status_code == 200:

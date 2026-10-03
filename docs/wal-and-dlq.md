@@ -8,7 +8,7 @@ someone money.
 
 ## The files
 
-One base path (`NULLRUN_WAL_PATH`, else `<tempdir>/nullrun.wal`) and four
+One base path (`NULLRUN_WAL_PATH`, else `<tempdir>/nullrun.wal`) and five
 files:
 
 | File | Holds | Read by |
@@ -16,6 +16,7 @@ files:
 | `sdk.wal` | events awaiting delivery | the next `Transport.start()` |
 | `sdk.wal.1` | the previous generation, after rotation | same |
 | `sdk.wal.inflight` | the batch that was on the wire when the process died | same |
+| `sdk.wal.holdover` | refusals the full DLQ had no room for | same — as a hold, never as a send |
 | `sdk.wal.dlq` | events the backend refused | **a human**, via `nullrun-wal` |
 | `sdk.wal.lock` | the advisory lock, 0 bytes | `flock` |
 
@@ -42,6 +43,16 @@ exists to break out of.
   confirmed. A 200 whose body cannot be read — a proxy's HTML page, an
   empty response, a backend predating that field — is not a confirmation
   either, and is treated as unconfirmed rather than delivered.
+* **A held refusal is durable and is never re-sent.** When the DLQ is at its
+  cap the refusal goes to `sdk.wal.holdover` and stays off the send path.
+  Both halves matter. Durable, because a memory-only hold is a `kill -9`
+  from losing the record — and the file that looked like it covered this,
+  `.inflight`, is overwritten by the next batch that goes on the wire. Never
+  re-sent, because a refusal is terminal: sending it again produces the same
+  refusal while occupying the head of the buffer, so the healthy events
+  behind it are never delivered. On restart the holdover is recovered as a
+  hold, not as a replay, and drains to the DLQ on the first flush that finds
+  room.
 
 ## What is refused
 
@@ -65,10 +76,13 @@ than assumed**, and the result is a metric:
 
 | Metric | Values | Meaning |
 |---|---|---|
-| `wal_dir_fsync` | `"enabled"` / `"unavailable"` / `None` | whether a directory fsync works here. Without it the data blocks land but a power cut can still lose the *name* after a rename. |
+| `wal_dir_fsync` | `"enabled"` / `"unavailable"` / `None` | whether a directory fsync *syscall* succeeds on this platform. It does not tell you the data survives a power cut — see the fsync scope note below. |
 | `wal_lock` | `"enabled"` / `"contended"` / `"unavailable"` | whether the cross-process WAL lock is in use. `"unavailable"` means no `fcntl.flock`: one writer per WAL path, so a multi-process deployment must set a per-worker `NULLRUN_WAL_PATH`. |
 | `wal_lock_timeouts_total` | count | writes skipped because the lock stayed held for the whole timeout. Zero is healthy. |
 | `dlq_bytes` / `dlq_overflow_total` | bytes / count | DLQ size, and how many appends the cap refused. |
+| `dlq_holdover` / `dlq_holdover_total` | count | refusals held for want of DLQ room, now and cumulative. |
+| `dlq_holdover_index_truncated` | count | held events dropped from the in-memory index by `NULLRUN_DLQ_HOLDOVER_MAX_EVENTS` (default 10 000). Non-zero means `dlq_holdover` under-reports; the events are in `sdk.wal.holdover` and still reach the DLQ. |
+| `dlq_holdover_persist_failures` | count | held events that could not be written to `sdk.wal.holdover` — **the only holdover counter that means possible loss**, because those rows are in memory only. |
 
 `None` means "not probed yet" — distinct from `"unavailable"`, which means
 "probed and refused". A degraded platform produces **one** warning per aspect
@@ -80,6 +94,26 @@ All are in `metrics.to_dict()["transport"]`.
 A green test run on Windows proves nothing about `flock` or a directory
 fsync, because neither exists there. The POSIX-only assertions are marked
 `skipif win32`; run the suite in a Linux container to exercise them.
+
+### What the fsync probe does and does not prove
+
+**Proves:** the `fsync(2)` syscall on a directory is reachable and returns
+success on this kernel and filesystem. `test_a_posix_volume_really_does_fsync_its_directory`
+asserts exactly that, by fsyncing a directory and checking for `EINVAL`
+rather than by reading the test's own name as a proxy.
+
+**Does not prove:** that any data survives power loss. That needs hardware
+that lies about a flush — a `removable`/`uninterruptible` cache-volume
+device, or a fault injector that cuts power mid-write. There is no such
+device in CI, and no assertion in this suite simulates one. So the honest
+statement is: **this is crash-safe against process death, and
+fsync-correct against kernel death, and neither is a claim about power.**
+
+The distinction matters when reading the guarantee above. Process death
+(`SIGKILL`, panic, OOM) is covered — an unlinked-but-fsynced file survives
+it, which is the entire WAL design. Kernel death is covered by the fsync
+ordering. Power loss depends on whether the storage stack honours the flush,
+which is a property of the device and the hypervisor, not of this code.
 
 ## Multi-process deployments
 
@@ -110,10 +144,49 @@ unparseable line is the one an operator most needs to look at, and
 rewriting the file from the rows that did parse would delete it without
 anyone noticing.
 
+**This contract was not the command's original behaviour, and calling it
+"pre-existing" was wrong.** `replay` arrived in `fd4e581`, and the report for
+that commit described it as removing a row only after confirming the
+`event_id` — which the code did not do. It derived "unconfirmed" from the
+transport's in-memory buffer alone, while a refused event lives in the
+scratch DLQ or the holdover and never in the buffer. A replay the backend
+refused outright reported zero unconfirmed, printed `sent 3 event(s);
+removed 3 row(s)`, and exited **0**: it deleted the operator's only record of
+the very events the backend had just refused, and reported success doing it.
+Two independent places in this file have now had a report describe behaviour
+the code lacked, so every destructive operation here is pinned by a test
+that asserts the *rows that remain*, not by one that asserts the command
+exited cleanly.
+
 The exit code distinguishes the two "nothing happened" cases: **1** when rows
 existed and none were confirmed (or all were withheld, see below), **0** when
 the DLQ was empty. A scheduled repair that reports 0 while sending nothing
 would be indistinguishable from one that worked.
+
+### When a 429 says "not for an hour"
+
+A `Retry-After` is a floor, and the SDK does not retry before it. Both RFC
+7231 forms are honoured — seconds and HTTP-date — and the jitter applied on
+that path is one-sided, so a fleet that got limited together spreads out
+without any member retrying under the limit.
+
+A floor also needs a ceiling, and the ceiling is **not** a shorter wait.
+`NULLRUN_RETRY_AFTER_CEILING` (60s default) says how long the SDK will sit
+through; past it the flush stops for that cycle and the next cycle tries
+again. The events are already durable, so declining to retry costs nothing.
+
+The alternative — clamping the wait to `max_delay` — looks identical from
+outside and is not. It retries an hour early, spends the whole retry budget
+re-tripping the limit it was just told to respect, and surfaces to the
+operator as a client that ignores rate limits rather than one that honours a
+long one. `retry_after_deferred` counts the deferrals; a sustained non-zero
+value is a backend rate-limiting longer than the SDK will wait, and is a
+signal to read rather than an SDK fault.
+
+The wait itself is an `Event.wait`, not a `time.sleep`, so `Transport.stop()`
+cuts it short. A process that is shutting down does not have to sit out the
+remainder of a rate-limit window — which matters most exactly when the
+backend is misbehaving and someone is killing the process because of it.
 
 ### Refusals `replay` will not send
 
@@ -191,6 +264,7 @@ What is verified instead, and what is not:
 | Outage longer than 24h, process alive | Events reach the backend, are refused `EXECUTION_NOT_BOUND`, land in the DLQ (`EXECUTION_NOT_BOUND:422`), and `replay` refuses to re-send them |
 | Restart with a rotated WAL present | Recovery reads `.wal.1`, `.wal` and `.wal.inflight` oldest-first, so no generation is dropped — pinned by `test_recovery_reads_the_rotated_wal_not_just_the_active_one` |
 | Kill during a WAL write | Not reachable as corruption: every write is tmp-file + fsync + `os.replace`, and the rename is atomic, so a kill leaves the old file or the new one, never a torn one. Directory fsync on a Linux volume is asserted in `test_a_posix_volume_really_does_fsync_its_directory` |
+| Kill while a DLQ refusal is held | The refusal is in `<wal>.holdover`, not only in memory, so a fresh process over the same WAL path finds it — pinned by `test_a_held_refusal_survives_a_kill_minus_nine`. The test builds a new `Transport` and never flushes, so the dying process writes nothing; a memory-only holdover cannot pass it |
 | **SIGKILL mid-outage, then restart, across the 24h boundary** | **Not tested, and not handled.** The restart behaves like a clean restart, so the same ceiling applies — but nothing in the suite exercises it, and it cannot pass without the ledger-only ingest below |
 
 The reason the last row is left open: making it pass would mean either

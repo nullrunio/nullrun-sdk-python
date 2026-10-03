@@ -103,16 +103,37 @@ class TransportMetrics:
     dlq_bytes: int = 0
     dlq_overflow_total: int = 0
     dlq_overflow_reason: str | None = None
-    # Terminal refusals the full DLQ could not take, currently held in memory.
-    # Non-zero means spend is being recorded nowhere durable yet. This is the
-    # state to alert on: `dlq_overflow_total` counts refusals over time, this
-    # counts events that are still unrecorded RIGHT NOW.
+    # Terminal refusals the full DLQ could not take, currently held. The rows
+    # are durable in `<wal>.holdover`; this counts what is held RIGHT NOW and
+    # is the state to alert on — `dlq_overflow_total` counts refusals over
+    # time, this counts events still unrecorded RIGHT NOW.
     dlq_holdover: int = 0
     dlq_holdover_total: int = 0
+    # Held events dropped from the in-memory index by
+    # NULLRUN_DLQ_HOLDOVER_MAX_EVENTS. Any value here means `dlq_holdover`
+    # UNDER-reports: the events are still in the holdover file and still reach
+    # the DLQ, but the gauge no longer counts all of them. Non-zero is a
+    # "raise the cap" signal, never a data-loss signal.
+    dlq_holdover_index_truncated: int = 0
+    # Held events that could not be written to the holdover file (lock held
+    # elsewhere, or I/O failed). These exist in memory only, so a kill before
+    # a later attempt loses them. This is the one holdover counter that means
+    # possible loss rather than deferred recording.
+    dlq_holdover_persist_failures: int = 0
     # Bisect cascades that stopped because the request budget ran out rather
     # than because the cascade converged. A sustained rate means batches are
     # being refused wholesale more often than the budget can isolate.
     batches_bisect_budget_exhausted: int = 0
+    # 429s whose `Retry-After` exceeded NULLRUN_RETRY_AFTER_CEILING, so the
+    # flush stopped for the cycle instead of retrying before the server
+    # permitted it. Non-zero means the backend is rate-limiting for longer
+    # than the SDK is willing to sit through — which is a backend signal to
+    # read, not an SDK fault. The events stay in the WAL.
+    retry_after_deferred: int = 0
+    # Retry waits cut short by `Transport.stop()`. Non-zero during shutdown
+    # is expected; a sustained rate outside shutdown means something is
+    # stopping the transport.
+    retries_interrupted_by_shutdown: int = 0
 
 
 @dataclass
@@ -235,7 +256,11 @@ class MetricsRegistry:
                     "dlq_overflow_reason": self.transport.dlq_overflow_reason,
                     "dlq_holdover": self.transport.dlq_holdover,
                     "dlq_holdover_total": self.transport.dlq_holdover_total,
+                    "dlq_holdover_index_truncated": self.transport.dlq_holdover_index_truncated,
+                    "dlq_holdover_persist_failures": self.transport.dlq_holdover_persist_failures,
                     "batches_bisect_budget_exhausted": self.transport.batches_bisect_budget_exhausted,
+                    "retry_after_deferred": self.transport.retry_after_deferred,
+                    "retries_interrupted_by_shutdown": self.transport.retries_interrupted_by_shutdown,
                 },
                 "runtime": {
                     "track_calls": self.runtime.track_calls,

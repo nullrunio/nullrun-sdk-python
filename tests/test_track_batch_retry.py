@@ -22,11 +22,14 @@ These tests pin the new contract:
 
 from __future__ import annotations
 
+import threading
+
 import httpx
 import pytest
 import respx
 
 from nullrun.breaker.exceptions import BreakerTransportError
+from nullrun.observability import metrics
 from nullrun.transport import Transport, _retry_with_backoff
 
 
@@ -275,3 +278,186 @@ def test_a_retry_after_already_in_the_past_is_not_a_floor(monkeypatch):
 
     _retry_with_backoff(_always_429, max_retries=1, base_delay=0.5, max_delay=10.0)
     assert delays and delays[0] > 0, f"a past date produced a non-positive wait: {delays}"
+
+
+# ──────────────────────────────────────────────────────────────
+# The ceiling: an 86400 must not hang a flush, and must not
+# be undercut either
+# ──────────────────────────────────────────────────────────────
+#
+# The previous code clamped with `min(server_wait, max_delay)`. That
+# bounds the wait — and it retries an hour early, which is exactly
+# what the floor tests above forbid at a smaller scale. A cap that
+# makes the SDK ignore a long Retry-After is not a safety feature; it
+# is the sustained-429 bug with a different number.
+
+
+def _reply(status: int, headers: dict | None = None) -> httpx.Response:
+    def _handler() -> httpx.Response:
+        resp = httpx.Response(
+            status, headers=headers or {}, json={"error": "rate_limited"}
+        )
+        resp.request = httpx.Request(
+            "POST", "https://api.test.nullrun.io/api/v1/track/batch"
+        )
+        resp.raise_for_status()
+        return resp
+
+    return _handler
+
+
+def test_a_retry_after_of_a_day_does_not_sit_through_the_day(monkeypatch):
+    """`Retry-After: 86400` must not park a flush thread for 24 hours."""
+    slept: list[float] = []
+    monkeypatch.setattr("nullrun.transport.time.sleep", lambda s: slept.append(s))
+    monkeypatch.setattr("nullrun.transport.threading.Event.wait", lambda self, t=None: False)
+
+    calls = {"n": 0}
+
+    def _always_429() -> httpx.Response:
+        calls["n"] += 1
+        resp = httpx.Response(429, headers={"Retry-After": "86400"}, json={})
+        resp.request = httpx.Request(
+            "POST", "https://api.test.nullrun.io/api/v1/track/batch"
+        )
+        resp.raise_for_status()
+        return resp
+
+    with pytest.raises(BreakerTransportError):
+        _retry_with_backoff(_always_429, max_retries=10, base_delay=0.5, max_delay=30.0)
+
+    assert not slept, f"a 24h Retry-After was waited out: {slept}"
+    assert calls["n"] == 1, (
+        f"the SDK retried {calls['n']} time(s) inside a window the server "
+        f"declared closed for a day"
+    )
+
+
+def test_an_over_ceiling_retry_after_stops_the_cycle_instead_of_retrying_early(
+    monkeypatch,
+):
+    """The distinction that matters: no wait, no retry, no data loss.
+
+    Refusing to retry is safe here only because the events are already
+    durable. Asserting the call count alone would pass against a version
+    that dropped them, so the exhaustion path is checked too.
+    """
+    # The metrics registry is process-global and this file has no reset
+    # fixture, so counters are asserted as DELTAS. An absolute assert here
+    # would fail on suite ordering and hide a real regression behind a
+    # bookkeeping error.
+    before = metrics.transport.retry_after_deferred
+    calls = {"n": 0}
+
+    def _always_429() -> httpx.Response:
+        calls["n"] += 1
+        resp = httpx.Response(429, headers={"Retry-After": "3600"}, json={})
+        resp.request = httpx.Request(
+            "POST", "https://api.test.nullrun.io/api/v1/track/batch"
+        )
+        resp.raise_for_status()
+        return resp
+
+    with pytest.raises(BreakerTransportError):
+        _retry_with_backoff(
+            _always_429, max_retries=10, base_delay=0.5, max_delay=30.0
+        )
+
+    assert calls["n"] == 1
+    assert metrics.transport.retry_after_deferred == before + 1
+
+
+def test_a_retry_after_under_the_ceiling_is_still_honoured(monkeypatch):
+    """The ceiling is a ceiling, not a replacement for the floor.
+
+    Capping everything at 30s would satisfy the previous test too — and
+    would make every 429 immediate, which is the bug this whole file
+    exists to pin. A 5s floor must still produce a >=5s wait.
+    """
+    delays: list[float] = []
+    monkeypatch.setattr("nullrun.transport.time.sleep", lambda s: delays.append(s))
+    calls = {"n": 0}
+
+    def _then_ok() -> httpx.Response:
+        calls["n"] += 1
+        resp = httpx.Response(
+            200 if calls["n"] >= 2 else 429,
+            **({} if calls["n"] >= 2 else {"headers": {"Retry-After": "5"}}),
+            json={},
+        )
+        resp.request = httpx.Request(
+            "POST", "https://api.test.nullrun.io/api/v1/track/batch"
+        )
+        resp.raise_for_status()
+        return resp
+
+    _retry_with_backoff(_then_ok, max_retries=2, base_delay=0.5, max_delay=30.0)
+    assert delays and min(delays) >= 5.0, f"a sub-ceiling floor was cut: {delays}"
+
+
+def test_the_ceiling_is_configurable(monkeypatch):
+    """An operator whose backend rate-limits for 5 minutes needs to say so."""
+    slept: list[float] = []
+    monkeypatch.setattr("nullrun.transport.time.sleep", lambda s: slept.append(s))
+    monkeypatch.setenv("NULLRUN_RETRY_AFTER_CEILING", "600")
+    before = metrics.transport.retry_after_deferred
+    calls = {"n": 0}
+
+    def _always_429() -> httpx.Response:
+        calls["n"] += 1
+        resp = httpx.Response(429, headers={"Retry-After": "300"}, json={})
+        resp.request = httpx.Request(
+            "POST", "https://api.test.nullrun.io/api/v1/track/batch"
+        )
+        resp.raise_for_status()
+        return resp
+
+    with pytest.raises(BreakerTransportError):
+        _retry_with_backoff(_always_429, max_retries=2, base_delay=0.5, max_delay=30.0)
+
+    assert metrics.transport.retry_after_deferred == before, (
+        "a raised ceiling did not let a 300s floor through"
+    )
+    assert slept, "the 300s floor produced no wait at all"
+
+
+def test_a_retry_wait_is_cut_short_by_shutdown(monkeypatch):
+    """`Transport.stop()` must not wait out a `Retry-After`.
+
+    A process that is exiting and is told to stop should stop. The wait it
+    is in is the one place it cannot currently choose to leave, because
+    `time.sleep` is not wakeable — which is why the wait became an
+    `Event.wait`. The SDK's own stop event is the one a shutdown sets.
+    """
+    cancel = threading.Event()
+    real_wait = threading.Event.wait
+    interrupted_before = metrics.transport.retries_interrupted_by_shutdown
+
+    def _wait_then_cancel(self, timeout=None):
+        # A shutdown arriving 20ms into a 30s wait.
+        cancel.set()
+        return real_wait(self, 0.02)
+
+    monkeypatch.setattr("nullrun.transport.threading.Event.wait", _wait_then_cancel)
+    monkeypatch.setattr("nullrun.transport.time.sleep", lambda s: pytest.fail("slept"))
+
+    calls = {"n": 0}
+
+    def _always_429() -> httpx.Response:
+        calls["n"] += 1
+        resp = httpx.Response(429, headers={"Retry-After": "30"}, json={})
+        resp.request = httpx.Request(
+            "POST", "https://api.test.nullrun.io/api/v1/track/batch"
+        )
+        resp.raise_for_status()
+        return resp
+
+    with pytest.raises(BreakerTransportError):
+        _retry_with_backoff(
+            _always_429, max_retries=10, base_delay=0.5, max_delay=30.0, cancel=cancel
+        )
+
+    assert calls["n"] == 1, (
+        f"shutdown did not stop the retry loop; it made {calls['n']} attempts"
+    )
+    assert metrics.transport.retries_interrupted_by_shutdown == interrupted_before + 1

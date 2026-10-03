@@ -79,12 +79,13 @@ def default_wal_path() -> str:
 
 
 def dlq_paths(wal_path: str) -> dict[str, str]:
-    """The four files that make up one WAL, for display and for the CLI."""
+    """The files that make up one WAL, for display and for the CLI."""
     return {
         "active": wal_path,
         "rotated": f"{wal_path}.1",
         "inflight": f"{wal_path}.inflight",
         "dlq": f"{wal_path}.dlq",
+        "holdover": f"{wal_path}.holdover",
         "lock": f"{wal_path}.lock",
     }
 
@@ -149,6 +150,15 @@ def _cmd_status(args: argparse.Namespace) -> int:
     for name, path in paths.items():
         exists = os.path.exists(path)
         print(f"  {name:<9} {path}  {os.path.getsize(path) if exists else '-'} bytes")
+
+    held, _ = read_dlq(paths["holdover"])
+    if held:
+        print(
+            f"\nHoldover: {len(held)} refusal(s) waiting for DLQ room. They are "
+            f"durable and are NOT being re-sent. Free space by raising "
+            f"NULLRUN_DLQ_MAX_BYTES or archiving the DLQ; they drain on the "
+            f"next flush."
+        )
 
     rows, corrupt = read_dlq(paths["dlq"])
     if not rows and not corrupt:
@@ -215,17 +225,24 @@ def _unconfirmed_event_ids(transport: Any, wal_path: str) -> set[str]:
 
     Reads the scratch DLQ file, not a parsed snapshot: a row can be written
     after the flush returns if the transport retried internally.
+
+    The holdover file is read for the same reason, and it is a file rather
+    than the in-memory index precisely because the index can be truncated by
+    NULLRUN_DLQ_HOLDOVER_MAX_EVENTS — a replay that trusted the index alone
+    would call a held-and-unwritten event confirmed and delete it.
     """
     ids = {str(e.get("event_id")) for e in getattr(transport, "_buffer", []) or []}
     for row in getattr(transport, "_dlq_overflow", []) or []:
         event = row.get("event") if isinstance(row, dict) else None
         if isinstance(event, dict):
             ids.add(str(event.get("event_id")))
-    parked, _ = read_dlq(dlq_paths(wal_path)["dlq"])
-    for row in parked:
-        event = _row_event(row)
-        if event is not None:
-            ids.add(str(event.get("event_id")))
+    paths = dlq_paths(wal_path)
+    for key in ("dlq", "holdover"):
+        parked, _ = read_dlq(paths[key])
+        for row in parked:
+            event = _row_event(row)
+            if event is not None:
+                ids.add(str(event.get("event_id")))
     return ids
 
 

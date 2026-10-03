@@ -514,8 +514,10 @@ def test_a_terminal_refusal_that_cannot_be_recorded_is_held_not_resent(
     It also must not go back on the SEND path. The earlier version of this
     test asserted exactly that, and it was asserting the bug: a terminal
     refusal re-sent produces the identical refusal forever while occupying
-    the head of the buffer. The event is held in memory instead, and
-    `.inflight` is retained because the holdover is not durable.
+    the head of the buffer. The event is held instead, and `.inflight` is
+    retained until the holdover has its own durable copy in
+    `<wal>.holdover` — see the kill -9 test below for why retaining
+    `.inflight` alone is not enough.
     """
     monkeypatch.setenv("NULLRUN_DLQ_MAX_BYTES", "1")
     transport.track(_event(1))
@@ -539,6 +541,201 @@ def test_a_terminal_refusal_that_cannot_be_recorded_is_held_not_resent(
     assert transport._buffer == [], "a terminally refused event was put back on the send path"
     assert [r["event"]["event_id"] for r in transport._dlq_overflow] == ["evt-1"]
     assert metrics.transport.dlq_holdover == 1
+
+
+def test_a_held_refusal_survives_a_kill_minus_nine(transport, tmp_path, monkeypatch):
+    """The user's question: are held events durable, or only in memory?
+
+    A memory-only holdover is lost by `kill -9`, and the fix that introduced
+    it looked safe because `.inflight` was still on disk holding the batch the
+    refusal came from. It is not: the next flush calls `_persist_inflight`
+    with ITS batch, which overwrites the file. So a process that holds a
+    refusal and then flushes again has silently overwritten the only
+    on-disk trace of it, and the events are in the DLQ nowhere, in `.wal`
+    nowhere, and in `.inflight` overwritten.
+
+    So the test does what a kill does, not what a graceful stop does: it
+    throws the Transport away and builds a NEW one over the same WAL path,
+    with no flush, no `stop()`, and no chance for the dying process to write
+    anything. A fresh instance that finds the held event proves the record
+    outlived the process; one that finds nothing proves the loss.
+    """
+    _dlq_never_fits(monkeypatch)
+    transport.track(_event(1))
+    transport._client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda r: httpx.Response(
+                422,
+                json={"error_code": "EXECUTION_NOT_BOUND", "message": "no binding"},
+            )
+        )
+    )
+    try:
+        transport._do_flush()
+    finally:
+        transport._client.close()
+
+    assert transport._dlq_overflow, "nothing was held, so this test proves nothing"
+
+    # The overwrite that loses a memory-only holdover. Same process, so this
+    # is the *benign* case; a kill needs no help from anyone.
+    transport._persist_inflight([_event(99)])
+
+    recovered = Transport(api_url=transport.api_url, api_key="test-key-12345678")
+    try:
+        recovered._recover_holdover()
+        assert [r["event"]["event_id"] for r in recovered._dlq_overflow] == ["evt-1"], (
+            "a fresh process over the same WAL does not find the held refusal: "
+            "it lived in memory only and a kill -9 would have lost it"
+        )
+        assert recovered._buffer == [], "a refused event was put back on the send path"
+    finally:
+        recovered.stop(flush=False)
+
+
+def test_a_recovered_holdover_drains_without_being_resent(transport, monkeypatch):
+    """Recovery restores the hold, not the send. Re-sending is the bug.
+
+    A refusal is terminal: sending it again produces the identical refusal
+    and occupies the head of the buffer while it does. If recovery put these
+    events back on the send path, the restart would reintroduce exactly the
+    head-of-buffer starvation the holdover was added to stop — and it would do
+    it on every restart, which is the condition under which an operator is
+    most likely to be watching.
+    """
+    _dlq_never_fits(monkeypatch)
+    transport.track(_event(1))
+    transport._client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda r: httpx.Response(
+                422,
+                json={"error_code": "EXECUTION_NOT_BOUND", "message": "no binding"},
+            )
+        )
+    )
+    try:
+        transport._do_flush()
+    finally:
+        transport._client.close()
+
+    sent: list[list[str]] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        sent.append([e["event_id"] for e in json.loads(request.content)["events"]])
+        return httpx.Response(200, json={"processed": 0, "accepted_event_ids": []})
+
+    recovered = Transport(api_url=transport.api_url, api_key="test-key-12345678")
+    try:
+        recovered._recover_holdover()
+        recovered._client = httpx.Client(transport=httpx.MockTransport(_handler))
+        # The DLQ still has no room, so this is a no-op — which is the point.
+        # What must not happen is a send.
+        assert recovered._drain_dlq_overflow() == 0
+        assert sent == [], f"a recovered refusal was re-sent: {sent}"
+        assert [r["event"]["event_id"] for r in recovered._dlq_overflow] == ["evt-1"]
+    finally:
+        recovered._client.close()
+        recovered.stop(flush=False)
+
+
+def test_a_drain_releases_only_the_drained_rows_from_the_holdover(
+    transport, monkeypatch
+):
+    """Partial drain must not delete the rows it did not write.
+
+    The holdover file can hold MORE than the in-memory index: the index is
+    bounded by NULLRUN_DLQ_HOLDOVER_MAX_EVENTS and drops its oldest entries,
+    and those rows are still owed a DLQ. Releasing the file wholesale after a
+    partial drain would delete exactly the rows nobody tracked — the events
+    the bound was introduced to stop the SDK from caring about, deleted
+    silently by the mechanism meant to protect them.
+    """
+    monkeypatch.setenv("NULLRUN_DLQ_MAX_BYTES", "1000000")
+    transport.track(_event(1))
+    transport.track(_event(2))
+    # Force the hold for both, so the file has two rows.
+    transport._hold_for_dlq(
+        [transport._dlq_row(_event(1), "EXECUTION_NOT_BOUND:422"),
+         transport._dlq_row(_event(2), "EXECUTION_NOT_BOUND:422")],
+        "EXECUTION_NOT_BOUND:422",
+    )
+    assert os.path.exists(transport._wal_holdover_path())
+
+    # Truncate the index, as the cap would, leaving one row tracked.
+    monkeypatch.setenv("NULLRUN_DLQ_HOLDOVER_MAX_EVENTS", "1")
+    transport._trim_holdover_index()
+    assert [r["event"]["event_id"] for r in transport._dlq_overflow] == ["evt-2"]
+
+    assert transport._drain_dlq_overflow() == 1
+
+    rows, _ = read_dlq(transport._wal_holdover_path())
+    remaining = [r["event"]["event_id"] for r in rows if isinstance(r.get("event"), dict)]
+    assert remaining == ["evt-1"], (
+        f"the drained row and/or the untracked row are wrong: {remaining}"
+    )
+
+
+def test_the_holdover_index_is_bounded_and_says_so(transport, monkeypatch, caplog):
+    """A bound with a metric, not a bound that quietly drops events.
+
+    Two properties, because they are the same decision: the index must not
+    grow without limit while the DLQ stays full, and the truncation must be
+    visible — a bound that silently discards makes `dlq_holdover` a liar,
+    and a metric that under-reports is worse than no metric.
+    """
+    monkeypatch.setenv("NULLRUN_DLQ_HOLDOVER_MAX_EVENTS", "3")
+    for i in range(1, 8):
+        transport._hold_for_dlq(
+            [transport._dlq_row(_event(i), "EXECUTION_NOT_BOUND:422")],
+            "EXECUTION_NOT_BOUND:422",
+        )
+
+    assert len(transport._dlq_overflow) == 3, "the index is unbounded"
+    assert [r["event"]["event_id"] for r in transport._dlq_overflow] == [
+        "evt-5", "evt-6", "evt-7",
+    ], "the bound kept the wrong end; the oldest are the ones still owed"
+    assert metrics.transport.dlq_holdover_index_truncated == 4
+    assert "NOT lost" in caplog.text, "truncation was not reported as non-loss"
+
+    # The data is not truncated, only the index — this is the whole claim.
+    rows, _ = read_dlq(transport._wal_holdover_path())
+    assert len([r for r in rows if isinstance(r.get("event"), dict)]) == 7
+
+
+def test_a_holdover_that_cannot_be_written_says_the_event_is_in_memory_only(
+    transport, monkeypatch, caplog
+):
+    """The one holdover counter that means possible LOSS must say so.
+
+    Every other holdover outcome is deferred recording, and a restart still
+    gets the rows. A failed holdover write is different: the rows are in RAM
+    and nowhere else, and a kill takes them. Silently continuing would make
+    the failure indistinguishable from the healthy case at the only point
+    where anyone could still act on it.
+    """
+    monkeypatch.setenv("NULLRUN_DLQ_MAX_BYTES", "1")
+    transport.track(_event(1))
+    transport._client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda r: httpx.Response(
+                422,
+                json={"error_code": "EXECUTION_NOT_BOUND", "message": "no binding"},
+            )
+        )
+    )
+    # The holdover write is the thing under test, so it is the thing that fails.
+    monkeypatch.setattr(
+        Transport, "_write_events_atomic",
+        lambda self, path, events, mode="w": False,
+    )
+    try:
+        transport._do_flush()
+    finally:
+        transport._client.close()
+
+    assert transport._dlq_overflow, "nothing was held"
+    assert metrics.transport.dlq_holdover_persist_failures == 1
+    assert "in memory only" in caplog.text
 
 
 def _dlq_never_fits(monkeypatch) -> None:
@@ -1022,3 +1219,54 @@ def test_replay_needs_an_api_key_before_it_does_anything(tmp_path, monkeypatch, 
     assert rc == 1
     assert dlq.read_bytes() == before
     assert "no API key" in capsys.readouterr().err
+
+
+def test_a_200_without_accepted_event_ids_removes_nothing(tmp_path, monkeypatch):
+    """The response-shape case: a 2xx that cannot be read as a confirmation.
+
+    A proxy's HTML page, an empty body, or a backend predating the field
+    all produce a 200 that says nothing about which events landed. Reading
+    it as "sent, therefore confirmed" deletes rows on the strength of a
+    response that never mentioned them — and a 2xx is exactly what a
+    misconfigured proxy returns.
+
+    This is the fourth way `replay` can lose a row, and the three covered
+    above (HTTP error, refusal named in `rejection_details`, explicit
+    partial list) all come from a backend that is answering in the
+    contract's shape. This one does not.
+    """
+    monkeypatch.setenv("NULLRUN_WAL_PATH", str(tmp_path / "sdk.wal"))
+    t = Transport(api_url="https://api.test.nullrun.io", api_key="test-key-12345678")
+    try:
+        _seed_dlq(t)
+        dlq = t._wal_dlq_path()
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, text="<html>proxy error</html>")
+
+        original = Transport.__init__
+
+        def _patched_init(self, *a, **kw):
+            original(self, *a, **kw)
+            self._client.close()
+            self._client = httpx.Client(transport=httpx.MockTransport(_handler))
+
+        monkeypatch.setattr(Transport, "__init__", _patched_init)
+        rc = wal_main(
+            [
+                "--wal",
+                str(tmp_path / "sdk.wal"),
+                "replay",
+                "--execute",
+                "--api-key",
+                "k-12345678",
+            ]
+        )
+    finally:
+        t._client.close()
+
+    assert rc == 1, f"an unreadable 200 was treated as a success: rc={rc}"
+    remaining = [r["event"]["event_id"] for r in _read_wal(dlq)]
+    assert remaining == ["evt-1", "evt-2", "evt-3"], (
+        f"rows were removed on the strength of a 200 that named no events: {remaining}"
+    )
