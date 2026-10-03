@@ -136,6 +136,7 @@ from nullrun.transport import (
     FallbackMode,
     FlushConfig,
     Transport,
+    TransportErrorHandler,
     TransportErrorSource,
     _emit_for_transport_error,
     _protocol_header_value,
@@ -3409,7 +3410,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         tool_name: str,
         input_data: dict[str, Any],
         mode: str = "auto",
-        on_transport_error: Callable[[Exception], dict[str, Any]] | None = None,
+        on_transport_error: TransportErrorHandler | None = None,
         business_impact: dict[str, Any] | None = None,
         action_digest: str | None = None,
         # ``tools`` is supplied by the ``@sensitive`` decorator and
@@ -3429,8 +3430,14 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             input_data: Tool input parameters
             mode: Execution mode ("auto", "strict"). "inline" was
                 removed in 0.19.0 and now raises.
-            on_transport_error: Optional callback for transport-error
-                handling; prefer the typed exception path.
+            on_transport_error: How a transport failure is surfaced —
+                a callback, or one of the ADR-008 strings ``"raise"`` /
+                ``"open"`` / ``"closed"``. Defaults to ``None``, which falls
+                through to ``fallback_mode`` (so ``mode="strict"`` blocks).
+                The strings are forwarded verbatim to
+                ``Transport.execute``; the annotation here was narrower than
+                the code has always accepted, which made the documented
+                ``"raise"`` arm un-passable under a type checker.
             business_impact: Typed action payload (Money impact for
                 now). When supplied, the backend uses it to evaluate
                 rule predicates AND stamps the approval row's

@@ -42,6 +42,30 @@ __all__ = ["main", "read_dlq", "dlq_paths", "default_wal_path"]
 
 _DEFAULT_WAL = os.path.join(tempfile.gettempdir(), "nullrun.wal")
 
+# Refusals that replaying cannot fix, so replay refuses them by default.
+#
+# `EXECUTION_NOT_BOUND` is the load-bearing case: the execution is bound
+# server-side for 24 hours and the binding has expired, which is a statement
+# about a resource that no longer exists. Re-sending the event does not
+# recreate the binding, it just produces the same 422. Recovering this class
+# needs an ingest that records the spend without a reservation to attach it
+# to — a ledger-only path that does not exist in this SDK yet, and that the
+# backend has to grow before it can be offered here.
+#
+# Without this list, `replay` accepts the refusal, gets the same refusal
+# back, and — because the check for "did it land?" could not see where the
+# event had gone — reports success and DELETES the operator's only record of
+# the event. A tool that destroys evidence on a failed repair is worse than
+# one that refuses to run.
+_TERMINAL_WITHOUT_REPLAY = {
+    "EXECUTION_NOT_BOUND:422",
+    "EXECUTION_NOT_BOUND:503",
+}
+
+
+def _is_terminal_without_replay(reason: str) -> bool:
+    return reason in _TERMINAL_WITHOUT_REPLAY
+
 
 def default_wal_path() -> str:
     """The WAL path this host would use, honouring ``NULLRUN_WAL_PATH``.
@@ -151,10 +175,58 @@ def _cmd_status(args: argparse.Namespace) -> int:
 
 
 def _select_rows(
-    rows: list[dict[str, Any]], reason: str | None, limit: int | None
-) -> list[dict[str, Any]]:
-    selected = [r for r in rows if reason is None or _row_reason(r) == reason]
-    return selected[:limit] if limit else selected
+    rows: list[dict[str, Any]],
+    reason: str | None,
+    limit: int | None,
+    include_terminal: bool = False,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Filter DLQ rows down to what the operator asked for.
+
+    Returns ``(selected, withheld)``. ``withheld`` is the terminal class that
+    was excluded by default (see ``_TERMINAL_WITHOUT_REPLAY``) — it is
+    returned rather than dropped so the caller can NAME it in its output. A
+    repair tool that silently skipped rows would leave the operator believing
+    the DLQ had been fully considered.
+
+    ``--reason`` is applied before the terminal filter, so naming a terminal
+    reason explicitly and getting nothing back is not a silent no-op either:
+    it still reports the rows as withheld.
+    """
+    matched = [r for r in rows if reason is None or _row_reason(r) == reason]
+    if include_terminal:
+        return (matched[:limit] if limit else matched), []
+    replayable = [r for r in matched if not _is_terminal_without_replay(_row_reason(r))]
+    withheld = [r for r in matched if _is_terminal_without_replay(_row_reason(r))]
+    return (replayable[:limit] if limit else replayable), withheld
+
+
+def _unconfirmed_event_ids(transport: Any, wal_path: str) -> set[str]:
+    """Event ids the backend did not accept, wherever they ended up.
+
+    An event the transport refused can be in exactly two places, and this
+    function used to look at neither consistently: the in-memory buffer (only
+    for a flush that never ran) and — through ``transport._buffer`` alone —
+    nothing at all for a flush that did run. A refused event is parked in the
+    scratch DLQ or held in ``_dlq_overflow``; neither is the buffer. So a
+    replay whose every event was refused reported zero unconfirmed and then
+    DELETED the operator's only record of events the backend had just refused.
+    That is the failure this exists to prevent, so both destinations are
+    enumerated here rather than one of them.
+
+    Reads the scratch DLQ file, not a parsed snapshot: a row can be written
+    after the flush returns if the transport retried internally.
+    """
+    ids = {str(e.get("event_id")) for e in getattr(transport, "_buffer", []) or []}
+    for row in getattr(transport, "_dlq_overflow", []) or []:
+        event = row.get("event") if isinstance(row, dict) else None
+        if isinstance(event, dict):
+            ids.add(str(event.get("event_id")))
+    parked, _ = read_dlq(dlq_paths(wal_path)["dlq"])
+    for row in parked:
+        event = _row_event(row)
+        if event is not None:
+            ids.add(str(event.get("event_id")))
+    return ids
 
 
 def _cmd_replay(args: argparse.Namespace) -> int:
@@ -168,10 +240,30 @@ def _cmd_replay(args: argparse.Namespace) -> int:
             "and are left in place",
             file=sys.stderr,
         )
-    selected = _select_rows(rows, args.reason, args.limit)
+    selected, withheld = _select_rows(
+        rows, args.reason, args.limit, include_terminal=args.include_terminal
+    )
+    if withheld:
+        reasons = Counter(_row_reason(r) for r in withheld)
+        listing = ", ".join(f"{r} x{n}" for r, n in reasons.most_common())
+        print(
+            f"note: {len(withheld)} selected row(s) are refusals that replaying "
+            f"cannot fix ({listing}). They stay in the DLQ. Re-sending them "
+            "would return the same refusal and could multiply duplicates if the "
+            "backend's behaviour changes between runs. Recovering this class "
+            "needs a ledger-only ingest that records the spend without a "
+            "reservation — not yet implemented. Pass --include-terminal to "
+            "send them anyway.",
+            file=sys.stderr,
+        )
     if not selected:
+        # rc 1 when rows existed but all were withheld, rc 0 when the DLQ
+        # simply had nothing. "Nothing to replay" after a deliberate --execute
+        # against a non-empty DLQ is a failure the caller needs to see; an
+        # empty DLQ is not. A 0 here would let a scheduled repair report
+        # success while sending nothing.
         print("nothing to replay")
-        return 0
+        return 1 if withheld else 0
 
     replayable = [(r, _row_event(r)) for r in selected]
     missing = [r for r, e in replayable if e is None]
@@ -209,14 +301,17 @@ def _cmd_replay(args: argparse.Namespace) -> int:
     # environment, so the override is scoped to the block and restored after.
     previous_wal = os.environ.get("NULLRUN_WAL_PATH")
     with tempfile.TemporaryDirectory(prefix="nullrun-wal-replay-") as scratch:
-        os.environ["NULLRUN_WAL_PATH"] = os.path.join(scratch, "replay.wal")
+        scratch_wal = os.path.join(scratch, "replay.wal")
+        os.environ["NULLRUN_WAL_PATH"] = scratch_wal
         try:
             transport = Transport(args.api_url, api_key=api_key, secret_key=args.secret_key)
             try:
                 for event in events:
                     transport.track(event)
                 transport._do_flush()  # no start(): we want no background thread
-                unconfirmed = {str(e.get("event_id")) for e in transport._buffer}
+                # Read BEFORE the scratch dir goes away — this is the only
+                # place the refusals from this run are recorded.
+                unconfirmed = _unconfirmed_event_ids(transport, scratch_wal)
             finally:
                 transport.stop(flush=False)
         finally:
@@ -329,6 +424,15 @@ def main(argv: list[str] | None = None) -> int:
         help="Only replay rows with this exact reason (default: all).",
     )
     replay.add_argument("--limit", type=int, help="Replay at most N rows.")
+    replay.add_argument(
+        "--include-terminal",
+        action="store_true",
+        help=(
+            "Also send refusals that re-sending cannot fix (currently "
+            + ", ".join(sorted(_TERMINAL_WITHOUT_REPLAY))
+            + "). Off by default: the send is expected to fail identically."
+        ),
+    )
     replay.add_argument(
         "--dry-run",
         action="store_true",

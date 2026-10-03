@@ -27,7 +27,7 @@ import pytest
 import respx
 
 from nullrun.breaker.exceptions import BreakerTransportError
-from nullrun.transport import Transport
+from nullrun.transport import Transport, _retry_with_backoff
 
 
 @pytest.fixture
@@ -103,3 +103,175 @@ class TestTrackBatchRetry:
         result = transport._send_batch_with_retry_info([{"event": "e1"}])
         assert route.call_count == 1
         assert "e1" in result.accepted_event_ids
+
+
+# ──────────────────────────────────────────────────────────────
+# Retry-After: the delay, not the call count
+# ──────────────────────────────────────────────────────────────
+#
+# The test above says "429 with Retry-After — helper honors the header
+# before the next attempt (we assert call count, not exact delay)". Asserting
+# the call count is what let a dead parameter survive: `last_retry_after_seconds`
+# was documented, threaded through the signature, and never passed by any
+# caller, and the suite stayed green because the number of attempts does not
+# depend on how long you wait between them. These assert the delay.
+
+
+def test_a_429_is_not_retried_before_the_server_said_it_may_be(monkeypatch):
+    """The floor is the server's, and the SDK must not undercut it.
+
+    Pre-fix, a 429 fell through to plain exponential backoff: base_delay
+    0.5s, so the retry landed well before the `Retry-After: 5` the server
+    asked for, re-tripping the rate limit that had just answered. The retry
+    then repeated at 1s, 2s, 4s — all inside the window the server had
+    declared closed.
+    """
+    delays: list[float] = []
+    monkeypatch.setattr(
+        "nullrun.transport.time.sleep", lambda s: delays.append(s)
+    )
+
+    calls = {"n": 0}
+
+    def _always_429() -> httpx.Response:
+        # `raise_for_status` is what the real `_post_batch` does for a 429;
+        # without it the loop sees a plain response and returns it, so no
+        # retry (and no delay) happens at all.
+        calls["n"] += 1
+        resp = httpx.Response(
+            200 if calls["n"] >= 2 else 429,
+            **({} if calls["n"] >= 2 else {"headers": {"Retry-After": "5"}}),
+            json={},
+        )
+        resp.request = httpx.Request("POST", "https://api.test.nullrun.io/api/v1/track/batch")
+        resp.raise_for_status()
+        return resp
+
+    _retry_with_backoff(_always_429, max_retries=3, base_delay=0.5, max_delay=10.0)
+
+    assert delays, "the retry happened without sleeping"
+    assert min(delays) >= 5.0, (
+        f"a retry went out before the server's floor: {delays}"
+    )
+
+
+def test_retry_after_jitter_never_reduces_the_wait_but_does_spread_it(monkeypatch):
+    """Jitter is one-sided, and it is present.
+
+    Two properties in one test because they are the same decision: a fleet
+    that got limited together must not retry together, but no member of it
+    may retry before the limit lifts. A symmetric jitter would satisfy the
+    first and violate the second.
+    """
+    samples: list[float] = []
+    monkeypatch.setattr(
+        "nullrun.transport.time.sleep", lambda s: samples.append(s)
+    )
+
+    for _ in range(12):
+        calls = {"n": 0}
+
+        def _always_429() -> httpx.Response:
+            calls["n"] += 1
+            resp = httpx.Response(
+                200 if calls["n"] >= 2 else 429,
+                **({} if calls["n"] >= 2 else {"headers": {"Retry-After": "5"}}),
+                json={},
+            )
+            resp.request = httpx.Request(
+                "POST", "https://api.test.nullrun.io/api/v1/track/batch"
+            )
+            resp.raise_for_status()
+            return resp
+
+        _retry_with_backoff(_always_429, max_retries=1, base_delay=0.5, max_delay=10.0)
+
+    assert all(s >= 5.0 for s in samples), f"jitter went under the floor: {samples}"
+    assert len(set(samples)) > 1, f"every client retried at the same instant: {samples}"
+
+
+def test_a_429_without_the_header_falls_back_to_exponential_backoff(monkeypatch):
+    """No header is not an instruction to wait forever.
+
+    A server that rate-limits without stating a wait should not be able to
+    pin the SDK to a five-second floor per attempt; the backoff path is the
+    right answer there, and it is jittered symmetrically because no floor
+    applies.
+    """
+    delays: list[float] = []
+    monkeypatch.setattr(
+        "nullrun.transport.time.sleep", lambda s: delays.append(s)
+    )
+    calls = {"n": 0}
+
+    def _always_429() -> httpx.Response:
+        calls["n"] += 1
+        resp = httpx.Response(200 if calls["n"] >= 2 else 429, json={})
+        resp.request = httpx.Request(
+            "POST", "https://api.test.nullrun.io/api/v1/track/batch"
+        )
+        resp.raise_for_status()
+        return resp
+
+    _retry_with_backoff(_always_429, max_retries=1, base_delay=0.5, max_delay=10.0)
+    assert delays and delays[0] < 5.0, f"a headerless 429 was treated as a floor: {delays}"
+
+
+def test_retry_after_as_an_http_date_is_honoured(monkeypatch):
+    """The other RFC 7231 form. nginx and hand-rolled limiters differ here."""
+    from datetime import datetime, timedelta, timezone
+    from email.utils import format_datetime
+
+    delays: list[float] = []
+    monkeypatch.setattr(
+        "nullrun.transport.time.sleep", lambda s: delays.append(s)
+    )
+    when = format_datetime(
+        datetime.now(timezone.utc) + timedelta(seconds=4), usegmt=True
+    )
+    calls = {"n": 0}
+
+    def _always_429() -> httpx.Response:
+        calls["n"] += 1
+        resp = httpx.Response(
+            200 if calls["n"] >= 2 else 429,
+            **({} if calls["n"] >= 2 else {"headers": {"Retry-After": when}}),
+            json={},
+        )
+        resp.request = httpx.Request(
+            "POST", "https://api.test.nullrun.io/api/v1/track/batch"
+        )
+        resp.raise_for_status()
+        return resp
+
+    _retry_with_backoff(_always_429, max_retries=1, base_delay=0.5, max_delay=10.0)
+    assert delays and delays[0] >= 3.0, f"the HTTP-date form was not honored: {delays}"
+
+
+def test_a_retry_after_already_in_the_past_is_not_a_floor(monkeypatch):
+    """A stale date means "no floor stated", not "wait negative seconds"."""
+    delays: list[float] = []
+    monkeypatch.setattr(
+        "nullrun.transport.time.sleep", lambda s: delays.append(s)
+    )
+    calls = {"n": 0}
+
+    def _always_429() -> httpx.Response:
+        calls["n"] += 1
+        resp = httpx.Response(
+            200 if calls["n"] >= 2 else 429,
+            **(
+                {}
+                if calls["n"] >= 2
+                else {"headers": {"Retry-After": "Wed, 21 Oct 2015 07:28:00 GMT"}}
+            ),
+            json={},
+        )
+        resp.request = httpx.Request(
+            "POST", "https://api.test.nullrun.io/api/v1/track/batch"
+        )
+        resp.raise_for_status()
+        return resp
+
+    _retry_with_backoff(_always_429, max_retries=1, base_delay=0.5, max_delay=10.0)
+    assert delays and delays[0] > 0, f"a past date produced a non-positive wait: {delays}"

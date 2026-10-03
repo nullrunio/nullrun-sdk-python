@@ -103,6 +103,16 @@ class TransportMetrics:
     dlq_bytes: int = 0
     dlq_overflow_total: int = 0
     dlq_overflow_reason: str | None = None
+    # Terminal refusals the full DLQ could not take, currently held in memory.
+    # Non-zero means spend is being recorded nowhere durable yet. This is the
+    # state to alert on: `dlq_overflow_total` counts refusals over time, this
+    # counts events that are still unrecorded RIGHT NOW.
+    dlq_holdover: int = 0
+    dlq_holdover_total: int = 0
+    # Bisect cascades that stopped because the request budget ran out rather
+    # than because the cascade converged. A sustained rate means batches are
+    # being refused wholesale more often than the budget can isolate.
+    batches_bisect_budget_exhausted: int = 0
 
 
 @dataclass
@@ -223,6 +233,9 @@ class MetricsRegistry:
                     "dlq_bytes": self.transport.dlq_bytes,
                     "dlq_overflow_total": self.transport.dlq_overflow_total,
                     "dlq_overflow_reason": self.transport.dlq_overflow_reason,
+                    "dlq_holdover": self.transport.dlq_holdover,
+                    "dlq_holdover_total": self.transport.dlq_holdover_total,
+                    "batches_bisect_budget_exhausted": self.transport.batches_bisect_budget_exhausted,
                 },
                 "runtime": {
                     "track_calls": self.runtime.track_calls,

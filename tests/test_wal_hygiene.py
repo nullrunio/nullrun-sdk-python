@@ -113,22 +113,32 @@ def test_a_wal_left_by_a_previous_run_is_tightened_at_startup(tmp_path, monkeypa
         t._client.close()
 
 
-def test_windows_states_the_degradation_instead_of_failing_at_import(transport, caplog):
+def test_a_platform_without_flock_states_the_degradation_instead_of_failing(
+    transport, caplog, monkeypatch
+):
     """No `flock` here is a supported configuration, and it says so once.
 
     The failure this prevents is not an ImportError at module load — it is the
     silent one: a multi-process deployment on Windows, or on any platform
     without flock, believing it has the same protection it has on Linux.
+
+    The branch is reached by REMOVING `fcntl` rather than by running on a
+    platform that lacks it. Testing it only where the platform happens to
+    cooperate means the branch is asserted on Windows and skipped on every
+    Linux CI run — the assertion then never runs on the platform where a
+    regression would be introduced, which is the point of having Linux CI.
     """
     from nullrun import transport as transport_mod
 
-    if transport_mod.fcntl is not None:
-        pytest.skip("this platform has flock; the degraded branch cannot be reached")
+    monkeypatch.setattr(transport_mod, "fcntl", None)
 
     with caplog.at_level("WARNING"):
         with transport._wal_file_lock() as acquired:
             assert acquired is True, "a platform without flock must still be able to write"
     assert metrics.transport.wal_lock == "unavailable"
+    assert any("flock" in r.message for r in caplog.records), (
+        "the degradation must be stated, not merely recorded in a metric"
+    )
 
     # Once, not once per flush: this is a standing condition, and a warning
     # on every cycle buries the log under a fact that cannot change.
@@ -248,6 +258,93 @@ def test_the_lock_is_released_so_the_next_cycle_can_write(transport):
 
 
 @requires_posix_lock
+def test_flock_excludes_two_threads_of_one_process(transport):
+    """flock is per open file DESCRIPTION, not per process.
+
+    The trap this pins: a reader who concludes "flock does not work between
+    threads in one process" would add a `threading.Lock` next to it and be
+    wrong in the other direction — the `threading.Lock` would then be the only
+    thing serialising threads while the cross-process guarantee quietly
+    depends on an implementation detail nobody re-checks. The two are not
+    interchangeable, and the fact that they compose is the thing to write
+    down.
+
+    It works because every acquisition opens its OWN descriptor. A future
+    refactor that caches the fd to avoid an `open()` per lock would make
+    `LOCK_EX` a no-op between threads — the kernel would see the same open
+    file description and grant the second acquisition immediately. This test
+    is what makes that refactor loud.
+    """
+    import threading
+
+    acquired = []
+    refused = []
+    barrier = threading.Barrier(8)
+    lock = threading.Lock()
+
+    def contend() -> None:
+        barrier.wait(timeout=30)
+        with transport._wal_file_lock() as got:
+            if got:
+                with lock:
+                    acquired.append(1)
+            else:
+                with lock:
+                    refused.append(1)
+
+    threads = [threading.Thread(target=contend) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+        assert not t.is_alive(), "a contending thread hung rather than waiting its turn"
+
+    assert len(acquired) + len(refused) == 8
+    assert len(acquired) >= 1
+    # Nobody is dropped: a thread that could not take the lock inside the
+    # timeout is a caller that never learned it had to wait, which on the
+    # write path means a silently-skipped write.
+    assert not refused, "a same-process thread was refused the lock it should have waited for"
+    assert metrics.transport.wal_lock == "enabled"
+
+
+@requires_posix_lock
+def test_concurrent_threads_do_not_lose_a_dlq_row(transport):
+    """The property the lock is for, across threads rather than processes.
+
+    Appends are read-copy-append, so two writers each rewrite the file from
+    their own read. Serialised correctly, N threads × M rows produce N×M rows
+    with N×M distinct ids — nothing lost, nothing interleaved into an
+    unparseable line.
+    """
+    import threading
+
+    rows_per_thread = 25
+    threads_count = 8
+    start = threading.Barrier(threads_count)
+
+    def append(tid: int) -> None:
+        start.wait(timeout=30)
+        for i in range(rows_per_thread):
+            transport._write_dlq_rows(
+                [transport._dlq_row({"event_id": f"t{tid}-{i}", "type": "llm_call"}, "synthetic")]
+            )
+
+    threads = [threading.Thread(target=append, args=(i,)) for i in range(threads_count)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=120)
+        assert not t.is_alive()
+
+    expected = threads_count * rows_per_thread
+    rows = _read_wal(transport._wal_dlq_path())
+    assert len(rows) == expected, f"expected {expected} rows, got {len(rows)}"
+    ids = {r["event"]["event_id"] for r in rows}
+    assert len(ids) == expected, "a row was lost to another thread's rewrite"
+
+
+@requires_posix_lock
 def test_a_dlq_append_is_not_interleaved_by_a_concurrent_writer(transport):
     """The read-copy-append is the region the lock exists for.
 
@@ -294,6 +391,80 @@ def tmp_path_for(transport) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Durability. What can this filesystem actually promise?
+# ---------------------------------------------------------------------------
+
+
+@requires_posix_lock
+def test_a_posix_volume_really_does_fsync_its_directory(transport, tmp_path):
+    """The durability claim, asserted rather than assumed.
+
+    Every WAL write is tmp-file + fsync + `os.replace`. That sequence is only
+    worth anything if the DIRECTORY entry is also fsynced — `os.replace` is
+    atomic with respect to readers, but the rename itself is not durable until
+    the directory is synced, and a power cut can otherwise leave the file
+    that the WAL points at absent or stale. Windows has no directory fsync at
+    all, which is why the SDK reports `wal_dir_fsync` as a probed fact rather
+    than a promise.
+
+    This asserts the positive on the platform where the answer is supposed to
+    be yes. The existing degradation test covers the negative by removing
+    `fcntl`, but nothing pinned the healthy case, so a change that made the
+    probe always return False — silently downgrading every deployment's
+    durability claim — would have passed the whole suite.
+    """
+    assert transport._dir_fsync_supported(str(tmp_path)) is True
+    assert metrics.transport.wal_dir_fsync == "enabled", (
+        "the probe succeeded but the metric does not say so, so an operator "
+        "reading /health is told less than the code knows"
+    )
+
+
+@requires_posix_lock
+def test_the_wal_write_actually_reaches_the_volume(transport, tmp_path):
+    """A real write survives a reopen — the whole point of the WAL.
+
+    Complements the fsync probe: that one says the syscall works, this one
+    says the file is really where the SDK says it is, with the bytes the SDK
+    says it wrote, after the handle is closed and a new one is opened.
+    """
+    transport.track({"event_id": "durable-1", "type": "llm_call", "cost_cents": 1})
+    assert transport._persist_to_wal() is True, "the WAL write reported failure"
+    rows = _read_wal(transport._wal_path())
+    assert [r["event_id"] for r in rows] == ["durable-1"]
+
+
+@requires_posix_lock
+def test_recovery_reads_the_rotated_wal_not_just_the_active_one(transport, monkeypatch):
+    """A restart must find events in BOTH generations of the WAL.
+
+    Rotation moves the active file to `.wal.1` before a new one is written, so
+    after any rotation the oldest unflushed events live only in the rotated
+    file. A recovery path that read just the active WAL would silently drop
+    them — the worst shape of bug, because the process starts cleanly and the
+    events are simply not there. This is the closest thing to the SIGKILL case
+    that can be tested deterministically: a kill is a restart whose previous
+    exit did no cleanup, and the state it leaves behind is exactly a rotated
+    plus active pair.
+    """
+    wal = transport._wal_path()
+    rotated = f"{wal}.1"
+    with open(rotated, "w") as f:
+        f.write(json.dumps({"event_id": "older-1", "type": "llm_call"}) + "\n")
+    with open(wal, "w") as f:
+        f.write(json.dumps({"event_id": "newer-1", "type": "llm_call"}) + "\n")
+
+    delivered: list[str] = []
+    monkeypatch.setattr(
+        transport, "_do_flush", lambda: delivered.extend(e["event_id"] for e in transport._buffer)
+    )
+    transport._replay_from_wal()
+    assert sorted(delivered) == ["newer-1", "older-1"], (
+        f"recovery lost a generation of the WAL: {delivered}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # DLQ size cap. A full DLQ stalls; it never deletes.
 # ---------------------------------------------------------------------------
 
@@ -331,16 +502,20 @@ def test_the_dlq_cap_stalls_the_write_and_deletes_nothing(transport, monkeypatch
     )
 
 
-def test_a_terminal_refusal_that_cannot_be_recorded_stays_on_the_retry_path(
+def test_a_terminal_refusal_that_cannot_be_recorded_is_held_not_resent(
     transport, monkeypatch
 ):
     """A permanent rejection with no DLQ space must not clear `.inflight`.
 
     `_quarantine_to_dlq` clears the in-flight file because the events are
     parked. If the park failed, that clear is the loss: the events are in
-    neither the DLQ nor the buffer nor `.inflight`. The refusal will simply
-    come back on the next send, which is the right outcome for a rejection we
-    could not record.
+    neither the DLQ nor the buffer nor `.inflight`.
+
+    It also must not go back on the SEND path. The earlier version of this
+    test asserted exactly that, and it was asserting the bug: a terminal
+    refusal re-sent produces the identical refusal forever while occupying
+    the head of the buffer. The event is held in memory instead, and
+    `.inflight` is retained because the holdover is not durable.
     """
     monkeypatch.setenv("NULLRUN_DLQ_MAX_BYTES", "1")
     transport.track(_event(1))
@@ -361,7 +536,206 @@ def test_a_terminal_refusal_that_cannot_be_recorded_stays_on_the_retry_path(
     assert os.path.exists(transport._wal_inflight_path()), (
         "the only durable copy of an unrecorded refusal was discarded"
     )
-    assert [e["event_id"] for e in transport._buffer] == ["evt-1"]
+    assert transport._buffer == [], "a terminally refused event was put back on the send path"
+    assert [r["event"]["event_id"] for r in transport._dlq_overflow] == ["evt-1"]
+    assert metrics.transport.dlq_holdover == 1
+
+
+def _dlq_never_fits(monkeypatch) -> None:
+    """Make every DLQ write fail, whatever the size."""
+    monkeypatch.setenv("NULLRUN_DLQ_MAX_BYTES", "1")
+
+
+def test_a_full_dlq_does_not_block_the_healthy_events_behind_it(transport, monkeypatch):
+    """The whole point: one refused event must not stop the stream.
+
+    A full DLQ plus a refused event is a condition the SDK creates, not one
+    the operator creates, so it must not cost the delivery of every healthy
+    event behind it. Before the holdover, the refused event was re-queued at
+    the HEAD of the buffer and re-sent on every cycle — refused again, held
+    again — and the buffer never drained. The events that were fine sat
+    behind it forever.
+    """
+    _dlq_never_fits(monkeypatch)
+    sent: list[list[str]] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        ids = [e["event_id"] for e in json.loads(request.content)["events"]]
+        sent.append(ids)
+        return httpx.Response(
+            200,
+            json={
+                "processed": len(ids),
+                "accepted_event_ids": [i for i in ids if i.startswith("good")],
+                "rejection_details": [
+                    {"event_id": i, "reason": "reservation_not_found"}
+                    for i in ids
+                    if i.startswith("bad")
+                ],
+                "rejected_count": sum(1 for i in ids if i.startswith("bad")),
+            },
+        )
+
+    transport._client = httpx.Client(transport=httpx.MockTransport(_handler))
+    try:
+        for i, name in ((1, "bad-1"), (2, "good-1"), (3, "good-2")):
+            event = _event(i)
+            event["event_id"] = name
+            transport.track(event)
+        transport._do_flush()
+        assert transport._buffer == [], "healthy events were held up by the refused one"
+        assert {"good-1", "good-2"} <= set(sent[-1]), "the healthy events were not delivered"
+
+        # And nothing keeps being re-sent on a cycle where nothing changed.
+        before = len(sent)
+        transport._do_flush()
+        transport._do_flush()
+        assert len(sent) == before, "a terminally refused event was re-sent on every cycle"
+    finally:
+        transport._client.close()
+
+    assert [r["event"]["event_id"] for r in transport._dlq_overflow] == ["bad-1"]
+
+
+def test_a_whole_batch_refusal_is_bisected_before_anything_is_parked(transport, monkeypatch):
+    """A batch-level refusal is not evidence about every event in it.
+
+    The backend refused the whole request because of the one event in it that
+    cannot be recorded. Quarantining the batch on that evidence files 49
+    healthy events as refused for a reason that never applied to them — and
+    with no DLQ space it also re-queues the batch, so the healthy events are
+    re-sent and refused forever.
+    """
+    _dlq_never_fits(monkeypatch)
+    sent: list[list[str]] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        ids = [e["event_id"] for e in json.loads(request.content)["events"]]
+        sent.append(ids)
+        # Refuses only while the offender is still travelling with the batch.
+        if "bad-1" in ids:
+            return httpx.Response(
+                422,
+                json={"error_code": "EXECUTION_NOT_BOUND", "message": "no binding"},
+            )
+        return httpx.Response(
+            200,
+            json={
+                "processed": len(ids),
+                "accepted_event_ids": ids,
+                "rejection_details": [],
+                "rejected_count": 0,
+            },
+        )
+
+    transport._client = httpx.Client(transport=httpx.MockTransport(_handler))
+    try:
+        for i, name in ((1, "bad-1"), (2, "good-1"), (3, "good-2")):
+            event = _event(i)
+            event["event_id"] = name
+            transport.track(event)
+        transport._do_flush()
+    finally:
+        transport._client.close()
+
+    assert transport._buffer == [], "the batch was left on the retry path"
+    assert len(sent) > 1, "the refusal was not bisected, so the offender was never isolated"
+    assert {"good-1", "good-2"} <= {i for call in sent for i in call if i.startswith("good")}
+    held = [r["event"]["event_id"] for r in transport._dlq_overflow]
+    assert held == ["bad-1"], f"only the offender should be held, got {held}"
+
+
+def test_a_held_refusal_lands_as_soon_as_the_dlq_has_room(transport, monkeypatch):
+    """The holdover defers the write; it must not turn into a silent drop.
+
+    If space never frees, the operator is left with a DLQ that is short the
+    events it is supposed to hold and no indication that they exist anywhere.
+    So the held rows are re-attempted on every flush and land the moment the
+    write can succeed.
+    """
+    _dlq_never_fits(monkeypatch)
+    transport._dlq_overflow.append(transport._dlq_row(_event(1), "reservation_not_found"))
+    assert transport._write_dlq_rows([transport._dlq_row(_event(2), "synthetic")]) is False
+    assert len(transport._dlq_overflow) == 1, "a refused write must not drop what is held"
+
+    monkeypatch.setenv("NULLRUN_DLQ_MAX_BYTES", str(8 * 1024 * 1024))
+    transport._client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda r: httpx.Response(200, json={"processed": 0, "accepted_event_ids": []})
+        )
+    )
+    try:
+        transport._do_flush()
+    finally:
+        transport._client.close()
+
+    assert transport._dlq_overflow == []
+    rows = _read_wal(transport._wal_dlq_path())
+    assert [r["event"]["event_id"] for r in rows] == ["evt-1"]
+    assert metrics.transport.dlq_holdover == 0
+
+
+def test_a_bisect_cascade_spends_a_bounded_number_of_requests(transport, monkeypatch):
+    """Halving is 2^depth sends. The depth guard does not bound that.
+
+    A batch the backend refuses as a unit costs one request per singleton
+    explored. Without a request budget an all-bad batch spends the operator's
+    rate limit rediscovering what the first response already said — and a
+    refusal is exactly what a rate limiter starts answering, so the cascade
+    feeds the condition it is diagnosing.
+
+    The claim is that the cost is a function of the BUDGET, not of the batch:
+    1024 events must not cost more requests than 16.
+    """
+    monkeypatch.setenv("NULLRUN_MAX_BISECT_REQUESTS", "4")
+    sent: list[int] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        sent.append(len(json.loads(request.content)["events"]))
+        return httpx.Response(
+            422, json={"error_code": "EXECUTION_NOT_BOUND", "message": "no binding"}
+        )
+
+    costs: list[int] = []
+    # `track` auto-flushes at `batch_size` (50 by default), and each flush
+    # gets a fresh budget — so leaving it on would measure 20 flushes of 1024
+    # against 1 flush of 16. The claim under test is the cost of isolating an
+    # offender WITHIN one batch, so one batch has to reach the wire. The
+    # config is read at construction, so this cannot be set via env here.
+    transport.config.batch_size = 100_000
+    for size in (16, 1024):
+        sent.clear()
+        transport._buffer.clear()
+        transport._dlq_overflow.clear()
+        before_parked = len(_read_wal(transport._wal_dlq_path()))
+        transport._client = httpx.Client(transport=httpx.MockTransport(_handler))
+        try:
+            for i in range(size):
+                event = _event(i)
+                event["event_id"] = f"b{size}-{i}"
+                transport.track(event)
+            assert len(transport._buffer) == size, "the buffer flushed before the test could"
+            transport._do_flush()
+        finally:
+            transport._client.close()
+        costs.append(len(sent))
+        assert transport._buffer == [], "the un-split remainder was left on the send path"
+        # Every event of THIS batch is accounted for: newly parked in the DLQ,
+        # or held pending room. The holdover drains on the next flush, so it
+        # may legitimately be empty by the second iteration — what must never
+        # happen is an event that is in neither.
+        parked = len(_read_wal(transport._wal_dlq_path())) - before_parked
+        recorded = parked + len(transport._dlq_overflow)
+        assert recorded == size, f"{recorded} of {size} events recorded anywhere"
+
+    # One request for the batch, then the budget's worth of splits. The slack
+    # is the halves already dispatched when the budget ran out.
+    assert costs[0] <= 1 + 4 + 2, f"a 16-event batch cost {costs[0]} requests"
+    assert costs[1] == costs[0], (
+        f"cost scaled with batch size: {costs[0]} requests for 16 events, "
+        f"{costs[1]} for 1024"
+    )
+    assert metrics.transport.batches_bisect_budget_exhausted >= 2
 
 
 # ---------------------------------------------------------------------------
@@ -475,6 +849,134 @@ def test_replay_removes_only_the_events_the_backend_confirmed(tmp_path, monkeypa
     remaining = [r["event"]["event_id"] for r in _read_wal(dlq)]
     assert remaining == ["evt-3"], f"an unconfirmed row was removed: {remaining}"
     assert "sent 2 event(s)" in capsys.readouterr().out
+
+
+def _refusing_backend(monkeypatch, status: int, code: str) -> list[httpx.Request]:
+    """Install a class-level mock that refuses EVERY event with ``code``.
+
+    Returns the list of requests it saw, so a test can assert on what was
+    sent as well as on what the command did with the reply.
+    """
+    seen: list[httpx.Request] = []
+    original = Transport.__init__
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            status, json={"error_code": code, "error_message": "no binding"}
+        )
+
+    def _patched_init(self, *a, **kw):
+        original(self, *a, **kw)
+        self._client.close()
+        self._client = httpx.Client(transport=httpx.MockTransport(_handler))
+
+    monkeypatch.setattr(Transport, "__init__", _patched_init)
+    return seen
+
+
+def test_replay_that_is_refused_again_keeps_the_row_and_reports_failure(
+    tmp_path, monkeypatch, capsys
+):
+    """The whole batch refused ⇒ the evidence stays and the exit code is 1.
+
+    This is the case the existing partial test cannot reach: there, one
+    confirmed event masked the accounting. With every event refused, nothing
+    remains in the transport's buffer, so a check that only looked there
+    concluded "all confirmed" and DELETED every row — reporting success after
+    the backend had just rejected all of them. A refused event lives in the
+    scratch DLQ or in the DLQ holdover, not in the buffer; all three are read.
+    """
+    monkeypatch.setenv("NULLRUN_WAL_PATH", str(tmp_path / "sdk.wal"))
+    t = Transport(api_url="https://api.test.nullrun.io", api_key="test-key-12345678")
+    dlq = t._wal_dlq_path()
+    try:
+        _seed_dlq(t)
+    finally:
+        t._client.close()
+    _refusing_backend(monkeypatch, 400, "VALIDATION_FAILED")
+
+    rc = wal_main(
+        ["--wal", str(tmp_path / "sdk.wal"), "replay", "--execute", "--api-key", "k-12345678"]
+    )
+    captured = capsys.readouterr()
+    assert rc == 1, f"a fully-refused replay reported success: {captured.out}"
+    remaining = [r["event"]["event_id"] for r in _read_wal(dlq)]
+    assert remaining == ["evt-1", "evt-2", "evt-3"], (
+        f"a refused replay deleted the operator's only record: {remaining}"
+    )
+    assert "not confirmed" in captured.err
+
+
+def test_replay_withholds_a_refusal_re_sending_cannot_fix(
+    tmp_path, monkeypatch, capsys
+):
+    """An expired 24h binding is not a transport fault; nothing recovers it.
+
+    Re-sending produces the identical 422, so the default is to leave the row
+    and say why. `--include-terminal` is the operator overriding that.
+    """
+    monkeypatch.setenv("NULLRUN_WAL_PATH", str(tmp_path / "sdk.wal"))
+    t = Transport(api_url="https://api.test.nullrun.io", api_key="test-key-12345678")
+    dlq = t._wal_dlq_path()
+    try:
+        for i in (1, 2):
+            t._write_dlq_rows([t._dlq_row(_event(i), "EXECUTION_NOT_BOUND:422")])
+    finally:
+        t._client.close()
+
+    sent = _refusing_backend(monkeypatch, 422, "EXECUTION_NOT_BOUND")
+
+    rc = wal_main(
+        ["--wal", str(tmp_path / "sdk.wal"), "replay", "--execute", "--api-key", "k-12345678"]
+    )
+    err = capsys.readouterr().err
+    assert sent == [], f"a terminal refusal was re-sent: {len(sent)} request(s)"
+    assert rc == 1
+    assert "cannot fix" in err and "EXECUTION_NOT_BOUND:422" in err
+    assert [r["event"]["event_id"] for r in _read_wal(dlq)] == ["evt-1", "evt-2"]
+
+
+def test_include_terminal_sends_them_anyway_and_does_not_duplicate(
+    tmp_path, monkeypatch, capsys
+):
+    """The override sends; the rows stay, because the send still failed."""
+    monkeypatch.setenv("NULLRUN_WAL_PATH", str(tmp_path / "sdk.wal"))
+    t = Transport(api_url="https://api.test.nullrun.io", api_key="test-key-12345678")
+    dlq = t._wal_dlq_path()
+    try:
+        t._write_dlq_rows([t._dlq_row(_event(1), "EXECUTION_NOT_BOUND:422")])
+    finally:
+        t._client.close()
+    _refusing_backend(monkeypatch, 422, "EXECUTION_NOT_BOUND")
+
+    rc = wal_main(
+        [
+            "--wal",
+            str(tmp_path / "sdk.wal"),
+            "replay",
+            "--execute",
+            "--include-terminal",
+            "--api-key",
+            "k-12345678",
+        ]
+    )
+    assert rc == 1, "a refused --include-terminal send reported success"
+    rows = _read_wal(dlq)
+    assert [r["event"]["event_id"] for r in rows] == ["evt-1"]
+    assert len(rows) == len({r["event"]["event_id"] for r in rows}), "the DLQ grew"
+    assert "not confirmed" in capsys.readouterr().err
+
+
+def test_an_empty_dlq_is_success_not_a_failure(tmp_path, monkeypatch):
+    """rc 0 on an empty DLQ, so a scheduled repair is not permanently red."""
+    monkeypatch.setenv("NULLRUN_WAL_PATH", str(tmp_path / "sdk.wal"))
+    assert (
+        wal_main(
+            ["--wal", str(tmp_path / "sdk.wal"), "replay", "--execute", "--api-key", "k-12345678"]
+        )
+        == 0
+    )
 
 
 def test_replay_preserves_a_line_it_cannot_parse(tmp_path):

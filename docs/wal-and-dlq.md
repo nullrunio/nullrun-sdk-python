@@ -110,6 +110,34 @@ unparseable line is the one an operator most needs to look at, and
 rewriting the file from the rows that did parse would delete it without
 anyone noticing.
 
+The exit code distinguishes the two "nothing happened" cases: **1** when rows
+existed and none were confirmed (or all were withheld, see below), **0** when
+the DLQ was empty. A scheduled repair that reports 0 while sending nothing
+would be indistinguishable from one that worked.
+
+### Refusals `replay` will not send
+
+Some rows are parked for a reason re-sending cannot address. `replay` leaves
+those alone by default, names them on stderr, and exits 1:
+
+| Reason | Why sending is pointless |
+|---|---|
+| `EXECUTION_NOT_BOUND:422` | The 24h server-side binding has expired (see below) |
+| `EXECUTION_NOT_BOUND:503` | Same class, arriving as a 5xx |
+
+`--include-terminal` overrides this and sends them anyway. Nothing is lost
+either way: an unconfirmed row is never removed, so the override cannot
+destroy evidence, and it cannot multiply DLQ rows either — the row already
+there is the row that is kept.
+
+Recovering this class is not a transport job. It needs a **ledger-only
+ingest** on the backend: an endpoint that records the spend against the
+period-bound counter *without* a live `execution_id` to attach it to, marking
+the row as reconstructed. Until that exists, the honest options are (a) accept
+the under-report, (b) reconcile the DLQ against the provider's own billing
+export, or (c) re-run the work under a fresh gate if the cost is acceptable to
+pay twice. Which one is right is a decision about accounting, not a retry.
+
 ## What a long outage costs
 
 > This section describes the interaction between the SDK's DLQ and an
@@ -138,8 +166,37 @@ gap; the control center is not.
 
 Two things follow. Re-sending them will not work, because the refusals are
 deterministic, so the repair is not a replay — it is a decision about
-accounting that has to be made deliberately. And an outage beyond 24 hours
+accounting that has to be made deliberately (and `replay` refuses that class
+by default rather than pretending otherwise). And an outage beyond 24 hours
 needs a plan that does not assume the buffered events will be accepted when
 it ends. If your agents can run unattended for more than a day against an
 unreachable backend, size that budget on the assumption that it is spent and
 unaccounted, not merely pending.
+
+### Not covered: SIGKILL after a long outage
+
+**This is consciously not handled, and the gap is deliberate rather than
+overlooked.** There is no test that kills the process mid-outage, restarts it,
+and asserts what happens to the 24-hour-old events — and no code path that
+would make such a test pass. If you adopt `direct` mode expecting that case
+to be handled, it will not be, and the failure is silent in the worst way:
+the events are not lost, they are *refused*, which looks like correct
+behaviour in the DLQ while the dashboard stays low.
+
+What is verified instead, and what is not:
+
+| Scenario | Status |
+|---|---|
+| Outage shorter than the 24h binding TTL | Events resume normally on reconnect |
+| Outage longer than 24h, process alive | Events reach the backend, are refused `EXECUTION_NOT_BOUND`, land in the DLQ (`EXECUTION_NOT_BOUND:422`), and `replay` refuses to re-send them |
+| Restart with a rotated WAL present | Recovery reads `.wal.1`, `.wal` and `.wal.inflight` oldest-first, so no generation is dropped — pinned by `test_recovery_reads_the_rotated_wal_not_just_the_active_one` |
+| Kill during a WAL write | Not reachable as corruption: every write is tmp-file + fsync + `os.replace`, and the rename is atomic, so a kill leaves the old file or the new one, never a torn one. Directory fsync on a Linux volume is asserted in `test_a_posix_volume_really_does_fsync_its_directory` |
+| **SIGKILL mid-outage, then restart, across the 24h boundary** | **Not tested, and not handled.** The restart behaves like a clean restart, so the same ceiling applies — but nothing in the suite exercises it, and it cannot pass without the ledger-only ingest below |
+
+The reason the last row is left open: making it pass would mean either
+holding events in memory across a kill (impossible) or re-minting bindings
+for past events (which double-counts against the budget — see above). The
+honest fix is the ledger-only ingest described in the replay section, not a
+retry. Until that exists, the operational guidance is unchanged and is the
+only thing that actually protects you: **size the budget as spent and
+unaccounted, not as pending.**

@@ -382,6 +382,15 @@ class UnknownRejectionReason(Exception):
         super().__init__(f"unhandled rejection reason {reason!r} for event {event_id}")
 
 
+# How a caller asks a transport failure to be surfaced (ADR-008). A callable
+# receives the exception and returns a decision dict; the three strings select
+# a built-in arm. ``None`` means "use ``fallback_mode``", which is fail-CLOSED
+# under ``mode="strict"``. Named because the union appears at several call
+# sites and the narrower callback-only annotation that used to stand here
+# made the documented ``"raise"`` arm un-passable under a type checker.
+TransportErrorHandler = str | Callable[[Exception], dict[str, Any]]
+
+
 class DeterministicBackendRefusal(Exception):
     """The backend named a refusal that retrying cannot fix.
 
@@ -397,6 +406,48 @@ class DeterministicBackendRefusal(Exception):
         self.status_code = status_code
         self.detail = message
         super().__init__(f"{error_code} (HTTP {status_code}): {message}" if message else error_code)
+
+
+def _retry_after_seconds_from(response: Any) -> float | None:
+    """``Retry-After`` in seconds, from either wire form. ``None`` if absent/unparseable.
+
+    Module-level because the retry loop needs it and has no Transport: it
+    reads the header off the ``HTTPStatusError`` the response produced. Both
+    RFC 7231 forms are accepted — delta-seconds and an HTTP-date — because
+    nginx and a hand-rolled rate limiter in front of the gate will each emit
+    a different one.
+
+    An HTTP-date already in the past yields a NEGATIVE number. That is
+    returned rather than clamped, so the caller can tell "the server said
+    wait zero" from "the server said wait, and that moment has passed" — the
+    retry loop treats non-positive as "no floor stated" and falls back to
+    exponential backoff, which is the safe reading of a stale date.
+    """
+    if response is None:
+        return None
+    headers = getattr(response, "headers", None)
+    if not headers:
+        return None
+    try:
+        retry_after = headers.get("Retry-After")
+    except Exception:
+        return None
+    if not retry_after:
+        return None
+
+    try:
+        return float(retry_after)
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        from datetime import datetime, timezone
+        from email.utils import parsedate_to_datetime
+
+        dt = parsedate_to_datetime(retry_after)
+        return (dt - datetime.now(timezone.utc)).total_seconds()
+    except Exception:
+        return None
 
 
 def _extract_backend_error_code(response: Any) -> str | None:
@@ -439,6 +490,58 @@ def _extract_error_message(response: Any) -> str:
 # =============================================================================
 
 
+def _next_retry_delay(
+    *,
+    attempt: int,
+    max_retries: int,
+    base_delay: float,
+    backoff_factor: float,
+    jitter: float,
+    max_delay: float,
+    server_wait: float | None,
+    error: Exception,
+) -> float:
+    """How long to wait before the next attempt, and the log line saying so.
+
+    Two regimes, and the choice between them is the whole function.
+
+    With a server-stated ``server_wait`` the value is a FLOOR, so jitter is
+    one-sided — the spread is ``[wait, wait * (1 + jitter)]``. Spreading
+    downward would retry before the rate limit permitted it, which is how a
+    429 becomes a sustained 429; and spreading symmetrically is what makes a
+    fleet that got limited together retry together.
+
+    Without one there is no floor, so jitter is symmetric around the
+    exponential curve, which is the standard defence against a thundering
+    herd on a shared failure.
+    """
+    if server_wait is not None and server_wait > 0:
+        base = min(server_wait, max_delay)
+        delay = base * (1.0 + random.uniform(0.0, jitter))  # noqa: S311
+        logger.warning(
+            "Request failed (attempt %d/%d), honoring Retry-After %.2fs "
+            "(+jitter -> %.2fs): %s",
+            attempt + 1,
+            max_retries + 1,
+            base,
+            delay,
+            type(error).__name__,
+        )
+        return delay
+
+    backoff = min(base_delay * (backoff_factor**attempt), max_delay)
+    spread = backoff * jitter
+    delay = max(0.0, backoff + random.uniform(-spread, spread))  # noqa: S311
+    logger.warning(
+        "Request failed (attempt %d/%d), retrying in %.2fs: %s",
+        attempt + 1,
+        max_retries + 1,
+        delay,
+        type(error).__name__,
+    )
+    return delay
+
+
 def _retry_with_backoff(
     func: Callable[[], Any],
     max_retries: int = 10,
@@ -447,7 +550,7 @@ def _retry_with_backoff(
     backoff_factor: float = 2.0,
     jitter: float = 0.1,
     last_retry_after_seconds: float = 0.0,
-    on_transport_error: str | Callable[[Exception], dict[str, Any]] | None = None,
+    on_transport_error: TransportErrorHandler | None = None,
     retry_on_5xx: bool = False,
 ) -> Any:
     """Retry with exponential backoff + jitter; honors Retry-After (429) header.
@@ -455,6 +558,11 @@ def _retry_with_backoff(
     Formula (without Retry-After): delay = min(base_delay * backoff_factor^attempt, max_delay)
                                     delay += random.uniform(-jitter * delay, jitter * delay)
     Formula (with Retry-After): actual_delay = min(last_retry_after_seconds, max_delay)
+                                    delay  *= (1 + random.uniform(0, jitter))
+    The Retry-After jitter is one-sided on purpose: a rate limit states a
+    FLOOR, so spreading downward would retry before the server permitted it.
+    Read off the response the exception carries; see
+    ``_retry_after_seconds_from``.
 
     NR-006: when ``retry_on_5xx=True`` a 5xx response is treated as
     transient infrastructure failure and retried via the same
@@ -555,11 +663,33 @@ def _retry_with_backoff(
             raise
 
         except httpx.HTTPStatusError as exc:
-            # 5xx HTTPStatusError from the retry_on_5xx branch above.
-            # Treat as retryable transient infra failure.
+            # 5xx HTTPStatusError from the retry_on_5xx branch above, and
+            # also the 429 that `_post_batch` turns into one. Treat as
+            # retryable transient infra failure.
+            #
+            # This branch used to set `last_exc` and fall straight through
+            # to the next attempt with NO delay: no backoff, no sleep, and
+            # the `Retry-After` header the server had just sent ignored
+            # entirely. A rate-limited client therefore spent its whole
+            # retry budget in milliseconds, hammering the limit that had
+            # just answered it, and then gave up — the opposite of what a
+            # 429 asks for. The suite stayed green because the existing
+            # 429 test asserted the CALL COUNT, which does not depend on
+            # how long you wait between calls.
             last_exc = exc
             if attempt >= max_retries:
                 break
+            metrics.inc_transport("retries_total")
+            actual_delay = _next_retry_delay(
+                attempt=attempt,
+                max_retries=max_retries,
+                base_delay=base_delay,
+                backoff_factor=backoff_factor,
+                jitter=jitter,
+                max_delay=max_delay,
+                server_wait=_retry_after_seconds_from(exc.response),
+                error=exc,
+            )
 
         except Exception as exc:
             last_exc = exc
@@ -572,30 +702,22 @@ def _retry_with_backoff(
 
             metrics.inc_transport("retries_total")
 
-            if last_retry_after_seconds > 0:
-                actual_delay = min(last_retry_after_seconds, max_delay)
-                last_retry_after_seconds = 0.0
-                logger.warning(
-                    "Request failed (attempt %d/%d), honoring Retry-After %.2fs: %s",
-                    attempt + 1,
-                    max_retries + 1,
-                    actual_delay,
-                    type(exc).__name__,
-                )
-            else:
-                delay = min(base_delay * (backoff_factor**attempt), max_delay)
-                jitter_amount = delay * jitter
-                actual_delay = delay + random.uniform(-jitter_amount, jitter_amount)  # noqa: S311
-                actual_delay = max(0.0, actual_delay)
-                logger.warning(
-                    "Request failed (attempt %d/%d), retrying in %.2fs: %s",
-                    attempt + 1,
-                    max_retries + 1,
-                    actual_delay,
-                    type(exc).__name__,
-                )
+            actual_delay = _next_retry_delay(
+                attempt=attempt,
+                max_retries=max_retries,
+                base_delay=base_delay,
+                backoff_factor=backoff_factor,
+                jitter=jitter,
+                max_delay=max_delay,
+                server_wait=last_retry_after_seconds,
+                error=exc,
+            )
+            last_retry_after_seconds = 0.0
 
-            time.sleep(actual_delay)
+        # Every path that reaches here has decided to retry. One sleep, one
+        # place: the two except branches used to carry their own, and the
+        # status branch had none, which is how the two drifted apart.
+        time.sleep(actual_delay)
 
     # ``retry_on_5xx`` and the failure mode was 5xx, return the
     # last response so the caller can synthesize a fallback
@@ -810,6 +932,15 @@ class Transport:
         self._dir_fsync_ok: bool | None = None
         self._max_batch_attempts = int(os.environ.get("NULLRUN_MAX_BATCH_ATTEMPTS", "10"))
         self._bisect_depth = 0  # recursion guard for 400/422 batch splitting
+        # Request budget for one bisect cascade. The depth guard alone bounds
+        # the RECURSION, not the wire: halving to depth 24 is 2^24 sends. A
+        # batch that is genuinely all-bad therefore spends an unbounded amount
+        # of the operator's rate limit rediscovering that fact. This counts
+        # sends instead, so the cost is a number a human chose.
+        self._bisect_budget = int(os.environ.get("NULLRUN_MAX_BISECT_REQUESTS", "64"))
+        # Terminal refusals the DLQ could not take, held in memory until it
+        # has room. See `_hold_for_dlq` for why they are not re-sent.
+        self._dlq_overflow: list[dict[str, Any]] = []
         # RLock so re-entrant acquisition (e.g. test fixtures that hold the
         # lock while calling lock-acquiring methods) doesn't deadlock.
         self._lock = threading.RLock()
@@ -1031,6 +1162,16 @@ class Transport:
     @contextmanager
     def _wal_file_lock(self) -> Iterator[bool]:
         """Hold the cross-process WAL lock. Yields False if it could not be had.
+
+        A NEW descriptor is opened per acquisition, and that is load-bearing,
+        not incidental. `flock` locks the open file DESCRIPTION, so two
+        threads of one process each opening their own descriptor DO conflict —
+        which is why this needs no companion `threading.Lock` and why adding
+        one would be redundant. Caching the descriptor to save an `open()`
+        would invert this: the kernel would see one description, and the
+        second `LOCK_EX` would succeed immediately against the first holder's
+        own lock. Cross-process safety survives that; in-process safety does
+        not. `test_flock_excludes_two_threads_of_one_process` is the tripwire.
 
         Advisory (`flock`), exclusive, and **bounded-wait, not
         non-blocking**. Non-blocking is the obvious choice and it is wrong:
@@ -1565,12 +1706,20 @@ class Transport:
 
     def _do_flush_locked(self) -> None:
         """Flush under lock. Must be called with _lock held."""
+        # Space may have freed up since the last refusal (the operator raised
+        # the cap, or archived the file with `nullrun-wal`). Draining first
+        # means the held refusals land before new traffic, not after an
+        # unbounded wait for the next one to fail.
+        self._drain_dlq_overflow()
+
         if not self._buffer:
             logger.debug("Buffer empty, skipping flush")
             return
 
         batch = self._buffer[:]
         self._buffer.clear()
+        # Refilled as the cascade below splits it, so one flush is one budget.
+        self._bisect_budget = int(os.environ.get("NULLRUN_MAX_BISECT_REQUESTS", "64"))
         logger.debug(f"Sending batch of {len(batch)} events")
 
         # Durability barrier: the batch has left `_buffer` and the process
@@ -1822,6 +1971,10 @@ class Transport:
             self._quarantine_to_dlq(left + right, error)
             return
 
+        if not self._bisect_request_available(len(left) + len(right)):
+            self._quarantine_to_dlq(left + right, error)
+            return
+
         self._bisect_depth += 1
         try:
             for half in (left, right):
@@ -1830,6 +1983,33 @@ class Transport:
                 self._attempt_half(half, error)
         finally:
             self._bisect_depth -= 1
+
+    def _bisect_request_available(self, remaining: int) -> bool:
+        """Whether the cascade may afford to split, and charge it if so.
+
+        A split costs two sends (one per half), so the budget is charged here
+        rather than at the send sites: two call sites spending independently
+        is how one of them ends up not spending at all.
+
+        Depth alone does not bound the wire: a full halving cascade is 2^depth
+        sends, and `_MAX_BISECT_DEPTH` is 24. When the budget runs out, stop
+        splitting and park what is left rather than spend the operator's rate
+        limit proving once more that a batch is bad — a refusal is exactly
+        what a rate limiter starts answering, so the cascade would be feeding
+        the condition it is trying to diagnose. Events already delivered in
+        the healthy halves stay delivered.
+        """
+        if self._bisect_budget < 2:
+            logger.error(
+                f"Bisect request budget ({max(self._bisect_budget, 0)} remaining) "
+                f"exhausted — parking the remaining {remaining} event(s) without "
+                f"splitting further. Raise NULLRUN_MAX_BISECT_REQUESTS if these "
+                f"batches deserve isolating."
+            )
+            metrics.inc_transport("batches_bisect_budget_exhausted")
+            return False
+        self._bisect_budget -= 2
+        return True
 
     def _attempt_half(self, half: list[dict[str, Any]], original: Exception) -> None:
         """Send one half, routing the result exactly as a top-level batch would."""
@@ -1871,14 +2051,41 @@ class Transport:
     def _route_deferred(self, batch: list[dict[str, Any]], error: Exception) -> None:
         """Classify a failure that was kept away from the circuit breaker."""
         if isinstance(error, DeterministicBackendRefusal):
-            # The backend named the refusal. Quarantine on the FIRST attempt:
-            # spending the attempt budget first would resend a request we know
-            # cannot succeed, delaying every healthy event queued behind it by
-            # N × the backoff schedule for no possible gain.
+            # The backend named the refusal. It named it for the BATCH, and a
+            # whole-batch refusal is what an unbatched per-event rejection
+            # looks like from out here: one event the backend cannot accept
+            # (an unbound execution, a policy limit) makes the request carrying
+            # it fail as a unit. Quarantining the batch on that evidence
+            # discards every healthy event sharing it — the 49 good events are
+            # recorded as refused for a reason that never applied to them.
+            #
+            # So bisect FIRST, exactly as the 400/422 path does, and only
+            # quarantine what survives as a singleton. The bisect is bounded by
+            # `_MAX_BISECT_DEPTH` and by a request budget, so an all-bad batch
+            # cannot turn this into a request storm.
+            if len(batch) > 1 and self._bisect_depth < self._MAX_BISECT_DEPTH:
+                if not self._bisect_request_available(len(batch)):
+                    metrics.inc_transport("batches_deterministic_refusal")
+                    self._quarantine_to_dlq(batch, error)
+                    return
+                half = len(batch) // 2
+                logger.warning(
+                    f"Backend refused a batch of {len(batch)} as "
+                    f"{error.error_code} — a whole-batch refusal is not evidence "
+                    f"about each event, so splitting into {half} + "
+                    f"{len(batch) - half} to isolate the offender."
+                )
+                metrics.inc_transport("batches_bisected")
+                self._bisect_depth += 1
+                try:
+                    self._send_subbatches(batch[:half], batch[half:], error)
+                finally:
+                    self._bisect_depth -= 1
+                return
             logger.error(
                 f"Backend refused the batch as {error.error_code} "
                 f"(HTTP {error.status_code}) — deterministic, quarantining "
-                f"{len(batch)} events on first attempt. {error.detail}"
+                f"{len(batch)} event(s). {error.detail}"
             )
             metrics.inc_transport("batches_deterministic_refusal")
             self._quarantine_to_dlq(batch, error)
@@ -2044,22 +2251,71 @@ class Transport:
     def _dead_letter_row(self, event: dict[str, Any], reason: str) -> bool:
         """Park one event, durably, before anything clears ``.inflight``.
 
-        Returns True when the event is back on the retry path because the DLQ
-        write failed — i.e. it is still live and `.inflight` must be retained.
+        Returns True when the event could NOT be parked and is still live, so
+        `.inflight` must be retained.
         """
         if not self._write_dlq_rows([self._dlq_row(event, reason)]):
-            # The write failed. Re-queue rather than pretend it is parked:
-            # an event that is only in memory is one crash from gone, and the
-            # next send will simply produce the same terminal refusal.
-            logger.error(
-                f"DLQ write failed for event {event.get('event_id')!r} ({reason}) — "
-                f"holding it on the retry path instead of dropping it"
-            )
-            self._requeue_at_head([event])
+            # The DLQ could not take it. Re-queueing would put a batch the
+            # backend has already refused terminally back on the send path,
+            # where it produces the identical refusal on every cycle forever
+            # AND sits at the head of the buffer ahead of every healthy event
+            # behind it. That is the "one bad event stops the whole stream"
+            # failure, and it is caused by parking, not by the refusal.
+            #
+            # So the event is HELD, not re-sent: a terminal refusal cannot
+            # become a success, so another request is pure waste, and holding
+            # keeps the head of the buffer clear. `_drain_dlq_overflow` retries
+            # the write whenever the DLQ may have room again, and the holdover
+            # is bounded — a holdover that grows without limit is the same
+            # memory blowup the cap exists to prevent, only invisible.
+            self._hold_for_dlq([self._dlq_row(event, reason)], reason)
             return True
         metrics.inc_transport("events_dead_lettered")
         metrics.set_transport("last_dlq_error", reason)
         return False
+
+    def _hold_for_dlq(self, rows: list[dict[str, Any]], reason: str) -> None:
+        """Park refused events in memory until the DLQ has room.
+
+        The alternative — leaving them on the send path — is what turns a full
+        DLQ into an outage: the events are re-sent every cycle, they are
+        refused every cycle, and they occupy the head of the buffer the whole
+        time, so the healthy events queued behind them are never delivered.
+        The refusal is terminal, so re-sending cannot help; only the recording
+        can, and that is what the holdover defers.
+        """
+        self._dlq_overflow.extend(rows)
+        metrics.inc_transport("dlq_holdover_total", len(rows))
+        metrics.set_transport("dlq_holdover", len(self._dlq_overflow))
+        metrics.set_transport("last_dlq_error", reason)
+        logger.error(
+            f"DLQ at its cap — holding {len(self._dlq_overflow)} refused event(s) "
+            f"in memory ({reason}). They are NOT being re-sent: a terminal "
+            f"refusal cannot succeed on retry, and re-sending would block every "
+            f"healthy event behind them. Raise NULLRUN_DLQ_MAX_BYTES, or triage "
+            f"and archive the file with `nullrun-wal`, and they drain on the "
+            f"next flush."
+        )
+
+    def _drain_dlq_overflow(self) -> int:
+        """Try to move held refusals into the DLQ now that space may exist.
+
+        Called at the top of every flush. Returns how many rows landed. A
+        refused write is a no-op — the holdover is unchanged and the operator
+        still sees the same alert — so this is safe to attempt unconditionally
+        and cheap when there is nothing held.
+        """
+        if not self._dlq_overflow:
+            return 0
+        pending, self._dlq_overflow = self._dlq_overflow, []
+        written = self._write_dlq_rows(pending)
+        if not written:
+            self._dlq_overflow = pending  # unchanged; try again next cycle
+            return 0
+        metrics.inc_transport("events_dead_lettered", len(pending))
+        metrics.set_transport("dlq_holdover", 0)
+        logger.info(f"Drained {len(pending)} held refusal(s) into the DLQ")
+        return len(pending)
 
     def _quarantine_to_dlq(self, batch: list[dict[str, Any]], error: Exception) -> None:
         """Move a permanently-rejected batch out of the retry path.
@@ -2085,7 +2341,10 @@ class Transport:
         )
         rows = [self._dlq_row(e, reason) for e in batch]
         if not self._write_dlq_rows(rows):
-            self._requeue_at_head(batch)
+            # Same reasoning as `_dead_letter_row`: the batch is terminally
+            # refused, so re-sending it produces the same refusal forever
+            # while blocking everything behind it. Hold instead.
+            self._hold_for_dlq(rows, reason)
             return
         self._clear_inflight()
         metrics.inc_transport("events_dead_lettered", len(batch))
@@ -2223,32 +2482,10 @@ class Transport:
     def _extract_retry_after(self, response: httpx.Response) -> float | None:
         """Extract Retry-After header value as seconds.
 
-        Handles both:
-        - Integer seconds (e.g., "30")
-        - HTTP-date format (e.g., "Wed, 21 Oct 2015 07:28:00 GMT")
+        Thin wrapper over the module-level helper, which the retry loop also
+        needs and which cannot reach a Transport instance.
         """
-        retry_after = response.headers.get("Retry-After")
-        if not retry_after:
-            return None
-
-        # Try parsing as seconds (integer or float)
-        try:
-            return float(retry_after)
-        except ValueError:
-            pass
-
-        # Try parsing as HTTP datetime (RFC 7231)
-        try:
-            from email.utils import parsedate_to_datetime
-
-            dt = parsedate_to_datetime(retry_after)
-            from datetime import datetime, timezone
-
-            return (dt - datetime.now(timezone.utc)).total_seconds()
-        except Exception:
-            pass
-
-        return None
+        return _retry_after_seconds_from(response)
 
     def _send_batch_with_retry_info(self, batch: list[dict[str, Any]]) -> "SendResult":
         """Send batch to server. Returns SendResult with retry info. Wrapped by _retry_with_backoff."""
@@ -2473,7 +2710,7 @@ class Transport:
         # Populated by `runtime.execute` from the `get_call_tools()` contextvar
         # when the caller invoked `set_call_context(tools=...)`.
         tools: tuple[str, ...] | None = None,
-        on_transport_error: Callable[[Exception], dict[str, Any]] | None = None,
+        on_transport_error: TransportErrorHandler | None = None,
     ) -> dict[str, Any]:
         """Pre-execution policy evaluation via /api/v1/execute (PRIMARY enforcement point).
 
@@ -2800,7 +3037,7 @@ class Transport:
     def check(
         self,
         check_request: dict[str, Any],
-        on_transport_error: Callable[[Exception], dict[str, Any]] | str | None = None,
+        on_transport_error: TransportErrorHandler | None = None,
         parent_execution_id: str | None = None,
     ) -> dict[str, Any]:
         """
@@ -3303,7 +3540,7 @@ class Transport:
     def check_v3(
         self,
         request: dict[str, Any],
-        on_transport_error: Callable[[Exception], dict[str, Any]] | str | None = None,
+        on_transport_error: TransportErrorHandler | None = None,
     ) -> dict[str, Any]:
         """Pre-execution gate — wire-protocol v3.
 
