@@ -201,6 +201,99 @@ def _signed_request_body(payload: dict[str, Any]) -> bytes:
 
 
 # =============================================================================
+# Backend error classification
+# =============================================================================
+
+# Backend `error_code` values that name a DETERMINISTIC refusal: the request
+# can never succeed as sent, no matter how long we wait or how often we resend
+# it. Classifying on these by name — rather than by HTTP status — is what keeps
+# a healthy backend from being treated as broken.
+#
+# EXECUTION_NOT_BOUND is the motivating case. The backend served it as 503
+# (handlers.rs:10016-10017 before the status correction) while naming the code
+# in the body, so by status alone it was indistinguishable from an outage. It
+# is not one: the execution binding lives in Redis under a 24h TTL
+# (EXECUTION_BINDING_TTL_SECONDS = 86_400) and only the server can mint it. Once
+# it is gone, every retry of that event hits the same wall. Left on the transient
+# path it would be resent until the attempt budget died AND, because it is a
+# 5xx, each attempt would be counted as a transport failure — ten of them open
+# the circuit breaker on a backend that is answering every other request
+# perfectly. Same bug class as "any 4xx is permanent", one status code over.
+#
+# The backend now answers 422 for this code. That is necessary but not
+# sufficient: deployed SDKs outlive the backend release that fixed it, so an
+# instance pinned to an older build keeps talking to a newer server, and
+# clients in the field are not upgraded in lockstep. Classifying on the code
+# is what makes this correct against BOTH statuses — relying on the server
+# having been upgraded first would turn a code-classification fix into a
+# fleet-coordination problem and leave the laggard instances quietly
+# mis-classifying.
+#
+# Every entry here must satisfy: (a) the backend names it explicitly, (b) no
+# client-side action on the SAME request can change the answer, (c) retrying
+# wastes an attempt without a chance of success. Anything that fails (b) or (c)
+# belongs in the transient path even if it looks permanent from the outside.
+_DETERMINISTIC_ERROR_CODES = frozenset(
+    {
+        "EXECUTION_NOT_BOUND",
+        "CONSUME_OVERBUDGET",
+    }
+)
+
+
+class DeterministicBackendRefusal(Exception):
+    """The backend named a refusal that retrying cannot fix.
+
+    Carries the wire ``error_code`` and status separately because the status is
+    not the signal — several of these arrive as 5xx, which is exactly why
+    status-based classification mis-routes them. Handlers of this exception
+    must NOT count it as a transport failure: the transport layer is healthy,
+    the answer is a decision.
+    """
+
+    def __init__(self, error_code: str, status_code: int | None, message: str = "") -> None:
+        self.error_code = error_code
+        self.status_code = status_code
+        self.detail = message
+        super().__init__(f"{error_code} (HTTP {status_code}): {message}" if message else error_code)
+
+
+def _extract_backend_error_code(response: Any) -> str | None:
+    """Pull ``error_code`` out of a backend error envelope, if there is one.
+
+    The envelope is ``{"error_code", "error_message", "details", "retry_after_ms"}``
+    (see the TrackError::WithBody sites in handlers.rs). Returns ``None`` for a
+    body that is absent, unparseable, or a plain proxy HTML page — a missing
+    code is NOT evidence of a deterministic refusal, so the caller keeps the
+    request on the transient path.
+    """
+    if response is None:
+        return None
+    try:
+        payload = response.json()
+    except Exception:  # noqa: BLE001 — non-JSON body (proxy error page, empty)
+        return None
+    if not isinstance(payload, dict):
+        return None
+    code = payload.get("error_code")
+    if isinstance(code, str) and code:
+        return code
+    return None
+
+
+def _extract_error_message(response: Any) -> str:
+    try:
+        payload = response.json()
+    except Exception:  # noqa: BLE001
+        return ""
+    if isinstance(payload, dict):
+        message = payload.get("error_message")
+        if isinstance(message, str):
+            return message
+    return ""
+
+
+# =============================================================================
 # Retry with exponential backoff + jitter
 # =============================================================================
 
@@ -312,6 +405,11 @@ def _retry_with_backoff(
             NullRunAuthenticationError,
             NullRunTransportError,
             NullRunBackendError,
+            # A refusal the backend NAMED as deterministic. Retrying it is
+            # guaranteed waste, and — since several of these arrive as 5xx —
+            # letting it fall through the generic handler would also count it
+            # as infrastructure failure on a perfectly healthy backend.
+            DeterministicBackendRefusal,
         ):
             raise
 
@@ -551,6 +649,13 @@ class Transport:
                 )
         self._buffer: list[dict[str, Any]] = []
         self._in_flight: dict[str, dict[str, Any]] = {}  # event_id -> event for retry dedup
+        # Per-batch re-queue budget. A failure we cannot classify as transient
+        # (a payload that will not serialize, a shape the signer rejects) repeats
+        # identically on every cycle and would pin the batch ahead of the whole
+        # buffer forever. Count attempts, and dead-letter once spent.
+        self._batch_attempts: dict[str, int] = {}  # batch signature -> attempts
+        self._max_batch_attempts = int(os.environ.get("NULLRUN_MAX_BATCH_ATTEMPTS", "10"))
+        self._bisect_depth = 0  # recursion guard for 400/422 batch splitting
         # RLock so re-entrant acquisition (e.g. test fixtures that hold the
         # lock while calling lock-acquiring methods) doesn't deadlock.
         self._lock = threading.RLock()
@@ -720,14 +825,26 @@ class Transport:
                     # Existing contents FIRST, so the file stays in
                     # chronological order. Writing the new rows first and
                     # folding the old ones in after would reverse the DLQ.
+                    #
+                    # A crash can leave the last line unterminated. Copying it
+                    # verbatim would glue the next row onto truncated JSON and
+                    # corrupt an event that was perfectly valid, so the torn
+                    # tail is dropped — it was never durable anyway.
                     with open(path) as prev:
-                        for line in prev:
-                            f.write(line)
+                        previous = prev.read()
+                    if previous and not previous.endswith("\n"):
+                        keep = previous.rfind("\n") + 1  # 0 when there is none
+                        logger.warning(
+                            f"Dropping {len(previous) - keep}B torn tail of {path} before append"
+                        )
+                        previous = previous[:keep]
+                    f.write(previous)
                 for event in events:
                     f.write(json.dumps(event, default=str) + "\n")
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp_path, path)
+            self._fsync_dir(wal_dir)
             return True
         except OSError as e:
             logger.warning(f"Failed to persist {len(events)} events to {path}: {e}")
@@ -736,6 +853,25 @@ class Transport:
             except OSError:
                 pass
             return False
+
+    @staticmethod
+    def _fsync_dir(path: str) -> None:
+        """Flush a directory entry so a rename survives a power cut.
+
+        Best-effort: Windows has no directory fsync and some filesystems
+        refuse it. A failure here costs durability of the NAME, not the data,
+        which is already fsynced.
+        """
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(fd)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
 
     def _persist_to_wal(self) -> bool:
         """Persist unflushed events to WAL file for replay on restart.
@@ -985,9 +1121,29 @@ class Transport:
         # crash mid-flight is recoverable on the next start.
         self._persist_inflight(batch)
 
-        # Circuit breaker wrapped send - uses proper 3-state circuit breaker
+        # Circuit breaker wrapped send - uses proper 3-state circuit breaker.
+        #
+        # Only genuine backend UNREACHABILITY may count as a breaker failure.
+        # A 4xx is the server answering, which proves the transport is healthy;
+        # a TypeError from local serialization is our own bug. Counting either
+        # would let a batch of malformed payloads open the circuit on a backend
+        # that is plainly up and would keep taking traffic, and then every
+        # buffered event sits blocked for the whole recovery window. Those are
+        # trapped here and handled after the call.
+        #
+        # httpx.TransportError (connect refused, DNS, read timeout) and
+        # BreakerTransportError (5xx exhaustion) still propagate, so the
+        # breaker keeps doing its actual job.
+        deferred: list[Exception] = []
+
         def send_batch():
-            result = self._send_batch_with_retry_info(batch)
+            try:
+                result = self._send_batch_with_retry_info(batch)
+            except (BreakerTransportError, httpx.TransportError):
+                raise
+            except Exception as exc:  # noqa: BLE001
+                deferred.append(exc)
+                return None
             # Remove accepted events from in-flight
             if result.accepted_event_ids:
                 for event in batch:
@@ -1019,15 +1175,230 @@ class Transport:
             metrics.inc_transport("batches_failed")
             return
         except Exception as e:  # noqa: BLE001
-            # Anything else from the send (connection reset mid-write,
-            # unexpected shape) is transient by assumption. Re-queue rather
-            # than let it escape and kill the flush thread.
-            logger.warning(f"Unexpected error during flush, re-queuing batch: {e}")
-            self._buffer.extend(batch)
-            metrics.inc_transport("batches_failed")
+            self._retry_or_dlq(batch, e, dead_letter=True)
             return
 
+        if deferred:
+            self._route_deferred(batch, deferred[0])
+            return
+
+        self._batch_attempts.pop(self._failure_signature(batch), None)  # landed
         self._clear_inflight()  # accepted — the batch is on the server now
+
+    # 4xx classes that MUST NOT be quarantined. Quarantining these would
+    # discard good data at exactly the moment it is recoverable.
+    #
+    # 408 Request Timeout / 429 Too Many Requests — transient. After an
+    # outage every SDK replays its WAL at once, the rate limiter answers
+    # 429, and a naive "any 4xx is permanent" rule would quarantine every
+    # recovering fleet in the first second of the window.
+    #
+    # 401 Unauthorized / 403 Forbidden — the key was rotated or revoked.
+    # Once the operator fixes the key the batch must still deliver, so it
+    # belongs back in the WAL, not on disk as DLQ litter.
+    #
+    # 413 Payload Too Large — the BATCH is too big, not the events. Halve
+    # and resend; every event is individually acceptable.
+    _TRANSIENT_4XX = frozenset({408, 429})
+    _AUTH_4XX = frozenset({401, 403})
+    _RESPLIT_4XX = frozenset({413})
+    # Cap on distinct batch signatures tracked for the attempt budget.
+    _MAX_TRACKED_BATCHES = 1024
+    # Ceiling on bisection. Each level halves the batch, so this bounds the
+    # worst case (an all-bad batch) to ~2n sends while still isolating a
+    # single offender in any realistic batch.
+    _MAX_BISECT_DEPTH = 24
+
+    def _handle_http_rejection(self, batch: list[dict[str, Any]], error: Exception) -> None:
+        """Route a 4xx to re-queue, split-and-resend, or DLQ by status class."""
+        status = getattr(getattr(error, "response", None), "status_code", None)
+
+        if status in self._TRANSIENT_4XX:
+            # Never dead-letter a rate limit or a timeout, no matter how many
+            # attempts: the batch is good data, the server is busy. It stays in
+            # the WAL until the window opens.
+            self._retry_or_dlq(batch, error, dead_letter=False)
+            return
+
+        if status in self._AUTH_4XX:
+            # Recoverable by operator action. Hold the data, keep the WAL,
+            # and say loudly that delivery is blocked on a key problem.
+            logger.error(
+                f"Backend rejected the batch with {status} (auth). The events stay "
+                f"in the WAL and WILL be delivered once the API key is fixed — "
+                f"rotate/verify it at https://app.nullrun.io/settings/api-keys. "
+                f"Quarantining is deliberately NOT done here."
+            )
+            self._requeue_at_head(batch)
+            metrics.inc_transport("batches_auth_blocked")
+            return
+
+        # 413 (batch too big) and 400/422 (one malformed event rejected the
+        # whole request) are both resolved the same way: halve and resend. The
+        # halves are sent as SEPARATE batches rather than pushed back onto the
+        # buffer — the buffer is flushed wholesale, so re-queuing both halves
+        # would re-form the batch we just proved the server will not accept,
+        # and the bisect would never make progress.
+        if len(batch) > 1:
+            half = len(batch) // 2
+            logger.warning(
+                f"Batch of {len(batch)} rejected with {status} — splitting into "
+                f"{half} + {len(batch) - half} and resending the halves separately."
+            )
+            metrics.inc_transport(
+                "batches_resplit" if status in self._RESPLIT_4XX else "batches_bisected"
+            )
+            self._send_subbatches(batch[:half], batch[half:], error)
+            return
+
+        # A single event the server will never accept.
+        self._quarantine_to_dlq(batch, error)
+
+    def _send_subbatches(
+        self, left: list[dict[str, Any]], right: list[dict[str, Any]], error: Exception
+    ) -> None:
+        """Send both halves as independent batches, isolating a single offender.
+
+        Recursion depth is log2(len(batch)), and `_MAX_BISECT_DEPTH` caps it,
+        so an entire bad batch cannot spin here. Whatever is still undeliverable
+        when the cap is hit falls back to the whole-batch quarantine.
+        """
+        if self._bisect_depth >= self._MAX_BISECT_DEPTH:
+            logger.error(f"Bisect depth cap reached, quarantining {len(left) + len(right)} events")
+            self._quarantine_to_dlq(left + right, error)
+            return
+
+        self._bisect_depth += 1
+        try:
+            for half in (left, right):
+                if not half:
+                    continue
+                self._attempt_half(half, error)
+        finally:
+            self._bisect_depth -= 1
+
+    def _attempt_half(self, half: list[dict[str, Any]], original: Exception) -> None:
+        """Send one half, routing the result exactly as a top-level batch would."""
+        deferred: list[Exception] = []
+
+        def send():
+            try:
+                result = self._send_batch_with_retry_info(half)
+            except (BreakerTransportError, httpx.TransportError):
+                raise
+            except Exception as exc:  # noqa: BLE001
+                deferred.append(exc)
+                return None
+            if result.accepted_event_ids:
+                for event in half:
+                    if event.get("event_id") in result.accepted_event_ids:
+                        self._in_flight.pop(event.get("event_id"), None)
+            metrics.inc_transport("batches_sent")
+            metrics.inc_transport("events_sent", len(half))
+            metrics.set_transport("last_flush_at", time.monotonic())
+            return result
+
+        try:
+            self._circuit_breaker.call(send)
+        except BreakerTransportError:
+            self._requeue_at_head(half)
+            metrics.inc_transport("batches_failed")
+            return
+        except Exception as exc:  # noqa: BLE001
+            self._retry_or_dlq(half, exc, dead_letter=True)
+            return
+
+        if deferred:
+            self._route_deferred(half, deferred[0])
+            return
+
+        self._batch_attempts.pop(self._failure_signature(half), None)
+
+    def _route_deferred(self, batch: list[dict[str, Any]], error: Exception) -> None:
+        """Classify a failure that was kept away from the circuit breaker."""
+        if isinstance(error, DeterministicBackendRefusal):
+            # The backend named the refusal. Quarantine on the FIRST attempt:
+            # spending the attempt budget first would resend a request we know
+            # cannot succeed, delaying every healthy event queued behind it by
+            # N × the backoff schedule for no possible gain.
+            logger.error(
+                f"Backend refused the batch as {error.error_code} "
+                f"(HTTP {error.status_code}) — deterministic, quarantining "
+                f"{len(batch)} events on first attempt. {error.detail}"
+            )
+            metrics.inc_transport("batches_deterministic_refusal")
+            self._quarantine_to_dlq(batch, error)
+            return
+        if isinstance(error, httpx.HTTPStatusError):
+            self._handle_http_rejection(batch, error)
+        else:
+            # Not obviously transient and not an HTTP status either. It may
+            # still be deterministic (an event that cannot be serialized will
+            # fail identically every cycle), so count attempts and dead-letter
+            # once the budget is spent rather than re-queuing forever.
+            self._retry_or_dlq(batch, error, dead_letter=True)
+
+    def _requeue_at_head(self, batch: list[dict[str, Any]]) -> None:
+        """Put a batch back at the FRONT of the buffer.
+
+        The bisect sends halves directly rather than re-queuing them, so any
+        event that comes back has to resume its place: appending would let a
+        steady stream of new events push a stalled batch to the back of the
+        queue indefinitely. ``.inflight`` stays — the batch is in memory only,
+        and a later successful flush overwrites and clears it.
+        """
+        self._buffer[0:0] = batch
+
+    def _retry_or_dlq(
+        self, batch: list[dict[str, Any]], error: Exception, *, dead_letter: bool
+    ) -> None:
+        """Re-queue a possibly-transient failure, with a bounded attempt budget.
+
+        Deterministic failures (a payload that will never serialize) repeat
+        identically on every cycle and would pin the batch ahead of the whole
+        buffer forever. So every re-queue costs an attempt; once the budget is
+        spent a ``dead_letter``-eligible batch is quarantined rather than
+        blocking delivery forever.
+
+        ``dead_letter=False`` is for genuinely transient statuses (408/429).
+        Those are counted for observability but NEVER quarantined: the batch is
+        valid data and the server is merely busy, so it waits in the WAL.
+        """
+        key = self._failure_signature(batch)
+        attempts = self._batch_attempts.get(key, 0) + 1
+        if len(self._batch_attempts) >= self._MAX_TRACKED_BATCHES:
+            # A long outage produces an unbounded stream of distinct batch
+            # signatures. Drop the map rather than grow it: a reset only costs
+            # one extra retry cycle, never correctness.
+            logger.warning(
+                f"Failure-attempt map hit {self._MAX_TRACKED_BATCHES} entries, resetting"
+            )
+            self._batch_attempts.clear()
+        self._batch_attempts[key] = attempts
+
+        if dead_letter and attempts > self._max_batch_attempts:
+            logger.error(
+                f"Batch failed {attempts} times without landing: {error}. "
+                f"Quarantining {len(batch)} events."
+            )
+            self._quarantine_to_dlq(batch, error)
+            return
+
+        if not dead_letter:
+            logger.warning(
+                f"Transient rejection (attempt {attempts}) — holding the batch: {error}"
+            )
+        else:
+            logger.warning(
+                f"Batch re-queued (attempt {attempts}/{self._max_batch_attempts}): {error}"
+            )
+        self._buffer.extend(batch)
+        metrics.inc_transport("batches_retried")
+
+    def _failure_signature(self, batch: list[dict[str, Any]]) -> str:
+        """Stable identity for a batch, used as the attempt-counter key."""
+        ids = sorted(str(e.get("event_id", "")) for e in batch)
+        return hashlib.sha256("|".join(ids).encode()).hexdigest()[:16]
 
     def _quarantine_to_dlq(self, batch: list[dict[str, Any]], error: Exception) -> None:
         """Move a permanently-rejected batch out of the retry path.
@@ -1037,11 +1408,19 @@ class Transport:
         subsequent start replays a batch that is guaranteed to fail and the
         poison pill blocks the whole WAL. Nothing is silently discarded: the
         file is inspectable and re-submittable after the caller is fixed.
+
+        The reason is the backend ``error_code`` when there is one, not the HTTP
+        status: several deterministic refusals arrive as 5xx (see
+        ``_DETERMINISTIC_ERROR_CODES``), and a DLQ row that only says "503" tells
+        an operator replaying it nothing about why the event was parked.
         """
-        status = getattr(getattr(error, "response", None), "status_code", None)
-        reason = f"{type(error).__name__}:{status}"
+        if isinstance(error, DeterministicBackendRefusal):
+            reason = f"{error.error_code}:{error.status_code}"
+        else:
+            status = getattr(getattr(error, "response", None), "status_code", None)
+            reason = f"{type(error).__name__}:{status}"
         logger.error(
-            f"Permanent rejection ({status}) on /track/batch — quarantining "
+            f"Permanent rejection ({reason}) on /track/batch — quarantining "
             f"{len(batch)} events to DLQ. They will NOT be retried."
         )
         rows = [{"error": reason, "event": e} for e in batch]
@@ -1217,6 +1596,17 @@ class Transport:
                 content=body,
                 headers=self._build_signed_headers(body=body),
             )
+            # A deterministic refusal is checked BEFORE the status test, and on
+            # any status. The backend sent EXECUTION_NOT_BOUND as 503 until the
+            # status correction (now 422), and a status-first test files the
+            # old shape under "the server is down": it retries, and counts
+            # every attempt as a transport failure. Testing the code first is
+            # what makes this correct against a server we may not control.
+            code = _extract_backend_error_code(resp)
+            if code in _DETERMINISTIC_ERROR_CODES and resp.status_code >= 400:
+                raise DeterministicBackendRefusal(
+                    code, resp.status_code, _extract_error_message(resp)
+                )
             if resp.status_code >= 500 or resp.status_code == 429:
                 # raise_for_status turns this into HTTPStatusError; the retry
                 # helper wraps that into BreakerTransportError after retries.
