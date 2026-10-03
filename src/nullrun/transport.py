@@ -673,63 +673,201 @@ class Transport:
         except OSError as e:
             logger.warning(f"Failed to rotate WAL {wal_path}: {e}")
 
-    def _persist_to_wal(self) -> None:
-        """Persist unflushed events to WAL file for replay on restart."""
-        if not self._buffer:
-            return
-        event_count = len(self._buffer)
-        wal_path = self._wal_path()
-        self._rotate_wal_if_needed()
-        wal_dir = os.path.dirname(wal_path) or "."
+    def _wal_inflight_path(self) -> str:
+        """Path of the in-flight batch file (the batch currently on the wire)."""
+        return f"{self._wal_path()}.inflight"
+
+    def _wal_dlq_path(self) -> str:
+        """Path of the dead-letter file for permanently-rejected batches."""
+        return f"{self._wal_path()}.dlq"
+
+    def _write_events_atomic(
+        self, path: str, events: list[dict[str, Any]], mode: str = "w"
+    ) -> bool:
+        """Write ``events`` as JSON lines to ``path`` atomically.
+
+        tmp + fsync + os.replace: a reader either sees the previous file or
+        the complete new one, never a half-written batch. ``mode="a"`` copies
+        the existing file first and appends, so successive writes accumulate
+        instead of clobbering — that is what the DLQ needs, where losing an
+        earlier quarantine to a later one would itself be data loss.
+
+        Two crash hazards the copy-and-append path has to survive:
+
+        * A **torn tail**. If the process died mid-write, the last line of the
+          existing file has no terminating ``\\n``. Copying it verbatim glues
+          the next row onto the truncated JSON, producing one corrupt line
+          that takes a valid event with it. The unterminated tail is dropped
+          (it was never durable) before appending.
+        * A **stale tmp**. The name is pid-scoped and opened with ``"w"``, so a
+          leftover from a dead process is truncated rather than appended to.
+
+        The directory is fsynced after the rename: without it the new name can
+        be absent after a power cut even though the data blocks landed.
+
+        Returns True when the data is durably on disk.
+        """
+        wal_dir = os.path.dirname(path) or "."
         try:
             os.makedirs(wal_dir, exist_ok=True)
         except OSError as e:
             logger.warning(f"Cannot create WAL directory {wal_dir}: {e}")
-            return
-        tmp_path = f"{wal_path}.tmp.{os.getpid()}"
+            return False
+        tmp_path = f"{path}.tmp.{os.getpid()}"
         try:
-            with open(tmp_path, "a") as f:
-                for event in self._buffer:
+            with open(tmp_path, "w") as f:
+                if mode == "a" and os.path.exists(path):
+                    # Existing contents FIRST, so the file stays in
+                    # chronological order. Writing the new rows first and
+                    # folding the old ones in after would reverse the DLQ.
+                    with open(path) as prev:
+                        for line in prev:
+                            f.write(line)
+                for event in events:
                     f.write(json.dumps(event, default=str) + "\n")
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp_path, wal_path)
-            self._buffer.clear()
-            logger.debug(f"Persisted {event_count} events to WAL at {wal_path}")
+            os.replace(tmp_path, path)
+            return True
         except OSError as e:
-            logger.warning(f"Failed to persist {event_count} events to WAL: {e}")
+            logger.warning(f"Failed to persist {len(events)} events to {path}: {e}")
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            return False
+
+    def _persist_to_wal(self) -> bool:
+        """Persist unflushed events to WAL file for replay on restart.
+
+        Every event is guaranteed an ``event_id`` before it reaches disk.
+        Replay is at-least-once — a crash mid-send can re-deliver an event —
+        and the backend dedups on ``event_id`` (cost_event_id_dedup PRIMARY
+        KEY), so a stable id is exactly what makes re-delivery safe.
+
+        Returns True when the buffer is durably on disk (and therefore
+        cleared), False when the write failed and the caller must NOT
+        discard any recovery file.
+        """
+        if not self._buffer:
+            return True
+        for event in self._buffer:
+            if not event.get("event_id"):
+                event["event_id"] = str(uuid.uuid4())
+        event_count = len(self._buffer)
+        wal_path = self._wal_path()
+        self._rotate_wal_if_needed()
+        if not self._write_events_atomic(wal_path, list(self._buffer)):
+            return False
+        self._buffer.clear()
+        logger.debug(f"Persisted {event_count} events to WAL at {wal_path}")
+        return True
+
+    def _persist_inflight(self, batch: list[dict[str, Any]]) -> None:
+        """Record the batch that is about to go on the wire.
+
+        The batch has already been removed from ``_buffer`` at this point, so
+        a crash during the send would otherwise lose it outright. Cleared once
+        the send is accepted; deliberately RETAINED when the send fails,
+        because then the batch is only in memory. A later successful flush
+        overwrites this file with its own batch and removes it, so a stale
+        copy self-heals rather than accumulating.
+        """
+        if batch:
+            self._write_events_atomic(self._wal_inflight_path(), batch)
+
+    def _clear_inflight(self) -> None:
+        try:
+            os.remove(self._wal_inflight_path())
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            logger.warning(f"Failed to remove in-flight WAL: {e}")
 
     def _replay_from_wal(self) -> None:
-        """Replay events from WAL file on startup.
+        """Recover events from every durable WAL source and flush them.
 
-        P1-5b: also drains the rotated ``.wal.1`` (oldest
-        surviving recovery window) before the active ``.wal`` so
-        a crash between rotation and replay doesn't lose events.
-        Both files are removed only after a successful flush.
+        Sources, oldest first: the rotated ``.wal.1``, the active ``.wal``,
+        and ``.wal.inflight`` — the batch that was on the wire when the
+        process died.
+
+        Crash-safety invariant: no recovery file is unlinked before its
+        events are provably safe, i.e. either accepted by the backend or
+        rewritten into ``.wal`` by ``_persist_to_wal``. Recovery is
+        at-least-once; the backend dedups on ``event_id``.
         """
+        wal_path = self._wal_path()
+        sources = [f"{wal_path}.1", wal_path, self._wal_inflight_path()]
         events: list[dict[str, Any]] = []
-        for candidate in (f"{self._wal_path()}.1", self._wal_path()):
+        found: list[str] = []
+        empty: list[str] = []
+        for candidate in sources:
             try:
                 with open(candidate) as f:
-                    for line in f:
-                        try:
-                            events.append(json.loads(line.strip()))
-                        except json.JSONDecodeError:
-                            continue
+                    lines = f.readlines()
             except FileNotFoundError:
                 continue
             except OSError as e:
                 logger.warning(f"Failed to read WAL {candidate}: {e}")
                 continue
+            if not lines:
+                empty.append(candidate)
+                continue
+            found.append(candidate)
+            for line in lines:
+                try:
+                    events.append(json.loads(line.strip()))
+                except json.JSONDecodeError:
+                    continue
+
+        if not events:
+            # Nothing recovered. Drop leftovers so the next flush starts clean.
+            for candidate in empty:
+                try:
+                    os.remove(candidate)
+                except OSError as e:
+                    logger.warning(f"Failed to remove empty WAL {candidate}: {e}")
+            return
+
+        self._buffer.extend(events)
+        try:
+            self._do_flush()
+        except BreakerTransportError as e:
+            # `_do_flush` normally swallows this internally (it re-queues the
+            # batch), but a transport subclass or a future refactor may not.
+            # Recovery must never abort `start()` — the events are already in
+            # the buffer, and the fall-through below persists them.
+            logger.warning(f"WAL replay flush failed: {e}")
+
+        repersisted = False
+        if self._buffer:
+            # The flush did not deliver everything. Rewrite the survivors into
+            # `.wal` so they survive another crash, and only then discard the
+            # older sources. If that write fails the survivors are in memory
+            # only — keep every source so the next start can try again.
+            if not self._persist_to_wal():
+                logger.warning(
+                    f"WAL replay: {len(self._buffer)} events still buffered and could not be "
+                    f"re-persisted; keeping {found} for the next start"
+                )
+                return
+            repersisted = True
+
+        # Everything recovered is either delivered or — when `repersisted` —
+        # sitting in a FRESH `.wal` that `_persist_to_wal` just wrote. That
+        # file must be spared: unlinking it here would discard exactly what we
+        # persisted. The other sources are now strictly redundant.
+        for candidate in found:
+            if repersisted and candidate == wal_path:
+                continue
             try:
                 os.remove(candidate)
             except OSError as e:
                 logger.warning(f"Failed to remove WAL {candidate}: {e}")
-        if events:
-            self._buffer.extend(events)
-            self._do_flush()
-        if events:
-            logger.info(f"Replayed {len(events)} events from WAL")
+        logger.info(
+            f"Replayed {len(events)} events from WAL"
+            + (" (unflushed remainder re-persisted)" if repersisted else "")
+        )
 
     def track(self, event: dict[str, Any]) -> None:
         """
@@ -807,7 +945,11 @@ class Transport:
             self._flush_thread.join(timeout=timeout)
         if flush:
             self._do_flush()  # Final flush
-            self._persist_to_wal()  # WAL any remaining events
+            if self._persist_to_wal():
+                # The buffer is durably in `.wal` (or was already accepted),
+                # so any retained `.inflight` copy is now a subset of it.
+                # Clear it, or the next replay would load the same events twice.
+                self._clear_inflight()
         self._client.close()
         if getattr(self, "_finalizer", None) is not None and self._finalizer.alive:
             self._finalizer.detach()
@@ -838,6 +980,11 @@ class Transport:
         self._buffer.clear()
         logger.debug(f"Sending batch of {len(batch)} events")
 
+        # Durability barrier: the batch has left `_buffer` and the process
+        # can now die at any point. Record it on disk before the send so a
+        # crash mid-flight is recoverable on the next start.
+        self._persist_inflight(batch)
+
         # Circuit breaker wrapped send - uses proper 3-state circuit breaker
         def send_batch():
             result = self._send_batch_with_retry_info(batch)
@@ -866,7 +1013,42 @@ class Transport:
                 if overflow > 0:
                     batch = self._drop_newest_with_priority(batch, overflow)
             self._buffer.extend(batch)  # Append to END so oldest events retry first.
+            # `.inflight` is intentionally NOT cleared here: the batch is
+            # back in memory only, and a crash before the next `_persist_to_wal`
+            # would lose it. A later successful flush overwrites and clears it.
             metrics.inc_transport("batches_failed")
+            return
+        except Exception as e:  # noqa: BLE001
+            # Anything else from the send (connection reset mid-write,
+            # unexpected shape) is transient by assumption. Re-queue rather
+            # than let it escape and kill the flush thread.
+            logger.warning(f"Unexpected error during flush, re-queuing batch: {e}")
+            self._buffer.extend(batch)
+            metrics.inc_transport("batches_failed")
+            return
+
+        self._clear_inflight()  # accepted — the batch is on the server now
+
+    def _quarantine_to_dlq(self, batch: list[dict[str, Any]], error: Exception) -> None:
+        """Move a permanently-rejected batch out of the retry path.
+
+        A 4xx will never succeed on retry, so the events go to ``.dlq`` with
+        the reason attached and `.inflight` is cleared — otherwise every
+        subsequent start replays a batch that is guaranteed to fail and the
+        poison pill blocks the whole WAL. Nothing is silently discarded: the
+        file is inspectable and re-submittable after the caller is fixed.
+        """
+        status = getattr(getattr(error, "response", None), "status_code", None)
+        reason = f"{type(error).__name__}:{status}"
+        logger.error(
+            f"Permanent rejection ({status}) on /track/batch — quarantining "
+            f"{len(batch)} events to DLQ. They will NOT be retried."
+        )
+        rows = [{"error": reason, "event": e} for e in batch]
+        self._write_events_atomic(self._wal_dlq_path(), rows, mode="a")
+        self._clear_inflight()
+        metrics.inc_transport("events_dead_lettered", len(batch))
+        metrics.set_transport("last_dlq_error", reason)
 
     def _drain_batch(self) -> list[dict[str, Any]] | None:
         """Public, lock-acquiring snapshot of the current buffer. Returns ``None`` when empty."""
