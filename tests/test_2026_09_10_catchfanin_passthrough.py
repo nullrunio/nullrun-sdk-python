@@ -370,16 +370,26 @@ class TestDefNrCatchfaninBehavior:
     def test_consume_overbudget_propagates_with_counter_attrs(
         self, transport
     ):
-        """CONSUME_OVERBUDGET (NR-O001) → NullRunConsumeOverbudgetError."""
+        """CONSUME_OVERBUDGET (NR-O001) → NullRunConsumeOverbudgetError.
+
+        The `details` block is the backend's real one (`handlers.rs`,
+        the ConsumeOverbudget 422): the reservation arrives in
+        MILLICENTS, the actual in cents, and there is no
+        `epsilon_cents` key. An earlier version of this test invented
+        `reserved_cents` / `max_allowed_cents` / `epsilon_cents`, passed
+        because the fixture matched the parser, and left the parser
+        reading three fields the server has never sent.
+        """
         respx.post(_EXECUTE_URL).mock(
             return_value=_v3_envelope(
                 "CONSUME_OVERBUDGET",
                 status=422,
                 execution_id="exec-consume-overrun",
-                reserved_cents=100,
-                max_allowed_cents=101,
+                reserved_millicents=1000,
+                max_allowed_millicents=1010,
                 actual_cost_cents=1000,
-                epsilon_cents=1,
+                soft_pass=False,
+                reservation_recorded=True,
             )
         )
         with pytest.raises(NullRunConsumeOverbudgetError) as excinfo:
@@ -389,10 +399,10 @@ class TestDefNrCatchfaninBehavior:
             "must raise NullRunConsumeOverbudgetError (NR-O001), "
             "not be swallowed."
         )
-        assert excinfo.value.reserved_cents == 100
-        assert excinfo.value.max_allowed_cents == 101
+        assert excinfo.value.reserved_millicents == 1000
+        assert excinfo.value.max_allowed_millicents == 1010
         assert excinfo.value.actual_cost_cents == 1000
-        assert excinfo.value.epsilon_cents == 1
+        assert excinfo.value.recorded is True
 
     @respx.mock
     def test_protocol_too_old_propagates_as_protocol_error(self, transport):

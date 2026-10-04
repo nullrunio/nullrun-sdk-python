@@ -23,7 +23,7 @@ the authoritative table; deviations require an ADR amendment (Rule 5).
 | `_enforce_sensitive_tool` (`_fallback_mode=permissive`, opt-in) | CLOSED -- body MUST NOT run when `decision_source` is any `FALLBACK_*` | n/a (body did not run) | `NULLRUN_SENSITIVE_FAIL_OPEN=1` -- explicitly documented as "OPEN-when-engine-unavailable" |
 | `_emit_span_start` / `_emit_span_end` | n/a -- never blocks | n/a | n/a |
 | `/track` batch path (legacy) | OPEN-on-network-error (event dropped, no retry) | n/a -- circuit breaker backoff applies | none |
-| `/track` v3 single path (`track_single`) | OPEN-on-network-error and OPEN-on-5xx (event dropped, no retry); **CLOSED for enforcement rejections** — a typed `NullRunDecision` (`CONSUME_OVERBUDGET` 422, budget block 402) propagates to the caller | caller reconciles the delta from the exception's `reserved_cents` / `actual_cost_cents` / `epsilon_cents`; ADR-005 forbids implicit re-reserve, so there is nothing for the SDK to retry | none |
+| `/track` v3 single path (`track_single`) | OPEN-on-network-error and OPEN-on-5xx (event dropped, no retry); **CLOSED for enforcement rejections** — a typed `NullRunDecision` (`CONSUME_OVERBUDGET` 422, budget block 402) propagates to the caller | caller reconciles the delta from the exception's `reserved_millicents` / `max_allowed_millicents` / `actual_cost_cents` / `recorded` (the reservation is on the wire in millicents and the actual in cents; the backend does not send its configured epsilon, so `actual - reserved` is the only honest way to recover it); ADR-005 forbids implicit re-reserve, so there is nothing for the SDK to retry | none |
 
 **Fail-OPEN policy** — SDK-side transport failure (network timeout,
 5xx, breaker open) is fail-OPEN on the *check* path so a dead

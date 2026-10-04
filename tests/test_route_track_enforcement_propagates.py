@@ -84,15 +84,19 @@ SERVER_MINTED_V1 = "0190c5b5-7c9a-7def-8a1b-0123456789ab"
 
 TRACK_URL = f"{BASE_URL}/api/v1/track"
 
+# The backend's real 422 body (`handlers.rs`, ConsumeOverbudget arm):
+# the reservation is in MILLICENTS, the actual in cents, and there is no
+# `epsilon_cents` key — the configured tolerance is not on this wire.
 CONSUMED_TOO_MUCH = {
     "error_code": "CONSUME_OVERBUDGET",
     "error_message": "actual > reserved + epsilon",
     "details": {
         "execution_id": SERVER_MINTED_V1,
-        "reserved_cents": 100,
-        "max_allowed_cents": 101,
+        "reserved_millicents": 1000,
+        "max_allowed_millicents": 1010,
         "actual_cost_cents": 150,
-        "epsilon_cents": 1,
+        "soft_pass": False,
+        "reservation_recorded": True,
     },
 }
 
@@ -142,9 +146,10 @@ class TestEnforcementRejectionPropagates:
         rt._transport.flush_now()
 
         err = ei.value
-        assert err.reserved_cents == 100
+        assert err.reserved_millicents == 1000
+        assert err.max_allowed_millicents == 1010
         assert err.actual_cost_cents == 150
-        assert err.epsilon_cents == 1
+        assert err.recorded is True
         assert err.status_code == 422
 
     @respx.mock

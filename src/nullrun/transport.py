@@ -511,6 +511,23 @@ def _extract_error_message(response: Any) -> str:
     return ""
 
 
+def _as_int_or_none(value: Any) -> int | None:
+    """An ``int`` if the wire value is one, else ``None``.
+
+    ``bool`` is excluded on purpose: it is an ``int`` in Python, and a
+    JSON ``true`` landing on a field typed as a money amount is a wire
+    defect worth surfacing as absence rather than as ``1``.
+
+    Used for the numeric fields of a typed error. Coercing a string
+    instead would hand a caller something that looks like a number and
+    fails at the arithmetic; ``None`` fails at the check, which is where
+    it can still be handled.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
 def _extract_error_details(response: Any) -> dict[str, Any]:
     """Pull the wire ``details`` object out of a backend error envelope.
 
@@ -5007,18 +5024,24 @@ def _parse_v3_error_envelope_uncategorised(
         return NullRunProtocolError(full_message)
 
     if backend_code == "CONSUME_OVERBUDGET":
-        # `reservation_recorded` is tri-state on purpose: the backend omits
-        # it when the settle was refused without being applied, and a
-        # pre-marker backend omits it because it cannot say. `is True` is
-        # the only reading that asserts the spend landed.
+        # The backend's 422 `details` block carries the reservation in
+        # MILLICENTS (`reserved_millicents` / `max_allowed_millicents`) and
+        # the actual in cents. Reading `reserved_cents` / `epsilon_cents`
+        # here — as this did — read keys the wire does not carry, so every
+        # one of them was permanently None. `reservation_recorded` is
+        # tri-state on purpose: the backend omits it when the settle was
+        # refused without being applied, and a pre-marker backend omits it
+        # because it cannot say. `is True` is the only reading that asserts
+        # the spend landed.
         recorded = details.get("reservation_recorded")
+        soft_pass = details.get("soft_pass")
         return NullRunConsumeOverbudgetError(
             full_message,
             execution_id=details.get("execution_id"),
-            reserved_cents=details.get("reserved_cents"),
-            max_allowed_cents=details.get("max_allowed_cents"),
-            actual_cost_cents=details.get("actual_cost_cents"),
-            epsilon_cents=details.get("epsilon_cents"),
+            reserved_millicents=_as_int_or_none(details.get("reserved_millicents")),
+            max_allowed_millicents=_as_int_or_none(details.get("max_allowed_millicents")),
+            actual_cost_cents=_as_int_or_none(details.get("actual_cost_cents")),
+            soft_pass=soft_pass if isinstance(soft_pass, bool) else None,
             status_code=status,  # 422 per backend mapping
             recorded=recorded if isinstance(recorded, bool) else None,
         )

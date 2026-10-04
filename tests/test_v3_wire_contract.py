@@ -476,25 +476,29 @@ class TestV3ErrorEnvelopeMapping:
         assert exc.workflow_id == "wf-1"
 
     def test_consume_overbudget_maps_to_consume_overbudget_error(self):
+        # The backend's real details block: reservation in MILLICENTS,
+        # actual in cents, no `epsilon_cents` key. See handlers.rs, the
+        # ConsumeOverbudget 422.
         resp = self._make_response(
             422,
             {
                 "error_code": "CONSUME_OVERBUDGET",
                 "error_message": "actual > reserved + epsilon",
                 "details": {
-                    "reserved_cents": 100,
-                    "max_allowed_cents": 101,
+                    "reserved_millicents": 1000,
+                    "max_allowed_millicents": 1010,
                     "actual_cost_cents": 150,
-                    "epsilon_cents": 1,
+                    "soft_pass": False,
+                    "reservation_recorded": True,
                 },
             },
         )
         exc = _parse_v3_error_envelope(resp, "track")
         assert isinstance(exc, NullRunConsumeOverbudgetError)
-        assert exc.reserved_cents == 100
-        assert exc.max_allowed_cents == 101
+        assert exc.reserved_millicents == 1000
+        assert exc.max_allowed_millicents == 1010
         assert exc.actual_cost_cents == 150
-        assert exc.epsilon_cents == 1
+        assert exc.recorded is True
 
     def test_budget_recheck_failed_maps_to_typed_error(self):
         #: AR-H6 (2026-08-12) — post-approval re-check failure must
