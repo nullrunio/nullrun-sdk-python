@@ -495,6 +495,17 @@ class NullRunConsumeOverbudgetError(NullRunDecision):
         actual_cost_cents: What the caller tried to consume (the
             rejected value).
         epsilon_cents: The configured tolerance (default 1).
+        recorded: Whether the backend already applied the spend
+            (``details.reservation_recorded``). ``True`` means the
+            period counter carries the real cost and the cost event
+            row is written — the rejection was about the reservation
+            ceiling, not about delivery, and ADR-005 forbids an
+            implicit re-reserve, so the caller reconciles the delta
+            rather than retrying. ``False`` means the backend
+            refused and charged nothing, leaving the reservation to
+            expire. ``None`` means an older backend sent no marker:
+            an unknown state, which is not the same as ``False`` and
+            must not be treated as one.
     """
 
     error_code = "NR-O001"
@@ -518,6 +529,7 @@ class NullRunConsumeOverbudgetError(NullRunDecision):
         actual_cost_cents: int | None = None,
         epsilon_cents: int | None = None,
         status_code: int | None = None,
+        recorded: bool | None = None,
         **kwargs: Any,
     ) -> None:
         self.execution_id = execution_id
@@ -526,6 +538,7 @@ class NullRunConsumeOverbudgetError(NullRunDecision):
         self.actual_cost_cents = actual_cost_cents
         self.epsilon_cents = epsilon_cents
         self.status_code = status_code
+        self.recorded = recorded
         super().__init__(message, **kwargs)
 
 

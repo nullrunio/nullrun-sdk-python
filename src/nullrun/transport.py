@@ -410,12 +410,27 @@ class DeterministicBackendRefusal(Exception):
     status-based classification mis-routes them. Handlers of this exception
     must NOT count it as a transport failure: the transport layer is healthy,
     the answer is a decision.
+
+    ``details`` is the wire ``details`` object. It is not decoration: for
+    ``CONSUME_OVERBUDGET`` it carries ``reservation_recorded`` — the backend
+    saying it already applied the spend — and the ``event_id`` it applied it
+    to. That marker is the difference between an event that is genuinely
+    undelivered (nothing charged, park it in the DLQ) and one the server has
+    already booked (delivered; quarantining it files a rejection that never
+    happened). See ``_deliver_recorded_overbudget``.
     """
 
-    def __init__(self, error_code: str, status_code: int | None, message: str = "") -> None:
+    def __init__(
+        self,
+        error_code: str,
+        status_code: int | None,
+        message: str = "",
+        details: dict[str, Any] | None = None,
+    ) -> None:
         self.error_code = error_code
         self.status_code = status_code
         self.detail = message
+        self.details: dict[str, Any] = details or {}
         super().__init__(f"{error_code} (HTTP {status_code}): {message}" if message else error_code)
 
 
@@ -494,6 +509,29 @@ def _extract_error_message(response: Any) -> str:
         if isinstance(message, str):
             return message
     return ""
+
+
+def _extract_error_details(response: Any) -> dict[str, Any]:
+    """Pull the wire ``details`` object out of a backend error envelope.
+
+    Returns ``{}`` for an absent, unparseable, or non-object body — the same
+    "no evidence" reading ``_extract_backend_error_code`` uses. Callers must
+    treat the empty dict as *the backend told us nothing*, never as *the
+    backend said no*: an absent marker is a different fact from a marker set
+    to ``false``, and conflating them would make a rollback indistinguishable
+    from a refusal that charged nothing.
+    """
+    if response is None:
+        return {}
+    try:
+        payload = response.json()
+    except Exception:  # noqa: BLE001 — non-JSON body (proxy page, empty)
+        return {}
+    if isinstance(payload, dict):
+        details = payload.get("details")
+        if isinstance(details, dict):
+            return details
+    return {}
 
 
 # =============================================================================
@@ -2201,9 +2239,100 @@ class Transport:
 
         self._batch_attempts.pop(self._failure_signature(half), None)
 
+    def _deliver_recorded_overbudget(
+        self, batch: list[dict[str, Any]], error: DeterministicBackendRefusal
+    ) -> bool:
+        """Settle a CONSUME_OVERBUDGET the backend says it already applied.
+
+        ``/track/batch`` rejects a settle that lands past
+        ``reserved + epsilon_cents`` with 422 — but the Lua overage branch
+        has already INCRBY'd the real spend onto the period counter and the
+        handler has already written the ``cost_events`` row. The refusal is
+        about the *reservation* being exceeded, not about the event being
+        refused. ``details.reservation_recorded`` is the backend stating
+        which of those two happened.
+
+        Treating the 422 as a refusal when the marker says the spend landed
+        is a two-part lie. The event goes to the DLQ annotated "permanent
+        rejection, will NOT be retried" — a rejection the server never made,
+        for an event it already has a row for — and the rest of the batch
+        dies with it, because the aborted request never reached them. The
+        operator's only durable trace of the event is that DLQ line.
+
+        So the marker decides, and only for this code:
+
+        * ``reservation_recorded: true`` → the event is DELIVERED. Drop it
+          from the retry path and from ``.inflight``, re-queue the rest of
+          the batch (unprocessed, still owed), return ``True``.
+        * anything else, including a body with no ``details`` at all → return
+          ``False`` and let the existing quarantine path run untouched. A
+          refusal that charged nothing must still park the data.
+
+        ``details.event_id`` names the offender. When it is absent (older
+        backend, or a proxy page) the answer is computed from the batch: a
+        singleton can only be the offender, so a recorded marker on it is
+        enough. A multi-event batch with no name is not — there the
+        cascade below isolates the offender and this runs again on the
+        singleton, which is why returning ``False`` here is correct and not
+        merely conservative.
+        """
+        if error.error_code != "CONSUME_OVERBUDGET":
+            return False
+        if error.details.get("reservation_recorded") is not True:
+            return False
+
+        offender_id = error.details.get("event_id")
+        if offender_id:
+            settled = [e for e in batch if e.get("event_id") == offender_id]
+            outstanding = [e for e in batch if e.get("event_id") != offender_id]
+        elif len(batch) == 1:
+            settled, outstanding = list(batch), []
+        else:
+            # Named by nobody, and not provable from a multi-event batch.
+            # Let the bisect isolate it; this runs again on the singleton.
+            return False
+
+        if not settled:
+            # The backend named an event that is not in this batch. Dropping
+            # "everything not named" here would silently discard real data
+            # on the strength of an id we cannot see; let it be quarantined
+            # so a human finds the mismatch.
+            logger.error(
+                f"CONSUME_OVERBUDGET names event {offender_id!r}, which is not in "
+                f"this batch of {len(batch)} — quarantining rather than guessing "
+                f"which event the backend settled."
+            )
+            return False
+
+        exec_id = error.details.get("execution_id")
+        logger.warning(
+            f"CONSUME_OVERBUDGET on {len(settled)} event(s) — the backend reports "
+            f"reservation_recorded=true, so the spend is already on the period "
+            f"counter and the cost_events row is written"
+            + (f" (execution {exec_id})" if exec_id else "")
+            + ". Treating as DELIVERED, not quarantined. "
+            + f"Re-queueing {len(outstanding)} event(s) the aborted batch never reached."
+        )
+        for event in settled:
+            eid = event.get("event_id")
+            if eid:
+                self._in_flight.pop(eid, None)
+            self._first_failed_at.pop(str(eid), None)
+        metrics.inc_transport("events_recorded_overage", len(settled))
+
+        if outstanding:
+            self._requeue_at_head(outstanding)
+        return True
+
     def _route_deferred(self, batch: list[dict[str, Any]], error: Exception) -> None:
         """Classify a failure that was kept away from the circuit breaker."""
         if isinstance(error, DeterministicBackendRefusal):
+            # A refusal the backend has already applied is not a refusal of
+            # delivery. Checked before the bisect so a resolved 422 costs one
+            # send, not log2(n), and so the events the aborted batch never
+            # reached are re-queued rather than dropped with it.
+            if self._deliver_recorded_overbudget(batch, error):
+                return
             # The backend named the refusal. It named it for the BATCH, and a
             # whole-batch refusal is what an unbatched per-event rejection
             # looks like from out here: one event the backend cannot accept
@@ -2854,7 +2983,10 @@ class Transport:
             code = _extract_backend_error_code(resp)
             if code in _DETERMINISTIC_ERROR_CODES and resp.status_code >= 400:
                 raise DeterministicBackendRefusal(
-                    code, resp.status_code, _extract_error_message(resp)
+                    code,
+                    resp.status_code,
+                    _extract_error_message(resp),
+                    _extract_error_details(resp),
                 )
             if resp.status_code >= 500 or resp.status_code == 429:
                 # raise_for_status turns this into HTTPStatusError; the retry
@@ -4875,6 +5007,11 @@ def _parse_v3_error_envelope_uncategorised(
         return NullRunProtocolError(full_message)
 
     if backend_code == "CONSUME_OVERBUDGET":
+        # `reservation_recorded` is tri-state on purpose: the backend omits
+        # it when the settle was refused without being applied, and a
+        # pre-marker backend omits it because it cannot say. `is True` is
+        # the only reading that asserts the spend landed.
+        recorded = details.get("reservation_recorded")
         return NullRunConsumeOverbudgetError(
             full_message,
             execution_id=details.get("execution_id"),
@@ -4883,6 +5020,7 @@ def _parse_v3_error_envelope_uncategorised(
             actual_cost_cents=details.get("actual_cost_cents"),
             epsilon_cents=details.get("epsilon_cents"),
             status_code=status,  # 422 per backend mapping
+            recorded=recorded if isinstance(recorded, bool) else None,
         )
 
     if (

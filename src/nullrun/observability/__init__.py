@@ -134,6 +134,16 @@ class TransportMetrics:
     # is expected; a sustained rate outside shutdown means something is
     # stopping the transport.
     retries_interrupted_by_shutdown: int = 0
+    # Events the backend settled past its epsilon and then told us it had
+    # already charged (422 CONSUME_OVERBUDGET with
+    # `reservation_recorded: true`). Counted here rather than as
+    # `events_dead_lettered` because these were DELIVERED — the counter is
+    # the operator's evidence that the DLQ is not lying about them, so a
+    # non-zero value is normal operation, not an error. Zero while the
+    # backend alert `NullRunBudgetBreaches` is firing means the SDK is
+    # talking to a backend that does not emit the marker, which is the
+    # case worth acting on.
+    events_recorded_overage: int = 0
 
 
 @dataclass
