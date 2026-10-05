@@ -2371,13 +2371,36 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # post-approval re-entry failed (DEF-TC14-002, ADR-065).
         #
         # A context with no envelope is an LLM check with no tool to
-        # name, for which `no_impact()` is the correct and honest
-        # answer — it is NOT a stand-in for a tool call.
+        # name. It has NO honest `none` to send: the gate's wire enum is
+        # `Money | ToolCall` (`backend/src/proxy/http/gate/
+        # business_impact.rs`) and it has no `none` variant, so
+        # `{"kind": "none"}` is refused by the DESERIALISER — 422,
+        # before any policy runs. This SDK shipped that for a release
+        # cycle (ADR-065 decision step 3 said to keep `no_impact()`
+        # here, which the same ADR tabulates as a 422 at line 45).
+        #
+        # `business_impact` is `Option` on the wire, so the honest
+        # encoding of "no envelope" is ABSENCE, not a sentinel. Only
+        # `action_digest` is mandatory at protocol >= 3
+        # (`gate.rs`, `if req.action_digest.is_none()`), so it is
+        # still computed and sent, over the same `no_impact()`
+        # canonical bytes as before — unchanged, so the digest stays
+        # stable across the upgrade.
+        #
+        # Measured on a live stand before choosing this: omitting the
+        # field returns 200 at /gate AND 200 at /execute on the
+        # no-approval path. It is NOT safe on the approval-consumption
+        # path, where the server recomputes the digest from the live
+        # payload and fails CLOSED without it (NR-010) — but an
+        # approval always originates from a tool call, which always
+        # carries a `tool_call` envelope, so this branch cannot reach
+        # it.
         call_impact = get_call_impact()
-        if call_impact is None:
-            call_impact = _BusinessImpact.no_impact()
-        check_req["action_digest"] = _compute_action_digest(call_impact)
-        check_req["business_impact"] = call_impact.to_wire_dict()
+        check_req["action_digest"] = _compute_action_digest(
+            call_impact if call_impact is not None else _BusinessImpact.no_impact()
+        )
+        if call_impact is not None:
+            check_req["business_impact"] = call_impact.to_wire_dict()
 
         # Forward the tool list so backend (T3) can match each tool
         # against the workflow's effective `blocked_tools` aggregate.
