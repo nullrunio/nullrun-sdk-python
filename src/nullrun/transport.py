@@ -5540,6 +5540,94 @@ def _build_v3_error_code_map() -> dict[str, type[Exception]]:
         # branches on the action_digest missing path with the same
         # `except NullRunBlockedException:` flow as TOOL_BLOCKED.
         "LEGACY_GRANT_REJECTED": NullRunBlockedException,
+        # -----------------------------------------------------------------
+        # 2026-10-07 — twelve codes the backend registered and this catalog
+        # never learned about.
+        #
+        # The parity guard in ``backend/tests/nr007_sdk_error_code_parity.rs``
+        # could not see them: it compared the SDK map against a hand-written
+        # 51-entry mirror of ``GateErrorCode::all()`` while the enum had
+        # grown to 72. Both "completeness" assertions were self-consistent —
+        # the list was checked against the number 51, and the number 51 was
+        # checked against the list — so nothing compared either to the enum
+        # they were supposed to mirror. Every code below therefore fell
+        # through to the status-based fallback and arrived as an untyped
+        # ``NullRunBackendError``.
+        #
+        # That is not a cosmetic gap for this family. ``is_model_message_safe()``
+        # on the backend is what keeps budget-blocked outcomes out of the
+        # model's context, and it keys off the error_code; a caller holding
+        # an untyped error has no branch to take. Several of these —
+        # ``CIRCUIT_BREAKER_TRIPPED``, ``BUDGET_ORG_CEILING_BLOCKED`` —
+        # are the codes an operator reaches for precisely when an agent is
+        # misbehaving.
+        #
+        # Family rationale per code:
+        #   - money blocks            → NullRunBudgetError ("stop spending")
+        #   - decision blocks         → NullRunBlockedException
+        #   - infra failures on a
+        #     fail-CLOSED gate arm   → NullRunBackendError / the typed
+        #                               infra sibling for that subsystem
+        # -----------------------------------------------------------------
+        # Org-scope ceiling (ADR-050) — the workflow cap is fine, the ORG
+        # cap is not. Distinct from BUDGET_HARD_BLOCKED: raising the org
+        # budget is the operator action this asks for, so it must be
+        # catchable as a budget error rather than a generic refusal.
+        "BUDGET_ORG_CEILING_BLOCKED": NullRunBudgetError,
+        # Circuit breaker. A decision, not an outage: the workflow's
+        # cb_state is OPEN and /gate refuses at step 0.5 until an operator
+        # resets it. Fail-CLOSED mode (Enforce) is why this reaches the
+        # wire at all; in LogOnly mode the gate allows and this never fires.
+        "CIRCUIT_BREAKER_TRIPPED": NullRunBlockedException,
+        # The breaker state itself could not be READ — Postgres/Redis
+        # unavailable at the lookup. Infrastructure, not a breaker
+        # decision: the gate fails CLOSED, but the cause is unavailability,
+        # and a caller should retry rather than treat it as a tripped
+        # workflow. Sibling of WORKFLOW_INACTIVE_LOOKUP_FAILED below.
+        "CIRCUIT_BREAKER_STATE_LOOKUP_FAILED": NullRunBackendError,
+        # Workflow lifecycle lookup failed. Deliberately NOT
+        # ``NullRunWorkflowInactiveError``: that class means "we read the
+        # row and it is inactive", which is a decision. This means we
+        # could not read it at all. Collapsing the two would make an
+        # outage look like a policy decision.
+        "WORKFLOW_INACTIVE_LOOKUP_FAILED": NullRunBackendError,
+        # Workflow is paused by an operator. Decision → blocked.
+        "WORKFLOW_PAUSED": NullRunBlockedException,
+        # Plan-tier execution quota exhausted. Distinct from the
+        # per-key token bucket (RATE_LIMIT_EXCEEDED): this is the org's
+        # plan allowance, and the remedy is a plan change rather than a
+        # backoff.
+        "EXECUTION_QUOTA_EXCEEDED": NullRunBlockedException,
+        # Same idempotency key replayed with a different payload. A
+        # client-side contract violation → protocol class. Same key with
+        # the SAME payload is an idempotent success, not this code.
+        "IDEMPOTENCY_KEY_MISMATCH": NullRunProtocolError,
+        # Body/workflow-id disagreement. Wire-shape family — maps to
+        # NullRunBackendError alongside EXECUTION_ID_MALFORMED /
+        # EXECUTION_ID_REQUIRED, which is the established treatment for
+        # "the server could not make sense of your envelope".
+        "WORKFLOW_ID_BODY_MISMATCH": NullRunBackendError,
+        # Approval-rule store unavailable at /gate step 7. The gate fails
+        # CLOSED (does not fall through to "no rule matched → allow"), so
+        # this is the approval subsystem being unavailable rather than a
+        # rule rejecting the call — the typed approval-infra class.
+        "APPROVAL_RULES_UNAVAILABLE": NullRunApprovalDbUnavailableError,
+        # Server-side digest recompute failed during approval consume.
+        # Same infra family as above; the distinction is that the failure
+        # is in recomputation rather than the rules store.
+        "APPROVAL_DIGEST_RECOMPUTE_FAILED": NullRunApprovalDbUnavailableError,
+        # Backend reserved 503: Redis down on the budget path. Note this
+        # is the WIRE string for the reserved unavailability; the older
+        # BUDGET_REDIS_UNAVAILABLE spelling above remains mapped for
+        # backward compatibility, since the SDK preserved the pre-v3
+        # string. Both routes are live depending on backend version —
+        # callers should not branch on which one arrives.
+        "REDIS_UNAVAILABLE": NullRunBackendError,
+        # Terminal backend-side error on an otherwise well-formed request.
+        # This is the code that proves the base-class fallback is not a
+        # catch-all hiding drift: previously every one of the eleven
+        # codes above landed here untyped.
+        "INTERNAL_ERROR": NullRunBackendError,
     }
 
 

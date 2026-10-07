@@ -1936,13 +1936,19 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
 
     #: Every decision value the SDK knows how to act on. The backend's
     #: `GateDecision` (`gate/internal.rs:574`) supplies allow / block /
-    #: require_approval / soft_pass / deny; ``throttle`` is an
-    #: SDK-side shape that maps to `WorkflowPausedException`. Anything
-    #: outside this set is a wire contract the SDK does not implement,
-    #: and guessing "allow" for it is the fail-OPEN ADR-008 assigns
-    #: only to transport failures.
+    #: require_approval / soft_pass / deny. 2026-10-07: "throttle"
+    #: was removed. It was listed here as an "SDK-side shape", but
+    #: the backend cannot emit it — `GateDecision` has no such variant,
+    #: and the only string producer in the tree is an uncalled Phase-2
+    #: schema stub. Keeping it in this set meant the validation gate
+    #: below ACCEPTED a decision value that nothing downstream could
+    #: ever handle, which is worse than rejecting it: a caller got
+    #: past validation and then hit no branch. Anything outside this
+    #: set is a wire contract the SDK does not implement, and guessing
+    #: "allow" for it is the fail-OPEN ADR-008 assigns only to
+    #: transport failures.
     _KNOWN_GATE_DECISIONS = frozenset(
-        {"allow", "block", "throttle", "soft_pass", "require_approval", "deny"}
+        {"allow", "block", "soft_pass", "require_approval", "deny"}
     )
 
     #: Provenance values a ``/gate`` answer may carry. ``gateway`` is
@@ -2666,14 +2672,33 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             if isinstance(block_error, NullRunBudgetError):
                 metrics.inc_runtime("cost_limit_exceeded")
             raise block_error
-        if decision == "throttle":
-            reasons = response.get("explanations") or (
-                [response["explanation"]] if response.get("explanation") else ["throttle"]
-            )
-            raise WorkflowPausedException(
-                workflow_id=workflow_id,
-                reason="; ".join(reasons),
-            )
+        # 2026-10-07: the `decision == "throttle"` arm that used to sit
+        # here was dead on arrival. The backend's `GateDecision` enum
+        # (backend/src/proxy/http/gate/internal.rs) has no `Throttle`
+        # variant — `as_str()` emits only allow / block / require_approval /
+        # soft_pass / deny. The single producer of the string "throttle"
+        # anywhere in the backend is `CheckResponse::throttled()` in
+        # `events/types.rs`, which has no production caller. So this
+        # branch could never run: the only producer of it was a
+        # Phase-2 schema declaration nothing serialises.
+        #
+        # Worse than dead — `_KNOWN_GATE_DECISIONS` listed "throttle",
+        # so the validation gate above accepted the value as
+        # implemented. A cookbook recipe written against the documented
+        # behaviour ("throttle = insufficient budget, resumable") would
+        # validate fine and then never fire; the same condition actually
+        # arrives as `decision="block"` with error_code BUDGET_* and
+        # raises NullRunBudgetError.
+        #
+        # The LIVE signal for a paused workflow is the wire code
+        # WORKFLOW_PAUSED, now mapped in `_V3_ERROR_CODE_MAP`. It
+        # raises NullRunBlockedException because
+        # WorkflowPausedException requires constructor kwargs
+        # (workflow_id, reason) that the catalog's uniform
+        # instantiation path does not supply. Wiring that properly means
+        # a bespoke dispatch arm; until one exists, callers should
+        # branch on the error_code rather than on an exception class
+        # that nothing raises.
         if decision == "soft_pass":
             # Soft-mode call proceeded via the chain's overdraft cap
             # (CLAUDE.md §5). The body MUST execute — soft_pass is
