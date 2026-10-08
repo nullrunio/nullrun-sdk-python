@@ -1936,6 +1936,79 @@ class TestBuildV3TrackPayload:
         assert out["tokens"] == 100
         assert isinstance(out["tokens"], int)
 
+    # ── ADR-068 §1 (backend NULLRUN): `provider` must reach the wire.
+    #
+    # The backend picks the cache-token convention off `provider`.
+    # Anthropic reports the cached fraction OUTSIDE `input_tokens`;
+    # OpenAI / Gemini / Mistral report it INSIDE `prompt_tokens`. If
+    # the field is missing, the backend sees an unmapped provider and
+    # applies the fail-CLOSED no-discount path — the full input rate,
+    # which is what we billed before ADR-068 landed. So dropping this
+    # key silently restores the overcharge for every cache-using call.
+    #
+    # The batch path already forwarded it (it ships the whole enriched
+    # event); this is the single-event path, which whitelists keys.
+
+    def test_provider_is_forwarded_when_present(self):
+        out = _build_v3_track_payload(
+            {
+                "type": "llm_call",
+                "workflow_id": "wf-1",
+                "tokens": 100,
+                "input_tokens": 60,
+                "output_tokens": 40,
+                "model": "claude-sonnet-4-6",
+                "provider": "anthropic",
+            },
+            SERVER_MINTED_V1,
+        )
+        assert out["provider"] == "anthropic"
+
+    def test_provider_absent_stays_absent(self):
+        # No fabricated key: the backend distinguishes "provider we
+        # could not determine" (fail-CLOSED, counted) from a provider
+        # we named. Emitting `None` would make both look the same.
+        out = _build_v3_track_payload(
+            {"type": "llm_call", "workflow_id": "wf-1", "tokens": 1},
+            SERVER_MINTED_V1,
+        )
+        assert "provider" not in out
+
+    def test_empty_provider_is_not_sent(self):
+        # `""` is the shape `_provider_label` returns for a host it
+        # cannot classify down to a real name; forwarding it would
+        # look like a known-but-unmapped provider to the backend.
+        out = _build_v3_track_payload(
+            {
+                "type": "llm_call",
+                "workflow_id": "wf-1",
+                "tokens": 1,
+                "provider": "",
+            },
+            SERVER_MINTED_V1,
+        )
+        assert "provider" not in out
+
+    def test_cache_token_fields_survive_to_the_wire(self):
+        # The companion half: the backend prices the cached fraction
+        # and persists it (ADR-068 §D2). Both fields have to be here
+        # for either to mean anything.
+        out = _build_v3_track_payload(
+            {
+                "type": "llm_call",
+                "workflow_id": "wf-1",
+                "tokens": 9100,
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "provider": "anthropic",
+                "cache_read_tokens": 9000,
+                "cache_write_tokens": 0,
+            },
+            SERVER_MINTED_V1,
+        )
+        assert out["cache_read_tokens"] == 9000
+        assert out["cache_write_tokens"] == 0
+
 
 # ─────────────────────────────────────────────────────────────────
 # 5. _route_track: routes llm_call → /track, others → /track/batch

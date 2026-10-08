@@ -4895,6 +4895,18 @@ def _build_v3_track_payload(
         payload["output_tokens"] = int(wire_event["output_tokens"])
     if "model" in wire_event and wire_event["model"]:
         payload["model"] = wire_event["model"]
+    # ADR-068 §1 (backend NULLRUN): the provider selects the
+    # cache-token convention. Anthropic reports the cached fraction
+    # OUTSIDE `input_tokens`; OpenAI / Gemini / Mistral report it
+    # INSIDE `prompt_tokens`. The backend has to know which, and
+    # `provider` is the only field that tells it. Without this key
+    # the backend sees an unmapped provider and applies the
+    # fail-CLOSED no-discount path — today's overcharging behaviour —
+    # for every cache-using call. The batch path already forwards it
+    # (it sends the whole enriched event); this is the single-event
+    # path, which whitelists keys explicitly.
+    if "provider" in wire_event and wire_event["provider"]:
+        payload["provider"] = wire_event["provider"]
     if "latency_ms" in wire_event and wire_event["latency_ms"] is not None:
         payload["latency_ms"] = int(wire_event["latency_ms"])
     if "metadata" in wire_event and wire_event["metadata"]:
