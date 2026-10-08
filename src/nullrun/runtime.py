@@ -1959,8 +1959,20 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
     #: falls through, and ``cached`` / ``local`` are the SDK's own
     #: shapes. A value outside this set means the body did not come
     #: from either party, whatever it claims.
+    # `edge_lease` is here because via-edge answers the same question
+    # from a different authority: a signed grant on a box, not the
+    # cloud's `/gate`. Without it in this set the runtime raises
+    # `NullRunMalformedGateResponseError` on every single via-edge
+    # decision — the mode would fail closed on its own successes, which
+    # reads as "the box is broken" rather than "the SDK has not heard of
+    # this decision source yet".
+    #
+    # Named by import, not by string literal, so the allowlist and the
+    # producer cannot drift into two different spellings of one value —
+    # which is exactly how `is_fallback_decision_source` ended up with
+    # two hand-maintained copies.
     _KNOWN_DECISION_SOURCES = frozenset(
-        {"gateway", "cached", "fallback", "local"}
+        {"gateway", "cached", "fallback", "local", EDGE_LEASE_DECISION_SOURCE}
     )
 
     def _require_gate_decision(self, response: Any) -> str:

@@ -1154,6 +1154,25 @@ class Transport:
                 keepalive_expiry=30.0,
             ),
         )
+        # Via-edge. `None` is the ordinary case and costs nothing: the
+        # cloud stays on the enforcement path exactly as before.
+        #
+        # Read HERE, at construction, rather than per call: a
+        # reconfigured box that silently switches enforcement targets
+        # mid-flight would be a budget being enforced by one authority
+        # and then another, with no record of the change. Configuration
+        # is expected to change at deploy, not at runtime.
+        from nullrun.edge import EdgeConfigurationError, edge_transport_from_env
+
+        try:
+            self.edge = edge_transport_from_env()
+        except EdgeConfigurationError:
+            # Raised, not warned and swallowed. Via-edge was asked for
+            # and cannot be enforced; continuing would mean every call
+            # runs with no gate at all while the operator believes the
+            # box is holding the line.
+            raise
+
         self._redis_client = redis_client
         self._circuit_breaker = CircuitBreaker(
             failure_threshold=self.config.max_failed_flush,
@@ -3251,6 +3270,23 @@ class Transport:
                   responses populate `policy_hash` only.
                 - decision_context: Context for replay (if available)
         """
+        # Via-edge: there is no /execute to make.
+        #
+        # The box's `/enforce` already did both halves of the cloud's
+        # `/gate` + `/execute` sequence in one call — it decided AND it
+        # charged the grant. A second call would either reach the cloud
+        # (defeating the mode) or ask the box a question it has no
+        # endpoint for. Re-asking would also double-charge: the charge
+        # and the decision are one event, done once.
+        if self.edge is not None:
+            from nullrun.edge import EDGE_LEASE
+            return {
+                "decision": "allow",
+                "decision_source": self.edge.last_source or EDGE_LEASE,
+                "execution_id": execution_id,
+                "via_edge": True,
+            }
+
         gate_request = {
             "organization_id": organization_id,
             "execution_id": execution_id,
@@ -3557,6 +3593,25 @@ class Transport:
                 - explanations: List of explanation strings
                 - suggestions: List of suggestion strings
         """
+        # Via-edge. When a box holds a signed lease, the box IS the gate
+        # and the cloud is not consulted at all.
+        #
+        # Placed before the gate body is built, not as a branch inside
+        # it, so there is no way for a later field to leak onto a cloud
+        # request or for a partial body to be sent somewhere. One of
+        # two paths runs; they do not interleave.
+        if self.edge is not None:
+            from nullrun.edge import token_split
+
+            input_tokens, output_tokens = token_split(check_request)
+            return self.edge.enforce(
+                model=str(check_request.get("model") or ""),
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                event_id=check_request.get("operation_id"),
+                on_transport_error=on_transport_error,
+            )
+
         # Convert check_request to gate_request format
         gate_request = {
             "organization_id": check_request.get("organization_id"),
