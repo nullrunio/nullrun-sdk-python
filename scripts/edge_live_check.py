@@ -144,9 +144,14 @@ def main() -> int:
         last.get("decision") == "allow",
         f"spending the exact remainder is allowed: {last.get('error_code')!r}",
     )
+    # `is None`, never `or`. Zero is the value this assertion exists to
+    # observe, and `0 or -1` evaluates to -1 — so the idiom reported the
+    # grant as NOT at zero on the one run where it was exactly zero.
+    # The box was right; the check that was supposed to prove it failed.
+    final_remaining = last.get("remaining_millicents")
     check(
-        (last.get("remaining_millicents") or -1) == 0,
-        f"the grant is at zero, not over: remaining={last.get('remaining_millicents')}",
+        final_remaining is not None and final_remaining == 0,
+        f"the grant is at zero, not over: remaining={final_remaining!r}",
     )
 
     beyond = call(t, 1)
