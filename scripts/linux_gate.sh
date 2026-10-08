@@ -21,6 +21,8 @@
 #   scripts/linux_gate.sh                 # 20 runs of the WAL hygiene file
 #   REPEAT=50 scripts/linux_gate.sh      # more
 #   REPEAT=1 scripts/linux_gate.sh       # smoke
+#   CPU_LIMIT=1 REPEAT=1 scripts/linux_gate.sh   # once, on a single cpu
+#   CPU_LIMIT=1 REPEAT=20 scripts/linux_gate.sh  # the run that means most
 #
 # Requires Docker. Runs the suite against the repo mounted read-only-ish at
 # /app with the image's own Python, so nothing local leaks in.
@@ -31,6 +33,20 @@ REPEAT="${REPEAT:-20}"
 IMAGE="${IMAGE:-python:3.11-slim}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET="${TARGET:-tests/test_wal_hygiene.py}"
+# Constrain the CPU when set, e.g. CPU_LIMIT=1 -> `--cpus=1`.
+#
+# This is not a stress test for its own sake. The bug this gate exists to
+# catch is a lock-timing bug, and lock timing is exactly what a machine
+# with cores to spare hides: a second process that should lose the race
+# wins it instead when the holder is descheduled late, or wins it every
+# time because the winner was always the one on the free core. Running
+# once on ONE cpu removes that variable, so a pass cannot be explained by
+# the scheduler being generous. Unset, it runs at full width.
+CPU_ARGS=()
+if [ -n "${CPU_LIMIT:-}" ]; then
+  CPU_ARGS=(--cpus="${CPU_LIMIT}")
+  echo "cpu limit: ${CPU_LIMIT}"
+fi
 
 if ! command -v docker >/dev/null 2>&1; then
   echo "error: docker is required — this gate asserts POSIX behaviour that" >&2
@@ -48,6 +64,7 @@ failures=0
 for i in $(seq 1 "$REPEAT"); do
   if out="$(
     MSYS_NO_PATHCONV=1 docker run --rm \
+      "${CPU_ARGS[@]}" \
       -v "${REPO_ROOT}:/app" -w /app \
       -e PYTHONDONTWRITEBYTECODE=1 \
       "${IMAGE}" sh -c "pip install -q -e '.[dev]' && ${RUNNER}" 2>&1
