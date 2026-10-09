@@ -67,6 +67,7 @@ import logging
 import os
 import time
 import uuid
+from collections.abc import Mapping
 from typing import Any
 
 import httpx
@@ -399,7 +400,7 @@ def token_split(check_request: dict[str, Any]) -> tuple[int, int]:
     return int(inp), int(out)
 
 
-def _float_env(source: dict[str, str], name: str, default: float) -> float:
+def _float_env(source: Mapping[str, str], name: str, default: float) -> float:
     raw = (source.get(name) or "").strip()
     if not raw:
         return default
@@ -414,7 +415,7 @@ def _float_env(source: dict[str, str], name: str, default: float) -> float:
     return value
 
 
-def _int_env(source: dict[str, str], name: str, default: int) -> int:
+def _int_env(source: Mapping[str, str], name: str, default: int) -> int:
     raw = (source.get(name) or "").strip()
     if not raw:
         return default
