@@ -128,6 +128,7 @@ from nullrun.context import (
     get_trace_id,
     get_workflow_id,
 )
+from nullrun.edge import EDGE_LEASE as EDGE_LEASE_DECISION_SOURCE
 from nullrun.observability import metrics
 from nullrun.transport import (
     HEADER_PROTOCOL,
