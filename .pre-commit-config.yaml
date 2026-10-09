@@ -19,3 +19,15 @@ repos:
     hooks:
       - id: mypy
         additional_dependencies: [types-all]
+
+  # Project rule, not a third-party check. Lives here rather than in
+  # .git/hooks so it is versioned, shared, and runs in CI — a hook installed
+  # only on one machine is the same convention that already failed twice.
+  - repo: local
+    hooks:
+      - id: reject-coauthored-trailer
+        name: reject Co-Authored-By trailer
+        entry: scripts/reject_coauthor_trailer.sh
+        language: script
+        stages: [commit-msg]
+        always_run: true
