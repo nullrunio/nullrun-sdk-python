@@ -4894,11 +4894,21 @@ def _build_v3_track_payload(
         logger.debug("_build_v3_track_payload: missing tokens — cannot shape v3 /track payload")
         return None
 
+    # ADR-068 §4b: the SDK does not compute a price and does not put one
+    # on the wire. It reports TOKENS; the backend prices them from its own
+    # catalog and accounts them there. This field was hardcoded `0`, so it
+    # never carried information — but its presence kept the shape of a
+    # client-priced request alive on every single track call, which is
+    # exactly the surface ADR-068 exists to close.
+    #
+    # The backend accepts the field's absence (`#[serde(default)]` on
+    # `TrackRequestRaw::cost_cents`), so dropping it here is not a
+    # breaking wire change: an older SDK that still sends it is accepted
+    # and ignored, this one simply never offers it.
     payload: dict[str, Any] = {
         "reservation_id": reservation_id,
         "workflow_id": wf_id,
         "tokens": int(tokens),
-        "cost_cents": 0,
         "cost_source": "provisional",  #
     }
     if "input_tokens" in wire_event and wire_event["input_tokens"] is not None:

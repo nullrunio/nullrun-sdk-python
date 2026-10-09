@@ -151,12 +151,15 @@ class TestSignedPostIncludesProtocolHeader:
     def test_track_single_includes_protocol_header(self):
         # 2026-07-04 (B2): body shape matches the v3 wire
         # contract — ``reservation_id`` (server-minted from /check)
-        # ``workflow_id`` + ``tokens`` + ``cost_cents`` (the SDK
-        # always emits 0 — backend recomputes from tokens) +
+        # ``workflow_id`` + ``tokens`` +
         # ``cost_source: "provisional"``. Pre-fix this test sent the
         # legacy / fictitious shape
         # ``{execution_id, actual_cost_cents}`` which doesn't match
         # ``TrackRequestRaw`` and would 422 on the wire.
+        # ADR-068 §4b (2026-10-09): the SDK used to emit
+        # ``cost_cents: 0`` here. It is stripped on the way out
+        # (``_WIRE_STRIP_FIELDS``), so passing it below is still fine —
+        # it exercises that an older caller's price does not survive.
         t = Transport(api_url=BASE_URL, api_key="nr_live_abc123")
         try:
             route = respx.post(f"{BASE_URL}/api/v1/track").mock(
@@ -1886,12 +1889,20 @@ class TestBuildV3TrackPayload:
             "trace_id": "trace-1",
             "span_id": "span-1",
             "agent_id": "agent-1",
-            "cost_cents": 0,
             "cost_source": "provisional",
         }
+        # ADR-068 §4b: a full event is no exception — a populated
+        # payload must still carry no price. See the minimal-event test
+        # for why the exact-dict match is the assertion that matters.
+        assert "cost_cents" not in out
 
     def test_minimal_event_only_required_fields(self):
         # workflow_id + tokens + reservation_id are the floor.
+        #
+        # ADR-068 §4b: no `cost_cents`. The SDK reports tokens and the
+        # backend prices them. Asserted by ABSENCE below — an exact-dict
+        # match is what makes "the SDK never offers a price" a checked
+        # property rather than a comment.
         out = _build_v3_track_payload(
             {"type": "llm_call", "workflow_id": "wf-1", "tokens": 1},
             SERVER_MINTED_V1,
@@ -1900,9 +1911,12 @@ class TestBuildV3TrackPayload:
             "reservation_id": SERVER_MINTED_V1,
             "workflow_id": "wf-1",
             "tokens": 1,
-            "cost_cents": 0,
             "cost_source": "provisional",
         }
+        assert "cost_cents" not in out, (
+            "ADR-068 §4b: the SDK must not put a price on the wire. It "
+            "sends tokens; the backend prices them from its own catalog."
+        )
 
     def test_missing_workflow_id_returns_none(self):
         # v0.16.0 (backend v3.66.2 alignment): caller now DROPS
