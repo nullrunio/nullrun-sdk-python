@@ -489,12 +489,41 @@ class NullRunConsumeOverbudgetError(NullRunDecision):
 
     Attributes:
         execution_id: Server-minted id from the matching /check.
-        reserved_cents: What the gate reserved (the binding ceiling).
-        max_allowed_cents: ``reserved + epsilon_cents`` — the actual
-            hard ceiling that was violated.
+        reserved_millicents: What the gate reserved (the binding
+            ceiling), as the backend sends it. This is the field that
+            is actually on the wire — see the note below on the
+            ``*_cents`` spellings.
+        max_allowed_millicents: ``reserved + epsilon`` — the ceiling
+            that was violated, in the same unit.
         actual_cost_cents: What the caller tried to consume (the
-            rejected value).
-        epsilon_cents: The configured tolerance (default 1).
+            rejected value). Sent in cents, not millicents.
+        soft_pass: Whether the backend soft-passed the event rather
+            than rejecting it. Sent by the backend since v3.75.
+        recorded: Whether the backend already applied the spend
+            (``details.reservation_recorded``). ``True`` means the
+            period counter carries the real cost and the cost event
+            row is written — the rejection was about the reservation
+            ceiling, not about delivery, and ADR-005 forbids an
+            implicit re-reserve, so the caller reconciles the delta
+            rather than retrying. ``False`` means the backend
+            refused and charged nothing, leaving the reservation to
+            expire. ``None`` means an older backend sent no marker:
+            an unknown state, which is not the same as ``False`` and
+            must not be treated as one.
+
+    Unit note, because the docstring above used to be wrong about it. The
+    backend's 422 ``details`` block carries ``reserved_millicents``,
+    ``max_allowed_millicents``, ``actual_cost_cents``, ``soft_pass`` and
+    ``reservation_recorded`` — it does NOT send ``reserved_cents``,
+    ``max_allowed_cents`` or ``epsilon_cents``, and never has. This class
+    read the three that do not exist, so all of them were permanently
+    ``None`` while ``runtime.py`` told callers to reconcile the delta from
+    exactly those fields. The millicents fields are now read directly and
+    the epsilon is not guessed: the backend does not put its configured
+    tolerance on this wire, and ``actual - reserved`` is the only honest
+    way to recover it, which the caller can do from the two numbers it
+    now has. The ``*_cents``/``epsilon_cents`` parameters are retained
+    because a caller may construct this exception itself.
     """
 
     error_code = "NR-O001"
@@ -513,19 +542,30 @@ class NullRunConsumeOverbudgetError(NullRunDecision):
         message: str,
         *,
         execution_id: str | None = None,
+        reserved_millicents: int | None = None,
+        max_allowed_millicents: int | None = None,
+        actual_cost_cents: int | None = None,
+        soft_pass: bool | None = None,
+        recorded: bool | None = None,
+        status_code: int | None = None,
         reserved_cents: int | None = None,
         max_allowed_cents: int | None = None,
-        actual_cost_cents: int | None = None,
         epsilon_cents: int | None = None,
-        status_code: int | None = None,
         **kwargs: Any,
     ) -> None:
         self.execution_id = execution_id
+        self.reserved_millicents = reserved_millicents
+        self.max_allowed_millicents = max_allowed_millicents
+        self.actual_cost_cents = actual_cost_cents
+        self.soft_pass = soft_pass
+        self.recorded = recorded
+        self.status_code = status_code
+        # Retained for callers that construct this directly. Nothing on the
+        # wire populates them, so reading them off a parsed 422 always yields
+        # None — see the unit note in the class docstring.
         self.reserved_cents = reserved_cents
         self.max_allowed_cents = max_allowed_cents
-        self.actual_cost_cents = actual_cost_cents
         self.epsilon_cents = epsilon_cents
-        self.status_code = status_code
         super().__init__(message, **kwargs)
 
 

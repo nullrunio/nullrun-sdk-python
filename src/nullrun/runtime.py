@@ -23,7 +23,7 @@ the authoritative table; deviations require an ADR amendment (Rule 5).
 | `_enforce_sensitive_tool` (`_fallback_mode=permissive`, opt-in) | CLOSED -- body MUST NOT run when `decision_source` is any `FALLBACK_*` | n/a (body did not run) | `NULLRUN_SENSITIVE_FAIL_OPEN=1` -- explicitly documented as "OPEN-when-engine-unavailable" |
 | `_emit_span_start` / `_emit_span_end` | n/a -- never blocks | n/a | n/a |
 | `/track` batch path (legacy) | OPEN-on-network-error (event dropped, no retry) | n/a -- circuit breaker backoff applies | none |
-| `/track` v3 single path (`track_single`) | OPEN-on-network-error and OPEN-on-5xx (event dropped, no retry); **CLOSED for enforcement rejections** — a typed `NullRunDecision` (`CONSUME_OVERBUDGET` 422, budget block 402) propagates to the caller | caller reconciles the delta from the exception's `reserved_cents` / `actual_cost_cents` / `epsilon_cents`; ADR-005 forbids implicit re-reserve, so there is nothing for the SDK to retry | none |
+| `/track` v3 single path (`track_single`) | OPEN-on-network-error and OPEN-on-5xx (event dropped, no retry); **CLOSED for enforcement rejections** — a typed `NullRunDecision` (`CONSUME_OVERBUDGET` 422, budget block 402) propagates to the caller | caller reconciles the delta from the exception's `reserved_millicents` / `max_allowed_millicents` / `actual_cost_cents` / `recorded` (the reservation is on the wire in millicents and the actual in cents; the backend does not send its configured epsilon, so `actual - reserved` is the only honest way to recover it); ADR-005 forbids implicit re-reserve, so there is nothing for the SDK to retry | none |
 
 **Fail-OPEN policy** — SDK-side transport failure (network timeout,
 5xx, breaker open) is fail-OPEN on the *check* path so a dead
@@ -128,6 +128,7 @@ from nullrun.context import (
     get_trace_id,
     get_workflow_id,
 )
+from nullrun.edge import EDGE_LEASE as EDGE_LEASE_DECISION_SOURCE
 from nullrun.observability import metrics
 from nullrun.transport import (
     HEADER_PROTOCOL,
@@ -135,6 +136,7 @@ from nullrun.transport import (
     FallbackMode,
     FlushConfig,
     Transport,
+    TransportErrorHandler,
     TransportErrorSource,
     _emit_for_transport_error,
     _protocol_header_value,
@@ -1934,13 +1936,19 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
 
     #: Every decision value the SDK knows how to act on. The backend's
     #: `GateDecision` (`gate/internal.rs:574`) supplies allow / block /
-    #: require_approval / soft_pass / deny; ``throttle`` is an
-    #: SDK-side shape that maps to `WorkflowPausedException`. Anything
-    #: outside this set is a wire contract the SDK does not implement,
-    #: and guessing "allow" for it is the fail-OPEN ADR-008 assigns
-    #: only to transport failures.
+    #: require_approval / soft_pass / deny. 2026-10-07: "throttle"
+    #: was removed. It was listed here as an "SDK-side shape", but
+    #: the backend cannot emit it — `GateDecision` has no such variant,
+    #: and the only string producer in the tree is an uncalled Phase-2
+    #: schema stub. Keeping it in this set meant the validation gate
+    #: below ACCEPTED a decision value that nothing downstream could
+    #: ever handle, which is worse than rejecting it: a caller got
+    #: past validation and then hit no branch. Anything outside this
+    #: set is a wire contract the SDK does not implement, and guessing
+    #: "allow" for it is the fail-OPEN ADR-008 assigns only to
+    #: transport failures.
     _KNOWN_GATE_DECISIONS = frozenset(
-        {"allow", "block", "throttle", "soft_pass", "require_approval", "deny"}
+        {"allow", "block", "soft_pass", "require_approval", "deny"}
     )
 
     #: Provenance values a ``/gate`` answer may carry. ``gateway`` is
@@ -1951,8 +1959,20 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
     #: falls through, and ``cached`` / ``local`` are the SDK's own
     #: shapes. A value outside this set means the body did not come
     #: from either party, whatever it claims.
+    # `edge_lease` is here because via-edge answers the same question
+    # from a different authority: a signed grant on a box, not the
+    # cloud's `/gate`. Without it in this set the runtime raises
+    # `NullRunMalformedGateResponseError` on every single via-edge
+    # decision — the mode would fail closed on its own successes, which
+    # reads as "the box is broken" rather than "the SDK has not heard of
+    # this decision source yet".
+    #
+    # Named by import, not by string literal, so the allowlist and the
+    # producer cannot drift into two different spellings of one value —
+    # which is exactly how `is_fallback_decision_source` ended up with
+    # two hand-maintained copies.
     _KNOWN_DECISION_SOURCES = frozenset(
-        {"gateway", "cached", "fallback", "local"}
+        {"gateway", "cached", "fallback", "local", EDGE_LEASE_DECISION_SOURCE}
     )
 
     def _require_gate_decision(self, response: Any) -> str:
@@ -2369,13 +2389,36 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # post-approval re-entry failed (DEF-TC14-002, ADR-065).
         #
         # A context with no envelope is an LLM check with no tool to
-        # name, for which `no_impact()` is the correct and honest
-        # answer — it is NOT a stand-in for a tool call.
+        # name. It has NO honest `none` to send: the gate's wire enum is
+        # `Money | ToolCall` (`backend/src/proxy/http/gate/
+        # business_impact.rs`) and it has no `none` variant, so
+        # `{"kind": "none"}` is refused by the DESERIALISER — 422,
+        # before any policy runs. This SDK shipped that for a release
+        # cycle (ADR-065 decision step 3 said to keep `no_impact()`
+        # here, which the same ADR tabulates as a 422 at line 45).
+        #
+        # `business_impact` is `Option` on the wire, so the honest
+        # encoding of "no envelope" is ABSENCE, not a sentinel. Only
+        # `action_digest` is mandatory at protocol >= 3
+        # (`gate.rs`, `if req.action_digest.is_none()`), so it is
+        # still computed and sent, over the same `no_impact()`
+        # canonical bytes as before — unchanged, so the digest stays
+        # stable across the upgrade.
+        #
+        # Measured on a live stand before choosing this: omitting the
+        # field returns 200 at /gate AND 200 at /execute on the
+        # no-approval path. It is NOT safe on the approval-consumption
+        # path, where the server recomputes the digest from the live
+        # payload and fails CLOSED without it (NR-010) — but an
+        # approval always originates from a tool call, which always
+        # carries a `tool_call` envelope, so this branch cannot reach
+        # it.
         call_impact = get_call_impact()
-        if call_impact is None:
-            call_impact = _BusinessImpact.no_impact()
-        check_req["action_digest"] = _compute_action_digest(call_impact)
-        check_req["business_impact"] = call_impact.to_wire_dict()
+        check_req["action_digest"] = _compute_action_digest(
+            call_impact if call_impact is not None else _BusinessImpact.no_impact()
+        )
+        if call_impact is not None:
+            check_req["business_impact"] = call_impact.to_wire_dict()
 
         # Forward the tool list so backend (T3) can match each tool
         # against the workflow's effective `blocked_tools` aggregate.
@@ -2641,14 +2684,33 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             if isinstance(block_error, NullRunBudgetError):
                 metrics.inc_runtime("cost_limit_exceeded")
             raise block_error
-        if decision == "throttle":
-            reasons = response.get("explanations") or (
-                [response["explanation"]] if response.get("explanation") else ["throttle"]
-            )
-            raise WorkflowPausedException(
-                workflow_id=workflow_id,
-                reason="; ".join(reasons),
-            )
+        # 2026-10-07: the `decision == "throttle"` arm that used to sit
+        # here was dead on arrival. The backend's `GateDecision` enum
+        # (backend/src/proxy/http/gate/internal.rs) has no `Throttle`
+        # variant — `as_str()` emits only allow / block / require_approval /
+        # soft_pass / deny. The single producer of the string "throttle"
+        # anywhere in the backend is `CheckResponse::throttled()` in
+        # `events/types.rs`, which has no production caller. So this
+        # branch could never run: the only producer of it was a
+        # Phase-2 schema declaration nothing serialises.
+        #
+        # Worse than dead — `_KNOWN_GATE_DECISIONS` listed "throttle",
+        # so the validation gate above accepted the value as
+        # implemented. A cookbook recipe written against the documented
+        # behaviour ("throttle = insufficient budget, resumable") would
+        # validate fine and then never fire; the same condition actually
+        # arrives as `decision="block"` with error_code BUDGET_* and
+        # raises NullRunBudgetError.
+        #
+        # The LIVE signal for a paused workflow is the wire code
+        # WORKFLOW_PAUSED, now mapped in `_V3_ERROR_CODE_MAP`. It
+        # raises NullRunBlockedException because
+        # WorkflowPausedException requires constructor kwargs
+        # (workflow_id, reason) that the catalog's uniform
+        # instantiation path does not supply. Wiring that properly means
+        # a bespoke dispatch arm; until one exists, callers should
+        # branch on the error_code rather than on an exception class
+        # that nothing raises.
         if decision == "soft_pass":
             # Soft-mode call proceeded via the chain's overdraft cap
             # (CLAUDE.md §5). The body MUST execute — soft_pass is
@@ -3408,7 +3470,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         tool_name: str,
         input_data: dict[str, Any],
         mode: str = "auto",
-        on_transport_error: Callable[[Exception], dict[str, Any]] | None = None,
+        on_transport_error: TransportErrorHandler | None = None,
         business_impact: dict[str, Any] | None = None,
         action_digest: str | None = None,
         # ``tools`` is supplied by the ``@sensitive`` decorator and
@@ -3428,8 +3490,14 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             input_data: Tool input parameters
             mode: Execution mode ("auto", "strict"). "inline" was
                 removed in 0.19.0 and now raises.
-            on_transport_error: Optional callback for transport-error
-                handling; prefer the typed exception path.
+            on_transport_error: How a transport failure is surfaced —
+                a callback, or one of the ADR-008 strings ``"raise"`` /
+                ``"open"`` / ``"closed"``. Defaults to ``None``, which falls
+                through to ``fallback_mode`` (so ``mode="strict"`` blocks).
+                The strings are forwarded verbatim to
+                ``Transport.execute``; the annotation here was narrower than
+                the code has always accepted, which made the documented
+                ``"raise"`` arm un-passable under a type checker.
             business_impact: Typed action payload (Money impact for
                 now). When supplied, the backend uses it to evaluate
                 rule predicates AND stamps the approval row's
@@ -4826,11 +4894,21 @@ def _build_v3_track_payload(
         logger.debug("_build_v3_track_payload: missing tokens — cannot shape v3 /track payload")
         return None
 
+    # ADR-068 §4b: the SDK does not compute a price and does not put one
+    # on the wire. It reports TOKENS; the backend prices them from its own
+    # catalog and accounts them there. This field was hardcoded `0`, so it
+    # never carried information — but its presence kept the shape of a
+    # client-priced request alive on every single track call, which is
+    # exactly the surface ADR-068 exists to close.
+    #
+    # The backend accepts the field's absence (`#[serde(default)]` on
+    # `TrackRequestRaw::cost_cents`), so dropping it here is not a
+    # breaking wire change: an older SDK that still sends it is accepted
+    # and ignored, this one simply never offers it.
     payload: dict[str, Any] = {
         "reservation_id": reservation_id,
         "workflow_id": wf_id,
         "tokens": int(tokens),
-        "cost_cents": 0,
         "cost_source": "provisional",  #
     }
     if "input_tokens" in wire_event and wire_event["input_tokens"] is not None:
@@ -4839,6 +4917,18 @@ def _build_v3_track_payload(
         payload["output_tokens"] = int(wire_event["output_tokens"])
     if "model" in wire_event and wire_event["model"]:
         payload["model"] = wire_event["model"]
+    # ADR-068 §1 (backend NULLRUN): the provider selects the
+    # cache-token convention. Anthropic reports the cached fraction
+    # OUTSIDE `input_tokens`; OpenAI / Gemini / Mistral report it
+    # INSIDE `prompt_tokens`. The backend has to know which, and
+    # `provider` is the only field that tells it. Without this key
+    # the backend sees an unmapped provider and applies the
+    # fail-CLOSED no-discount path — today's overcharging behaviour —
+    # for every cache-using call. The batch path already forwards it
+    # (it sends the whole enriched event); this is the single-event
+    # path, which whitelists keys explicitly.
+    if "provider" in wire_event and wire_event["provider"]:
+        payload["provider"] = wire_event["provider"]
     if "latency_ms" in wire_event and wire_event["latency_ms"] is not None:
         payload["latency_ms"] = int(wire_event["latency_ms"])
     if "metadata" in wire_event and wire_event["metadata"]:

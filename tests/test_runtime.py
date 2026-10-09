@@ -242,30 +242,58 @@ class TestNullRunRuntimeExecute:
         # so any caller that branched on it pre-fix keeps working.
         assert wire_details.get("mapped_class") == "NullRunApprovalDbUnavailableError"
 
-    @pytest.mark.skip(
-        reason=(
-            "runtime.execute now requires "
-            'on_transport_error="raise" to surface classified errors '
-            "(preserves legacy fail-OPEN behaviour by default so "
-            "check_workflow_budget can treat network errors as transient). "
-            "Re-enable when the test passes the opt-in flag."
-        )
-    )
     def test_execute_network_error_raises_classified(self, make_runtime, mock_api):
-        """Network error during execute surfaces as classified NullRunTransportError (ADR-008)."""
+        """Network error during execute surfaces as classified NullRunTransportError (ADR-008).
+
+        Opted in explicitly. The default is fail-OPEN by design so
+        `check_workflow_budget` can treat a network blip as transient — but
+        that default is exactly the thing this test pins, because a silent
+        flip of it back to fail-CLOSED (or, worse, the other way) would
+        otherwise be invisible: the test was disabled rather than asserting
+        the flag, which left the default itself unasserted.
+        """
         from nullrun.breaker.exceptions import (
             NullRunTransportError,
             TransportErrorSource,
         )
 
-        respx.post(f"{BASE_URL}/api/v1/gate").mock(
+        respx.post(f"{BASE_URL}/api/v1/execute").mock(
             side_effect=httpx.ConnectError("connection refused")
         )
         rt = make_runtime()
         with pytest.raises(NullRunTransportError) as exc_info:
-            rt.execute(tool_name="gpt-4", input_data={}, mode="strict")
+            rt.execute(
+                tool_name="gpt-4",
+                input_data={},
+                mode="strict",
+                on_transport_error="raise",
+            )
         assert exc_info.value.source == TransportErrorSource.NETWORK_ERROR
         assert exc_info.value.endpoint == "execute"
+
+    def test_execute_network_error_without_the_flag_fails_closed_via_fallback(
+        self, make_runtime, mock_api
+    ):
+        """The default path, asserted. An unreachable backend BLOCKS.
+
+        The counterpart to the opt-in test above, and the reason that test's
+        flag is worth having: without it, `on_transport_error` is None and a
+        ConnectError falls through to the fallback_mode path, which under
+        `mode="strict"` is a block — after exhausting the retry budget. So
+        the enforcement gate is fail-CLOSED on this class of failure, which is
+        the property that matters. Writing this down is what stops a future
+        change from quietly turning the default into a fail-OPEN "allow":
+        the opt-in test alone would still pass in that world.
+        """
+        from nullrun.breaker.exceptions import NullRunBlockedException
+
+        respx.post(f"{BASE_URL}/api/v1/execute").mock(
+            side_effect=httpx.ConnectError("connection refused")
+        )
+        rt = make_runtime()
+        with pytest.raises(NullRunBlockedException) as exc_info:
+            rt.execute(tool_name="gpt-4", input_data={}, mode="strict")
+        assert "Gateway unavailable" in str(exc_info.value)
 
     # T3-S2 (0.3.0): `test_execute_local_mode_allows` was removed along
     # with the `local_mode` field. The execute path now always hits

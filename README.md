@@ -422,8 +422,13 @@ What remains is specific, and it is not "use https". It is: **an on-path respond
 
 So the honest boundary is: server-authoritative enforcement is authoritative against a *client* and against a *network observer*, not against an attacker who terminates TLS inside your trust store. If you operate on such a network, exclude `api.nullrun.io` from interception and check that it stays excluded — that is an operational control, not something the SDK can do for you.
 
-### What does fail open
+### What a long outage costs
 
+An execution is bound server-side for **24 hours**. Reservations expire on a TTL too. An outage longer than that does not resume when the backend returns: every event buffered during it is refused with `EXECUTION_NOT_BOUND`, and the backend cannot re-mint the binding, because that would produce a *new* execution and double-count against the budget. The SDK parks those events in the dead-letter queue on the first refusal rather than retrying, which is correct — retrying is not slow there, it is pointless.
+
+The part that costs money: the spend is real and the period-bound counter did not account for it. **The control center under-reports what you spent by exactly the amount buffered during the outage, and the DLQ is the record of the gap.** If your agents can run unattended for more than a day against an unreachable backend, budget on the assumption that it is spent and unaccounted, not pending. Full details, including how to inspect and replay the DLQ: [docs/wal-and-dlq.md](docs/wal-and-dlq.md).
+
+### What does fail open
 Fail-open here is narrow and deliberate, and the authoritative table lives in `runtime.py` (ADR-008). In short: a **transport** failure on the check path is open, so an unreachable backend cannot freeze your agent; a **wire response that names an enforcement failure** is closed, because the backend made a decision and the SDK will not overrule it; a **body that is not a verdict at all** — no `decision`, no `decision_source`, or an unrecognised value in either — is closed, because something answered and what it said was not a decision, and reading that as permission would let a non-NullRun responder authorise a call no policy engine evaluated; a **401** is closed, because no retry fixes a revoked key; and the `/execute` path is closed by default (`FallbackMode.STRICT`).
 
 ---

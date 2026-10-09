@@ -76,6 +76,74 @@ class TransportMetrics:
     # We split it from hmac_verify_failures_total so the two
     # alert paths can have different runbooks.
     hmac_verify_expired_total: int = 0
+    # --- WAL durability state (set by Transport, not incremented) ----------
+    # These answer "what can this deployment actually promise?", which the
+    # code cannot answer on your behalf across OSes and filesystems. A field
+    # that was never set and a field that says "no" are different facts, so
+    # they are declared here with an explicit unprobed value instead of
+    # defaulting through `getattr(..., 0)`.
+    #
+    #   "enabled"     — directory fsync works; a rename survives power cut
+    #   "unavailable" — probed, and the platform/filesystem refused
+    #   None          — never probed (no WAL write has happened yet)
+    wal_dir_fsync: str | None = None
+    #   "enabled"   — the advisory lock is taken around WAL mutations
+    #   "contended" — another process held it on the last attempt
+    #   "unavailable" — no fcntl.flock on this platform
+    wal_lock: str | None = None
+    # Writes skipped because the lock stayed held for the whole timeout. Zero
+    # is the healthy state; a sustained non-zero rate means the volume is
+    # contended enough that some DLQ rows are being re-queued rather than
+    # recorded.
+    wal_lock_timeouts_total: int = 0
+    # Dead-letter queue: current size, and how many appends the size cap
+    # refused. A non-zero `dlq_overflow_total` is the alertable signal — it
+    # means events are being refused a place to be recorded and are spinning
+    # on the retry path instead. The cap never deletes rows.
+    dlq_bytes: int = 0
+    dlq_overflow_total: int = 0
+    dlq_overflow_reason: str | None = None
+    # Terminal refusals the full DLQ could not take, currently held. The rows
+    # are durable in `<wal>.holdover`; this counts what is held RIGHT NOW and
+    # is the state to alert on — `dlq_overflow_total` counts refusals over
+    # time, this counts events still unrecorded RIGHT NOW.
+    dlq_holdover: int = 0
+    dlq_holdover_total: int = 0
+    # Held events dropped from the in-memory index by
+    # NULLRUN_DLQ_HOLDOVER_MAX_EVENTS. Any value here means `dlq_holdover`
+    # UNDER-reports: the events are still in the holdover file and still reach
+    # the DLQ, but the gauge no longer counts all of them. Non-zero is a
+    # "raise the cap" signal, never a data-loss signal.
+    dlq_holdover_index_truncated: int = 0
+    # Held events that could not be written to the holdover file (lock held
+    # elsewhere, or I/O failed). These exist in memory only, so a kill before
+    # a later attempt loses them. This is the one holdover counter that means
+    # possible loss rather than deferred recording.
+    dlq_holdover_persist_failures: int = 0
+    # Bisect cascades that stopped because the request budget ran out rather
+    # than because the cascade converged. A sustained rate means batches are
+    # being refused wholesale more often than the budget can isolate.
+    batches_bisect_budget_exhausted: int = 0
+    # 429s whose `Retry-After` exceeded NULLRUN_RETRY_AFTER_CEILING, so the
+    # flush stopped for the cycle instead of retrying before the server
+    # permitted it. Non-zero means the backend is rate-limiting for longer
+    # than the SDK is willing to sit through — which is a backend signal to
+    # read, not an SDK fault. The events stay in the WAL.
+    retry_after_deferred: int = 0
+    # Retry waits cut short by `Transport.stop()`. Non-zero during shutdown
+    # is expected; a sustained rate outside shutdown means something is
+    # stopping the transport.
+    retries_interrupted_by_shutdown: int = 0
+    # Events the backend settled past its epsilon and then told us it had
+    # already charged (422 CONSUME_OVERBUDGET with
+    # `reservation_recorded: true`). Counted here rather than as
+    # `events_dead_lettered` because these were DELIVERED — the counter is
+    # the operator's evidence that the DLQ is not lying about them, so a
+    # non-zero value is normal operation, not an error. Zero while the
+    # backend alert `NullRunBudgetBreaches` is firing means the SDK is
+    # talking to a backend that does not emit the marker, which is the
+    # case worth acting on.
+    events_recorded_overage: int = 0
 
 
 @dataclass
@@ -190,6 +258,19 @@ class MetricsRegistry:
                     "fallback_mode_activations": self.transport.fallback_mode_activations,
                     "hmac_verify_failures_total": self.transport.hmac_verify_failures_total,
                     "hmac_verify_expired_total": self.transport.hmac_verify_expired_total,
+                    "wal_dir_fsync": self.transport.wal_dir_fsync,
+                    "wal_lock": self.transport.wal_lock,
+                    "wal_lock_timeouts_total": self.transport.wal_lock_timeouts_total,
+                    "dlq_bytes": self.transport.dlq_bytes,
+                    "dlq_overflow_total": self.transport.dlq_overflow_total,
+                    "dlq_overflow_reason": self.transport.dlq_overflow_reason,
+                    "dlq_holdover": self.transport.dlq_holdover,
+                    "dlq_holdover_total": self.transport.dlq_holdover_total,
+                    "dlq_holdover_index_truncated": self.transport.dlq_holdover_index_truncated,
+                    "dlq_holdover_persist_failures": self.transport.dlq_holdover_persist_failures,
+                    "batches_bisect_budget_exhausted": self.transport.batches_bisect_budget_exhausted,
+                    "retry_after_deferred": self.transport.retry_after_deferred,
+                    "retries_interrupted_by_shutdown": self.transport.retries_interrupted_by_shutdown,
                 },
                 "runtime": {
                     "track_calls": self.runtime.track_calls,

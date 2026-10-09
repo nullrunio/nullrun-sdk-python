@@ -16,8 +16,9 @@ import threading
 import time
 import uuid
 import weakref
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 
 import httpx
@@ -201,8 +202,493 @@ def _signed_request_body(payload: dict[str, Any]) -> bytes:
 
 
 # =============================================================================
+# Backend error classification
+# =============================================================================
+
+# Backend `error_code` values that name a DETERMINISTIC refusal: the request
+# can never succeed as sent, no matter how long we wait or how often we resend
+# it. Classifying on these by name — rather than by HTTP status — is what keeps
+# a healthy backend from being treated as broken.
+#
+# EXECUTION_NOT_BOUND is the motivating case. The backend served it as 503
+# (handlers.rs:10016-10017 before the status correction) while naming the code
+# in the body, so by status alone it was indistinguishable from an outage. It
+# is not one: the execution binding lives in Redis under a 24h TTL
+# (EXECUTION_BINDING_TTL_SECONDS = 86_400) and only the server can mint it. Once
+# it is gone, every retry of that event hits the same wall. Left on the transient
+# path it would be resent until the attempt budget died AND, because it is a
+# 5xx, each attempt would be counted as a transport failure — ten of them open
+# the circuit breaker on a backend that is answering every other request
+# perfectly. Same bug class as "any 4xx is permanent", one status code over.
+#
+# The backend now answers 422 for this code. That is necessary but not
+# sufficient: deployed SDKs outlive the backend release that fixed it, so an
+# instance pinned to an older build keeps talking to a newer server, and
+# clients in the field are not upgraded in lockstep. Classifying on the code
+# is what makes this correct against BOTH statuses — relying on the server
+# having been upgraded first would turn a code-classification fix into a
+# fleet-coordination problem and leave the laggard instances quietly
+# mis-classifying.
+#
+# Every entry here must satisfy: (a) the backend names it explicitly, (b) no
+# client-side action on the SAME request can change the answer, (c) retrying
+# wastes an attempt without a chance of success. Anything that fails (b) or (c)
+# belongs in the transient path even if it looks permanent from the outside.
+_DETERMINISTIC_ERROR_CODES = frozenset(
+    {
+        "EXECUTION_NOT_BOUND",
+        "CONSUME_OVERBUDGET",
+    }
+)
+
+# Per-item reasons on a 200 response that retrying cannot fix.
+#
+# `/track/batch` answers 200 even when it refuses individual events, naming
+# each one in `rejection_details`. Those reasons split three ways, and the
+# wire tells us which: the backend sends `retry_after_ms` on a refusal it
+# expects to be retried, and omits it on one it does not.
+#
+# The set below is the "omits it AND we have checked" list — reasons we have
+# looked at and know are permanent:
+#
+#   reservation_not_found — the reservation the consume needed is gone.
+#     Reservations are minted by /api/v1/gate and live under a TTL; nothing
+#     the client can send re-mints one for a past event. The agent would have
+#     to re-issue /gate, which produces a NEW execution and would double-count
+#     against the budget. Same class as EXECUTION_NOT_BOUND one layer down.
+#
+# `budget_exceeded` is NOT here even though the spend has already happened,
+# because the period-bound counter will not clear until the period rolls —
+# retrying within the period is provably pointless — but the decision of
+# whether such a row belongs in the ledger at all (spend as fact, enforcement
+# separately) is open, and parking the event in the DLQ is the only response
+# that preserves the fact without asserting one.
+#
+# The compatibility rule matters more than the list. Absence of
+# `retry_after_ms` alone is NOT enough to call something terminal: an older
+# backend omits the field entirely, so "no retry hint" would silently mean
+# "drop" for every reason a pre-field backend can produce. Unknown reasons
+# therefore take the bounded-retry path and land in the DLQ afterwards —
+# a delay, never a silent drop. Adding a reason here is safe; forgetting one
+# is not.
+_TERMINAL_REJECTION_REASONS = frozenset(
+    {
+        "reservation_not_found",
+    }
+)
+
+# DLQ row schema version. Bump when the record gains or changes a field.
+#
+# v1 (implicit — the field did not exist): `{"error": str, "event": {...}}`
+# v2: adds `reason` (machine-readable, distinct from the v1 `error` string),
+# `first_failed_at` (epoch seconds — an operator replaying a DLQ needs to
+# know whether the refusal is still current or whether the world moved on),
+# `attempts` (how many send cycles this event survived), and `event_type` so
+# a DLQ can be triaged without opening every payload.
+#
+# Readers must accept v1 rows: a DLQ written before an upgrade stays on disk
+# across it, and a reader that requires `v == 2` would make the whole file
+# unreadable — turning a data-recovery file into data loss.
+_DLQ_ROW_VERSION = 2
+
+# ---------------------------------------------------------------------------
+# Durability primitives: what this platform can actually promise.
+#
+# The WAL is the SDK's only copy of an event between `track()` and the
+# backend accepting it. Three things protect it, and none of them is
+# available everywhere:
+#
+#   0600 on every file  — the WAL holds full event payloads, which for an
+#                         agent means prompts, completions and tool arguments.
+#                         Default umask 022 leaves them world-readable in
+#                         /tmp, on a shared volume, and in a container.
+#   advisory flock     — a WAL is a SHARED path by default (one per tempdir,
+#                         not one per process), so a second process appending
+#                         the read-copy-append of the DLQ can interleave a
+#                         line into the middle of another.
+#   directory fsync    — `os.replace` is atomic, but without fsyncing the
+#                         containing directory the new NAME can be absent
+#                         after a power cut even though the data blocks
+#                         landed.
+#
+# All three are probed, not imported. A platform lacking one is a supported
+# configuration, so the probe result becomes observable state (metrics
+# `wal_dir_fsync` / `wal_lock`) and a single warning, rather than an
+# ImportError at module load or a silent downgrade nobody can see.
+#
+# The absence of `flock` is the sharp one. It means a multi-process
+# deployment (gunicorn -w N) shares a WAL with no protection against
+# interleaved appends, and the correct configuration is a per-process
+# NULLRUN_WAL_PATH. The lock does not merge per-process buffers either way;
+# re-delivery is absorbed by the backend's dedup on `event_id`. What the
+# lock buys is that the FILES stay parseable.
+# ---------------------------------------------------------------------------
+
+try:  # POSIX only. Absence is a configuration, not an error.
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - exercised on Windows
+    _fcntl = None
+
+# Typed as `Any` deliberately. A bare `fcntl = None` makes the type of the
+# name depend on which platform the type checker is running on, and mypy
+# resolves `fcntl` to a stub without `flock` on win32 — so the same line is a
+# clean type on Linux CI and five errors on a Windows dev box.
+fcntl: Any = _fcntl
+# DLQ size cap (default 64 MB). Override via NULLRUN_DLQ_MAX_BYTES.
+_DLQ_MAX_BYTES_DEFAULT: int = 64 * 1024 * 1024
+
+# Max refused events tracked in memory while the DLQ is full. Override via
+# NULLRUN_DLQ_HOLDOVER_MAX_EVENTS. The rows are durable in `<wal>.holdover`
+# either way; this bounds the index, not the data.
+_DLQ_HOLDOVER_INDEX_MAX_DEFAULT: int = 10_000
+
+# Longest server-stated `Retry-After` the SDK will sit through. Past this it
+# stops retrying for the cycle rather than retrying early — see
+# `_next_retry_delay` for why shortening the wait is the wrong cap.
+# Override via NULLRUN_RETRY_AFTER_CEILING.
+_RETRY_AFTER_CEILING_DEFAULT: float = 60.0
+
+# How long a writer waits for the cross-process WAL lock before skipping its
+# write. The critical section is a local file copy plus an fsync, so the
+# uncontended cost is microseconds; the timeout exists for a descheduled
+# holder, not for a busy one.
+_WAL_LOCK_TIMEOUT_DEFAULT: float = 5.0
+
+_DEGRADATION_WARNING = (
+    "WAL durability degraded on this platform: %s. The events are still "
+    "written and still replayed, but the guarantee they rest on is weaker. "
+    "See metrics `wal_dir_fsync` / `wal_lock` for the live state."
+)
+
+
+class UnconfirmedBatchResponse(Exception):
+    """A 2xx whose body did not say which events landed.
+
+    Status said success; the body said nothing we can read — a proxy HTML
+    page, an empty response, or a backend predating ``accepted_event_ids``.
+    The request may well have been fully processed, and it may not have been
+    delivered at all, and the difference decides whether the caller retries
+    or stops. Guessing either way loses something, so the batch keeps its
+    attempt budget and only reaches the DLQ once that budget is spent.
+    """
+
+    def __init__(self, event_count: int) -> None:
+        self.event_count = event_count
+        super().__init__(f"{event_count} events got a 2xx with no readable batch confirmation")
+
+
+class UnknownRejectionReason(Exception):
+    """The backend refused one event and named a reason we have no rule for.
+
+    Not a reason to drop it. An SDK built before a reason existed would
+    otherwise be the only fleet that discards those events, and the discard
+    is invisible — the operator sees a shorter ledger and no error. So the
+    event keeps its attempt budget and lands in the DLQ when it runs out,
+    with the reason preserved verbatim for whoever triages it.
+    """
+
+    def __init__(self, reason: str, event_id: str | None) -> None:
+        self.reason = reason
+        self.event_id = event_id
+        super().__init__(f"unhandled rejection reason {reason!r} for event {event_id}")
+
+
+# How a caller asks a transport failure to be surfaced (ADR-008). A callable
+# receives the exception and returns a decision dict; the three strings select
+# a built-in arm. ``None`` means "use ``fallback_mode``", which is fail-CLOSED
+# under ``mode="strict"``. Named because the union appears at several call
+# sites and the narrower callback-only annotation that used to stand here
+# made the documented ``"raise"`` arm un-passable under a type checker.
+TransportErrorHandler = str | Callable[[Exception], dict[str, Any]]
+
+
+class DeterministicBackendRefusal(Exception):
+    """The backend named a refusal that retrying cannot fix.
+
+    Carries the wire ``error_code`` and status separately because the status is
+    not the signal — several of these arrive as 5xx, which is exactly why
+    status-based classification mis-routes them. Handlers of this exception
+    must NOT count it as a transport failure: the transport layer is healthy,
+    the answer is a decision.
+
+    ``details`` is the wire ``details`` object. It is not decoration: for
+    ``CONSUME_OVERBUDGET`` it carries ``reservation_recorded`` — the backend
+    saying it already applied the spend — and the ``event_id`` it applied it
+    to. That marker is the difference between an event that is genuinely
+    undelivered (nothing charged, park it in the DLQ) and one the server has
+    already booked (delivered; quarantining it files a rejection that never
+    happened). See ``_deliver_recorded_overbudget``.
+    """
+
+    def __init__(
+        self,
+        error_code: str,
+        status_code: int | None,
+        message: str = "",
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        self.error_code = error_code
+        self.status_code = status_code
+        self.detail = message
+        self.details: dict[str, Any] = details or {}
+        super().__init__(f"{error_code} (HTTP {status_code}): {message}" if message else error_code)
+
+
+def _retry_after_seconds_from(response: Any) -> float | None:
+    """``Retry-After`` in seconds, from either wire form. ``None`` if absent/unparseable.
+
+    Module-level because the retry loop needs it and has no Transport: it
+    reads the header off the ``HTTPStatusError`` the response produced. Both
+    RFC 7231 forms are accepted — delta-seconds and an HTTP-date — because
+    nginx and a hand-rolled rate limiter in front of the gate will each emit
+    a different one.
+
+    An HTTP-date already in the past yields a NEGATIVE number. That is
+    returned rather than clamped, so the caller can tell "the server said
+    wait zero" from "the server said wait, and that moment has passed" — the
+    retry loop treats non-positive as "no floor stated" and falls back to
+    exponential backoff, which is the safe reading of a stale date.
+    """
+    if response is None:
+        return None
+    headers = getattr(response, "headers", None)
+    if not headers:
+        return None
+    try:
+        retry_after = headers.get("Retry-After")
+    except Exception:
+        return None
+    if not retry_after:
+        return None
+
+    try:
+        return float(retry_after)
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        from datetime import datetime, timezone
+        from email.utils import parsedate_to_datetime
+
+        dt = parsedate_to_datetime(retry_after)
+        return (dt - datetime.now(timezone.utc)).total_seconds()
+    except Exception:
+        return None
+
+
+def _extract_backend_error_code(response: Any) -> str | None:
+    """Pull ``error_code`` out of a backend error envelope, if there is one.
+
+    The envelope is ``{"error_code", "error_message", "details", "retry_after_ms"}``
+    (see the TrackError::WithBody sites in handlers.rs). Returns ``None`` for a
+    body that is absent, unparseable, or a plain proxy HTML page — a missing
+    code is NOT evidence of a deterministic refusal, so the caller keeps the
+    request on the transient path.
+    """
+    if response is None:
+        return None
+    try:
+        payload = response.json()
+    except Exception:  # noqa: BLE001 — non-JSON body (proxy error page, empty)
+        return None
+    if not isinstance(payload, dict):
+        return None
+    code = payload.get("error_code")
+    if isinstance(code, str) and code:
+        return code
+    return None
+
+
+def _extract_error_message(response: Any) -> str:
+    try:
+        payload = response.json()
+    except Exception:  # noqa: BLE001
+        return ""
+    if isinstance(payload, dict):
+        message = payload.get("error_message")
+        if isinstance(message, str):
+            return message
+    return ""
+
+
+def _as_int_or_none(value: Any) -> int | None:
+    """An ``int`` if the wire value is one, else ``None``.
+
+    ``bool`` is excluded on purpose: it is an ``int`` in Python, and a
+    JSON ``true`` landing on a field typed as a money amount is a wire
+    defect worth surfacing as absence rather than as ``1``.
+
+    Used for the numeric fields of a typed error. Coercing a string
+    instead would hand a caller something that looks like a number and
+    fails at the arithmetic; ``None`` fails at the check, which is where
+    it can still be handled.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _extract_error_details(response: Any) -> dict[str, Any]:
+    """Pull the wire ``details`` object out of a backend error envelope.
+
+    Returns ``{}`` for an absent, unparseable, or non-object body — the same
+    "no evidence" reading ``_extract_backend_error_code`` uses. Callers must
+    treat the empty dict as *the backend told us nothing*, never as *the
+    backend said no*: an absent marker is a different fact from a marker set
+    to ``false``, and conflating them would make a rollback indistinguishable
+    from a refusal that charged nothing.
+    """
+    if response is None:
+        return {}
+    try:
+        payload = response.json()
+    except Exception:  # noqa: BLE001 — non-JSON body (proxy page, empty)
+        return {}
+    if isinstance(payload, dict):
+        details = payload.get("details")
+        if isinstance(details, dict):
+            return details
+    return {}
+
+
+# =============================================================================
 # Retry with exponential backoff + jitter
 # =============================================================================
+
+
+def _next_retry_delay(
+    *,
+    attempt: int,
+    max_retries: int,
+    base_delay: float,
+    backoff_factor: float,
+    jitter: float,
+    max_delay: float,
+    server_wait: float | None,
+    error: Exception,
+    retry_after_ceiling: float = _RETRY_AFTER_CEILING_DEFAULT,
+) -> float | None:
+    """How long to wait before the next attempt — or ``None`` to not retry.
+
+    Two regimes, and the choice between them is the whole function.
+
+    With a server-stated ``server_wait`` the value is a FLOOR, so jitter is
+    one-sided — the spread is ``[wait, wait * (1 + jitter)]``. Spreading
+    downward would retry before the rate limit permitted it, which is how a
+    429 becomes a sustained 429; and spreading symmetrically is what makes a
+    fleet that got limited together retry together.
+
+    Without one there is no floor, so jitter is symmetric around the
+    exponential curve, which is the standard defence against a thundering
+    herd on a shared failure.
+
+    Returns ``None`` when the server's floor is beyond ``retry_after_ceiling``.
+    This is the part that used to be wrong, and it was wrong in the
+    direction that looks like a safety feature.
+
+    The previous code clamped with ``min(server_wait, max_delay)``. That
+    bounds the wait, so ``Retry-After: 86400`` cannot hang a flush — and it
+    also retries 60 minutes early, which is precisely what the floor
+    semantics forbid. A server that says "not for an hour" and gets a client
+    back in 30 seconds gets the same 429, spends its whole retry budget
+    re-tripping the limit it was told to respect, and the operator sees a
+    client that ignores rate limits rather than one that honours a long one.
+
+    The fix is not a shorter wait, it is no wait. The events are already
+    durable — ``.inflight`` is retained and the WAL is the recovery path —
+    so declining to retry in this cycle costs nothing and loses nothing. The
+    flush ends, and the next cycle tries again. So the ceiling produces an
+    honest "not now" instead of a dishonest "yes, sooner".
+    """
+    if server_wait is not None and server_wait > 0:
+        if server_wait > retry_after_ceiling:
+            metrics.inc_transport("retry_after_deferred")
+            logger.warning(
+                "Request failed (attempt %d/%d), Retry-After %.2fs exceeds the "
+                "%.2fs ceiling — not retrying in this cycle rather than "
+                "retrying before the server permits it. The events stay in the "
+                "WAL; the next flush cycle tries again. Raise "
+                "NULLRUN_RETRY_AFTER_CEILING to wait longer: %s",
+                attempt + 1,
+                max_retries + 1,
+                server_wait,
+                retry_after_ceiling,
+                type(error).__name__,
+            )
+            return None
+        base = server_wait
+        delay = base * (1.0 + random.uniform(0.0, jitter))  # noqa: S311
+        logger.warning(
+            "Request failed (attempt %d/%d), honoring Retry-After %.2fs "
+            "(+jitter -> %.2fs): %s",
+            attempt + 1,
+            max_retries + 1,
+            base,
+            delay,
+            type(error).__name__,
+        )
+        return delay
+
+    backoff = min(base_delay * (backoff_factor**attempt), max_delay)
+    spread = backoff * jitter
+    delay = max(0.0, backoff + random.uniform(-spread, spread))  # noqa: S311
+    logger.warning(
+        "Request failed (attempt %d/%d), retrying in %.2fs: %s",
+        attempt + 1,
+        max_retries + 1,
+        delay,
+        type(error).__name__,
+    )
+    return delay
+
+
+def _retry_after_ceiling() -> float:
+    """Effective ``Retry-After`` ceiling. Non-positive env values are ignored."""
+    raw = os.environ.get("NULLRUN_RETRY_AFTER_CEILING", "").strip()
+    if not raw:
+        return _RETRY_AFTER_CEILING_DEFAULT
+    try:
+        value = float(raw)
+        return value if value > 0 else _RETRY_AFTER_CEILING_DEFAULT
+    except ValueError:
+        return _RETRY_AFTER_CEILING_DEFAULT
+
+
+def _wait_on(cancel: threading.Event, seconds: float) -> bool:
+    """Wait on ``cancel`` for up to ``seconds``. The clock seam for tests.
+
+    A module-level function, not an inline ``cancel.wait``, so the test
+    fixture can stub the CLOCK without stubbing the decision. The
+    alternative — patching ``threading.Event.wait`` globally — changes the
+    semantics of every other ``Event.wait`` in the suite, including the
+    approval-wait tests that legitimately assert on real elapsed time, and
+    turns them into load-sensitive flakes to make the retry path fast.
+    Stubbing the seam keeps the full retry path — the ceiling check, the
+    one-sided jitter, the shutdown branch — under test, and only removes
+    the wall clock from it.
+    """
+    return not cancel.wait(seconds)
+
+
+def _interruptible_sleep(seconds: float, cancel: threading.Event | None) -> bool:
+    """Sleep, but wake early when the SDK is shutting down.
+
+    Returns True if the full delay elapsed, False if it was cut short by
+    ``cancel``.
+
+    ``time.sleep`` is the wrong primitive on the flush path for one reason:
+    it cannot be woken. ``Transport.stop()`` sets an event that the flush
+    loop honours between cycles, but a retry sleeping on ``Retry-After:
+    45`` inside a cycle does not check that event, so a shutdown that arrives
+    during a rate-limit wait blocks for the remainder of the wait. For a
+    process that is exiting, that is the difference between a prompt stop
+    and one that appears hung — and it is worst exactly when the backend is
+    misbehaving, which is when someone is most likely to be killing it.
+    """
+    if cancel is None:
+        time.sleep(seconds)
+        return True
+    return _wait_on(cancel, seconds)
 
 
 def _retry_with_backoff(
@@ -213,14 +699,21 @@ def _retry_with_backoff(
     backoff_factor: float = 2.0,
     jitter: float = 0.1,
     last_retry_after_seconds: float = 0.0,
-    on_transport_error: str | Callable[[Exception], dict[str, Any]] | None = None,
+    on_transport_error: TransportErrorHandler | None = None,
     retry_on_5xx: bool = False,
+    cancel: threading.Event | None = None,
+    retry_after_ceiling: float | None = None,
 ) -> Any:
     """Retry with exponential backoff + jitter; honors Retry-After (429) header.
 
     Formula (without Retry-After): delay = min(base_delay * backoff_factor^attempt, max_delay)
                                     delay += random.uniform(-jitter * delay, jitter * delay)
     Formula (with Retry-After): actual_delay = min(last_retry_after_seconds, max_delay)
+                                    delay  *= (1 + random.uniform(0, jitter))
+    The Retry-After jitter is one-sided on purpose: a rate limit states a
+    FLOOR, so spreading downward would retry before the server permitted it.
+    Read off the response the exception carries; see
+    ``_retry_after_seconds_from``.
 
     NR-006: when ``retry_on_5xx=True`` a 5xx response is treated as
     transient infrastructure failure and retried via the same
@@ -243,6 +736,9 @@ def _retry_with_backoff(
         NullRunAuthError,
         NullRunBackendError,
     )
+
+    if retry_after_ceiling is None:
+        retry_after_ceiling = _retry_after_ceiling()
 
     last_exc: Exception | None = None
 
@@ -312,14 +808,46 @@ def _retry_with_backoff(
             NullRunAuthenticationError,
             NullRunTransportError,
             NullRunBackendError,
+            # A refusal the backend NAMED as deterministic. Retrying it is
+            # guaranteed waste, and — since several of these arrive as 5xx —
+            # letting it fall through the generic handler would also count it
+            # as infrastructure failure on a perfectly healthy backend.
+            DeterministicBackendRefusal,
         ):
             raise
 
         except httpx.HTTPStatusError as exc:
-            # 5xx HTTPStatusError from the retry_on_5xx branch above.
-            # Treat as retryable transient infra failure.
+            # 5xx HTTPStatusError from the retry_on_5xx branch above, and
+            # also the 429 that `_post_batch` turns into one. Treat as
+            # retryable transient infra failure.
+            #
+            # This branch used to set `last_exc` and fall straight through
+            # to the next attempt with NO delay: no backoff, no sleep, and
+            # the `Retry-After` header the server had just sent ignored
+            # entirely. A rate-limited client therefore spent its whole
+            # retry budget in milliseconds, hammering the limit that had
+            # just answered it, and then gave up — the opposite of what a
+            # 429 asks for. The suite stayed green because the existing
+            # 429 test asserted the CALL COUNT, which does not depend on
+            # how long you wait between calls.
             last_exc = exc
             if attempt >= max_retries:
+                break
+            metrics.inc_transport("retries_total")
+            actual_delay = _next_retry_delay(
+                attempt=attempt,
+                max_retries=max_retries,
+                base_delay=base_delay,
+                backoff_factor=backoff_factor,
+                jitter=jitter,
+                max_delay=max_delay,
+                server_wait=_retry_after_seconds_from(exc.response),
+                error=exc,
+                retry_after_ceiling=retry_after_ceiling,
+            )
+            if actual_delay is None:
+                # The server's floor is past our ceiling. Stop this cycle
+                # rather than retry early; the caller keeps the events.
                 break
 
         except Exception as exc:
@@ -333,30 +861,31 @@ def _retry_with_backoff(
 
             metrics.inc_transport("retries_total")
 
-            if last_retry_after_seconds > 0:
-                actual_delay = min(last_retry_after_seconds, max_delay)
-                last_retry_after_seconds = 0.0
-                logger.warning(
-                    "Request failed (attempt %d/%d), honoring Retry-After %.2fs: %s",
-                    attempt + 1,
-                    max_retries + 1,
-                    actual_delay,
-                    type(exc).__name__,
-                )
-            else:
-                delay = min(base_delay * (backoff_factor**attempt), max_delay)
-                jitter_amount = delay * jitter
-                actual_delay = delay + random.uniform(-jitter_amount, jitter_amount)  # noqa: S311
-                actual_delay = max(0.0, actual_delay)
-                logger.warning(
-                    "Request failed (attempt %d/%d), retrying in %.2fs: %s",
-                    attempt + 1,
-                    max_retries + 1,
-                    actual_delay,
-                    type(exc).__name__,
-                )
+            actual_delay = _next_retry_delay(
+                attempt=attempt,
+                max_retries=max_retries,
+                base_delay=base_delay,
+                backoff_factor=backoff_factor,
+                jitter=jitter,
+                max_delay=max_delay,
+                server_wait=last_retry_after_seconds,
+                error=exc,
+                retry_after_ceiling=retry_after_ceiling,
+            )
+            last_retry_after_seconds = 0.0
+            if actual_delay is None:
+                break
 
-            time.sleep(actual_delay)
+        # Every path that reaches here has decided to retry. One sleep, one
+        # place: the two except branches used to carry their own, and the
+        # status branch had none, which is how the two drifted apart.
+        if not _interruptible_sleep(actual_delay, cancel):
+            # Shutdown arrived mid-wait. Stop retrying now; the caller still
+            # holds the events, and `.inflight` is retained because the send
+            # did not complete.
+            logger.info("Retry wait interrupted by shutdown; stopping this cycle")
+            metrics.inc_transport("retries_interrupted_by_shutdown")
+            break
 
     # ``retry_on_5xx`` and the failure mode was 5xx, return the
     # last response so the caller can synthesize a fallback
@@ -551,6 +1080,35 @@ class Transport:
                 )
         self._buffer: list[dict[str, Any]] = []
         self._in_flight: dict[str, dict[str, Any]] = {}  # event_id -> event for retry dedup
+        # Per-batch re-queue budget. A failure we cannot classify as transient
+        # (a payload that will not serialize, a shape the signer rejects) repeats
+        # identically on every cycle and would pin the batch ahead of the whole
+        # buffer forever. Count attempts, and dead-letter once spent.
+        self._batch_attempts: dict[str, int] = {}  # batch signature -> attempts
+        # event_id -> epoch seconds of its first observed failure, so a DLQ
+        # record says how long the event was failing rather than only that it
+        # was. In-memory only: after a restart the clock restarts, and the
+        # durable history is the DLQ file's own row order (each re-park
+        # appends). That is a deliberate trade — reading the whole DLQ to
+        # recover a timestamp would make the write path O(file), and the
+        # value is diagnostic, not load-bearing for recovery.
+        self._first_failed_at: dict[str, float] = {}
+        # Durability state. Probed on first use against the real filesystem,
+        # reported in metrics, warned about once. See the "Durability
+        # primitives" block above for why each of these is optional-but-named.
+        self._degradation_warned: set[str] = set()
+        self._dir_fsync_ok: bool | None = None
+        self._max_batch_attempts = int(os.environ.get("NULLRUN_MAX_BATCH_ATTEMPTS", "10"))
+        self._bisect_depth = 0  # recursion guard for 400/422 batch splitting
+        # Request budget for one bisect cascade. The depth guard alone bounds
+        # the RECURSION, not the wire: halving to depth 24 is 2^24 sends. A
+        # batch that is genuinely all-bad therefore spends an unbounded amount
+        # of the operator's rate limit rediscovering that fact. This counts
+        # sends instead, so the cost is a number a human chose.
+        self._bisect_budget = int(os.environ.get("NULLRUN_MAX_BISECT_REQUESTS", "64"))
+        # Terminal refusals the DLQ could not take, held in memory until it
+        # has room. See `_hold_for_dlq` for why they are not re-sent.
+        self._dlq_overflow: list[dict[str, Any]] = []
         # RLock so re-entrant acquisition (e.g. test fixtures that hold the
         # lock while calling lock-acquiring methods) doesn't deadlock.
         self._lock = threading.RLock()
@@ -596,6 +1154,25 @@ class Transport:
                 keepalive_expiry=30.0,
             ),
         )
+        # Via-edge. `None` is the ordinary case and costs nothing: the
+        # cloud stays on the enforcement path exactly as before.
+        #
+        # Read HERE, at construction, rather than per call: a
+        # reconfigured box that silently switches enforcement targets
+        # mid-flight would be a budget being enforced by one authority
+        # and then another, with no record of the change. Configuration
+        # is expected to change at deploy, not at runtime.
+        from nullrun.edge import EdgeConfigurationError, edge_transport_from_env
+
+        try:
+            self.edge = edge_transport_from_env()
+        except EdgeConfigurationError:
+            # Raised, not warned and swallowed. Via-edge was asked for
+            # and cannot be enforced; continuing would mean every call
+            # runs with no gate at all while the operator believes the
+            # box is holding the line.
+            raise
+
         self._redis_client = redis_client
         self._circuit_breaker = CircuitBreaker(
             failure_threshold=self.config.max_failed_flush,
@@ -614,6 +1191,14 @@ class Transport:
         if _OTEL_AVAILABLE:
             self._tracer = trace.get_tracer("nullrun.transport")
             self._propagator = TraceContextTextMapPropagator()
+
+        # Tighten anything a previous run left behind, BEFORE the replay
+        # path reads it. A file created by an older SDK, or by a run under a
+        # different umask, keeps its old mode through every `os.replace`,
+        # so hardening only new writes would leave the existing events — the
+        # ones most likely to hold full prompts and tool arguments — readable
+        # by everyone with access to the volume.
+        self._harden_wal_permissions()
 
         # Final-flush hook via weakref.finalize — only fires if this Transport
         self._finalizer = weakref.finalize(self, self._atexit_flush_safe)
@@ -673,63 +1258,571 @@ class Transport:
         except OSError as e:
             logger.warning(f"Failed to rotate WAL {wal_path}: {e}")
 
-    def _persist_to_wal(self) -> None:
-        """Persist unflushed events to WAL file for replay on restart."""
-        if not self._buffer:
+    def _wal_inflight_path(self) -> str:
+        """Path of the in-flight batch file (the batch currently on the wire)."""
+        return f"{self._wal_path()}.inflight"
+
+    def _wal_dlq_path(self) -> str:
+        """Path of the dead-letter file for permanently-rejected batches."""
+        return f"{self._wal_path()}.dlq"
+
+    def _wal_holdover_path(self) -> str:
+        """Path of the holdover file: refused events the DLQ had no room for.
+
+        Deliberately NOT `.wal` and NOT `.wal.inflight`. `.wal` is rewritten
+        wholesale by `_persist_to_wal` on every buffer persist, so held rows
+        appended there are erased by the next unsent event; `.inflight` is
+        overwritten with whatever batch is about to go on the wire, which is
+        precisely the loss this file exists to prevent. A separate file has
+        one writer (the hold) and one eraser (the drain), and nothing else
+        touches it.
+        """
+        return f"{self._wal_path()}.holdover"
+
+    def _wal_lock_path(self) -> str:
+        """Path of the advisory lock guarding mutations of the WAL files."""
+        return f"{self._wal_path()}.lock"
+
+    @property
+    def _dlq_max_bytes(self) -> int:
+        """Effective DLQ size cap. Same shape as ``_wal_max_bytes``."""
+        raw = os.environ.get("NULLRUN_DLQ_MAX_BYTES", "").strip()
+        if not raw:
+            return _DLQ_MAX_BYTES_DEFAULT
+        try:
+            value = int(raw)
+            return value if value > 0 else _DLQ_MAX_BYTES_DEFAULT
+        except ValueError:
+            return _DLQ_MAX_BYTES_DEFAULT
+
+    @property
+    def _holdover_index_max(self) -> int:
+        """Max tracked holdover entries. Bounded on COUNT, not bytes.
+
+        Count is the unit the metric reports and the unit an operator alerts
+        on; a byte bound here would be a second cap for the same property and
+        would fail at a threshold nobody chose deliberately. The cap trims
+        the in-memory index only — the holdover file keeps every row, so a
+        saturated index under-reports `dlq_holdover` rather than losing an
+        event.
+        """
+        raw = os.environ.get("NULLRUN_DLQ_HOLDOVER_MAX_EVENTS", "").strip()
+        if not raw:
+            return _DLQ_HOLDOVER_INDEX_MAX_DEFAULT
+        try:
+            value = int(raw)
+            return value if value > 0 else _DLQ_HOLDOVER_INDEX_MAX_DEFAULT
+        except ValueError:
+            return _DLQ_HOLDOVER_INDEX_MAX_DEFAULT
+
+    # -- durability probes ------------------------------------------------
+
+    def _warn_degraded_once(self, aspect: str, state: str, detail: str) -> None:
+        """Say it once per aspect per Transport, and record the state.
+
+        The metric gets a short enum value and the log gets the sentence.
+        A metric field an operator has to substring-match to alert on is a
+        metric field nobody alerts on.
+
+        Once, because a degraded platform is a standing condition, not an
+        event: warning on every flush would bury the log under a fact that
+        never changes and never resolves itself.
+        """
+        metrics.set_transport(f"wal_{aspect}", state)
+        if aspect in self._degradation_warned:
             return
-        event_count = len(self._buffer)
-        wal_path = self._wal_path()
-        self._rotate_wal_if_needed()
-        wal_dir = os.path.dirname(wal_path) or "."
+        self._degradation_warned.add(aspect)
+        logger.warning(_DEGRADATION_WARNING % detail)
+
+    def _dir_fsync_supported(self, directory: str) -> bool:
+        """Whether this platform and filesystem can fsync a DIRECTORY.
+
+        Probed against the real directory rather than inferred from the OS:
+        Windows has no directory fsync at all, and on Linux some mounts
+        (overlayfs upper dirs, certain network and FUSE filesystems) accept
+        the open and then refuse the fsync. Both are indistinguishable from
+        the outside and both mean the same thing, so both report False.
+        """
+        if self._dir_fsync_ok is not None:
+            return self._dir_fsync_ok
+        ok = True
+        fd = -1
+        try:
+            fd = os.open(directory, os.O_RDONLY)
+            os.fsync(fd)
+        except OSError:
+            ok = False
+        finally:
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        self._dir_fsync_ok = ok
+        if ok:
+            metrics.set_transport("wal_dir_fsync", "enabled")
+        else:
+            self._warn_degraded_once(
+                "dir_fsync", "unavailable", f"directory fsync unavailable on {directory}"
+            )
+        return ok
+
+    @property
+    def _wal_lock_timeout(self) -> float:
+        """Seconds to wait for the cross-process WAL lock before giving up."""
+        raw = os.environ.get("NULLRUN_WAL_LOCK_TIMEOUT_MS", "").strip()
+        if not raw:
+            return _WAL_LOCK_TIMEOUT_DEFAULT
+        try:
+            value = float(raw) / 1000.0
+            return value if value > 0 else _WAL_LOCK_TIMEOUT_DEFAULT
+        except ValueError:
+            return _WAL_LOCK_TIMEOUT_DEFAULT
+
+    @contextmanager
+    def _wal_file_lock(self) -> Iterator[bool]:
+        """Hold the cross-process WAL lock. Yields False if it could not be had.
+
+        A NEW descriptor is opened per acquisition, and that is load-bearing,
+        not incidental. `flock` locks the open file DESCRIPTION, so two
+        threads of one process each opening their own descriptor DO conflict —
+        which is why this needs no companion `threading.Lock` and why adding
+        one would be redundant. Caching the descriptor to save an `open()`
+        would invert this: the kernel would see one description, and the
+        second `LOCK_EX` would succeed immediately against the first holder's
+        own lock. Cross-process safety survives that; in-process safety does
+        not. `test_flock_excludes_two_threads_of_one_process` is the tripwire.
+
+        Advisory (`flock`), exclusive, and **bounded-wait, not
+        non-blocking**. Non-blocking is the obvious choice and it is wrong:
+        it was tried here, and on a 4-worker deployment the losing writer was
+        refused on every single attempt, forever, because the winner was
+        always mid-append. Its events were never lost — the caller re-queues
+        them — and never landed either, so a DLQ nobody could ever write to
+        while the other process was busy. A wait costs the losing writer
+        microseconds, because the critical section is a local file copy and
+        fsync; starvation is not a cheaper option than waiting.
+
+        Bounded, because "wait forever" turns a descheduled writer into a
+        hung flush thread. On expiry the caller skips its write and keeps the
+        events — the same fail-safe as any other reason the write did not
+        happen. The lock is released by the kernel if a holder dies, so a
+        crashed process cannot hold it.
+
+        The scope is the FILE MUTATION only — never the network send.
+        Holding it across a request would serialise every worker behind one
+        another's latency, which is the opposite of what it is for.
+        """
+        if fcntl is None:
+            # No flock here (Windows). The files still get 0600 and the
+            # platform's own sharing semantics; what is missing is the guard
+            # against two processes appending at once, which is a real
+            # multi-process hazard and is why the warning says so.
+            self._warn_degraded_once(
+                "lock",
+                "unavailable",
+                "no fcntl.flock — one writer per WAL path, set NULLRUN_WAL_PATH per worker",
+            )
+            yield True
+            return
+
+        lock_path = self._wal_lock_path()
+        directory = os.path.dirname(lock_path) or "."
+        try:
+            os.makedirs(directory, exist_ok=True)
+        except OSError as e:
+            logger.warning(f"Cannot create WAL directory {directory}: {e}")
+            yield False
+            return
+
+        try:
+            fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        except OSError as e:
+            # A lock we cannot open is a lock we do not have. Say so once
+            # and proceed unlocked rather than refusing to write at all —
+            # the alternative is losing every event on a permissions
+            # problem in a directory the WAL itself already lives in.
+            self._warn_degraded_once(
+                "lock", "unavailable", f"cannot open {lock_path}: {e}"
+            )
+            yield True
+            return
+
+        acquired = False
+        deadline_step = 0.02
+        # Measured, not counted. A budget expressed as "50 naps of 20ms" is
+        # a budget of 50 *naps*, and anything that returns from sleep early —
+        # a signal, a test harness that stubs sleep, a coarse scheduler —
+        # spends the whole 5s in milliseconds and gives up while the lock is
+        # still held. The timeout is a duration, so it is compared against a
+        # clock.
+        start = time.monotonic()
+        try:
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                    break
+                except OSError:
+                    if time.monotonic() - start >= self._wal_lock_timeout:
+                        break
+                    time.sleep(deadline_step)
+            waited = time.monotonic() - start
+            if not acquired:
+                metrics.set_transport("wal_lock", "contended")
+                metrics.inc_transport("wal_lock_timeouts_total")
+                logger.warning(
+                    f"WAL lock {lock_path} still held after {waited:.2f}s; "
+                    f"skipping this write. The events stay on the retry path."
+                )
+                yield False
+                return
+            if waited > deadline_step:
+                metrics.set_transport("wal_lock", "contended")
+                logger.debug(
+                    f"WAL lock {lock_path} waited {waited:.2f}s before being granted"
+                )
+            metrics.set_transport("wal_lock", "enabled")
+            yield True
+        finally:
+            if acquired:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def _harden_wal_permissions(self) -> None:
+        """Force 0600 on every WAL file, including ones a previous run left.
+
+        A file written by an older SDK, or by a run under a different umask,
+        keeps its old mode: `os.replace` carries the mode of the file it
+        renamed, so tightening only the tmp file tightens new writes and
+        leaves every existing file as it was. Events are payloads, so this is
+        a data-exposure fix, not a tidiness one.
+        """
+        base = self._wal_path()
+        for candidate in (
+            base,
+            f"{base}.1",
+            f"{base}.inflight",
+            f"{base}.holdover",
+            f"{base}.dlq",
+            f"{base}.lock",
+        ):
+            try:
+                os.chmod(candidate, 0o600)
+            except FileNotFoundError:
+                continue
+            except OSError as e:
+                # Best-effort by design. Refusing to run because a mode
+                # could not be tightened would trade a permissions warning
+                # for total data loss.
+                logger.warning(f"Could not restrict permissions on {candidate}: {e}")
+
+    def _dlq_size(self) -> int:
+        try:
+            return os.path.getsize(self._wal_dlq_path())
+        except OSError:
+            return 0
+
+    def _dlq_over_cap(self, incoming_bytes: int) -> bool:
+        """True when appending would take the DLQ past its cap.
+
+        The cap NEVER deletes anything. The alternative — rotating or
+        trimming the oldest rows — destroys the only copy of an event the SDK
+        could not deliver, silently, with no trace beyond a short file. A
+        DLQ that has stopped growing is a visible, alertable condition; a
+        DLQ that quietly dropped the oldest refusals is neither. So the cap
+        stalls the write and the caller re-queues the event on the retry path
+        instead, where a further crash still holds it and the next attempt
+        reports the same refusal.
+
+        `incoming_bytes` is part of the test, not an optimisation: a cap
+        checked only against the current size admits any single write, so an
+        operator who set 1 GB would get a 40 GB file the first time a large
+        batch was quarantined.
+        """
+        size = self._dlq_size()
+        metrics.set_transport("dlq_bytes", size)
+        if size < self._dlq_max_bytes and size + incoming_bytes <= self._dlq_max_bytes:
+            return False
+        metrics.inc_transport("dlq_overflow_total")
+        metrics.set_transport("dlq_overflow_reason", "size_cap")
+        logger.error(
+            f"DLQ {self._wal_dlq_path()} would exceed its cap "
+            f"({size} bytes + {incoming_bytes} incoming > {self._dlq_max_bytes}). "
+            f"Refusing to append: the cap never deletes rows, so the event "
+            f"stays on the retry path. Raise NULLRUN_DLQ_MAX_BYTES, or triage "
+            f"and archive the file with `nullrun-wal`."
+        )
+        return True
+
+    def _write_events_atomic(
+        self, path: str, events: list[dict[str, Any]], mode: str = "w"
+    ) -> bool:
+        """Write ``events`` as JSON lines to ``path`` atomically.
+
+        tmp + fsync + os.replace: a reader either sees the previous file or
+        the complete new one, never a half-written batch. ``mode="a"`` copies
+        the existing file first and appends, so successive writes accumulate
+        instead of clobbering — that is what the DLQ needs, where losing an
+        earlier quarantine to a later one would itself be data loss.
+
+        Two crash hazards the copy-and-append path has to survive:
+
+        * A **torn tail**. If the process died mid-write, the last line of the
+          existing file has no terminating ``\\n``. Copying it verbatim glues
+          the next row onto the truncated JSON, producing one corrupt line
+          that takes a valid event with it. The unterminated tail is dropped
+          (it was never durable) before appending.
+        * A **stale tmp**. The name is pid-scoped and opened with ``"w"``, so a
+          leftover from a dead process is truncated rather than appended to.
+
+        The directory is fsynced after the rename: without it the new name can
+        be absent after a power cut even though the data blocks landed.
+
+        The tmp file is created 0600 rather than through ``open(..., "w")``,
+        because the mode of the file that ``os.replace`` renames is the mode
+        the WAL ends up with, and ``open`` applies the process umask to
+        whatever 0666 it asks for. On a default umask that leaves every event
+        payload world-readable in the tempdir, on a shared volume, and inside
+        a container that several services mount.
+
+        The whole read-copy-append runs under the cross-process WAL lock:
+        it is a read followed by a write of the same file, and a second
+        process doing the same thing concurrently interleaves its lines into
+        the middle of the other's, which no reader can then parse.
+
+        Returns True when the data is durably on disk.
+        """
+        wal_dir = os.path.dirname(path) or "."
         try:
             os.makedirs(wal_dir, exist_ok=True)
         except OSError as e:
             logger.warning(f"Cannot create WAL directory {wal_dir}: {e}")
+            return False
+        tmp_path = f"{path}.tmp.{os.getpid()}"
+        with self._wal_file_lock() as acquired:
+            if not acquired:
+                # Another process owns these files. Our events are still in
+                # memory / still covered by `.inflight`, and the caller is
+                # told "not written" so it keeps the recovery file.
+                return False
+            try:
+                fd = os.open(
+                    tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+                )
+                with os.fdopen(fd, "w") as f:
+                    if mode == "a" and os.path.exists(path):
+                        # Existing contents FIRST, so the file stays in
+                        # chronological order. Writing the new rows first and
+                        # folding the old ones in after would reverse the DLQ.
+                        #
+                        # A crash can leave the last line unterminated. Copying it
+                        # verbatim would glue the next row onto truncated JSON and
+                        # corrupt an event that was perfectly valid, so the torn
+                        # tail is dropped — it was never durable anyway.
+                        with open(path) as prev:
+                            previous = prev.read()
+                        if previous and not previous.endswith("\n"):
+                            keep = previous.rfind("\n") + 1  # 0 when there is none
+                            logger.warning(
+                                f"Dropping {len(previous) - keep}B torn tail of {path} before append"
+                            )
+                            previous = previous[:keep]
+                        f.write(previous)
+                    for event in events:
+                        f.write(json.dumps(event, default=str) + "\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_path, path)
+                self._fsync_dir(wal_dir)
+                return True
+            except OSError as e:
+                logger.warning(
+                    f"Failed to persist {len(events)} events to {path}: {e}"
+                )
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                return False
+
+    def _fsync_dir(self, path: str) -> None:
+        """Flush a directory entry so a rename survives a power cut.
+
+        Best-effort: a failure here costs durability of the NAME, not the
+        data, which is already fsynced. What it must not cost is
+        *visibility* — a platform that cannot do this is probed once by
+        ``_dir_fsync_supported``, reported in metrics, and warned about, so
+        "we lose the rename on power cut here" is a known state rather than
+        an assumption nobody checked.
+        """
+        if not self._dir_fsync_supported(path):
             return
-        tmp_path = f"{wal_path}.tmp.{os.getpid()}"
         try:
-            with open(tmp_path, "a") as f:
-                for event in self._buffer:
-                    f.write(json.dumps(event, default=str) + "\n")
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp_path, wal_path)
-            self._buffer.clear()
-            logger.debug(f"Persisted {event_count} events to WAL at {wal_path}")
+            fd = os.open(path, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(fd)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+
+    def _persist_to_wal(self) -> bool:
+        """Persist unflushed events to WAL file for replay on restart.
+
+        Every event is guaranteed an ``event_id`` before it reaches disk.
+        Replay is at-least-once — a crash mid-send can re-deliver an event —
+        and the backend dedups on ``event_id`` (cost_event_id_dedup PRIMARY
+        KEY), so a stable id is exactly what makes re-delivery safe.
+
+        Returns True when the buffer is durably on disk (and therefore
+        cleared), False when the write failed and the caller must NOT
+        discard any recovery file.
+        """
+        if not self._buffer:
+            return True
+        for event in self._buffer:
+            if not event.get("event_id"):
+                event["event_id"] = str(uuid.uuid4())
+        event_count = len(self._buffer)
+        wal_path = self._wal_path()
+        self._rotate_wal_if_needed()
+        if not self._write_events_atomic(wal_path, list(self._buffer)):
+            return False
+        self._buffer.clear()
+        logger.debug(f"Persisted {event_count} events to WAL at {wal_path}")
+        return True
+
+    def _persist_inflight(self, batch: list[dict[str, Any]]) -> None:
+        """Record the batch that is about to go on the wire.
+
+        The batch has already been removed from ``_buffer`` at this point, so
+        a crash during the send would otherwise lose it outright. Cleared once
+        the send is accepted; deliberately RETAINED when the send fails,
+        because then the batch is only in memory. A later successful flush
+        overwrites this file with its own batch and removes it, so a stale
+        copy self-heals rather than accumulating.
+        """
+        if batch:
+            self._write_events_atomic(self._wal_inflight_path(), batch)
+
+    def _clear_inflight(self) -> None:
+        try:
+            os.remove(self._wal_inflight_path())
+        except FileNotFoundError:
+            pass
         except OSError as e:
-            logger.warning(f"Failed to persist {event_count} events to WAL: {e}")
+            logger.warning(f"Failed to remove in-flight WAL: {e}")
 
     def _replay_from_wal(self) -> None:
-        """Replay events from WAL file on startup.
+        """Recover events from every durable WAL source and flush them.
 
-        P1-5b: also drains the rotated ``.wal.1`` (oldest
-        surviving recovery window) before the active ``.wal`` so
-        a crash between rotation and replay doesn't lose events.
-        Both files are removed only after a successful flush.
+        Sources, oldest first: the rotated ``.wal.1``, the active ``.wal``,
+        and ``.wal.inflight`` — the batch that was on the wire when the
+        process died.
+
+        Crash-safety invariant: no recovery file is unlinked before its
+        events are provably safe, i.e. either accepted by the backend or
+        rewritten into ``.wal`` by ``_persist_to_wal``. Recovery is
+        at-least-once; the backend dedups on ``event_id``.
+
+        The read phase runs under the cross-process WAL lock; the send does
+        not. That leaves a window in which two processes have read the same
+        file and both replay it — a duplicate, absorbed by the backend's dedup
+        — and no window in which one of them can remove a file the other
+        still needs, because removal only ever happens after the events are
+        delivered or re-persisted. Holding the lock across the send instead
+        would serialise every worker in a multi-process deployment behind one
+        another's latency to remove a duplication the dedup key already
+        handles.
         """
+        wal_path = self._wal_path()
+        sources = [f"{wal_path}.1", wal_path, self._wal_inflight_path()]
         events: list[dict[str, Any]] = []
-        for candidate in (f"{self._wal_path()}.1", self._wal_path()):
-            try:
-                with open(candidate) as f:
-                    for line in f:
-                        try:
-                            events.append(json.loads(line.strip()))
-                        except json.JSONDecodeError:
-                            continue
-            except FileNotFoundError:
-                continue
-            except OSError as e:
-                logger.warning(f"Failed to read WAL {candidate}: {e}")
+        found: list[str] = []
+        empty: list[str] = []
+        with self._wal_file_lock() as acquired:
+            if not acquired:
+                logger.warning(
+                    "WAL replay skipped: another process holds the WAL lock. "
+                    "Its replay covers the same files."
+                )
+                return
+            for candidate in sources:
+                try:
+                    with open(candidate) as f:
+                        lines = f.readlines()
+                except FileNotFoundError:
+                    continue
+                except OSError as e:
+                    logger.warning(f"Failed to read WAL {candidate}: {e}")
+                    continue
+                if not lines:
+                    empty.append(candidate)
+                    continue
+                found.append(candidate)
+                for line in lines:
+                    try:
+                        events.append(json.loads(line.strip()))
+                    except json.JSONDecodeError:
+                        continue
+
+            if not events:
+                # Nothing recovered. Drop leftovers so the next flush starts clean.
+                for candidate in empty:
+                    try:
+                        os.remove(candidate)
+                    except OSError as e:
+                        logger.warning(f"Failed to remove empty WAL {candidate}: {e}")
+                return
+
+        self._buffer.extend(events)
+        try:
+            self._do_flush()
+        except BreakerTransportError as e:
+            # `_do_flush` normally swallows this internally (it re-queues the
+            # batch), but a transport subclass or a future refactor may not.
+            # Recovery must never abort `start()` — the events are already in
+            # the buffer, and the fall-through below persists them.
+            logger.warning(f"WAL replay flush failed: {e}")
+
+        repersisted = False
+        if self._buffer:
+            # The flush did not deliver everything. Rewrite the survivors into
+            # `.wal` so they survive another crash, and only then discard the
+            # older sources. If that write fails the survivors are in memory
+            # only — keep every source so the next start can try again.
+            if not self._persist_to_wal():
+                logger.warning(
+                    f"WAL replay: {len(self._buffer)} events still buffered and could not be "
+                    f"re-persisted; keeping {found} for the next start"
+                )
+                return
+            repersisted = True
+
+        # Everything recovered is either delivered or — when `repersisted` —
+        # sitting in a FRESH `.wal` that `_persist_to_wal` just wrote. That
+        # file must be spared: unlinking it here would discard exactly what we
+        # persisted. The other sources are now strictly redundant.
+        for candidate in found:
+            if repersisted and candidate == wal_path:
                 continue
             try:
                 os.remove(candidate)
             except OSError as e:
                 logger.warning(f"Failed to remove WAL {candidate}: {e}")
-        if events:
-            self._buffer.extend(events)
-            self._do_flush()
-        if events:
-            logger.info(f"Replayed {len(events)} events from WAL")
+        logger.info(
+            f"Replayed {len(events)} events from WAL"
+            + (" (unflushed remainder re-persisted)" if repersisted else "")
+        )
 
     def track(self, event: dict[str, Any]) -> None:
         """
@@ -758,6 +1851,12 @@ class Transport:
             return
         # Replay any events from WAL that were persisted due to previous crash
         self._replay_from_wal()
+        # Held refusals are recovered separately and are NOT replayed onto the
+        # send path. `_replay_from_wal` recovers undelivered events, which is
+        # the right thing for them; these were already refused, so re-sending
+        # produces the same refusal while blocking everything queued behind
+        # them. They go to the DLQ on the first flush that finds room.
+        self._recover_holdover()
         self._running = True
         # Clear the stop latch so a previous stop() does not short-circuit
         # the new flush loop on its first sleep.
@@ -807,7 +1906,11 @@ class Transport:
             self._flush_thread.join(timeout=timeout)
         if flush:
             self._do_flush()  # Final flush
-            self._persist_to_wal()  # WAL any remaining events
+            if self._persist_to_wal():
+                # The buffer is durably in `.wal` (or was already accepted),
+                # so any retained `.inflight` copy is now a subset of it.
+                # Clear it, or the next replay would load the same events twice.
+                self._clear_inflight()
         self._client.close()
         if getattr(self, "_finalizer", None) is not None and self._finalizer.alive:
             self._finalizer.detach()
@@ -830,17 +1933,50 @@ class Transport:
 
     def _do_flush_locked(self) -> None:
         """Flush under lock. Must be called with _lock held."""
+        # Space may have freed up since the last refusal (the operator raised
+        # the cap, or archived the file with `nullrun-wal`). Draining first
+        # means the held refusals land before new traffic, not after an
+        # unbounded wait for the next one to fail.
+        self._drain_dlq_overflow()
+
         if not self._buffer:
             logger.debug("Buffer empty, skipping flush")
             return
 
         batch = self._buffer[:]
         self._buffer.clear()
+        # Refilled as the cascade below splits it, so one flush is one budget.
+        self._bisect_budget = int(os.environ.get("NULLRUN_MAX_BISECT_REQUESTS", "64"))
         logger.debug(f"Sending batch of {len(batch)} events")
 
-        # Circuit breaker wrapped send - uses proper 3-state circuit breaker
+        # Durability barrier: the batch has left `_buffer` and the process
+        # can now die at any point. Record it on disk before the send so a
+        # crash mid-flight is recoverable on the next start.
+        self._persist_inflight(batch)
+
+        # Circuit breaker wrapped send - uses proper 3-state circuit breaker.
+        #
+        # Only genuine backend UNREACHABILITY may count as a breaker failure.
+        # A 4xx is the server answering, which proves the transport is healthy;
+        # a TypeError from local serialization is our own bug. Counting either
+        # would let a batch of malformed payloads open the circuit on a backend
+        # that is plainly up and would keep taking traffic, and then every
+        # buffered event sits blocked for the whole recovery window. Those are
+        # trapped here and handled after the call.
+        #
+        # httpx.TransportError (connect refused, DNS, read timeout) and
+        # BreakerTransportError (5xx exhaustion) still propagate, so the
+        # breaker keeps doing its actual job.
+        deferred: list[Exception] = []
+
         def send_batch():
-            result = self._send_batch_with_retry_info(batch)
+            try:
+                result = self._send_batch_with_retry_info(batch)
+            except (BreakerTransportError, httpx.TransportError):
+                raise
+            except Exception as exc:  # noqa: BLE001
+                deferred.append(exc)
+                return None
             # Remove accepted events from in-flight
             if result.accepted_event_ids:
                 for event in batch:
@@ -854,7 +1990,7 @@ class Transport:
             return result
 
         try:
-            self._circuit_breaker.call(send_batch)
+            result = self._circuit_breaker.call(send_batch)
         except BreakerTransportError:
             logger.warning(f"Circuit breaker OPEN. Batch of {len(batch)} events will be re-queued.")
             # Drop NEWEST non-critical (state_change etc.) so oldest events
@@ -866,7 +2002,858 @@ class Transport:
                 if overflow > 0:
                     batch = self._drop_newest_with_priority(batch, overflow)
             self._buffer.extend(batch)  # Append to END so oldest events retry first.
+            # `.inflight` is intentionally NOT cleared here: the batch is
+            # back in memory only, and a crash before the next `_persist_to_wal`
+            # would lose it. A later successful flush overwrites and clears it.
             metrics.inc_transport("batches_failed")
+            return
+        except Exception as e:  # noqa: BLE001
+            self._retry_or_dlq(batch, e, dead_letter=True)
+            return
+
+        if deferred:
+            self._route_deferred(batch, deferred[0])
+            return
+
+        # The batch was on the wire and came back 2xx. A 2xx is not
+        # delivery: settle each event against the per-item answer before
+        # clearing `.inflight`.
+        if not self._settle_batch_outcome(batch, result):
+            # Something is still live. `.inflight` stays — it is the durable
+            # copy of those events, and a crash before the next
+            # `_persist_to_wal` would otherwise lose them.
+            return
+
+        self._batch_attempts.pop(self._failure_signature(batch), None)  # landed
+        self._clear_inflight()  # every event is durably accounted for
+
+    def _settle_batch_outcome(self, batch: list[dict[str, Any]], result: Any) -> bool:
+        """Apply a 2xx per-item outcome. Returns True when nothing is still live.
+
+        The load-bearing property is the ORDER, not the classification. Every
+        event must be durable — written to the DLQ, or still covered by a
+        retained ``.inflight`` — BEFORE ``.inflight`` is cleared. Cleared in
+        between and a crash loses whatever was only in memory. The other order
+        (durable first, crash after) costs a duplicate, which is safe: the
+        backend dedups on ``event_id`` and an ``IdempotentReplay`` consume
+        comes back accepted, so the replay lands instead of looping. A
+        duplicate is recoverable; a silent gap is not.
+
+        That is also why this method writes the DLQ itself and returns rather
+        than calling ``_quarantine_to_dlq``: the latter clears ``.inflight``,
+        which would be wrong whenever anything in the same batch is being
+        re-queued rather than parked.
+        """
+        if not getattr(result, "body_confirmed", True):
+            # We cannot read the answer. Bounded retry, then the DLQ — the
+            # budget is what stops an unreadable 200 from looping forever,
+            # and the DLQ is what stops it from ending in a silent drop.
+            #
+            # Negated on the way out: `_retry_or_dlq` answers "is it live",
+            # this method answers "is anything settled". Getting that backwards
+            # pops the attempt counter on every cycle, so the budget never
+            # depletes and the event retries forever.
+            return not self._retry_or_dlq(
+                batch, UnconfirmedBatchResponse(len(batch)), dead_letter=True
+            )
+
+        rejected_by_id = {
+            item["event_id"]: item for item in getattr(result, "rejected_items", []) or []
+        }
+        accepted = set(getattr(result, "accepted_event_ids", []) or [])
+
+        still_live = False
+        requeue: list[dict[str, Any]] = []
+        unknown: list[tuple[dict[str, Any], str]] = []
+        refused = 0
+
+        for event in batch:
+            eid = event.get("event_id")
+            if eid in accepted:
+                self._in_flight.pop(eid, None)
+                continue
+            refused += 1
+            detail = rejected_by_id.get(eid)
+            if detail is None:
+                # In neither list. The server's answer does not account for
+                # this event at all, so we cannot claim it landed. Treated as
+                # an unknown refusal: bounded retry, then the DLQ. Guessing
+                # "accepted" here is how a partition bug turns into silent
+                # data loss, and guessing "rejected" is how a partition bug
+                # turns into an infinite retry.
+                unknown.append((event, "unaccounted_in_response"))
+                continue
+            reason = detail.get("reason") or "unspecified"
+            if reason in _TERMINAL_REJECTION_REASONS:
+                # Durably parked by the time this returns, so it does not keep
+                # `.inflight` alive — but the write had to happen first, which
+                # is why the DLQ row is written here rather than in the tail.
+                if self._dead_letter_row(event, reason):
+                    still_live = True
+
+            elif detail.get("retry_after_ms") is not None:
+                # The backend gave a retry hint: it expects this to succeed
+                # later. Bounded by the per-event attempt counter anyway, so
+                # a hint that never materialises cannot pin the buffer.
+                requeue.append(event)
+                still_live = True
+            else:
+                unknown.append((event, reason))
+
+        for event, reason in unknown:
+            if self._retry_or_dlq(
+                [event], UnknownRejectionReason(reason, event.get("event_id")), dead_letter=True
+            ):
+                still_live = True
+
+        if requeue:
+            # Head, not tail: a refusal the backend expects to clear should
+            # not sit behind a steady stream of new events until the buffer
+            # drains.
+            self._requeue_at_head(requeue)
+        if refused:
+            metrics.inc_transport("events_partial_refused", refused)
+        return not still_live
+
+    # 4xx classes that MUST NOT be quarantined. Quarantining these would
+    # discard good data at exactly the moment it is recoverable.
+    #
+    # 408 Request Timeout / 429 Too Many Requests — transient. After an
+    # outage every SDK replays its WAL at once, the rate limiter answers
+    # 429, and a naive "any 4xx is permanent" rule would quarantine every
+    # recovering fleet in the first second of the window.
+    #
+    # 401 Unauthorized / 403 Forbidden — the key was rotated or revoked.
+    # Once the operator fixes the key the batch must still deliver, so it
+    # belongs back in the WAL, not on disk as DLQ litter.
+    #
+    # 413 Payload Too Large — the BATCH is too big, not the events. Halve
+    # and resend; every event is individually acceptable.
+    _TRANSIENT_4XX = frozenset({408, 429})
+    _AUTH_4XX = frozenset({401, 403})
+    _RESPLIT_4XX = frozenset({413})
+    # Cap on distinct batch signatures tracked for the attempt budget.
+    _MAX_TRACKED_BATCHES = 1024
+    # Ceiling on bisection. Each level halves the batch, so this bounds the
+    # worst case (an all-bad batch) to ~2n sends while still isolating a
+    # single offender in any realistic batch.
+    _MAX_BISECT_DEPTH = 24
+
+    def _handle_http_rejection(self, batch: list[dict[str, Any]], error: Exception) -> None:
+        """Route a 4xx to re-queue, split-and-resend, or DLQ by status class."""
+        status = getattr(getattr(error, "response", None), "status_code", None)
+
+        if status in self._TRANSIENT_4XX:
+            # Never dead-letter a rate limit or a timeout, no matter how many
+            # attempts: the batch is good data, the server is busy. It stays in
+            # the WAL until the window opens.
+            self._retry_or_dlq(batch, error, dead_letter=False)
+            return
+
+        if status in self._AUTH_4XX:
+            # Recoverable by operator action. Hold the data, keep the WAL,
+            # and say loudly that delivery is blocked on a key problem.
+            logger.error(
+                f"Backend rejected the batch with {status} (auth). The events stay "
+                f"in the WAL and WILL be delivered once the API key is fixed — "
+                f"rotate/verify it at https://app.nullrun.io/settings/api-keys. "
+                f"Quarantining is deliberately NOT done here."
+            )
+            self._requeue_at_head(batch)
+            metrics.inc_transport("batches_auth_blocked")
+            return
+
+        # 413 (batch too big) and 400/422 (one malformed event rejected the
+        # whole request) are both resolved the same way: halve and resend. The
+        # halves are sent as SEPARATE batches rather than pushed back onto the
+        # buffer — the buffer is flushed wholesale, so re-queuing both halves
+        # would re-form the batch we just proved the server will not accept,
+        # and the bisect would never make progress.
+        if len(batch) > 1:
+            half = len(batch) // 2
+            logger.warning(
+                f"Batch of {len(batch)} rejected with {status} — splitting into "
+                f"{half} + {len(batch) - half} and resending the halves separately."
+            )
+            metrics.inc_transport(
+                "batches_resplit" if status in self._RESPLIT_4XX else "batches_bisected"
+            )
+            self._send_subbatches(batch[:half], batch[half:], error)
+            return
+
+        # A single event the server will never accept.
+        self._quarantine_to_dlq(batch, error)
+
+    def _send_subbatches(
+        self, left: list[dict[str, Any]], right: list[dict[str, Any]], error: Exception
+    ) -> None:
+        """Send both halves as independent batches, isolating a single offender.
+
+        Recursion depth is log2(len(batch)), and `_MAX_BISECT_DEPTH` caps it,
+        so an entire bad batch cannot spin here. Whatever is still undeliverable
+        when the cap is hit falls back to the whole-batch quarantine.
+        """
+        if self._bisect_depth >= self._MAX_BISECT_DEPTH:
+            logger.error(f"Bisect depth cap reached, quarantining {len(left) + len(right)} events")
+            self._quarantine_to_dlq(left + right, error)
+            return
+
+        if not self._bisect_request_available(len(left) + len(right)):
+            self._quarantine_to_dlq(left + right, error)
+            return
+
+        self._bisect_depth += 1
+        try:
+            for half in (left, right):
+                if not half:
+                    continue
+                self._attempt_half(half, error)
+        finally:
+            self._bisect_depth -= 1
+
+    def _bisect_request_available(self, remaining: int) -> bool:
+        """Whether the cascade may afford to split, and charge it if so.
+
+        A split costs two sends (one per half), so the budget is charged here
+        rather than at the send sites: two call sites spending independently
+        is how one of them ends up not spending at all.
+
+        Depth alone does not bound the wire: a full halving cascade is 2^depth
+        sends, and `_MAX_BISECT_DEPTH` is 24. When the budget runs out, stop
+        splitting and park what is left rather than spend the operator's rate
+        limit proving once more that a batch is bad — a refusal is exactly
+        what a rate limiter starts answering, so the cascade would be feeding
+        the condition it is trying to diagnose. Events already delivered in
+        the healthy halves stay delivered.
+        """
+        if self._bisect_budget < 2:
+            logger.error(
+                f"Bisect request budget ({max(self._bisect_budget, 0)} remaining) "
+                f"exhausted — parking the remaining {remaining} event(s) without "
+                f"splitting further. Raise NULLRUN_MAX_BISECT_REQUESTS if these "
+                f"batches deserve isolating."
+            )
+            metrics.inc_transport("batches_bisect_budget_exhausted")
+            return False
+        self._bisect_budget -= 2
+        return True
+
+    def _attempt_half(self, half: list[dict[str, Any]], original: Exception) -> None:
+        """Send one half, routing the result exactly as a top-level batch would."""
+        deferred: list[Exception] = []
+
+        def send():
+            try:
+                result = self._send_batch_with_retry_info(half)
+            except (BreakerTransportError, httpx.TransportError):
+                raise
+            except Exception as exc:  # noqa: BLE001
+                deferred.append(exc)
+                return None
+            if result.accepted_event_ids:
+                for event in half:
+                    if event.get("event_id") in result.accepted_event_ids:
+                        self._in_flight.pop(event.get("event_id"), None)
+            metrics.inc_transport("batches_sent")
+            metrics.inc_transport("events_sent", len(half))
+            metrics.set_transport("last_flush_at", time.monotonic())
+            return result
+
+        try:
+            self._circuit_breaker.call(send)
+        except BreakerTransportError:
+            self._requeue_at_head(half)
+            metrics.inc_transport("batches_failed")
+            return
+        except Exception as exc:  # noqa: BLE001
+            self._retry_or_dlq(half, exc, dead_letter=True)
+            return
+
+        if deferred:
+            self._route_deferred(half, deferred[0])
+            return
+
+        self._batch_attempts.pop(self._failure_signature(half), None)
+
+    def _deliver_recorded_overbudget(
+        self, batch: list[dict[str, Any]], error: DeterministicBackendRefusal
+    ) -> bool:
+        """Settle a CONSUME_OVERBUDGET the backend says it already applied.
+
+        ``/track/batch`` rejects a settle that lands past
+        ``reserved + epsilon_cents`` with 422 — but the Lua overage branch
+        has already INCRBY'd the real spend onto the period counter and the
+        handler has already written the ``cost_events`` row. The refusal is
+        about the *reservation* being exceeded, not about the event being
+        refused. ``details.reservation_recorded`` is the backend stating
+        which of those two happened.
+
+        Treating the 422 as a refusal when the marker says the spend landed
+        is a two-part lie. The event goes to the DLQ annotated "permanent
+        rejection, will NOT be retried" — a rejection the server never made,
+        for an event it already has a row for — and the rest of the batch
+        dies with it, because the aborted request never reached them. The
+        operator's only durable trace of the event is that DLQ line.
+
+        So the marker decides, and only for this code:
+
+        * ``reservation_recorded: true`` → the event is DELIVERED. Drop it
+          from the retry path and from ``.inflight``, re-queue the rest of
+          the batch (unprocessed, still owed), return ``True``.
+        * anything else, including a body with no ``details`` at all → return
+          ``False`` and let the existing quarantine path run untouched. A
+          refusal that charged nothing must still park the data.
+
+        ``details.event_id`` names the offender. When it is absent (older
+        backend, or a proxy page) the answer is computed from the batch: a
+        singleton can only be the offender, so a recorded marker on it is
+        enough. A multi-event batch with no name is not — there the
+        cascade below isolates the offender and this runs again on the
+        singleton, which is why returning ``False`` here is correct and not
+        merely conservative.
+        """
+        if error.error_code != "CONSUME_OVERBUDGET":
+            return False
+        if error.details.get("reservation_recorded") is not True:
+            return False
+
+        offender_id = error.details.get("event_id")
+        if offender_id:
+            settled = [e for e in batch if e.get("event_id") == offender_id]
+            outstanding = [e for e in batch if e.get("event_id") != offender_id]
+        elif len(batch) == 1:
+            settled, outstanding = list(batch), []
+        else:
+            # Named by nobody, and not provable from a multi-event batch.
+            # Let the bisect isolate it; this runs again on the singleton.
+            return False
+
+        if not settled:
+            # The backend named an event that is not in this batch. Dropping
+            # "everything not named" here would silently discard real data
+            # on the strength of an id we cannot see; let it be quarantined
+            # so a human finds the mismatch.
+            logger.error(
+                f"CONSUME_OVERBUDGET names event {offender_id!r}, which is not in "
+                f"this batch of {len(batch)} — quarantining rather than guessing "
+                f"which event the backend settled."
+            )
+            return False
+
+        exec_id = error.details.get("execution_id")
+        logger.warning(
+            f"CONSUME_OVERBUDGET on {len(settled)} event(s) — the backend reports "
+            f"reservation_recorded=true, so the spend is already on the period "
+            f"counter and the cost_events row is written"
+            + (f" (execution {exec_id})" if exec_id else "")
+            + ". Treating as DELIVERED, not quarantined. "
+            + f"Re-queueing {len(outstanding)} event(s) the aborted batch never reached."
+        )
+        for event in settled:
+            eid = event.get("event_id")
+            if eid:
+                self._in_flight.pop(eid, None)
+            self._first_failed_at.pop(str(eid), None)
+        metrics.inc_transport("events_recorded_overage", len(settled))
+
+        if outstanding:
+            self._requeue_at_head(outstanding)
+        return True
+
+    def _route_deferred(self, batch: list[dict[str, Any]], error: Exception) -> None:
+        """Classify a failure that was kept away from the circuit breaker."""
+        if isinstance(error, DeterministicBackendRefusal):
+            # A refusal the backend has already applied is not a refusal of
+            # delivery. Checked before the bisect so a resolved 422 costs one
+            # send, not log2(n), and so the events the aborted batch never
+            # reached are re-queued rather than dropped with it.
+            if self._deliver_recorded_overbudget(batch, error):
+                return
+            # The backend named the refusal. It named it for the BATCH, and a
+            # whole-batch refusal is what an unbatched per-event rejection
+            # looks like from out here: one event the backend cannot accept
+            # (an unbound execution, a policy limit) makes the request carrying
+            # it fail as a unit. Quarantining the batch on that evidence
+            # discards every healthy event sharing it — the 49 good events are
+            # recorded as refused for a reason that never applied to them.
+            #
+            # So bisect FIRST, exactly as the 400/422 path does, and only
+            # quarantine what survives as a singleton. The bisect is bounded by
+            # `_MAX_BISECT_DEPTH` and by a request budget, so an all-bad batch
+            # cannot turn this into a request storm.
+            if len(batch) > 1 and self._bisect_depth < self._MAX_BISECT_DEPTH:
+                if not self._bisect_request_available(len(batch)):
+                    metrics.inc_transport("batches_deterministic_refusal")
+                    self._quarantine_to_dlq(batch, error)
+                    return
+                half = len(batch) // 2
+                logger.warning(
+                    f"Backend refused a batch of {len(batch)} as "
+                    f"{error.error_code} — a whole-batch refusal is not evidence "
+                    f"about each event, so splitting into {half} + "
+                    f"{len(batch) - half} to isolate the offender."
+                )
+                metrics.inc_transport("batches_bisected")
+                self._bisect_depth += 1
+                try:
+                    self._send_subbatches(batch[:half], batch[half:], error)
+                finally:
+                    self._bisect_depth -= 1
+                return
+            logger.error(
+                f"Backend refused the batch as {error.error_code} "
+                f"(HTTP {error.status_code}) — deterministic, quarantining "
+                f"{len(batch)} event(s). {error.detail}"
+            )
+            metrics.inc_transport("batches_deterministic_refusal")
+            self._quarantine_to_dlq(batch, error)
+            return
+        if isinstance(error, httpx.HTTPStatusError):
+            self._handle_http_rejection(batch, error)
+        else:
+            # Not obviously transient and not an HTTP status either. It may
+            # still be deterministic (an event that cannot be serialized will
+            # fail identically every cycle), so count attempts and dead-letter
+            # once the budget is spent rather than re-queuing forever.
+            self._retry_or_dlq(batch, error, dead_letter=True)
+
+    def _requeue_at_head(self, batch: list[dict[str, Any]]) -> None:
+        """Put a batch back at the FRONT of the buffer.
+
+        The bisect sends halves directly rather than re-queuing them, so any
+        event that comes back has to resume its place: appending would let a
+        steady stream of new events push a stalled batch to the back of the
+        queue indefinitely. ``.inflight`` stays — the batch is in memory only,
+        and a later successful flush overwrites and clears it.
+        """
+        self._buffer[0:0] = batch
+
+    def _retry_or_dlq(
+        self, batch: list[dict[str, Any]], error: Exception, *, dead_letter: bool
+    ) -> bool:
+        """Re-queue a possibly-transient failure, with a bounded attempt budget.
+
+        Deterministic failures (a payload that will never serialize) repeat
+        identically on every cycle and would pin the batch ahead of the whole
+        buffer forever. So every re-queue costs an attempt; once the budget is
+        spent a ``dead_letter``-eligible batch is quarantined rather than
+        blocking delivery forever.
+
+        ``dead_letter=False`` is for genuinely transient statuses (408/429).
+        Those are counted for observability but NEVER quarantined: the batch is
+        valid data and the server is merely busy, so it waits in the WAL.
+
+        Returns True when the batch is back on the retry path, False when it
+        was quarantined. The caller needs the distinction to decide whether
+        anything from this send is still live, which is what governs whether
+        ``.inflight`` may be cleared.
+        """
+        key = self._failure_signature(batch)
+        attempts = self._batch_attempts.get(key, 0) + 1
+        if len(self._batch_attempts) >= self._MAX_TRACKED_BATCHES:
+            # A long outage produces an unbounded stream of distinct batch
+            # signatures. Drop the map rather than grow it: a reset only costs
+            # one extra retry cycle, never correctness.
+            logger.warning(
+                f"Failure-attempt map hit {self._MAX_TRACKED_BATCHES} entries, resetting"
+            )
+            self._batch_attempts.clear()
+        self._batch_attempts[key] = attempts
+
+        if dead_letter and attempts > self._max_batch_attempts:
+            logger.error(
+                f"Batch failed {attempts} times without landing: {error}. "
+                f"Quarantining {len(batch)} events."
+            )
+            self._quarantine_to_dlq(batch, error)
+            return False
+
+        if not dead_letter:
+            logger.warning(
+                f"Transient rejection (attempt {attempts}) — holding the batch: {error}"
+            )
+        else:
+            logger.warning(
+                f"Batch re-queued (attempt {attempts}/{self._max_batch_attempts}): {error}"
+            )
+        self._buffer.extend(batch)
+        metrics.inc_transport("batches_retried")
+        return True
+
+    def _failure_signature(self, batch: list[dict[str, Any]]) -> str:
+        """Stable identity for a batch, used as the attempt-counter key."""
+        ids = sorted(str(e.get("event_id", "")) for e in batch)
+        return hashlib.sha256("|".join(ids).encode()).hexdigest()[:16]
+
+    def _dlq_reason(self, error: Exception) -> str:
+        """The machine-readable reason a batch is being parked.
+
+        Prefers what the wire named over how it was wrapped. Several
+        deterministic refusals arrive as 5xx (see
+        ``_DETERMINISTIC_ERROR_CODES``), and a DLQ row that only says "503"
+        tells an operator replaying it nothing about why the event was
+        parked. The two reasons this transport raises itself carry their
+        reason as a field rather than in a formatted message, for the same
+        reason — a message is for a log, a field is for a record.
+        """
+        if isinstance(error, DeterministicBackendRefusal):
+            return f"{error.error_code}:{error.status_code}"
+        if isinstance(error, UnknownRejectionReason):
+            return f"{error.reason}:unknown"
+        if isinstance(error, UnconfirmedBatchResponse):
+            return "unconfirmed_response:no_accepted_event_ids"
+        status = getattr(getattr(error, "response", None), "status_code", None)
+        return f"{type(error).__name__}:{status}"
+
+    def _dlq_row(self, event: dict[str, Any], reason: str) -> dict[str, Any]:
+        """Build one versioned DLQ record. See ``_DLQ_ROW_VERSION`` for the schema.
+
+        ``error`` is kept alongside ``reason`` so a v1 reader — anything
+        written before this field existed and still on disk across an
+        upgrade — keeps working. Dropping it would make a recovery file
+        unreadable, which is the one thing a recovery file must not be.
+        """
+        eid = str(event.get("event_id") or "")
+        first_failed = self._first_failed_at.get(eid)
+        if first_failed is None:
+            first_failed = time.time()
+            if eid:
+                self._first_failed_at[eid] = first_failed
+        signature = self._failure_signature([event])
+        return {
+            "v": _DLQ_ROW_VERSION,
+            "event": event,
+            "error": reason,
+            "reason": reason,
+            "event_type": event.get("type"),
+            "first_failed_at": first_failed,
+            # Sends this event took to end up here, including the current one.
+            # A terminal refusal is parked on its first response and never
+            # touches `_retry_or_dlq`, so reading the counter alone would record
+            # 0 — "never attempted" — for an event that was in fact refused on
+            # the first send. The two are different stories for whoever triages
+            # the DLQ, and only this one is true.
+            "attempts": self._batch_attempts.get(signature, 0) + 1,
+        }
+
+    def _write_dlq_rows(self, rows: list[dict[str, Any]]) -> bool:
+        """Append DLQ records durably. Does NOT touch ``.inflight``.
+
+        Kept separate from ``_quarantine_to_dlq`` because that method clears
+        ``.inflight``, which is only correct when the WHOLE batch is parked.
+        A partial refusal parks some events and re-queues others from the same
+        send, and clearing there would drop the re-queued ones on the next
+        crash.
+
+        Returns False — and writes nothing — when the DLQ is at its size cap.
+        The caller treats False as "not parked", which re-queues the event on
+        the retry path. That is the whole design of the cap: a full DLQ
+        stalls parking rather than dropping the oldest rows, so the operator
+        gets a loud, alertable condition instead of a file that quietly lost
+        the events from three hours ago.
+        """
+        if not rows:
+            return True
+        # Measured, not estimated from `len(row)`: `len` of a dict is its
+        # number of keys, which is off by a factor of an order of magnitude
+        # and would make the cap meaningless in the only direction that
+        # matters — under-counting.
+        incoming = sum(len(json.dumps(r, default=str)) + 1 for r in rows)
+        if self._dlq_over_cap(incoming):
+            return False
+        if not self._write_events_atomic(self._wal_dlq_path(), rows, mode="a"):
+            return False
+        metrics.set_transport("dlq_bytes", self._dlq_size())
+        return True
+
+    def _dead_letter_row(self, event: dict[str, Any], reason: str) -> bool:
+        """Park one event, durably, before anything clears ``.inflight``.
+
+        Returns True when the event could NOT be parked and is still live, so
+        `.inflight` must be retained.
+        """
+        if not self._write_dlq_rows([self._dlq_row(event, reason)]):
+            # The DLQ could not take it. Re-queueing would put a batch the
+            # backend has already refused terminally back on the send path,
+            # where it produces the identical refusal on every cycle forever
+            # AND sits at the head of the buffer ahead of every healthy event
+            # behind it. That is the "one bad event stops the whole stream"
+            # failure, and it is caused by parking, not by the refusal.
+            #
+            # So the event is HELD, not re-sent: a terminal refusal cannot
+            # become a success, so another request is pure waste, and holding
+            # keeps the head of the buffer clear. `_drain_dlq_overflow` retries
+            # the write whenever the DLQ may have room again, and the holdover
+            # is bounded — a holdover that grows without limit is the same
+            # memory blowup the cap exists to prevent, only invisible.
+            self._hold_for_dlq([self._dlq_row(event, reason)], reason)
+            return True
+        metrics.inc_transport("events_dead_lettered")
+        metrics.set_transport("last_dlq_error", reason)
+        return False
+
+    def _hold_for_dlq(self, rows: list[dict[str, Any]], reason: str) -> None:
+        """Park refused events durably until the DLQ has room.
+
+        The alternative — leaving them on the send path — is what turns a full
+        DLQ into an outage: the events are re-sent every cycle, they are
+        refused every cycle, and they occupy the head of the buffer the whole
+        time, so the healthy events queued behind them are never delivered.
+        The refusal is terminal, so re-sending cannot help; only the recording
+        can, and that is what the holdover defers.
+
+        They are written to `.wal.holdover`, not just kept in memory. A
+        memory-only holdover is a `kill -9` away from total loss: the next
+        `_persist_inflight` overwrites `.inflight` with the batch it is about
+        to send, so once the process restarts the events are in the DLQ
+        nowhere, in `.wal` nowhere, and in `.inflight` overwritten. Keeping
+        them in RAM looked like the fix and was a new loss path — the same
+        shape of bug as the one that put `replay` in the tree, where the
+        report described a durability the code did not have.
+
+        Recovery reads the holdover file back into `_dlq_overflow` at
+        startup, so the drain resumes without re-deriving the refusal by
+        re-sending. That matters for a terminal reason: re-sending is the one
+        thing the holdover exists to avoid, and a restart that recovers the
+        events by re-sending them would reintroduce the head-of-buffer
+        starvation the hold was built to stop.
+
+        The in-memory index is bounded, and the bound is on COUNT, not bytes.
+        Count is what the metric reports and what an operator alerts on; a
+        byte bound would need a second cap for the same property and would
+        fail silently on a different threshold. Past the bound the oldest
+        entries stop being *tracked* — they are not lost, they are in the
+        file and `_drain_dlq_overflow` reads the file as well as the index —
+        so the only cost is an under-reported `dlq_holdover`, which is loud
+        and named in the log rather than silent.
+        """
+        self._dlq_overflow.extend(rows)
+        metrics.inc_transport("dlq_holdover_total", len(rows))
+        self._persist_holdover(rows)
+        self._trim_holdover_index()
+        metrics.set_transport("dlq_holdover", len(self._dlq_overflow))
+        metrics.set_transport("last_dlq_error", reason)
+        logger.error(
+            f"DLQ at its cap — holding {len(self._dlq_overflow)} refused event(s) "
+            f"({reason}). They are NOT being re-sent: a terminal refusal cannot "
+            f"succeed on retry, and re-sending would block every healthy event "
+            f"behind them. They are durably in {self._wal_holdover_path()}, so a "
+            f"kill -9 does not lose them. Raise NULLRUN_DLQ_MAX_BYTES, or triage "
+            f"and archive the DLQ with `nullrun-wal`, and they drain on the next "
+            f"flush."
+        )
+
+    def _trim_holdover_index(self) -> None:
+        """Bound the in-memory holdover index; the file is the record of truth.
+
+        Only the index is trimmed. Trimming the file would be the cap deleting
+        the only copy of an event the SDK could not deliver — the same thing
+        `_dlq_over_cap` refuses to do, for the same reason.
+        """
+        cap = self._holdover_index_max
+        if not cap or len(self._dlq_overflow) <= cap:
+            return
+        dropped = len(self._dlq_overflow) - cap
+        del self._dlq_overflow[:-cap]
+        metrics.inc_transport("dlq_holdover_index_truncated", dropped)
+        logger.error(
+            f"Holdover index passed NULLRUN_DLQ_HOLDOVER_MAX_EVENTS ({cap}); "
+            f"stopped tracking the {dropped} oldest held event(s). They are NOT "
+            f"lost — {self._wal_holdover_path()} still holds them and the drain "
+            f"reads it — but `dlq_holdover` now under-reports by {dropped}. Raise "
+            f"the env var to keep the count exact."
+        )
+
+    def _persist_holdover(self, rows: list[dict[str, Any]]) -> None:
+        """Append the held rows to `.wal.holdover`.
+
+        Append, and the rows are the same DLQ-shaped dicts the drain already
+        knows how to write — a `event_id` plus the `event` — so the drain does
+        not need a second format, and `nullrun-wal` can archive the holdover
+        file with the same reader it uses for the DLQ.
+
+        Failure to persist is loud but not fatal. The events remain in the
+        index and the caller has already been told the DLQ refused them, so
+        raising here would abort a flush over a bookkeeping failure on a path
+        whose whole purpose is to not lose the event. The log says the one
+        true thing: a kill before a later attempt loses them.
+        """
+        if not rows:
+            return
+        if not self._write_events_atomic(self._wal_holdover_path(), rows, mode="a"):
+            logger.error(
+                f"Could not persist {len(rows)} held refusal(s) to "
+                f"{self._wal_holdover_path()} (lock held elsewhere, or I/O "
+                f"failed). They are in memory only, and a kill before a later "
+                f"attempt loses them."
+            )
+            metrics.inc_transport("dlq_holdover_persist_failures", len(rows))
+
+    def _recover_holdover(self) -> None:
+        """Load rows from `.wal.holdover` into the index at startup.
+
+        Appends rather than replaces, so a second process that finds the file
+        already drained — or empty — does not erase an index it does not own.
+        The lock is not taken: read-only, and the only writer appends whole
+        lines atomically, so the worst case is one incomplete final line,
+        which is dropped exactly as `_replay_from_wal` drops it.
+        """
+        path = self._wal_holdover_path()
+        try:
+            with open(path) as f:
+                lines = f.readlines()
+        except FileNotFoundError:
+            return
+        except OSError as e:
+            logger.warning(f"Failed to read holdover file {path}: {e}")
+            return
+        recovered: list[dict[str, Any]] = []
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                # A torn tail from a kill mid-append. The event is not
+                # recoverable from this line, and the refusal will simply be
+                # re-derived if the event is still in another source.
+                continue
+            if isinstance(row, dict):
+                recovered.append(row)
+        if recovered:
+            self._dlq_overflow.extend(recovered)
+            logger.warning(
+                f"Recovered {len(recovered)} held refusal(s) from {path}. They "
+                f"were refused and the DLQ was full when the process died; they "
+                f"are NOT re-sent, they go to the DLQ as soon as it has room."
+            )
+        self._trim_holdover_index()
+
+    def _drain_dlq_overflow(self) -> int:
+        """Try to move held refusals into the DLQ now that space may exist.
+
+        Called at the top of every flush. Returns how many rows landed. A
+        refused write is a no-op — the holdover is unchanged and the operator
+        still sees the same alert — so this is safe to attempt unconditionally
+        and cheap when there is nothing held.
+
+        The holdover FILE is released by `event_id`, not deleted wholesale.
+        The index can be shorter than the file: `_trim_holdover_index` drops
+        the oldest entries from memory to bound it, and those rows are still
+        owed a DLQ. Removing the file after a partial drain would delete them.
+        Deleting by id also means a crash between the DLQ write and the file
+        release replays into the DLQ a second time rather than losing
+        anything — at-least-once, which is the same trade the WAL already
+        makes and which the `event_id` dedup absorbs.
+        """
+        if not self._dlq_overflow:
+            return 0
+        pending, self._dlq_overflow = self._dlq_overflow, []
+        written = self._write_dlq_rows(pending)
+        if not written:
+            self._dlq_overflow = pending  # unchanged; try again next cycle
+            return 0
+        if not self._release_holdover(
+            {
+                str(r["event"]["event_id"])
+                for r in pending
+                if isinstance(r.get("event"), dict) and r["event"].get("event_id")
+            }
+        ):
+            # The rows are in the DLQ. The file still names them, so a restart
+            # re-drains them into the DLQ a second time — a duplicate the
+            # `event_id` dedup absorbs, which is strictly better than the
+            # alternative of not knowing whether the release happened.
+            logger.warning(
+                f"Could not release {self._wal_holdover_path()} after draining "
+                f"{len(pending)} refusal(s) into the DLQ. The rows are safely in "
+                f"the DLQ; the stale holdover file will re-drain them on the next "
+                f"start, which duplicates rather than loses."
+            )
+        metrics.inc_transport("events_dead_lettered", len(pending))
+        metrics.set_transport("dlq_holdover", len(self._dlq_overflow))
+        logger.info(f"Drained {len(pending)} held refusal(s) into the DLQ")
+        return len(pending)
+
+    def _release_holdover(self, event_ids: set[str]) -> bool:
+        """Rewrite `.wal.holdover` without the drained `event_id`s.
+
+        The id is read from ``row["event"]["event_id"]`` because that is where
+        `_dlq_row` puts it. Matching a top-level ``event_id`` — which the row
+        schema does not have — would release nothing while reporting success,
+        which is the failure mode this whole file exists to remove.
+
+        Returns True when the file now names none of them (including the
+        not-there case, which is success), False when the rewrite failed and
+        the caller must assume the rows are still listed.
+        """
+        if not event_ids:
+            return True
+        path = self._wal_holdover_path()
+        try:
+            with open(path) as f:
+                lines = f.readlines()
+        except FileNotFoundError:
+            return True
+        except OSError as e:
+            logger.warning(f"Failed to read holdover file {path} to release: {e}")
+            return False
+        kept: list[dict[str, Any]] = []
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                # Unparseable: we cannot prove which event it is, so it stays.
+                # Dropping it would be deleting the only copy of an unknown row.
+                kept.append({"raw": line})
+                continue
+            event = row.get("event") if isinstance(row, dict) else None
+            eid = str(event.get("event_id")) if isinstance(event, dict) else None
+            if eid not in event_ids:
+                kept.append(row)
+        try:
+            if not kept:
+                os.remove(path)
+                return True
+            return self._write_events_atomic(path, kept)
+        except OSError as e:
+            logger.warning(f"Failed to release holdover file {path}: {e}")
+            return False
+
+    def _quarantine_to_dlq(self, batch: list[dict[str, Any]], error: Exception) -> None:
+        """Move a permanently-rejected batch out of the retry path.
+
+        A 4xx will never succeed on retry, so the events go to ``.dlq`` with
+        the reason attached and `.inflight` is cleared — otherwise every
+        subsequent start replays a batch that is guaranteed to fail and the
+        poison pill blocks the whole WAL. Nothing is silently discarded: the
+        file is inspectable and re-submittable after the caller is fixed.
+
+        The whole batch is parked here, so clearing ``.inflight`` afterwards
+        is correct — but ONLY once the DLQ write is confirmed. A failed
+        write (full cap, read-only volume, lost lock) leaves the batch on the
+        retry path and retains ``.inflight``, because the alternative is
+        clearing the only durable copy of events that were not parked
+        anywhere. The events will be refused again on the next send, which is
+        the correct outcome for a permanent rejection we could not record.
+        """
+        reason = self._dlq_reason(error)
+        logger.error(
+            f"Permanent rejection ({reason}) on /track/batch — quarantining "
+            f"{len(batch)} events to DLQ. They will NOT be retried."
+        )
+        rows = [self._dlq_row(e, reason) for e in batch]
+        if not self._write_dlq_rows(rows):
+            # Same reasoning as `_dead_letter_row`: the batch is terminally
+            # refused, so re-sending it produces the same refusal forever
+            # while blocking everything behind it. Hold instead.
+            self._hold_for_dlq(rows, reason)
+            return
+        self._clear_inflight()
+        metrics.inc_transport("events_dead_lettered", len(batch))
+        metrics.set_transport("last_dlq_error", reason)
 
     def _drain_batch(self) -> list[dict[str, Any]] | None:
         """Public, lock-acquiring snapshot of the current buffer. Returns ``None`` when empty."""
@@ -922,6 +2909,16 @@ class Transport:
         accepted_event_ids: list[str]
         retry_after_ms: float | None = None
         is_policy_limit: bool = False
+        # Per-item refusals from a 200 body: `{"event_id", "reason",
+        # "retry_after_ms"}`. Absent `retry_after_ms` (None) means the backend
+        # gave no retry hint for that event.
+        rejected_items: list[dict[str, Any]] = field(default_factory=list)
+        # False when the response was a success status but the body could not
+        # be read as a confirmation (proxy HTML page, empty body, a backend
+        # that predates `accepted_event_ids`). A 200 we cannot interpret is
+        # NOT proof of delivery — treating it as one is the failure this
+        # field exists to prevent.
+        body_confirmed: bool = True
 
     def _add_hmac_headers(self, headers: dict[str, str], body: str | bytes) -> None:
         """Add X-Signature-Timestamp + X-Signature headers. No-op if secret_key/api_key missing."""
@@ -990,32 +2987,10 @@ class Transport:
     def _extract_retry_after(self, response: httpx.Response) -> float | None:
         """Extract Retry-After header value as seconds.
 
-        Handles both:
-        - Integer seconds (e.g., "30")
-        - HTTP-date format (e.g., "Wed, 21 Oct 2015 07:28:00 GMT")
+        Thin wrapper over the module-level helper, which the retry loop also
+        needs and which cannot reach a Transport instance.
         """
-        retry_after = response.headers.get("Retry-After")
-        if not retry_after:
-            return None
-
-        # Try parsing as seconds (integer or float)
-        try:
-            return float(retry_after)
-        except ValueError:
-            pass
-
-        # Try parsing as HTTP datetime (RFC 7231)
-        try:
-            from email.utils import parsedate_to_datetime
-
-            dt = parsedate_to_datetime(retry_after)
-            from datetime import datetime, timezone
-
-            return (dt - datetime.now(timezone.utc)).total_seconds()
-        except Exception:
-            pass
-
-        return None
+        return _retry_after_seconds_from(response)
 
     def _send_batch_with_retry_info(self, batch: list[dict[str, Any]]) -> "SendResult":
         """Send batch to server. Returns SendResult with retry info. Wrapped by _retry_with_backoff."""
@@ -1035,6 +3010,20 @@ class Transport:
                 content=body,
                 headers=self._build_signed_headers(body=body),
             )
+            # A deterministic refusal is checked BEFORE the status test, and on
+            # any status. The backend sent EXECUTION_NOT_BOUND as 503 until the
+            # status correction (now 422), and a status-first test files the
+            # old shape under "the server is down": it retries, and counts
+            # every attempt as a transport failure. Testing the code first is
+            # what makes this correct against a server we may not control.
+            code = _extract_backend_error_code(resp)
+            if code in _DETERMINISTIC_ERROR_CODES and resp.status_code >= 400:
+                raise DeterministicBackendRefusal(
+                    code,
+                    resp.status_code,
+                    _extract_error_message(resp),
+                    _extract_error_details(resp),
+                )
             if resp.status_code >= 500 or resp.status_code == 429:
                 # raise_for_status turns this into HTTPStatusError; the retry
                 # helper wraps that into BreakerTransportError after retries.
@@ -1049,6 +3038,7 @@ class Transport:
             max_delay=10.0,
             backoff_factor=2.0,
             jitter=0.1,
+            cancel=self._stop_event,
         )
 
         # P0: Extract retry_after from response headers or body
@@ -1059,19 +3049,85 @@ class Transport:
         # Check Retry-After header (may be seconds or HTTP-date)
         retry_after_seconds = self._extract_retry_after(response)
 
-        # Check response body for retry info
+        # Parse the body ONCE. Three consumers below need it — the batch-level
+        # `rejected` block, the per-item `rejection_details`, and the actions
+        # loop — and each used to call `response.json()` independently, so a
+        # non-JSON body was re-raised and re-caught once per consumer.
+        data: dict[str, Any] | None = None
         try:
-            data = response.json()
-            # Check for rejection info
-            if "rejected" in data and data["rejected"]:
-                rejected_info = data["rejected"]
-                if isinstance(rejected_info, dict):
-                    if "retry_after_ms" in rejected_info:
-                        retry_after_ms = rejected_info["retry_after_ms"]
-                    if "reason" in rejected_info and rejected_info["reason"] == "policy_limit":
-                        is_policy_limit = True
-        except Exception:  # noqa: S110
-            pass
+            parsed = response.json()
+            if isinstance(parsed, dict):
+                data = parsed
+        except Exception:  # noqa: S110 — non-JSON body; handled below per status
+            data = None
+
+        # Check response body for batch-level retry info
+        if data is not None:
+            rejected_info = data.get("rejected")
+            if isinstance(rejected_info, dict):
+                if "retry_after_ms" in rejected_info:
+                    retry_after_ms = rejected_info["retry_after_ms"]
+                if rejected_info.get("reason") == "policy_limit":
+                    is_policy_limit = True
+
+        # ---- Per-item outcome of a 200 ------------------------------------
+        # A 200 from /track/batch is NOT proof of delivery. The endpoint
+        # refuses individual events and still answers 200, naming the
+        # survivors in `accepted_event_ids` and the casualties in
+        # `rejection_details`. The pre-fix code read the status, saw 200,
+        # treated the whole batch as delivered, cleared `.inflight` and
+        # dropped the refused events with no trace in the buffer and none in
+        # the DLQ. That is the largest hole in the "data is not lost" claim,
+        # which until now held only for transport failures.
+        #
+        # `accepted_event_ids` is read as a partition, not a hint: anything
+        # absent from it is NOT delivered, whatever the status said. That is
+        # the only reading an SDK can act on, and it is why the backend has
+        # to report events it persisted through other paths (the span /
+        # org_action_catalog writes) — see the `accepted_event_ids` partition
+        # fix in backend handlers.rs.
+        accepted_event_ids: list[str] = []
+        rejected_items: list[dict[str, Any]] = []
+        body_confirmed = True
+        if response.status_code < 400:
+            raw_accepted = (data or {}).get("accepted_event_ids")
+            if data is None or not isinstance(raw_accepted, list):
+                # 200 we cannot read as a confirmation. Either something in
+                # front of the backend answered with an HTML error page and a
+                # 200 status, or the backend predates `accepted_event_ids`.
+                # Neither is evidence that anything landed. Treating this as
+                # delivery is precisely the loss we are preventing, so the
+                # batch stays on the retry path under a bounded budget.
+                body_confirmed = False
+                logger.error(
+                    f"/track/batch returned {response.status_code} with a body "
+                    f"that is not a batch confirmation (parseable dict with an "
+                    f"accepted_event_ids list: {data is not None}). Treating "
+                    f"{len(batch)} events as NOT delivered. A reverse proxy "
+                    f"answering 200, or a backend older than the "
+                    f"accepted_event_ids field, produces this."
+                )
+            else:
+                accepted_event_ids = [i for i in raw_accepted if isinstance(i, str)]
+                raw_details = (data or {}).get("rejection_details")
+                if isinstance(raw_details, list):
+                    for detail in raw_details:
+                        if not isinstance(detail, dict):
+                            continue
+                        eid = detail.get("event_id")
+                        reason = detail.get("reason")
+                        if not isinstance(eid, str) or not isinstance(reason, str):
+                            continue
+                        hint = detail.get("retry_after_ms")
+                        rejected_items.append(
+                            {
+                                "event_id": eid,
+                                "reason": reason,
+                                "retry_after_ms": (
+                                    float(hint) if isinstance(hint, (int, float)) else None
+                                ),
+                            }
+                        )
 
         # Store for next retry calculation (prefer header seconds, fallback to body ms)
         if retry_after_seconds is not None:
@@ -1094,8 +3150,7 @@ class Transport:
         # Process actions from server response. Per-element try/except so one
         # malformed entry doesn't abort the whole loop.
         try:
-            data = response.json()
-            actions = data.get("actions") or []
+            actions = (data or {}).get("actions") or []
             for action in actions:
                 try:
                     if not isinstance(action, dict):
@@ -1108,18 +3163,18 @@ class Transport:
                         handle_action(action_type, workflow_id, reason)
                 except Exception as item_err:
                     logger.warning("Skipping malformed action %r: %s", action, item_err)
-            for msg in data.get("messages", []) or []:
+            for msg in (data or {}).get("messages", []) or []:
                 logger.info("Backend message: %s", msg)
         except Exception as e:
             logger.warning(f"Failed to process actions: {e}")
 
-        # Return accepted event_ids for retry dedup
-        accepted_event_ids = data.get("accepted_event_ids", []) if "data" in locals() else []
         logger.debug(f"Batch track: sent {len(batch)} events")
         return self.SendResult(
             accepted_event_ids=accepted_event_ids,
             retry_after_ms=retry_after_ms,
             is_policy_limit=is_policy_limit,
+            rejected_items=rejected_items,
+            body_confirmed=body_confirmed,
         )
 
     def flush_now(self) -> None:
@@ -1164,7 +3219,7 @@ class Transport:
         # Populated by `runtime.execute` from the `get_call_tools()` contextvar
         # when the caller invoked `set_call_context(tools=...)`.
         tools: tuple[str, ...] | None = None,
-        on_transport_error: Callable[[Exception], dict[str, Any]] | None = None,
+        on_transport_error: TransportErrorHandler | None = None,
     ) -> dict[str, Any]:
         """Pre-execution policy evaluation via /api/v1/execute (PRIMARY enforcement point).
 
@@ -1215,6 +3270,23 @@ class Transport:
                   responses populate `policy_hash` only.
                 - decision_context: Context for replay (if available)
         """
+        # Via-edge: there is no /execute to make.
+        #
+        # The box's `/enforce` already did both halves of the cloud's
+        # `/gate` + `/execute` sequence in one call — it decided AND it
+        # charged the grant. A second call would either reach the cloud
+        # (defeating the mode) or ask the box a question it has no
+        # endpoint for. Re-asking would also double-charge: the charge
+        # and the decision are one event, done once.
+        if self.edge is not None:
+            from nullrun.edge import EDGE_LEASE
+            return {
+                "decision": "allow",
+                "decision_source": self.edge.last_source or EDGE_LEASE,
+                "execution_id": execution_id,
+                "via_edge": True,
+            }
+
         gate_request = {
             "organization_id": organization_id,
             "execution_id": execution_id,
@@ -1270,6 +3342,7 @@ class Transport:
                 max_retries=max_execute_retries,
                 base_delay=0.5,
                 on_transport_error=on_transport_error,
+                cancel=self._stop_event,
             )
 
             if response.status_code == 200:
@@ -1491,7 +3564,7 @@ class Transport:
     def check(
         self,
         check_request: dict[str, Any],
-        on_transport_error: Callable[[Exception], dict[str, Any]] | str | None = None,
+        on_transport_error: TransportErrorHandler | None = None,
         parent_execution_id: str | None = None,
     ) -> dict[str, Any]:
         """
@@ -1520,6 +3593,25 @@ class Transport:
                 - explanations: List of explanation strings
                 - suggestions: List of suggestion strings
         """
+        # Via-edge. When a box holds a signed lease, the box IS the gate
+        # and the cloud is not consulted at all.
+        #
+        # Placed before the gate body is built, not as a branch inside
+        # it, so there is no way for a later field to leak onto a cloud
+        # request or for a partial body to be sent somewhere. One of
+        # two paths runs; they do not interleave.
+        if self.edge is not None:
+            from nullrun.edge import token_split
+
+            input_tokens, output_tokens = token_split(check_request)
+            return self.edge.enforce(
+                model=str(check_request.get("model") or ""),
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                event_id=check_request.get("operation_id"),
+                on_transport_error=on_transport_error,
+            )
+
         # Convert check_request to gate_request format
         gate_request = {
             "organization_id": check_request.get("organization_id"),
@@ -1660,6 +3752,7 @@ class Transport:
                 jitter=0.1,
                 retry_on_5xx=True,
                 on_transport_error=on_transport_error,
+                cancel=self._stop_event,
             )
 
             if response.status_code == 200:
@@ -1994,7 +4087,7 @@ class Transport:
     def check_v3(
         self,
         request: dict[str, Any],
-        on_transport_error: Callable[[Exception], dict[str, Any]] | str | None = None,
+        on_transport_error: TransportErrorHandler | None = None,
     ) -> dict[str, Any]:
         """Pre-execution gate — wire-protocol v3.
 
@@ -2986,14 +5079,26 @@ def _parse_v3_error_envelope_uncategorised(
         return NullRunProtocolError(full_message)
 
     if backend_code == "CONSUME_OVERBUDGET":
+        # The backend's 422 `details` block carries the reservation in
+        # MILLICENTS (`reserved_millicents` / `max_allowed_millicents`) and
+        # the actual in cents. Reading `reserved_cents` / `epsilon_cents`
+        # here — as this did — read keys the wire does not carry, so every
+        # one of them was permanently None. `reservation_recorded` is
+        # tri-state on purpose: the backend omits it when the settle was
+        # refused without being applied, and a pre-marker backend omits it
+        # because it cannot say. `is True` is the only reading that asserts
+        # the spend landed.
+        recorded = details.get("reservation_recorded")
+        soft_pass = details.get("soft_pass")
         return NullRunConsumeOverbudgetError(
             full_message,
             execution_id=details.get("execution_id"),
-            reserved_cents=details.get("reserved_cents"),
-            max_allowed_cents=details.get("max_allowed_cents"),
-            actual_cost_cents=details.get("actual_cost_cents"),
-            epsilon_cents=details.get("epsilon_cents"),
+            reserved_millicents=_as_int_or_none(details.get("reserved_millicents")),
+            max_allowed_millicents=_as_int_or_none(details.get("max_allowed_millicents")),
+            actual_cost_cents=_as_int_or_none(details.get("actual_cost_cents")),
+            soft_pass=soft_pass if isinstance(soft_pass, bool) else None,
             status_code=status,  # 422 per backend mapping
+            recorded=recorded if isinstance(recorded, bool) else None,
         )
 
     if (
@@ -3490,6 +5595,94 @@ def _build_v3_error_code_map() -> dict[str, type[Exception]]:
         # branches on the action_digest missing path with the same
         # `except NullRunBlockedException:` flow as TOOL_BLOCKED.
         "LEGACY_GRANT_REJECTED": NullRunBlockedException,
+        # -----------------------------------------------------------------
+        # 2026-10-07 — twelve codes the backend registered and this catalog
+        # never learned about.
+        #
+        # The parity guard in ``backend/tests/nr007_sdk_error_code_parity.rs``
+        # could not see them: it compared the SDK map against a hand-written
+        # 51-entry mirror of ``GateErrorCode::all()`` while the enum had
+        # grown to 72. Both "completeness" assertions were self-consistent —
+        # the list was checked against the number 51, and the number 51 was
+        # checked against the list — so nothing compared either to the enum
+        # they were supposed to mirror. Every code below therefore fell
+        # through to the status-based fallback and arrived as an untyped
+        # ``NullRunBackendError``.
+        #
+        # That is not a cosmetic gap for this family. ``is_model_message_safe()``
+        # on the backend is what keeps budget-blocked outcomes out of the
+        # model's context, and it keys off the error_code; a caller holding
+        # an untyped error has no branch to take. Several of these —
+        # ``CIRCUIT_BREAKER_TRIPPED``, ``BUDGET_ORG_CEILING_BLOCKED`` —
+        # are the codes an operator reaches for precisely when an agent is
+        # misbehaving.
+        #
+        # Family rationale per code:
+        #   - money blocks            → NullRunBudgetError ("stop spending")
+        #   - decision blocks         → NullRunBlockedException
+        #   - infra failures on a
+        #     fail-CLOSED gate arm   → NullRunBackendError / the typed
+        #                               infra sibling for that subsystem
+        # -----------------------------------------------------------------
+        # Org-scope ceiling (ADR-050) — the workflow cap is fine, the ORG
+        # cap is not. Distinct from BUDGET_HARD_BLOCKED: raising the org
+        # budget is the operator action this asks for, so it must be
+        # catchable as a budget error rather than a generic refusal.
+        "BUDGET_ORG_CEILING_BLOCKED": NullRunBudgetError,
+        # Circuit breaker. A decision, not an outage: the workflow's
+        # cb_state is OPEN and /gate refuses at step 0.5 until an operator
+        # resets it. Fail-CLOSED mode (Enforce) is why this reaches the
+        # wire at all; in LogOnly mode the gate allows and this never fires.
+        "CIRCUIT_BREAKER_TRIPPED": NullRunBlockedException,
+        # The breaker state itself could not be READ — Postgres/Redis
+        # unavailable at the lookup. Infrastructure, not a breaker
+        # decision: the gate fails CLOSED, but the cause is unavailability,
+        # and a caller should retry rather than treat it as a tripped
+        # workflow. Sibling of WORKFLOW_INACTIVE_LOOKUP_FAILED below.
+        "CIRCUIT_BREAKER_STATE_LOOKUP_FAILED": NullRunBackendError,
+        # Workflow lifecycle lookup failed. Deliberately NOT
+        # ``NullRunWorkflowInactiveError``: that class means "we read the
+        # row and it is inactive", which is a decision. This means we
+        # could not read it at all. Collapsing the two would make an
+        # outage look like a policy decision.
+        "WORKFLOW_INACTIVE_LOOKUP_FAILED": NullRunBackendError,
+        # Workflow is paused by an operator. Decision → blocked.
+        "WORKFLOW_PAUSED": NullRunBlockedException,
+        # Plan-tier execution quota exhausted. Distinct from the
+        # per-key token bucket (RATE_LIMIT_EXCEEDED): this is the org's
+        # plan allowance, and the remedy is a plan change rather than a
+        # backoff.
+        "EXECUTION_QUOTA_EXCEEDED": NullRunBlockedException,
+        # Same idempotency key replayed with a different payload. A
+        # client-side contract violation → protocol class. Same key with
+        # the SAME payload is an idempotent success, not this code.
+        "IDEMPOTENCY_KEY_MISMATCH": NullRunProtocolError,
+        # Body/workflow-id disagreement. Wire-shape family — maps to
+        # NullRunBackendError alongside EXECUTION_ID_MALFORMED /
+        # EXECUTION_ID_REQUIRED, which is the established treatment for
+        # "the server could not make sense of your envelope".
+        "WORKFLOW_ID_BODY_MISMATCH": NullRunBackendError,
+        # Approval-rule store unavailable at /gate step 7. The gate fails
+        # CLOSED (does not fall through to "no rule matched → allow"), so
+        # this is the approval subsystem being unavailable rather than a
+        # rule rejecting the call — the typed approval-infra class.
+        "APPROVAL_RULES_UNAVAILABLE": NullRunApprovalDbUnavailableError,
+        # Server-side digest recompute failed during approval consume.
+        # Same infra family as above; the distinction is that the failure
+        # is in recomputation rather than the rules store.
+        "APPROVAL_DIGEST_RECOMPUTE_FAILED": NullRunApprovalDbUnavailableError,
+        # Backend reserved 503: Redis down on the budget path. Note this
+        # is the WIRE string for the reserved unavailability; the older
+        # BUDGET_REDIS_UNAVAILABLE spelling above remains mapped for
+        # backward compatibility, since the SDK preserved the pre-v3
+        # string. Both routes are live depending on backend version —
+        # callers should not branch on which one arrives.
+        "REDIS_UNAVAILABLE": NullRunBackendError,
+        # Terminal backend-side error on an otherwise well-formed request.
+        # This is the code that proves the base-class fallback is not a
+        # catch-all hiding drift: previously every one of the eleven
+        # codes above landed here untyped.
+        "INTERNAL_ERROR": NullRunBackendError,
     }
 
 

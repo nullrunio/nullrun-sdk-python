@@ -7,6 +7,59 @@ on:
     branches: [main, master]
 
 jobs:
+  commit-message:
+    # The commits in this repository are authored solely by the repo owner.
+    # That rule is in CLAUDE.md and was still broken twice, so it is checked
+    # here rather than trusted.
+    #
+    # Scope is `origin/master..HEAD`, not `--all`. A whole-history grep counts
+    # trailers on the 200+ commits that are already published and are nobody's
+    # to rewrite; the meaningful question is only whether THIS branch adds
+    # one, and that is the number worth a red build.
+    #
+    # This checks the trailer form — a `Co-Authored-By:` line at the start of
+    # a line. A commit body that discusses the rule, or a CHANGELOG entry
+    # that credits a person, is not a violation and must not fail the build.
+    #
+    # A `commit-msg` hook is the stronger place for this (it fails before the
+    # commit exists rather than after), and one is configured in
+    # `.pre-commit-config.yaml`. This step is the backstop for the case the
+    # hook cannot cover: a contributor with no pre-commit installed, or a
+    # `--no-commit` push. Two mechanisms fail differently, which is the
+    # point — one rule enforced one way is a rule enforced once.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history, because the range check needs the merge base with
+          # origin/master, and `fetch-depth: 0` is what makes that base
+          # exist. A shallow clone has no origin/master to diff against and
+          # the range would silently be empty — a check that always passes
+          # is worse than no check, because it reads as enforcement.
+          fetch-depth: 0
+      - name: Reject a Co-Authored-By trailer on this branch
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin master || true
+          range=origin/master..HEAD
+          if ! git rev-parse --verify origin/master >/dev/null 2>&1; then
+            echo "::warning::origin/master unavailable; trailer check skipped"
+            exit 0
+          fi
+          offenders="$(
+            git log "$range" --format=%B \
+              | grep -inE '^[[:space:]]*co-authored-by[[:space:]]*:' || true
+          )"
+          if [ -n "$offenders" ]; then
+            echo "::error::Co-Authored-By trailer found in $range"
+            echo "$offenders"
+            echo "Remove the trailer and amend. See CLAUDE.md."
+            exit 1
+          fi
+          echo "no Co-Authored-By trailer in $range"
+
   test:
     runs-on: ubuntu-latest
     permissions:

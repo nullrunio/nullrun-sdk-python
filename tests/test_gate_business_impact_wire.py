@@ -114,10 +114,17 @@ class TestEnvelopeReachesTheWire:
             "extractor_version": "1",
         }
 
-    def test_none_envelope_is_forwarded(self, transport):
-        # `{"kind": "none"}` is a real value, not an absence. An LLM
-        # check with no tool to name sends it, and the backend tells
-        # it apart from an omitted envelope.
+    def test_none_envelope_is_forwarded_verbatim(self, transport):
+        # The TRANSPORT forwards whatever it is handed, verbatim. It
+        # does not decide what is sendable.
+        #
+        # This used to read "`{"kind": "none"}` is a real value, not
+        # an absence ... and the backend tells it apart from an
+        # omitted envelope". The second half is false: the backend has
+        # no `none` variant and refuses it at the deserialiser. The
+        # transport is still a faithful pipe -- the decision not to
+        # SEND one belongs to the runtime preflight, which now omits
+        # the field (see `test_no_context_envelope_omits_the_field`).
         body = _check(transport, business_impact=BusinessImpact.no_impact().to_wire_dict())
         assert body["business_impact"] == {"kind": "none"}
 
@@ -219,14 +226,29 @@ class TestCheckWorkflowBudgetPopulatesTheEnvelope:
         body = captured_gate_bodies[-1]
         assert _server_recompute(body["business_impact"]) == body["action_digest"]
 
-    def test_no_context_envelope_sends_none(self, make_runtime, mock_api, captured_gate_bodies):
-        # An LLM check with no tool to name is legitimately
-        # impact-free. It must still send an envelope, because the
-        # backend needs one to recompute the stored digest.
+    def test_no_context_envelope_omits_the_field(self, make_runtime, mock_api, captured_gate_bodies):
+        # An LLM check with no tool to name has no envelope, and the
+        # honest wire encoding of "no envelope" is ABSENCE.
+        #
+        # This test used to assert `body["business_impact"] ==
+        # {"kind": "none"}`, on the reasoning that "the backend needs
+        # one to recompute the stored digest". That reasoning is false
+        # and the assertion shipped a 422: the gate's wire enum is
+        # `Money | ToolCall` and has no `none` variant, so the request
+        # was refused by the deserialiser before any policy ran.
+        # Measured against a live stand, not inferred — see
+        # `tests/test_live_stand_business_impact.py`.
+        #
+        # The digest is still mandatory at protocol >= 3 and is still
+        # sent, so the gate's version-gate passes.
         make_runtime().check_workflow_budget()
         body = captured_gate_bodies[-1]
-        assert body["business_impact"] == {"kind": "none"}
-        assert _server_recompute(body["business_impact"]) == body["action_digest"]
+        assert "business_impact" not in body
+        assert body["action_digest"]
+        # Unchanged from before the fix: the digest is still computed
+        # over the same `no_impact()` canonical bytes, so a stored
+        # digest does not change across the upgrade.
+        assert body["action_digest"] == _server_recompute({"kind": "none"})
 
     def test_two_different_tools_produce_two_different_gate_digests(
         self, make_runtime, mock_api, captured_gate_bodies

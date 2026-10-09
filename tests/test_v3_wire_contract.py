@@ -151,12 +151,15 @@ class TestSignedPostIncludesProtocolHeader:
     def test_track_single_includes_protocol_header(self):
         # 2026-07-04 (B2): body shape matches the v3 wire
         # contract — ``reservation_id`` (server-minted from /check)
-        # ``workflow_id`` + ``tokens`` + ``cost_cents`` (the SDK
-        # always emits 0 — backend recomputes from tokens) +
+        # ``workflow_id`` + ``tokens`` +
         # ``cost_source: "provisional"``. Pre-fix this test sent the
         # legacy / fictitious shape
         # ``{execution_id, actual_cost_cents}`` which doesn't match
         # ``TrackRequestRaw`` and would 422 on the wire.
+        # ADR-068 §4b (2026-10-09): the SDK used to emit
+        # ``cost_cents: 0`` here. It is stripped on the way out
+        # (``_WIRE_STRIP_FIELDS``), so passing it below is still fine —
+        # it exercises that an older caller's price does not survive.
         t = Transport(api_url=BASE_URL, api_key="nr_live_abc123")
         try:
             route = respx.post(f"{BASE_URL}/api/v1/track").mock(
@@ -476,25 +479,29 @@ class TestV3ErrorEnvelopeMapping:
         assert exc.workflow_id == "wf-1"
 
     def test_consume_overbudget_maps_to_consume_overbudget_error(self):
+        # The backend's real details block: reservation in MILLICENTS,
+        # actual in cents, no `epsilon_cents` key. See handlers.rs, the
+        # ConsumeOverbudget 422.
         resp = self._make_response(
             422,
             {
                 "error_code": "CONSUME_OVERBUDGET",
                 "error_message": "actual > reserved + epsilon",
                 "details": {
-                    "reserved_cents": 100,
-                    "max_allowed_cents": 101,
+                    "reserved_millicents": 1000,
+                    "max_allowed_millicents": 1010,
                     "actual_cost_cents": 150,
-                    "epsilon_cents": 1,
+                    "soft_pass": False,
+                    "reservation_recorded": True,
                 },
             },
         )
         exc = _parse_v3_error_envelope(resp, "track")
         assert isinstance(exc, NullRunConsumeOverbudgetError)
-        assert exc.reserved_cents == 100
-        assert exc.max_allowed_cents == 101
+        assert exc.reserved_millicents == 1000
+        assert exc.max_allowed_millicents == 1010
         assert exc.actual_cost_cents == 150
-        assert exc.epsilon_cents == 1
+        assert exc.recorded is True
 
     def test_budget_recheck_failed_maps_to_typed_error(self):
         #: AR-H6 (2026-08-12) — post-approval re-check failure must
@@ -1882,12 +1889,20 @@ class TestBuildV3TrackPayload:
             "trace_id": "trace-1",
             "span_id": "span-1",
             "agent_id": "agent-1",
-            "cost_cents": 0,
             "cost_source": "provisional",
         }
+        # ADR-068 §4b: a full event is no exception — a populated
+        # payload must still carry no price. See the minimal-event test
+        # for why the exact-dict match is the assertion that matters.
+        assert "cost_cents" not in out
 
     def test_minimal_event_only_required_fields(self):
         # workflow_id + tokens + reservation_id are the floor.
+        #
+        # ADR-068 §4b: no `cost_cents`. The SDK reports tokens and the
+        # backend prices them. Asserted by ABSENCE below — an exact-dict
+        # match is what makes "the SDK never offers a price" a checked
+        # property rather than a comment.
         out = _build_v3_track_payload(
             {"type": "llm_call", "workflow_id": "wf-1", "tokens": 1},
             SERVER_MINTED_V1,
@@ -1896,9 +1911,12 @@ class TestBuildV3TrackPayload:
             "reservation_id": SERVER_MINTED_V1,
             "workflow_id": "wf-1",
             "tokens": 1,
-            "cost_cents": 0,
             "cost_source": "provisional",
         }
+        assert "cost_cents" not in out, (
+            "ADR-068 §4b: the SDK must not put a price on the wire. It "
+            "sends tokens; the backend prices them from its own catalog."
+        )
 
     def test_missing_workflow_id_returns_none(self):
         # v0.16.0 (backend v3.66.2 alignment): caller now DROPS
@@ -1931,6 +1949,79 @@ class TestBuildV3TrackPayload:
         assert out is not None
         assert out["tokens"] == 100
         assert isinstance(out["tokens"], int)
+
+    # ── ADR-068 §1 (backend NULLRUN): `provider` must reach the wire.
+    #
+    # The backend picks the cache-token convention off `provider`.
+    # Anthropic reports the cached fraction OUTSIDE `input_tokens`;
+    # OpenAI / Gemini / Mistral report it INSIDE `prompt_tokens`. If
+    # the field is missing, the backend sees an unmapped provider and
+    # applies the fail-CLOSED no-discount path — the full input rate,
+    # which is what we billed before ADR-068 landed. So dropping this
+    # key silently restores the overcharge for every cache-using call.
+    #
+    # The batch path already forwarded it (it ships the whole enriched
+    # event); this is the single-event path, which whitelists keys.
+
+    def test_provider_is_forwarded_when_present(self):
+        out = _build_v3_track_payload(
+            {
+                "type": "llm_call",
+                "workflow_id": "wf-1",
+                "tokens": 100,
+                "input_tokens": 60,
+                "output_tokens": 40,
+                "model": "claude-sonnet-4-6",
+                "provider": "anthropic",
+            },
+            SERVER_MINTED_V1,
+        )
+        assert out["provider"] == "anthropic"
+
+    def test_provider_absent_stays_absent(self):
+        # No fabricated key: the backend distinguishes "provider we
+        # could not determine" (fail-CLOSED, counted) from a provider
+        # we named. Emitting `None` would make both look the same.
+        out = _build_v3_track_payload(
+            {"type": "llm_call", "workflow_id": "wf-1", "tokens": 1},
+            SERVER_MINTED_V1,
+        )
+        assert "provider" not in out
+
+    def test_empty_provider_is_not_sent(self):
+        # `""` is the shape `_provider_label` returns for a host it
+        # cannot classify down to a real name; forwarding it would
+        # look like a known-but-unmapped provider to the backend.
+        out = _build_v3_track_payload(
+            {
+                "type": "llm_call",
+                "workflow_id": "wf-1",
+                "tokens": 1,
+                "provider": "",
+            },
+            SERVER_MINTED_V1,
+        )
+        assert "provider" not in out
+
+    def test_cache_token_fields_survive_to_the_wire(self):
+        # The companion half: the backend prices the cached fraction
+        # and persists it (ADR-068 §D2). Both fields have to be here
+        # for either to mean anything.
+        out = _build_v3_track_payload(
+            {
+                "type": "llm_call",
+                "workflow_id": "wf-1",
+                "tokens": 9100,
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "provider": "anthropic",
+                "cache_read_tokens": 9000,
+                "cache_write_tokens": 0,
+            },
+            SERVER_MINTED_V1,
+        )
+        assert out["cache_read_tokens"] == 9000
+        assert out["cache_write_tokens"] == 0
 
 
 # ─────────────────────────────────────────────────────────────────

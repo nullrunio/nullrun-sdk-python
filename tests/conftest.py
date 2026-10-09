@@ -224,6 +224,30 @@ def _fast_sleep(monkeypatch, request):
         return _real_sleep(seconds)
 
     monkeypatch.setattr(_time, "sleep", _fast_sleep)
+    # `nullrun.transport._wait_on` is the OTHER way this suite waits. The
+    # retry loop moved to it so a `Transport.stop()` can cut a `Retry-After`
+    # wait short — `time.sleep` cannot be woken, which is why a shutdown
+    # during a rate-limit wait used to block for the remainder of the wait.
+    # Patching only `time.sleep` leaves that wait real, and a single 429
+    # test then costs its full `Retry-After` in wall clock.
+    #
+    # Scoped to the seam rather than to `threading.Event.wait` globally:
+    # a global patch changes the behaviour of every other Event.wait in the
+    # suite, including the approval-wait tests that assert on real elapsed
+    # time, and those then fail (or flake under load) for a reason that has
+    # nothing to do with the retry path.
+    def _fast_wait_on(cancel, seconds):
+        # The set-and-immediately-return branch is preserved: it is what
+        # makes the wait interruptible, and a stub that broke it would test
+        # the uninterruptible behaviour while claiming to test the fix.
+        return not cancel.wait(0.001)
+
+    try:
+        import nullrun.transport as _transport_mod
+
+        monkeypatch.setattr(_transport_mod, "_wait_on", _fast_wait_on)
+    except Exception:
+        pass
     # Stub the modules that captured a module-level reference at import time.
     try:
         import nullrun.transport as _transport_mod
