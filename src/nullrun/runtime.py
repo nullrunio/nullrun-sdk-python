@@ -2167,18 +2167,52 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         budget never gets to spend tokens.
 
         Decision → exception mapping:
-            "block" → NullRunBudgetError (NR-B004, hard policy /
-                reservation error; 2026-09-08 typed signal)
-            "throttle"→ WorkflowPausedException (insufficient budget, can resume)
             "allow" → return
+            "block" / "require_approval" / "deny" → typed by the
+                dispatch that follows. The mapping is by MACHINE-READABLE
+                WIRE CODE (``_build_v3_error_code_map``), not by the
+                decision string: ``RATE_LIMIT_EXCEEDED`` →
+                ``RateLimitError``, ``TOOL_BLOCKED`` →
+                ``NullRunToolBlockedError``, ``CIRCUIT_BREAKER_TRIPPED``
+                → the typed breaker class, and a budget refusal →
+                ``NullRunBudgetError`` (NR-B004). Since 0.21.0 a rate
+                limit no longer surfaces as ``NullRunBudgetError``, so
+                code branching on the class branches on the real cause.
+                A refusal with no machine-readable code still raises
+                ``NullRunBudgetError`` (legacy tier, pinned).
 
-        Fail-OPEN: any transport error (network, timeout, 5xx) is logged
-        at warning level and the caller proceeds. This mirrors the
-        pattern in `check_control_plane` -- a transient backend outage
-        must never freeze the user's agent. The /track fast path also
-        does not gate on budget, so the worst case under /gate failure
-        is that budget enforcement is advisory until the gateway
-        recovers.
+                There is NO ``"throttle"`` decision. The arm that mapped
+                it was removed in 0.22.0 as unreachable — the backend's
+                only producer of that string is an uncalled phase-2
+                schema stub. Code written against the old docstring will
+                catch the wrong class.
+
+        Fail-OPEN is NARROWER than "any transport error". Precisely:
+
+            - Network error / timeout / 5xx with NO refusal body →
+              the transport synthesizes a block carrying
+              ``decision_source=FALLBACK``; ``is_fallback_decision_
+              source`` matches, so we log, count
+              ``gate_fail_open_total``, and PROCEED.
+            - 5xx (or any status) WITH a real refusal body → ADR-062
+              §2.2 classifies it and returns
+              ``decision_source=GATEWAY``. That is a real backend
+              decision, so it is HONOURED and BLOCKS. A 5xx is not
+              automatically fail-open.
+            - Credential failure (``NullRunAuthenticationError``),
+              malformed body, and ``NullRunUnclassifiedRefusalError``
+              all `raise` rather than fail open. Ordering matters:
+              each precedes the bare ``except Exception`` arm, which is
+              a superset of all three.
+            - A non-fallback synthetic source is likewise treated as a
+              transport error and fails open.
+
+        The rationale for the fail-open arms is that a transient backend
+        outage must never freeze the user's agent, and `/track` does not
+        gate on budget, so the worst case while `/gate` is unreachable is
+        that enforcement is advisory until the gateway recovers. That
+        rationale covers UNREACHABLE, not REFUSING — which is why the
+        ADR-062 arms were split out above.
 
         Uses `estimated_tokens=1` (the minimum the API accepts). Goal
         is the binary question "is there any budget left?", not cost

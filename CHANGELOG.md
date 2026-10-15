@@ -1,3 +1,139 @@
+## [0.22.1] - 2026-10-15
+
+Patch release, no protocol change. The SDK's public exception surface
+is restored after QA pass u3h (2026-10-15) reported 24 classes the
+SDK RAISES were not importable from the top-level `nullrun`
+namespace. The classes existed, `_V3_ERROR_CODE_MAP` constructed
+them, and enforcement was never affected — only the documented
+public name was missing. The defect survived because the documented
+catch (`except NullRunError:`) kept matching the instance; a narrower
+`except NullRunApprovalDeniedError:` only fails when someone goes
+looking for the name.
+
+The second behavioural fix closes a discarded-coroutine class of bug
+on the WS dispatch path: `on_policy_invalidated` was wired as
+`async def` while the dispatcher calls it without `await`, so the
+callback was created and silently discarded (the dispatcher's
+`try/except` cannot see an un-awaited coroutine either). The
+`logger.info` and the user-supplied callback never fired — only a
+stderr `RuntimeWarning` that nobody reads. Same bug class as the
+approval-resolved fix from 2026-07-24, missed on the sibling
+callback.
+
+The third change aligns stale docstrings with current behaviour:
+the kill-vs-on_error-hook asymmetry between sync and async `@protect`
+was documented as a `BaseException` bypass that never existed (the
+class is `WorkflowKilledInterrupt -> NullRunError -> BreakerError ->
+Exception` — verified), and chasing the truth exposed an actual
+behavioural split governed by `unify_block`, not by base-class
+membership. The new `tests/test_guard_kill_semantics.py` pins the
+real behaviour so the comments describing it cannot drift the way the
+old ones did.
+
+### Migration
+
+None on a healthy configuration. Three things differ from 0.22.0:
+
+1. **24 more exception names are reachable via `from nullrun import
+   X`** (DEF-PUBEX-01). Code that imports a previously-missing name
+   will now succeed. The names are also added to `__all__` so
+   tab-completion and `from nullrun import *` reach them. See the
+   `Fixed` section below for the full list and rationale by tier
+   (infrastructure / transport / decision / approval).
+2. **`on_policy_invalidated` fires on every WS message** (DEF-WS-SYNC-01).
+   Pre-0.22.1 the wrapper was an un-awaited coroutine; the
+   `logger.info` and the user-supplied callback never ran. Code that
+   subscribed to policy-cache invalidations expecting a callback
+   will now actually get one.
+3. **No wire or backend change.** This is purely SDK-side restoration
+   and comment alignment.
+
+### Fixed
+
+- **DEF-PUBEX-01 (public exception surface)** — 24 classes the SDK
+  RAISES were missing from `nullrun.__init__._LAZY_EXPORTS` and
+  `__all__`. `from nullrun import NullRunApprovalDeniedError`
+  raised `ImportError` while `except NullRunError:` in the same
+  file kept matching the instance, so the defect survived every
+  existing test. Now registered in `_LAZY_EXPORTS`, grouped by tier
+  (root / markers, infrastructure, transport, decision, approval),
+  and reachable via `from nullrun import X`. `BreakerError` and
+  `TransportErrorSource` are deliberately absent from `__all__`:
+  the first is the pre-Layer-1 root alias kept for old cookbook
+  code (already offered by tab-completion via `NullRunError`), the
+  second is an enum a caller passes to `RateLimitError`, not
+  something to catch. `NullRunUnclassifiedRefusalError` lives in
+  `nullrun.breaker.categories`, not `.exceptions`, and is the
+  reason a caller must NOT assume every block carries a policy
+  verdict — ADR-062 §2.2 requires it to RAISE when a refusal
+  carries no category the SDK trusts. The full list: BreakerError,
+  NullRunDecision, NullRunInfrastructureError,
+  NullRunTransportError, BreakerTransportError,
+  InsecureTransportError, NullRunProtocolError,
+  NullRunMalformedGateResponseError, NullRunRateLimitRedisError,
+  NullRunBudgetRecheckFailedError, NullRunExecutionNotFoundError,
+  RateLimitError, TransportErrorSource, NullRunUnclassifiedRefusalError,
+  NullRunDeniedError, NullRunChainError,
+  NullRunConsumeOverbudgetError, NullRunWorkflowInactiveError,
+  NullRunApprovalNotYetApprovedError,
+  NullRunApprovalResponseMissingError, NullRunApprovalDeniedError,
+  NullRunApprovalExpiredError, NullRunApprovalReplayRejectedError,
+  NullRunApprovalDigestMismatchError,
+  NullRunApprovalToolDigestMismatchError.
+- **DEF-WS-SYNC-01 (sync `on_policy_invalidated` wrapper)** —
+  `Transport.connect_websocket` wired `on_policy_invalidated` as
+  `async def` while the WS dispatch path calls it without `await`.
+  Constructing an un-awaited coroutine raises nothing, so the
+  dispatcher's `try/except` could not catch it either. The body
+  never ran; the `logger.info` and the user-supplied
+  `on_policy_invalidated` never fired. Same shape as the approval
+  fix from 2026-07-24, missed on the sibling callback. Now a plain
+  `def`. `wrapped_key_rotated` stays `async def` because it awaits
+  `self._refetch_credentials()` and its dispatcher DOES await it.
+
+### Cleanup
+
+- Dropped `C:UsersAnatolii` (216 bytes — contents are a one-line
+  `fatal: ambiguous argument` message from a previous shell that
+  mis-decoded an absolute Windows path and wrote the error output
+  into the repo root). `.gitignore` extended with `"/C:UsersAnatolii*"`
+  so the shape cannot recur; the broader class
+  ("Windows path decoded without its separator") produces
+  single-byte replacement-char filenames that don't pattern-match
+  cleanly, so the entry is narrow on purpose.
+
+### Documentation
+
+- **DEF-DRIFT-01 (kill-vs-on_error-hook asymmetry)** — the
+  `@protect` / `on_error` / `check_workflow_budget` / `messages.NR-B007`
+  docstring blocks were aligned with current behaviour. The
+  `BaseException` explanation for the hook bypass was wrong
+  (`WorkflowKilledInterrupt -> NullRunError -> BreakerError ->
+  Exception`, verified); the real split is the `unify_block` flag
+  in `_protect_body`. Sync `@protect` re-wraps as
+  `NullRunBlockedException` (error code `NR-W002`), the hook fires;
+  async `@protect` lets the raw `WorkflowKilledInterrupt`
+  propagate, the hook does NOT fire. `decision == "throttle"` does
+  not exist — the only producer is an uncalled phase-2 schema stub.
+  Fail-OPEN is narrower than "any transport error": a 5xx WITH a
+  refusal body is HONOURED (decision_source=`GATEWAY`, blocks);
+  only unreachable / synthetic-source paths fail open. `NR-B007`
+  was removed 2026-09-10 (it only ever fired on the never-sent
+  `throttle` decision); `WorkflowPausedException` is NOT zombie
+  and must not be lumped in with `NR-B007` — it is still raised
+  for a genuinely paused workflow.
+
+### Verification
+
+| Check | Result |
+|---|---|
+| `ruff check src tests` | All checks passed |
+| `mypy src/nullrun` | Success: no issues found in 39 source files |
+| `pytest -q` | **1849 passed, 12 skipped** in 124.76s (vs baseline 1828 / 12 — **+21 new tests** from `test_public_exception_surface`, `test_policy_invalidated_ws_sync_callback`, `test_guard_kill_semantics`) |
+| Scratch diff | clean (`dist_local/`, `*.defect*` absent) |
+| `nullrun.__version__` | `0.22.1` |
+| Wire-format compatibility | unchanged from 0.22.0 |
+
 ## [0.22.0] - 2026-10-09
 
 The SDK's enforcement question can now go to a local box that holds a

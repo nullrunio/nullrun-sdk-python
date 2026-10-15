@@ -3586,7 +3586,13 @@ class Transport:
 
         Returns:
             Dict with:
-                - decision: "allow" | "block" | "throttle"
+                - decision: one of ``allow`` | ``block`` |
+                  ``soft_pass`` | ``require_approval`` | ``deny``
+                  (the canonical set is
+                  ``Runtime._KNOWN_GATE_DECISIONS``; anything else is
+                  rejected rather than guessed at). There is NO
+                  ``"throttle"`` — the backend's only producer of that
+                  string is an uncalled phase-2 schema stub.
                 - reservation_id: Optional reservation ID
                 - remaining_budget_cents: Remaining budget
                 - projected_cost_cents: Projected cost for this operation
@@ -3758,8 +3764,8 @@ class Transport:
             if response.status_code == 200:
                 return response.json()  # type: ignore[no-any-return]
             # 4xx is a REAL gate decision — surface it through the
-            # existing block / throttle / soft_pass dispatch in
-            # runtime.check_workflow_budget. The runtime's
+            # existing block / soft_pass / require_approval / deny
+            # dispatch in runtime.check_workflow_budget. The runtime's
             # ``decision_source != fallback`` check honours the wire
             # decision and raises ``NullRunBudgetError`` via its
             # existing ``decision=="block"`` arm. The wire
@@ -4001,7 +4007,15 @@ class Transport:
 
         # 0.7.0 thin client: no local policy cache; the next /gate or /execute
         # call re-reads from the backend. Just forward the notification.
-        async def wrapped_policy_invalidated(ws_id: str, policy_id: str, new_version: int) -> None:
+        #
+        # Synchronous adapter: ``transport_websocket.py`` dispatches
+        # ``self.on_policy_invalidated(...)`` without awaiting it, so an
+        # `async def` here produced an un-awaited coroutine — the body
+        # never ran, and because constructing one raises nothing the
+        # dispatcher's `try/except` could not catch it either. The
+        # callback was created and silently discarded. Same shape as
+        # `wrapped_approval_resolved` below, for the same reason.
+        def wrapped_policy_invalidated(ws_id: str, policy_id: str, new_version: int) -> None:
             logger.info(f"Policy {policy_id} invalidated (v{new_version})")
             if on_policy_invalidated:
                 on_policy_invalidated(ws_id, policy_id, new_version)
@@ -4147,10 +4161,18 @@ class Transport:
                           ``_capture_server_minted_execution_id``)
                         * ``workflow_id`` (str, the workflow the call belongs to)
                         * ``tokens`` (int, sum of input + output tokens)
-                        * ``cost_cents`` (int, ``0`` — backend computes the
-                          authoritative cost from tokens + the org's
-                          pricing policy; sending a wrong number risks
-                          double-billing, see _WIRE_STRIP_FIELDS in runtime.py)
+                        * ``cost_cents`` (int — NOT SENT as of ADR-068 §4f.
+                          The backend computes the authoritative cost
+                          from tokens + the org's pricing policy. The
+                          SDK reports tokens because only it knows
+                          them; it never offers a price. The field is
+                          stripped from the wire by
+                          ``_WIRE_STRIP_FIELDS`` (runtime.py) — an
+                          older SDK that still sends it is accepted
+                          and dropped server-side via
+                          ``#[serde(default)]``. ``local_cost_cents``
+                          in the RETURN value is unchanged and is
+                          never on the wire.)
                         * ``cost_source`` (str, ``"provisional"`` /
                           ``"authoritative"`` per — SDK always emits
                           ``"provisional"``)
@@ -4182,9 +4204,10 @@ class Transport:
                     NullRunAuthenticationError: 401/403.
 
                  Wire contract: ``TrackRequestRaw`` is
-                ``{workflow_id, tokens, cost_cents,...}``; ``execution_id``
-                is replaced by ``reservation_id``, ``actual_cost_cents`` is
-                replaced by ``cost_cents`` (the SDK always sends 0 — see
+                ``{workflow_id, tokens,...}``; ``execution_id``
+                is replaced by ``reservation_id``, ``actual_cost_cents``
+                is replaced by nothing (ADR-068 §4f removed the
+                client-priced field entirely — see
                 ``_WIRE_STRIP_FIELDS``), and ``api_key_id`` is derived
                 server-side from the request auth, not supplied by the SDK.
         """
