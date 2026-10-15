@@ -617,13 +617,19 @@ def protect(fn: F | None = None) -> F | Callable[[F], F]:
     # ``ToolParamsExtractor(include_all=True)`` here and stored it
     # on the function via ``_nullrun_extractor``. That path was
     # removed because it forced the SDK to know what an "extractor"
-    # is. The 0.18.2 design is simpler: ``@protect`` has no
-    # per-function state. Every call constructs an opaque
-    # ``NoImpact`` envelope locally and forwards it to
-    # ``runtime.execute(...)``. All policy decisions
+    # is. ``@protect`` has no per-function state. Every call builds
+    # a ``BusinessImpact`` envelope locally (``_build_call_impact``)
+    # and forwards it to ``runtime.execute(...)``.
+    #
+    # ADR-065 (0.21.0) changed WHICH envelope: it used to be a
+    # constant ``NoImpact`` on every call, which hashed to a constant
+    # and so bound each stored approval to no action at all. It is now
+    # a ``tool_call`` envelope carrying the tool name and its masked
+    # kwargs, built once per call before the /gate pre-flight so
+    # /gate and /execute carry identical bytes. All policy decisions
     # (allow / block / require-approval) live on the backend; the
-    # SDK only relays (tool_name, kwargs, args) and renders the
-    # decision back into an exception class.
+    # SDK only relays the envelope and renders the decision back into
+    # an exception class.
 
     @contextlib.contextmanager
     def _protect_body(args: tuple[Any, ...], kwargs: dict[str, Any], unify_block: bool):
@@ -722,7 +728,7 @@ def protect(fn: F | None = None) -> F | Callable[[F], F]:
             # 4. Per-tool policy gate via /execute. Runs on EVERY
             # @protect call (no extractor / no short-circuit). The
             # SDK is policy-blind; it ships tool_name + args + kwargs
-            # + the NoImpact envelope/digest to the backend and the
+            # + the tool_call envelope/digest to the backend and the
             # backend decides allow/block/require-approval.
             _run_tool_policy_gate(runtime, fn, args, kwargs)
 
@@ -753,10 +759,25 @@ def protect(fn: F | None = None) -> F | Callable[[F], F]:
                 # Layer 2: fire the on_error hook. Kill/pause is a
                 # user-visible state change (the dashboard did
                 # this) so most observability hooks want to know
-                # about it. Note: the underlying kill signal
-                # itself (WorkflowKilledInterrupt) does NOT fire
-                # the hook (BaseException bypass) — only this
-                # re-wrapped form does.
+                # about it.
+                #
+                # Only THIS form fires the hook, and the reason is
+                # `unify_block`, not the exception's base class. An
+                # earlier version of this comment claimed a
+                # "BaseException bypass": `WorkflowKilledInterrupt`
+                # derives from NullRunError -> BreakerError ->
+                # Exception (verified), so there is no BaseException
+                # in play to bypass. The real split is the wrapper
+                # flag — see `_protect_body`'s docstring:
+                #
+                #   sync  (unify_block=True)  → re-wrapped here,
+                #     hook fires with error_code NR-W002 / NR-W003.
+                #   async (unify_block=False) → falls through to the
+                #     bare `raise`, raw WorkflowKilledInterrupt
+                #     propagates, hook does NOT fire.
+                #
+                # If you change the async behaviour, change this
+                # comment in the same commit.
                 runtime._emit_sdk_error(err, stage="decorator", workflow_id=exc.workflow_id)
                 raise err from exc
             raise

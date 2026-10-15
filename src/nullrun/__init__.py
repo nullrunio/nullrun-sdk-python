@@ -133,8 +133,10 @@ def on_error(hook):
 
     What does NOT fire the hook:
 
-    *:class:`WorkflowKilledInterrupt` (BaseException subclass)
-      — kill is a non-recoverable signal, not an error.
+    *:class:`WorkflowKilledInterrupt` on the async ``@protect``
+      path — kill is a non-recoverable signal, not an error. On the
+      sync path it is re-wrapped as ``NullRunBlockedException``
+      (error code ``NR-W002``) and that wrapper DOES fire the hook.
     * Non-``NullRunError`` exceptions (e.g. raw ``httpx`` errors
       from SDK-internal code paths not yet migrated to the
       structured hierarchy).
@@ -484,6 +486,85 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "NullRunBackendError": ("nullrun.breaker.exceptions", "NullRunBackendError"),
     "NullRunBudgetError": ("nullrun.breaker.exceptions", "NullRunBudgetError"),
     "NullRunToolBlockedError": ("nullrun.breaker.exceptions", "NullRunToolBlockedError"),
+    # The rest of the exception hierarchy.
+    #
+    # 2026-10-15 (QA u3h): 24 classes the SDK can RAISE were missing
+    # from this table, so `from nullrun import
+    # NullRunApprovalDeniedError` raised ImportError while
+    # `except NullRunError:` in the caller's own code still caught
+    # the instance. The classes existed, `_V3_ERROR_CODE_MAP`
+    # constructed them, and enforcement was never affected — only the
+    # public import was broken. The failure was invisible because the
+    # documented catch is the BASE class: a cookbook written against
+    # `except NullRunError:` passes in production and the missing
+    # narrower name is only discovered when a user goes looking for
+    # it. That is the whole point of the typed catalog (ADR-062
+    # §2.2), so the names have to be reachable.
+    #
+    # Grouped by tier, so a reader can see the hierarchy without
+    # reading exceptions.py:
+    #   root / markers  — catch-all `except` targets
+    #   infrastructure  — the SDK could not reach or read the backend
+    #   decision       — the backend reached a deliberate verdict
+    #   transport       — network / protocol shape
+    "BreakerError": ("nullrun.breaker.exceptions", "BreakerError"),
+    "NullRunDecision": ("nullrun.breaker.exceptions", "NullRunDecision"),
+    "NullRunInfrastructureError": ("nullrun.breaker.exceptions", "NullRunInfrastructureError"),
+    # Infrastructure — transport, protocol, backend-unreadable.
+    "NullRunTransportError": ("nullrun.breaker.exceptions", "NullRunTransportError"),
+    "BreakerTransportError": ("nullrun.breaker.exceptions", "BreakerTransportError"),
+    "InsecureTransportError": ("nullrun.breaker.exceptions", "InsecureTransportError"),
+    "NullRunProtocolError": ("nullrun.breaker.exceptions", "NullRunProtocolError"),
+    "NullRunMalformedGateResponseError": (
+        "nullrun.breaker.exceptions",
+        "NullRunMalformedGateResponseError",
+    ),
+    "NullRunRateLimitRedisError": ("nullrun.breaker.exceptions", "NullRunRateLimitRedisError"),
+    "NullRunBudgetRecheckFailedError": ("nullrun.breaker.exceptions", "NullRunBudgetRecheckFailedError"),
+    "NullRunExecutionNotFoundError": ("nullrun.breaker.exceptions", "NullRunExecutionNotFoundError"),
+    "RateLimitError": ("nullrun.breaker.exceptions", "RateLimitError"),
+    "TransportErrorSource": ("nullrun.breaker.exceptions", "TransportErrorSource"),
+    # `resolve_refusal_category` raises this when the gate refuses
+    # without a category the SDK trusts (ADR-062 §2.2: an
+    # unclassifiable refusal must RAISE, never be guessed). It lives
+    # in `breaker.categories`, not `breaker.exceptions`, and is the
+    # reason a caller must NOT assume every block carries a policy
+    # verdict.
+    "NullRunUnclassifiedRefusalError": (
+        "nullrun.breaker.categories",
+        "NullRunUnclassifiedRefusalError",
+    ),
+    # Decision — the backend refused, and the reason is knowable.
+    "NullRunDeniedError": ("nullrun.breaker.exceptions", "NullRunDeniedError"),
+    "NullRunChainError": ("nullrun.breaker.exceptions", "NullRunChainError"),
+    "NullRunConsumeOverbudgetError": ("nullrun.breaker.exceptions", "NullRunConsumeOverbudgetError"),
+    "NullRunWorkflowInactiveError": ("nullrun.breaker.exceptions", "NullRunWorkflowInactiveError"),
+    # The approval family. One class per wire code (NR-A010 … NR-A015)
+    # so a caller can branch on WHICH approval failure occurred
+    # instead of string-matching the message. The base
+    # `NullRunBlockedException` collapses all of them into one.
+    "NullRunApprovalNotYetApprovedError": (
+        "nullrun.breaker.exceptions",
+        "NullRunApprovalNotYetApprovedError",
+    ),
+    "NullRunApprovalResponseMissingError": (
+        "nullrun.breaker.exceptions",
+        "NullRunApprovalResponseMissingError",
+    ),
+    "NullRunApprovalDeniedError": ("nullrun.breaker.exceptions", "NullRunApprovalDeniedError"),
+    "NullRunApprovalExpiredError": ("nullrun.breaker.exceptions", "NullRunApprovalExpiredError"),
+    "NullRunApprovalReplayRejectedError": (
+        "nullrun.breaker.exceptions",
+        "NullRunApprovalReplayRejectedError",
+    ),
+    "NullRunApprovalDigestMismatchError": (
+        "nullrun.breaker.exceptions",
+        "NullRunApprovalDigestMismatchError",
+    ),
+    "NullRunApprovalToolDigestMismatchError": (
+        "nullrun.breaker.exceptions",
+        "NullRunApprovalToolDigestMismatchError",
+    ),
     # Layer 2: on_error context type
     "ErrorContext": ("nullrun.observability.error_hooks", "ErrorContext"),
     # Layer 3: status dataclasses
@@ -522,8 +603,22 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     # nullrun/_handle.py for the rationale). Pair with @nullrun.protect
     # so a typical ``run an agent and print a friendly message on
     # failure`` script needs no explicit try/except around
-    # NullRunError. WorkflowKilledInterrupt (BaseException) still
-    # propagates — kill is never swallowed.
+    # NullRunError.
+    #
+    # Kill behaviour is ASYMMETRIC between the two @protect
+    # wrappers, and this comment used to paper over it by calling
+    # WorkflowKilledInterrupt a BaseException:
+    #   async @protect → raw WorkflowKilledInterrupt propagates →
+    #     guard re-raises it explicitly (see _handle.py) → the
+    #     agent loop sees the kill.
+    #   sync  @protect → the wrapper substitutes
+    #     NullRunBlockedException (error_code NR-W002), which is a
+    #     NullRunDecision and NOT a WorkflowKilledInterrupt
+    #     subclass → guard's isinstance re-raise does not match →
+    #     it prints a report and sys.exit(1).
+    # So `with nullrun.guard()` + a sync @protect turns a kill into
+    # a graceful exit. Pinned by
+    # tests/test_guard_kill_semantics.py.
     #
     # History: 0.18.4 renamed this from ``handle`` to ``guard``.
     # The module file name is still ``_handle.py`` for the
@@ -627,6 +722,43 @@ __all__ = [
     "NullRunMcpReadonlyBypassBlockedError",
     "NullRunMcpApprovalRequiredError",
     "NullRunApprovalDbUnavailableError",
+    # The narrower `except` targets. Same 2026-10-15 reasoning as the
+    # `_LAZY_EXPORTS` block above: every name here is a class the SDK
+    # raises, and a caller cannot branch on a name that tab-completion
+    # does not offer. Ordering follows the tier hierarchy —
+    # infrastructure, then transport, then decision, then approval —
+    # so the list reads top-down as "how bad is this".
+    #
+    # `BreakerError` is deliberately absent: it is the pre-Layer-1
+    # root alias, kept only so `except BreakerError` in old cookbook
+    # code keeps matching. It is reachable via
+    # `nullrun.breaker.exceptions` and adds nothing to the
+    # tab-completion list, where `NullRunError` is the name to use.
+    # `TransportErrorSource` is likewise absent — it is an enum a
+    # caller passes to `RateLimitError`, not something to catch.
+    "NullRunDecision",
+    "NullRunInfrastructureError",
+    "NullRunTransportError",
+    "BreakerTransportError",
+    "InsecureTransportError",
+    "NullRunProtocolError",
+    "NullRunMalformedGateResponseError",
+    "NullRunRateLimitRedisError",
+    "NullRunBudgetRecheckFailedError",
+    "NullRunExecutionNotFoundError",
+    "RateLimitError",
+    "NullRunUnclassifiedRefusalError",
+    "NullRunDeniedError",
+    "NullRunChainError",
+    "NullRunConsumeOverbudgetError",
+    "NullRunWorkflowInactiveError",
+    "NullRunApprovalNotYetApprovedError",
+    "NullRunApprovalResponseMissingError",
+    "NullRunApprovalDeniedError",
+    "NullRunApprovalExpiredError",
+    "NullRunApprovalReplayRejectedError",
+    "NullRunApprovalDigestMismatchError",
+    "NullRunApprovalToolDigestMismatchError",
     # User-facing message catalog — the single entry point for
     # turning an SDK exception into a string safe to display to
     # end users. ``set_user_message`` lets a deployment brand its

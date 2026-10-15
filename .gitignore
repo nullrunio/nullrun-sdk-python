@@ -79,3 +79,10 @@ docs/postman/
 # (mirrors the convention that `dist/` is ignored: built / scratch
 # outputs never belong in VCS regardless of where they were created).
 src/**/*.defect*
+
+# Top-level files dropped by mis-decoded absolute Windows paths
+# (e.g. `git status C:\Users\Anatolii\...` writes a file named
+# `C:UsersAnatolii` to the repo root when the path separator is
+# lost and the byte is rendered as the U+FFFD placeholder).
+# Quoted because gitignore treats `:` as a path separator on its own.
+"/C:UsersAnatolii*"

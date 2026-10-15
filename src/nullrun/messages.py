@@ -144,10 +144,16 @@ DEFAULT_MESSAGES: dict[str, str] = {
     # the next /gate will mint a fresh reservation against the current
     # available budget.
     "NR-B006": "Your request couldn't be completed because the available capacity changed. Please try again.",
-    # zombie class — never raised on a wire or runtime path
-    # (runtime.py:2116 raises WorkflowPausedException on
-    # decision=="throttle"). Catalog entry removed to keep
+    # zombie ERROR CODE — ``NullRunBudgetThrottleError`` (NR-B007) was
+    # removed 2026-09-10: it only ever fired on decision=="throttle",
+    # which the backend never sends. Catalog entry removed to keep
     # messages in sync with the exception module.
+    #
+    # NOTE: ``WorkflowPausedException`` itself is NOT zombie and must
+    # not be lumped in with this — it is still raised for a genuinely
+    # paused workflow (``runtime.py`` pause pre-flight, and the
+    # ``pause`` action handler in ``actions.py``). It simply never
+    # carried NR-B007.
     # "NR-B007": "...",
     # NR-O001: consume > reserve + ε tolerance. ADR-005 invariant;
     # the SDK rejects rather than silently re-reserving. User-facing
