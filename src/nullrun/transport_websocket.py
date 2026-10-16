@@ -20,6 +20,11 @@ from typing import Any
 # only consumes it.
 from nullrun.transport import generate_hmac_signature, verify_hmac_signature
 
+# ``websockets`` is an optional dependency (the ``websocket`` extra).
+# The ImportError below names that extra, so the two have to stay in
+# step — DEF-SDK-16 was exactly the case where the message pointed at
+# an extra pyproject.toml never declared, making the suggested command
+# uninstallable. ``test_websocket_extra_is_declared`` pins it.
 try:
     import websockets
 

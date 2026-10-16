@@ -386,14 +386,23 @@ def edge_transport_from_env(env: dict[str, str] | None = None) -> EdgeTransport 
 def token_split(check_request: dict[str, Any]) -> tuple[int, int]:
     """The token counts this call is reported with.
 
-    Explicit `edge_input_tokens` / `edge_output_tokens` win. Absent
-    them, `estimated_tokens` is reported as OUTPUT tokens — output is
-    what the price is dominated by for most models, and reporting the
-    whole estimate as output errs toward charging more rather than
-    less. Under-reporting is the one direction this cannot take, since
-    the box cannot check the number and will simply believe it.
+    Precedence for output: explicit `edge_output_tokens`, then the
+    declared `max_output_tokens`, then `estimated_tokens`. Each step
+    down is a weaker answer to "how big will the output be" — a known
+    size, then the upper bound the caller is about to ask the provider
+    for, then a blob the runtime only ever sets to 1.
+
+    Every step errs toward charging MORE, never less. That is
+    deliberate and load-bearing: the box cannot check the number, it
+    will believe it, and output is what the price is dominated by for
+    most models (5× the input rate on the live catalog). Reporting the
+    declared cap when it is the only real signal costs a little
+    over-reserve on calls that finish short; reporting `1` instead
+    under-reserves every real call.
     """
     out = check_request.get("edge_output_tokens")
+    if out is None:
+        out = check_request.get("max_output_tokens")
     if out is None:
         out = check_request.get("estimated_tokens") or 0
     inp = check_request.get("edge_input_tokens") or 0

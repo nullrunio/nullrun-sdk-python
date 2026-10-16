@@ -89,6 +89,10 @@ def _runtime_with_ws(conn: object) -> NullRunRuntime:
     # on it, and a bare list fails there instead of at the assertion.
     rt._recent_errors = _RecentErrorRing(capacity=10)
     rt._remote_states = {}
+    # `status()` acquires this lock to read the backend-attempt pair
+    # atomically, so a fixture that omits it raises at the `with` and
+    # never reaches the WS assertion.
+    rt._backend_attempt_lock = threading.Lock()
     rt._last_backend_attempt_ok = None
     rt._last_backend_attempt_at = None
     rt.workflow_id = None

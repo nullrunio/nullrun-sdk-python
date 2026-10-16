@@ -3629,6 +3629,16 @@ class Transport:
             "check_type": check_request.get("check_type"),
             "model": check_request.get("model"),
             "estimated_tokens": check_request.get("estimated_tokens"),
+            # Declared output cap, forwarded only when the caller set
+            # one. The backend needs it together with its own per-model
+            # catalog cap to size an output reserve; sent as null it
+            # would be a half-answer, and the backend prices `None` as
+            # "no reserve" (ADR-016 §2.1).
+            **(
+                {"max_output_tokens": check_request["max_output_tokens"]}
+                if check_request.get("max_output_tokens") is not None
+                else {}
+            ),
             "operation_id": check_request.get("operation_id") or str(uuid.uuid4()),
             # Forward the per-call `tools` list so the backend's
             # `gate/internal.rs::check_tool_block` can match each
