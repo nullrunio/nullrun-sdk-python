@@ -1,3 +1,131 @@
+## [0.22.2] - 2026-10-16
+
+Patch release, no protocol change. Three unrelated bugs closed in one
+shipping window: a status field that structurally could not report
+the failure it existed to report (`backend_reachable` initialised to
+`None` and never written), a packaging extra that the SDK's own
+`ImportError` told users to install but that `pyproject.toml` never
+declared, and a pre-flight that priced at the input rate and so
+silently under-reserved every real LLM call. None is a wire
+change — all three are SDK-side. The status and packaging fixes are
+behaviourally invisible to a healthy configuration; the reserve fix
+is visible to anyone whose `max_output_tokens` is currently being
+ignored.
+
+### Migration
+
+Three things differ from 0.22.1. None is silent on a healthy
+configuration, but the third is a new opt-in signal that the wire
+contract was always supposed to carry:
+
+1. **`NullRunStatus` reflects a backend that has actually been
+   attempted.** A backend unreachable since `init()` used to read
+   `backend_reachable=None` and so the DEGRADED headline stayed
+   `STATE_OK` — a monitoring surface that structurally could not
+   report the failure it exists to report. The writer is now
+   called from every site that learns whether the backend answered
+   (both `/gate` paths in `check_workflow_budget`, both
+   `/auth/verify` outcomes); "answered" means transport-level, not
+   HTTP-2xx — a 402/403/429 is the backend replying and stays
+   reachable, only DNS / refused / TLS / timeout sets it False.
+2. **`pip install nullrun[websocket]` actually installs `websockets`.**
+   The error message named an extra `pyproject.toml` never declared
+   (only the opentelemetry pair and `dev` were listed). The failure
+   mode was worse than a missing feature: a user told precisely how
+   to install it typed it, and got a *second* error. `websockets`
+   was in `uv.lock` only as a transitive of `langsmith`, so the
+   WS wire test's coverage depended on a dependency edge nobody
+   here controls. Now declared with floor `14.0` (the `additional_headers`
+   spelling replaced `extra_headers` in the asyncio client in
+   14.0; an older install would `TypeError` at connect time,
+   later and in production traffic, instead of at the
+   `ImportError` the user was told to fix).
+3. **`set_call_context(max_output_tokens=…)` reaches `/gate`.**
+   The pre-flight has always sent `estimated_tokens=1`, which
+   prices at the INPUT rate and covers no output at all. Output
+   bills at the completion rate (5× input on the live catalog),
+   so a real 20k-token Opus response costs 50¢ against a 1¢
+   reserve: `/track` then rejects the row with
+   `CONSUME_OVERBUDGET` and the period counter under-counts the
+   spend. Now the caller's declared cap is sent when set, the key
+   is ABSENT (not present-and-null) when not, and a cap of zero
+   or less is treated as "not declared" rather than silently
+   under-reserving. The via-edge box's `token_split()` falls back
+   to the declared cap before the one-token estimate, never the
+   other way.
+
+### Fixed
+
+- **DEF-STATUS-WRITER-01** — `NullRunStatus.backend_reachable` was
+  initialised to `None` in `__init__` and read in `status()` — and
+  never assigned anywhere in the SDK. The comment above the
+  initialisation claimed the pair was "set in `_authenticate` and
+  updated on every successful / failed backend call thereafter";
+  no such writer had ever existed. Two silent consequences: the
+  DEGRADED headline was gated on `is False` so it never fired
+  (pinned to `None`), and the MISCONFIGURED arm was gated on
+  `_last_backend_attempt_at is not None` so it was dead for the
+  same reason. Fix: one writer `_note_backend_attempt(ok)` called
+  from the four sites that actually learn whether the backend
+  answered. "Ok" means "the backend answered", NOT "the call
+  succeeded": a 402/403/429 and a 401 are the backend replying,
+  and only a transport-level failure sets it False. Collapsing
+  those would brand a healthy server that correctly refused a
+  call as unreachable and drive DEGRADED off a credential
+  problem. The pair is read under a new lock because gate calls
+  arrive on the tool thread while `_authenticate` runs on the
+  caller's thread. (`b076643`, +100/-8; test files
+  `test_status_backend_reachable_has_a_writer.py`,
+  `test_status_ws_connected_reads_real_attribute.py`)
+
+- **DEF-SDK-16 (packaging: declare the `websocket` extra)** —
+  `WebSocketConnection.connect` raises
+  `websockets library not available. Install with: pip install
+  nullrun[websocket]`, but `nullrun` had no `websocket` extra.
+  `[project.optional-dependencies]` declared exactly two — the
+  opentelemetry pair and `dev` — and `websockets` appeared
+  nowhere in `pyproject.toml`. Two declarations, not one:
+  `websocket = ["websockets>=14.0,<17.0"]` and `dev` also gains
+  `websockets` (so `tests/test_ws_push.py` resolves through a
+  declared edge, not through `langchain-core -> langsmith ->
+  websockets` which nobody here controls). A new source pin
+  asserts the general property: every `nullrun[<extra>]` install
+  hint appearing anywhere under `src/` must name an extra
+  `pyproject.toml` actually declares. (`a8cb823`, +24/-1;
+  `tests/test_websocket_extra_is_declared.py`)
+
+### Added
+
+- **DEF-MOT-01 (reserve: forward caller-declared
+  `max_output_tokens` to `/gate`)** — per ADR-016 §2.1 the
+  backend prices an output reserve from TWO independent signals
+  (the caller's declared cap and its own per-model catalog cap)
+  and refuses to reserve from either one alone. The SDK's half
+  of that contract is now narrow and specific: when the caller
+  set a cap it is sent, when the caller did not the key is
+  ABSENT (not present-and-null — a null is a value the backend
+  has to defend against, not an honest "I don't know"), and a
+  cap of zero or less is treated as "not declared" rather than
+  silently under-reserving. New ContextVar
+  `_call_max_output_tokens_var`, reader
+  `get_call_max_output_tokens()`, and a `max_output_tokens=`
+  parameter on `set_call_context(...)`. The via-edge box's
+  `token_split()` falls back to the declared cap before the
+  one-token estimate; every step down errs toward charging
+  MORE, never less. (`f095c46`, +251/-9; test file
+  `tests/test_max_output_tokens_reserve.py`)
+
+### Verification
+
+| Check | Result |
+|---|---|
+| `ruff check src tests` | All checks passed |
+| `mypy src/nullrun` | Success: no issues found in 39 source files |
+| `pytest -q` | **1913 passed, 12 skipped** in 156.34s (vs baseline 1849 / 12 — **+64 new tests** from `test_status_backend_reachable_has_a_writer`, `test_status_ws_connected_reads_real_attribute`, `test_websocket_extra_is_declared`, `test_max_output_tokens_reserve`) |
+| Scratch diff | clean (`dist_local/`, `*.defect*` absent) |
+| `nullrun.__version__` | `0.22.2` |
+| Wire-format compatibility | unchanged from 0.22.1 (no protocol change; the `max_output_tokens` key is new-but-OPTIONAL, the backend ignores its absence as before) |
+
 ## [0.22.1] - 2026-10-15
 
 Patch release, no protocol change. The SDK's public exception surface

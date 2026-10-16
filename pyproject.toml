@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "nullrun"
 # Full release history lives in CHANGELOG.md; only the current version
 # is pinned here.
-version = "0.22.1"
+version = "0.22.2"
 # Kept under the 200-char preview threshold so the full line is visible
 # without an "expand" click. The headline is the canonical §1 statement
 # from positioning.md — "runtime decision layer for tool-using AI agents"
@@ -77,7 +77,31 @@ opentelemetry = [
     "opentelemetry-api>=1.26.0,<2.0",
     "opentelemetry-sdk>=1.26.0,<2.0",
 ]
+# DEF-SDK-16 (RUN_ID 20261015T1809). ``transport_websocket.connect``
+# raises ``ImportError("… Install with: pip install nullrun[websocket]")``
+# when the ``websockets`` import fails — but no ``websocket`` extra was
+# ever declared, so the command in the error message did not exist and
+# pip rejected it. The extra below makes the message true.
+#
+# The floor is 14.0, not "any version": the transport calls
+# ``websockets.connect(url, additional_headers=...)``. The
+# ``additional_headers`` spelling belongs to the asyncio client that
+# became the default ``websockets.connect`` in 14.0; earlier releases
+# spelled the same argument ``extra_headers``, so a lower floor
+# resolves and then fails at connect time with a TypeError instead of
+# at import time.
+websocket = [
+    "websockets>=14.0,<17.0",
+]
 dev = [
+    # ``tests/test_ws_push.py`` imports ``websockets`` at module scope
+    # and spins up a real local WS server. It used to pass only because
+    # ``langchain-core`` -> ``langsmith`` -> ``websockets`` happened to
+    # pull it in transitively; a langchain/langsmith release that drops
+    # that edge would turn the whole module into a collection error.
+    # Declared directly so the test suite's WS coverage depends on the
+    # websocket extra existing, not on someone else's dependency graph.
+    "websockets>=14.0,<17.0",
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     # Sprint 0 (coverage): ``pytest-rerunfailures`` is used on a
@@ -135,6 +159,15 @@ dev = [
     # bound as the `[fastapi]` extra so CI and end users agree on the
     # minimum. `httpx` (already a core dep) covers `TestClient`.
     "fastapi>=0.100,<1.0",
+    # `tests/test_websocket_extra_is_declared.py` parses
+    # `pyproject.toml` at collection time to pin the general
+    # "every `nullrun[<extra>]` install hint under `src/` names
+    # an extra `pyproject.toml` actually declares" property.
+    # `tomllib` is stdlib from 3.11; on 3.10 the test must fall
+    # back to `tomli`, and the fallback is only safe if the dep
+    # is declared. Conditional on `<3.11` so the upper-bound
+    # environments do not pull a redundant package.
+    "tomli>=2.0; python_version < '3.11'",
 ]
 
 [project.scripts]

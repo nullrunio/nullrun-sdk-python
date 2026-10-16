@@ -18,7 +18,11 @@ def reset_runtime():
     import nullrun.actions as _act
     import nullrun.decorators as _dec
     import nullrun.runtime as _rt_mod
-    from nullrun.context import _call_model_var, _call_tools_var
+    from nullrun.context import (
+        _call_max_output_tokens_var,
+        _call_model_var,
+        _call_tools_var,
+    )
     from nullrun.runtime import NullRunRuntime
 
     NullRunRuntime.reset_instance()
@@ -30,6 +34,7 @@ def reset_runtime():
     _rt_mod._runtime = None
     _call_model_var.set(None)
     _call_tools_var.set(())
+    _call_max_output_tokens_var.set(None)
 
     yield
 
@@ -51,6 +56,7 @@ def reset_runtime():
     _rt_mod._runtime = None
     _call_model_var.set(None)
     _call_tools_var.set(())
+    _call_max_output_tokens_var.set(None)
 
 
 @pytest.fixture

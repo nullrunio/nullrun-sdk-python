@@ -42,6 +42,23 @@ _attempt_index_var: ContextVar[int] = ContextVar("attempt_index", default=0)
 # enforced on /track only).
 _call_model_var: ContextVar[str | None] = ContextVar("call_model", default=None)
 _call_tools_var: ContextVar[tuple[str, ...]] = ContextVar("call_tools", default=())
+# The `max_output_tokens` the caller intends to request from the
+# provider — Anthropic/OpenAI's `max_tokens` / `max_output_tokens`.
+#
+# The pre-flight has always sent `estimated_tokens=1`, which prices at
+# the INPUT rate and covers no output at all. Output is billed at the
+# completion rate (5× the input rate on the live catalog), so a real
+# 20k-token Opus response costs 50¢ against a 1¢ reserve: /track then
+# rejects the row with CONSUME_OVERBUDGET and the period counter
+# under-counts the spend.
+#
+# `None` means "the caller didn't say", and the backend keeps the old
+# arithmetic — a missing signal must not invent a reserve. The backend
+# bounds whatever arrives here by its own per-model catalog cap, so a
+# client can only ever LOWER the reserve, never inflate it.
+_call_max_output_tokens_var: ContextVar[int | None] = ContextVar(
+    "call_max_output_tokens", default=None
+)
 # Per-call MCP tool class + annotations. Set via the
 # ``set_mcp_tool_context`` helper when the SDK recognises an MCP
 # server. The gate honors `tool_class` over its own
@@ -140,6 +157,18 @@ def get_call_tools() -> tuple[str, ...]:
     configured ``blocked_tools`` aggregate.
     """
     return _call_tools_var.get()
+
+
+def get_call_max_output_tokens() -> int | None:
+    """The declared output cap for the next pre-flight, or ``None``.
+
+    ``None`` is the honest default: the SDK cannot invent an output
+    size for a call it does not make. The backend treats the pair
+    (declared, catalog cap) as the only inputs it will price an output
+    reserve from — see ADR-016 §2.1 — and refuses to reserve from
+    either signal alone.
+    """
+    return _call_max_output_tokens_var.get()
 
 
 def get_call_mcp_class() -> str | None:
@@ -802,9 +831,10 @@ def create_child_span_with_id(parent: SpanContext, span_id: str) -> SpanContext:
 def set_call_context(
     model: str | None = None,
     tools: list[str] | tuple[str, ...] | None = None,
+    max_output_tokens: int | None = None,
 ) -> None:
-    """Set per-call context (model name, tool list) for the next /gate
-    pre-flight check.
+    """Set per-call context (model name, tool list, output cap) for the
+    next /gate pre-flight check.
 
     Replaces the previous fake ``model="budget-precheck"`` and
     ``estimated_tokens=1`` always-default / always-empty pre-flight.
@@ -821,11 +851,25 @@ def set_call_context(
             ``blocked_tools`` aggregate and returns block on any
             match. Pass ``None`` to leave the current value
             unchanged, ``[]`` to clear.
+        max_output_tokens: The output cap you are about to send the
+            provider — Anthropic's ``max_tokens``, OpenAI's
+            ``max_output_tokens``. Sent only when you pass a positive
+            integer; omitting it keeps the pre-flight exactly as it
+            was, which under-reserves output rather than guessing at
+            a number. The backend clamps this to its own per-model
+            catalog cap, so a value larger than the model can emit is
+            not a way to raise your own reserve.
     """
     if model is not None:
         _call_model_var.set(model)
     if tools is not None:
         _call_tools_var.set(tuple(tools))
+    if max_output_tokens is not None:
+        # A cap of zero or less is not a cap; forwarding it would let a
+        # caller declare "no output" and reserve nothing at all. Treat
+        # it as "not declared" instead of silently under-reserving.
+        if max_output_tokens > 0:
+            _call_max_output_tokens_var.set(max_output_tokens)
 
 
 def set_mcp_tool_context(

@@ -785,8 +785,28 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         self._zero_activity_lock = threading.Lock()
 
         # Layer 3: backend connectivity timestamps for the status
-        # snapshot. Set in ``_authenticate`` and updated on every
-        # successful / failed backend call thereafter.
+        # snapshot. Written ONLY by ``_note_backend_attempt`` —
+        # ``status()`` reads them, but nothing else may assign them.
+        #
+        # Pre-fix this comment claimed they were "set in
+        # ``_authenticate`` and updated on every successful / failed
+        # backend call thereafter". No such writer existed anywhere in
+        # the SDK: the two attributes were initialised to ``None`` at
+        # line 790 and read at line 1053, and never assigned again.
+        # So ``NullRunStatus.backend_reachable`` was structurally pinned
+        # to ``None`` for the life of the process, and because the
+        # headline derivation gates DEGRADED on
+        # ``backend_reachable is False`` (line 1105), a backend that had
+        # been down since ``init()`` still reported ``STATE_OK``. The
+        # same two attributes also gate the MISCONFIGURED arm through
+        # ``_last_backend_attempt_at`` (line 1100), so that arm was
+        # dead for the same reason.
+        #
+        # Paired fields, so they are written together under one lock —
+        # gate calls arrive on the tool thread while ``_authenticate``
+        # runs on the caller's thread, and a torn read could pair a
+        # fresh timestamp with a stale verdict.
+        self._backend_attempt_lock = threading.Lock()
         self._last_backend_attempt_at: float | None = None
         self._last_backend_attempt_ok: bool | None = None
 
@@ -1049,12 +1069,20 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             api_key_valid = True
 
         # --- Connectivity ---
+        # Read under the lock so the pair is consistent: a gate call on
+        # the tool thread can land between the two reads below and
+        # pair a fresh timestamp with the previous verdict. The verdict
+        # is None only when no attempt has been recorded since init.
+        with self._backend_attempt_lock:
+            last_attempt_at = self._last_backend_attempt_at
+            last_attempt_ok = self._last_backend_attempt_ok
         backend_reachable: bool | None = None
-        if self._last_backend_attempt_at is not None:
-            # ``_last_backend_attempt_ok`` is set to True on
-            # a successful HTTP response, False on a transport
-            # error. ``None`` if no attempt since init.
-            backend_reachable = self._last_backend_attempt_ok
+        if last_attempt_at is not None:
+            # ``_last_backend_attempt_ok`` is True when the backend
+            # ANSWERED (any HTTP status, including a refusal) and False
+            # only on a transport-level failure. ``None`` means no
+            # attempt has been recorded since init.
+            backend_reachable = last_attempt_ok
 
         ws_connected: bool | None = None
         if self._ws_connection is not None:
@@ -1097,7 +1125,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # --- Headline state derivation ---
         # Order matters: most specific first.
         if self.api_key is None or (
-            self.organization_id is None and self._last_backend_attempt_at is not None
+            self.organization_id is None and last_attempt_at is not None
         ):
             headline = STATE_MISCONFIGURED
         elif (
@@ -1217,6 +1245,32 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 message=str(err)[:200],
             )
         )
+
+    def _note_backend_attempt(self, ok: bool) -> None:
+        """Record the outcome of one backend HTTP attempt.
+
+        The single writer for ``_last_backend_attempt_at`` /
+        ``_last_backend_attempt_ok``. ``status()`` derives
+        ``backend_reachable`` from them and gates the DEGRADED headline
+        on ``backend_reachable is False``, so every path that learns
+        whether the backend answered MUST funnel through here — a path
+        that raises on transport failure without calling this leaves the
+        field at its previous value, which is the bug this method
+        exists to close.
+
+        ``ok`` means "the backend answered", NOT "the call succeeded".
+        A 402/403/429 is an answer and must count as reachable; only a
+        transport-level failure (DNS, refused, TLS, timeout) sets it
+        False. Collapsing those two would mark a healthy backend that
+        correctly refused a call as unreachable.
+
+        Best-effort by construction: assigns two attributes under a
+        lock and never raises, so a status read can never be broken by
+        this bookkeeping.
+        """
+        with self._backend_attempt_lock:
+            self._last_backend_attempt_at = time.monotonic()
+            self._last_backend_attempt_ok = ok
 
     def _emit_sdk_error(
         self,
@@ -1376,11 +1430,24 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                     self._transport.secret_key = new_secret_key
 
                 logger.info(f"Authenticated: organization_id={self.organization_id}")
+                # A 200 from /auth/verify is the strongest liveness
+                # signal the SDK has. Recording it here is what makes
+                # `backend_reachable` True rather than None on the
+                # happy path.
+                self._note_backend_attempt(True)
             else:
                 # 5xx routes to NullRunBackendError (backend-class
                 # error, per CLAUDE.md §13). 401/NR-A003 = key
                 # rejected (true auth failure). Other 4xx / NR-A001
                 # covers 403 etc.
+                #
+                # A non-2xx status is still the backend ANSWERING — a
+                # 401 is a reachable backend with a bad key, and a 5xx
+                # is a reachable backend in trouble. Recording False
+                # here would report "unreachable" for a server that just
+                # replied, and would drive the DEGRADED headline off a
+                # credential problem instead of a connectivity one.
+                self._note_backend_attempt(True)
                 status = response.status_code
                 correlation_id = response.headers.get("x-correlation-id")
                 if 500 <= status < 600:
@@ -1414,6 +1481,14 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             # the rest of the SDK. ``NullRunTransportError.__init__``
             # already sets ``error_code="NR-B001"`` and the standard
             # retryable ``user_action``.
+            #
+            # This is the FIRST backend attempt in a normal run, so it
+            # is what makes ``backend_reachable`` observable at all
+            # when the backend is down from the start. Without it a
+            # caller that only ever calls ``status()`` (never a tool)
+            # would read ``None`` — "never tested" — for a backend that
+            # had just refused the connection outright.
+            self._note_backend_attempt(False)
             err = NullRunTransportError(
                 f"Auth request failed: {e}. Cannot establish secure connection to NullRun. "
                 f"Refusing to operate in unprotected mode.",
@@ -2341,6 +2416,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         )
         from nullrun.context import (
             get_call_impact,
+            get_call_max_output_tokens,
             get_call_mcp_annotations,
             get_call_mcp_class,
             get_call_model,
@@ -2406,6 +2482,16 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             "estimated_tokens": 1,
             "stream": False,
         }
+
+        # The declared output cap, when the caller set one. Kept out of
+        # the dict literal because "not declared" must be ABSENT on the
+        # wire, not present-and-null: the backend prices an output
+        # reserve only when it has BOTH this number and its own per-model
+        # catalog cap (ADR-016 §2.1), and a null would be one signal
+        # short of that pair rather than an honest "I don't know".
+        call_max_output = get_call_max_output_tokens()
+        if call_max_output is not None:
+            check_req["max_output_tokens"] = call_max_output
 
         # `action_digest` is required on every /gate call. Per
         # `backend/src/proxy/http/gate/gate.rs:56` (ADR-023 P1-6)
@@ -2510,6 +2596,10 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 # Cache miss or expired — go to the server, then store.
                 try:
                     response = self._transport.check(check_req)
+                    # The backend ANSWERED. A refusal (402/403/429) is
+                    # still an answer and must not be read as
+                    # unreachable.
+                    self._note_backend_attempt(True)
                 except NullRunAuthenticationError:
                     # DEF-MP-TS12-ENF-01 (RUN_ID 20260929T1338, 2026-09-29):
                     # a 401 is a CREDENTIAL failure, not a transport
@@ -2538,6 +2628,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                     # classified SDK errors. Internal bugs
                     # (KeyError, AttributeError) surface rather
                     # than silently allowing an unbounded call.
+                    self._note_backend_attempt(False)
                     logger.warning(f"check_workflow_budget: /gate unavailable, failing open: {exc}")
                     metrics.inc_runtime("gate_fail_open_total")
                     return
@@ -2560,6 +2651,9 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         else:
             try:
                 response = self._transport.check(check_req)
+                # Same rationale as the cached branch: a refusal is an
+                # answer, not an outage.
+                self._note_backend_attempt(True)
             except NullRunAuthenticationError:
                 # Same rationale as the cached branch above. Ordering
                 # matters: this arm precedes the broad `except
@@ -2579,6 +2673,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 # ``except Exception``.
                 raise
             except Exception as exc:  # noqa: BLE001
+                self._note_backend_attempt(False)
                 logger.warning(f"check_workflow_budget: /gate unavailable, failing open: {exc}")
                 metrics.inc_runtime("gate_fail_open_total")
                 return
