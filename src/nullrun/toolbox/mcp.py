@@ -323,6 +323,10 @@ class MCPAdapter:
         self,
         tool_name: str,
         arguments: dict[str, Any] | None = None,
+        *,
+        approval_id: str | None = None,
+        business_impact: dict[str, Any] | None = None,
+        action_digest: str | None = None,
         **passthrough: Any,
     ) -> Any:
         """Call a tool on the underlying MCP client, stamping
@@ -335,6 +339,21 @@ class MCPAdapter:
         client-specific kwargs without changing the public
         surface.
 
+        The three GATE kwargs — ``approval_id``, ``business_impact``
+        and ``action_digest`` — are NAMED keyword-only parameters, so
+        they can never fall into ``**passthrough`` and be forwarded to
+        the MCP server. They are consumed here and sent to the GATE:
+
+        * ``approval_id`` — the operator-approved grant. Without it
+          the backend had no way to learn that the call was approved,
+          so the approval round trip could not be completed
+          (NR-058, SDK half).
+        * ``business_impact`` / ``action_digest`` — the typed impact
+          and its SHA-256 digest. The backend stamps the approval row
+          with the digest and re-derives it from the live payload at
+          consume time, so a tampered payload is refused (NR-015,
+          SDK half).
+
         Gate enforcement: ``call_tool`` ALWAYS routes the invocation
         through ``runtime.execute(...)`` (the /api/v1/execute gate
         endpoint) BEFORE the underlying MCP client is called. The
@@ -346,6 +365,17 @@ class MCPAdapter:
         ``NullRunBlockedException`` with the approval_id attached so the
         caller can route the user through the approval flow and retry
         with ``approval_id=``.
+
+        PRE-FLIGHT: ``/execute`` is bound to an execution id that a
+        prior ``/gate`` minted — the backend answers 404
+        EXECUTION_NOT_FOUND when the ``execution:{id}`` binding is
+        missing. The ``@protect`` path gets that ``/gate`` from its own
+        pre-flight; a DIRECT ``adapter.call_tool(...)`` has no such
+        wrapper, so the adapter runs the pre-flight ITSELF when no
+        server-minted execution id is in scope. When one IS in scope
+        the pre-flight is SKIPPED: that path reserves money at the
+        gate, and a second ``/gate`` would charge the org twice for
+        one logical tool call.
 
         B2 (2026-09-30): there is no ungated path. ``runtime=None``
         used to mean "skip the round-trip entirely"; it now means
@@ -410,13 +440,62 @@ class MCPAdapter:
         # called the MCP server with no gate at all.
         runtime = self._resolve_runtime()
         execute_input = arguments if arguments is not None else {}
+
+        # ── Pre-flight: /execute needs a prior /gate ───────────────
+        #
+        # The backend's ``/api/v1/execute`` runs an existence check on
+        # the Redis binding ``execution:{id}`` and answers 404
+        # EXECUTION_NOT_FOUND when no prior ``/gate`` minted it
+        # (``backend/src/proxy/http/gate/execute.rs``). The
+        # ``@protect`` path runs ``check_workflow_budget()`` BEFORE
+        # ``runtime.execute()``; a DIRECT ``adapter.call_tool(...)``
+        # has no such wrapper, so without this pre-flight the /execute
+        # round trip was refused and the MCP server was never called.
+        #
+        # The pre-flight is CONDITIONAL, and the condition is the
+        # server-minted execution id: when one is already in scope a
+        # ``/gate`` has already run for this logical action, and
+        # running it again would reserve the budget a second time
+        # (that path charges money at the gate). The contextvar is
+        # exactly what ``runtime.execute`` reads to decide whether to
+        # reuse the id, so the two agree by construction.
+        #
+        # A refusal from the pre-flight propagates: the MCP client is
+        # NOT called. Same ordering and same error handling as the
+        # ``@protect`` wrapper (``decorators._protect_body``: gate
+        # pre-flight → /execute → body).
+        from nullrun.context import get_server_minted_execution_id
+
+        if get_server_minted_execution_id() is None:
+            runtime.check_workflow_budget()
+
         # Every MCP tool call routed through the runtime contacts
         # /api/v1/execute unconditionally — there is no
         # ``mode=`` opt-out for audit bypass.
-        execute_result = runtime.execute(
-            tool_name=tool_name,
-            input_data=execute_input,
-        )
+        #
+        # ``tool_arguments`` is the canonical argument bag
+        # (ADR-060 §4): the backend resolves the bag as
+        # ``tool_arguments`` → ``tool_params`` → Null, so a payload
+        # that only travels as the legacy ``input`` field leaves every
+        # params-based rule with "no bag" and leaves the approval
+        # decision with no argument snapshot to bind to. The SAME dict
+        # is sent as both — ``input`` is the tool payload and is
+        # unchanged; ``tool_arguments`` is the canonical view of it.
+        execute_kwargs: dict[str, Any] = {
+            "tool_name": tool_name,
+            "input_data": execute_input,
+            "tool_arguments": execute_input,
+        }
+        # The three gate kwargs are forwarded ONLY when supplied —
+        # an absent field means "no grant" / "no envelope", which is
+        # not the same wire statement as a null.
+        if approval_id is not None:
+            execute_kwargs["approval_id"] = approval_id
+        if business_impact is not None:
+            execute_kwargs["business_impact"] = business_impact
+        if action_digest is not None:
+            execute_kwargs["action_digest"] = action_digest
+        execute_result = runtime.execute(**execute_kwargs)
         decision = execute_result.get("decision")
         if decision == "block":
             # ``NullRunBlockedException`` is raised by

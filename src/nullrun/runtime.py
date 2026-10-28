@@ -3607,6 +3607,25 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # otherwise the contextvar flows through (populated by
         # decorators.py from ``fn.__name__`` before this method runs).
         tools: tuple[str, ...] | None = None,
+        # The approved grant, replayed on the wire.
+        #
+        # ``Transport.execute`` already accepts and puts ``approval_id``
+        # on the wire; this method was the only missing link between
+        # the caller and the transport. Without it a caller that had an
+        # operator-approved grant had nowhere to put it, and the
+        # backend's ``/execute`` fell back to "no grant" — the
+        # approval could never be consumed (NR-058, SDK half).
+        #
+        # Deliberately appended AFTER ``tools`` so the existing
+        # positional order of the parameters above is unchanged.
+        approval_id: str | None = None,
+        # The canonical tool-argument bag (ADR-060 §4). The backend
+        # resolves the argument bag as ``tool_arguments`` →
+        # ``tool_params`` → Null, so a caller that only sends the
+        # legacy ``input`` field leaves every params-based rule with
+        # "no bag" and leaves the approval decision with no argument
+        # snapshot to bind to (NR-015, SDK half).
+        tool_arguments: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """
         Pre-execution policy evaluation via /execute endpoint.
@@ -3640,6 +3659,19 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 supplied alongside ``business_impact``, the
                 grant is digest-bound; without it, the backend
                 falls back to approval_id-only grant consume.
+            approval_id: The operator-approved grant, replayed on the
+                wire. The backend consumes it against the approval row
+                (and, when the row is digest-bound, against the
+                server-recomputed ``action_digest``). Absent means "no
+                grant" — the call is decided by policy alone.
+            tool_arguments: The canonical tool-argument bag. The
+                backend resolves the argument bag as
+                ``tool_arguments`` → ``tool_params`` → Null
+                (ADR-060 §4), so this is the field the backend
+                snapshots the arguments from when it binds an
+                approval decision to the payload. It is an
+                ADDITIONAL field: the legacy ``input`` payload is
+                unchanged.
 
         Returns:
             Dict with:
@@ -3831,6 +3863,15 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             execute_kwargs["business_impact"] = business_impact
         if action_digest is not None:
             execute_kwargs["action_digest"] = action_digest
+        # The approved grant + the canonical argument bag. Both are
+        # forwarded verbatim to ``Transport.execute``, which puts them
+        # on the wire. Like the two above, the key is added ONLY when
+        # the value is not None — an absent field means "no grant" /
+        # "no bag", which is not the same wire statement as a null.
+        if approval_id is not None:
+            execute_kwargs["approval_id"] = approval_id
+        if tool_arguments is not None:
+            execute_kwargs["tool_arguments"] = tool_arguments
         try:
             result = self._transport.execute(**execute_kwargs)
         except NullRunBlockedException as exc:

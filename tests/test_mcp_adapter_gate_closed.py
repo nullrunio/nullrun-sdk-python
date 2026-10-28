@@ -92,11 +92,27 @@ class _RecordingRuntime:
 
     def __init__(self, payload=None):
         self.calls: list[dict[str, Any]] = []
+        self.preflight_calls = 0
         self._payload = payload or {
             "decision": "allow",
             "decision_source": "gateway",
             "explanation": "allow",
         }
+
+    def check_workflow_budget(self):
+        """Stand-in for the ``/gate`` pre-flight.
+
+        The adapter runs this before ``/execute`` when no
+        server-minted execution id is in scope — the backend's
+        ``/execute`` answers 404 EXECUTION_NOT_FOUND without a prior
+        ``/gate``. It deliberately does NOT touch the ``order`` list
+        used by ``test_gate_runs_before_the_mcp_client``: that test
+        pins the ORDER OF THE ENFORCEMENT HOP (``/execute`` before the
+        MCP call), and the pre-flight is a separate hop with its own
+        pins in ``tests/test_mcp_approval_wire.py``.
+        """
+
+        self.preflight_calls += 1
 
     def execute(self, **kwargs):
         self.calls.append(kwargs)

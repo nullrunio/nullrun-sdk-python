@@ -578,12 +578,28 @@ class _StubRuntime:
 
     def __init__(self, decision_payload: dict[str, Any] | None = None) -> None:
         self.calls: list[dict[str, Any]] = []
+        self.preflight_calls = 0
         self._payload = decision_payload or {
             "decision": "allow",
             "decision_source": "gateway",
             "explanation": "stub allow",
             "policy_version": 1,
         }
+
+    def check_workflow_budget(self) -> None:
+        """Stand-in for the ``/gate`` pre-flight.
+
+        The adapter runs this before ``/execute`` when no
+        server-minted execution id is in scope: the backend's
+        ``/execute`` answers 404 EXECUTION_NOT_FOUND unless a prior
+        ``/gate`` minted the ``execution:{id}`` binding. The
+        pre-flight's own behaviour (when it runs, when it is skipped,
+        what it does on a block) is pinned in
+        ``tests/test_mcp_approval_wire.py``; here it only has to
+        exist so the adapter's call site is modelled.
+        """
+
+        self.preflight_calls += 1
 
     def execute(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(kwargs)
