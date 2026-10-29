@@ -49,7 +49,6 @@ import pytest
 # before any test in the suite can run, so this fallback is the
 # difference between "3.10 in CI green" and "3.10 errors the
 # whole module at import".
-import sys
 
 if sys.version_info >= (3, 11):
     import tomllib

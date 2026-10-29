@@ -2235,11 +2235,41 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         )
         return True
 
-    def check_workflow_budget(self) -> None:
+    def check_workflow_budget(
+        self,
+        *,
+        model: str | None = None,
+        estimated_tokens: int | None = None,
+        max_output_tokens: int | None = None,
+        use_gate_cache: bool = True,
+    ) -> str | None:
         """
         Pre-flight budget check via /api/v1/gate. Called from @protect
         before the wrapped function runs, so a workflow with no remaining
         budget never gets to spend tokens.
+
+        Returns the server-minted reservation id — the id the backend
+        settles when the matching `/track` arrives — or ``None`` when no
+        reservation was minted (no workflow bound, the gate failed open,
+        or the backend answered without one).
+
+        Keyword arguments (ADR-101):
+
+            model: overrides the call-context model. The zero-code LLM
+                path reads the model out of the provider request body,
+                which is the only place it exists on that path.
+            estimated_tokens: overrides the hardcoded ``1``. ``1`` was
+                the right answer to the binary question the pre-flight
+                used to ask ("is ANY budget left?"); it is the wrong
+                answer to "will THIS call fit?", which is what the
+                zero-code path needs in order to reserve the call's own
+                cost instead of one token's worth of it.
+            max_output_tokens: overrides the call-context output cap.
+            use_gate_cache: set False by a path that needs its OWN
+                reservation per call. The chain-mode cache replays a
+                previous response — including its reservation id — so a
+                cached "allow" would hand a second LLM call the FIRST
+                call's reservation.
 
         Decision → exception mapping:
             "allow" → return
@@ -2347,7 +2377,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                     metrics.inc_runtime("skip_budget_allowed_in_prod")
                 except Exception:  # noqa: BLE001
                     pass
-                return
+                return None
             # Non-production. Pre-fix this was `logger.debug`, which
             # means a test suite running the whole budget path with
             # the bypass on leaves no trace anywhere: the tests go
@@ -2379,7 +2409,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 metrics.inc_runtime("skip_budget_used_non_prod")
             except Exception:  # noqa: BLE001 — metrics never gate
                 pass
-            return
+            return None
 
         # Bump the ``check_calls`` counter so the dashboard can show
         # the rate of pre-flight budget checks and the operator can
@@ -2459,14 +2489,14 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 metrics.inc_runtime("budget_preflight_no_workflow_total")
             except Exception:  # noqa: BLE001 — metrics never gate
                 pass
-            return
+            return None
 
         # Use the real model name from the call context if the user set
         # it via `set_call_context(model=...)`. Sending `None` is
         # fine — backend `calculate_projected_cost` defaults when
         # model is unset, and tool_block enforcement on /gate is
         # best-effort when no tools are sent.
-        call_model = get_call_model()
+        call_model = model if model is not None else get_call_model()
         call_tools = get_call_tools()
 
         # Chain context for soft-mode enforcement.
@@ -2479,7 +2509,12 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             "operation_id": op_id,
             "check_type": "llm",
             "model": call_model,  # may be None if user didn't set it
-            "estimated_tokens": 1,
+            # The input side of the reserve. ``1`` is the historical
+            # value and it is deliberately kept for the @protect path:
+            # the pre-flight there answers "is any budget left?", not
+            # "what will this call cost?". The zero-code LLM path
+            # passes the request's own estimate (ADR-101).
+            "estimated_tokens": estimated_tokens if estimated_tokens is not None else 1,
             "stream": False,
         }
 
@@ -2489,7 +2524,10 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # reserve only when it has BOTH this number and its own per-model
         # catalog cap (ADR-016 §2.1), and a null would be one signal
         # short of that pair rather than an honest "I don't know".
-        call_max_output = get_call_max_output_tokens()
+        call_max_output = (
+            max_output_tokens if max_output_tokens is not None
+            else get_call_max_output_tokens()
+        )
         if call_max_output is not None:
             check_req["max_output_tokens"] = call_max_output
 
@@ -2583,6 +2621,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         cache_key: tuple[str, str | None, str | None, int] | None = None
         cache_enabled = (
             chain_id is not None
+            and use_gate_cache
             and not os.environ.get("NULLRUN_GATE_CACHE_DISABLE", "").strip() == "1"
         )
         if cache_enabled:
@@ -2591,7 +2630,6 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             if cached is not None and (time.monotonic() - cached[0]) < _GATE_CACHE_TTL_SECONDS:
                 # Cache hit within TTL — reuse the response without a
                 response = cached[1]
-                _capture_server_minted_execution_id(response)
             else:
                 # Cache miss or expired — go to the server, then store.
                 try:
@@ -2631,7 +2669,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                     self._note_backend_attempt(False)
                     logger.warning(f"check_workflow_budget: /gate unavailable, failing open: {exc}")
                     metrics.inc_runtime("gate_fail_open_total")
-                    return
+                    return None
                 except ValueError as exc:
                     # `Transport.check` ends in `response.json()`. A
                     # body that is not JSON — proxy error page,
@@ -2676,9 +2714,15 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 self._note_backend_attempt(False)
                 logger.warning(f"check_workflow_budget: /gate unavailable, failing open: {exc}")
                 metrics.inc_runtime("gate_fail_open_total")
-                return
+                return None
 
-        _capture_server_minted_execution_id(response)
+        # The reservation id the backend minted for THIS call. It is
+        # captured into the server-minted contextvar (the legacy
+        # single-slot carrier) AND returned to the caller, which needs
+        # it explicitly: the zero-code LLM path runs one reservation per
+        # provider request and cannot rely on a contextvar that two
+        # concurrent calls in the same task would overwrite.
+        reservation_id = _capture_server_minted_execution_id(response)
 
         decision = self._require_gate_decision(response)
         decision_source = response.get("decision_source", DecisionSource.GATEWAY)
@@ -2699,7 +2743,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 f"{decision_source!r}, treating as transport error"
             )
             metrics.inc_runtime("gate_fail_open_total")
-            return
+            return None
         if decision == "block":
             reasons = response.get("explanations") or (
                 [response["explanation"]] if response.get("explanation") else ["block"]
@@ -2875,7 +2919,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 max_overdraft,
                 remaining,
             )
-            return
+            return None
 
         if decision == "require_approval":
             # The gate requires human-approval before the call
@@ -2962,7 +3006,10 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                             _captured_eid, None
                         )
                 logger.info(f"check_workflow_budget: approval {approval_id} approved -- resuming")
-                return
+                # The gate minted a reservation for the approved
+                # execution; hand it back so the caller can settle it
+                # against the same id.
+                return reservation_id
             if outcome == "denied":
                 raise NullRunApprovalDeniedError(
                     workflow_id=workflow_id,
@@ -3007,7 +3054,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # relying on fall-off-the-end, so that adding a variant to the
         # known set without adding an arm is a visible no-op here
         # rather than an implicit allow.
-        return
+        return reservation_id
 
     # =============================================================================
     # v3 wire-protocol helpers
@@ -3362,6 +3409,8 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
     def track(
         self,
         event: dict[str, Any],
+        *,
+        reservation_id: str | None = None,
     ) -> dict[str, Any]:
         """
         Track a cost event.
@@ -3380,6 +3429,13 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                    - is_retry: bool (optional)
                    - latency_ms: int (optional)
                    - metadata: dict (optional)
+            reservation_id: the server-minted reservation this event
+                   settles, when the caller knows it. The legacy
+                   carrier is the server-minted contextvar (one slot per
+                   task); a caller that mints one reservation per call
+                   — the zero-code LLM path — passes it explicitly, so
+                   two concurrent calls cannot swap reservations
+                   (ADR-101).
 
         Note:
             `cost_cents` is NOT a valid event key -- the SDK does not
@@ -3482,7 +3538,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             metrics.inc_runtime("dropped_llm_call_no_model")
             wire_event["__missing_model"] = True
 
-        self._route_track(wire_event)
+        self._route_track(wire_event, reservation_id=reservation_id)
 
         # Update metrics (thread-safe)
         metrics.inc_runtime("track_calls")
@@ -3607,6 +3663,25 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # otherwise the contextvar flows through (populated by
         # decorators.py from ``fn.__name__`` before this method runs).
         tools: tuple[str, ...] | None = None,
+        # The approved grant, replayed on the wire.
+        #
+        # ``Transport.execute`` already accepts and puts ``approval_id``
+        # on the wire; this method was the only missing link between
+        # the caller and the transport. Without it a caller that had an
+        # operator-approved grant had nowhere to put it, and the
+        # backend's ``/execute`` fell back to "no grant" — the
+        # approval could never be consumed (NR-058, SDK half).
+        #
+        # Deliberately appended AFTER ``tools`` so the existing
+        # positional order of the parameters above is unchanged.
+        approval_id: str | None = None,
+        # The canonical tool-argument bag (ADR-060 §4). The backend
+        # resolves the argument bag as ``tool_arguments`` →
+        # ``tool_params`` → Null, so a caller that only sends the
+        # legacy ``input`` field leaves every params-based rule with
+        # "no bag" and leaves the approval decision with no argument
+        # snapshot to bind to (NR-015, SDK half).
+        tool_arguments: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """
         Pre-execution policy evaluation via /execute endpoint.
@@ -3640,6 +3715,19 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 supplied alongside ``business_impact``, the
                 grant is digest-bound; without it, the backend
                 falls back to approval_id-only grant consume.
+            approval_id: The operator-approved grant, replayed on the
+                wire. The backend consumes it against the approval row
+                (and, when the row is digest-bound, against the
+                server-recomputed ``action_digest``). Absent means "no
+                grant" — the call is decided by policy alone.
+            tool_arguments: The canonical tool-argument bag. The
+                backend resolves the argument bag as
+                ``tool_arguments`` → ``tool_params`` → Null
+                (ADR-060 §4), so this is the field the backend
+                snapshots the arguments from when it binds an
+                approval decision to the payload. It is an
+                ADDITIONAL field: the legacy ``input`` payload is
+                unchanged.
 
         Returns:
             Dict with:
@@ -3831,6 +3919,15 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             execute_kwargs["business_impact"] = business_impact
         if action_digest is not None:
             execute_kwargs["action_digest"] = action_digest
+        # The approved grant + the canonical argument bag. Both are
+        # forwarded verbatim to ``Transport.execute``, which puts them
+        # on the wire. Like the two above, the key is added ONLY when
+        # the value is not None — an absent field means "no grant" /
+        # "no bag", which is not the same wire statement as a null.
+        if approval_id is not None:
+            execute_kwargs["approval_id"] = approval_id
+        if tool_arguments is not None:
+            execute_kwargs["tool_arguments"] = tool_arguments
         try:
             result = self._transport.execute(**execute_kwargs)
         except NullRunBlockedException as exc:
@@ -4427,7 +4524,11 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
 
         return enriched
 
-    def _route_track(self, wire_event: dict[str, Any]) -> None:
+    def _route_track(
+        self,
+        wire_event: dict[str, Any],
+        reservation_id: str | None = None,
+    ) -> None:
         """Route a tracked event to v3 single-event /track or the
                batch /track/batch endpoint.
 
@@ -4466,7 +4567,12 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             self._transport.track(wire_event)
             return
 
-        smid = get_server_minted_execution_id()
+        # An explicit reservation id wins over the ambient contextvar.
+        # The contextvar is ONE slot per task: two LLM calls running
+        # concurrently in the same task would overwrite each other's
+        # reservation, and the second /track would settle the first
+        # call's reservation (ADR-101).
+        smid = reservation_id or get_server_minted_execution_id()
         if not smid:
             # Server-authoritative model (CLAUDE.md §22): an llm_call
             # event without a paired /check reservation has no

@@ -1,3 +1,152 @@
+## [0.23.0] - 2026-10-29
+
+Minor release. Two enforcement paths that could not complete their own
+contract are closed. The MCP path could not finish an approval round
+trip at all: a retry after the operator approved landed in
+`**passthrough` and was forwarded to the MCP server, so the gate never
+saw the grant. The zero-code LLM path booked the call only AFTER the
+provider had already answered — the `llm_call` event is the only thing
+that moves the budget counter, so a call the ceiling was supposed to
+stop was counted instead of stopped, and the control centre showed the
+sum of spend that had already happened. Both fixes are SDK-side; there
+is no wire-protocol change. The public surface grows by ten
+keyword-only parameters across four public methods, and one changed
+return value.
+
+### Migration
+
+Nothing breaks on a healthy configuration, and the one behavioural
+change is the point of the release rather than a side effect. Five
+things differ from 0.22.2:
+
+1. **`MCPAdapter.call_tool` can carry an approval grant.** The method
+   gains three NAMED keyword-only parameters — `approval_id`,
+   `business_impact`, `action_digest` — placed BEFORE `**passthrough`
+   so they can never fall into the passthrough and be forwarded to the
+   MCP server. A caller that wrote
+   `adapter.call_tool("x", {}, approval_id="...")` was sending the
+   approval id to the MCP server as a tool argument; now it goes to
+   the gate.
+2. **`NullRunRuntime.execute` gains `approval_id` and
+   `tool_arguments`.** Both are appended AFTER `tools`, so the existing
+   positional order of the parameters above is unchanged. Each key is
+   added to the wire only when the value is not `None` — an absent
+   field means "no grant", which is not the same wire statement as a
+   null. `tool_arguments` is the canonical argument bag the backend
+   already resolves (ADR-060 §4); the SDK now sends it alongside the
+   legacy `input` field instead of only the latter.
+3. **`check_workflow_budget` returns the reservation id.** The method
+   gains `model`, `estimated_tokens`, `max_output_tokens` and
+   `use_gate_cache`, and its return type changes from `None` to
+   `str | None` — the server-minted reservation the backend settles
+   when the matching `/track` arrives, or `None` when no reservation
+   was minted. Callers that ignored the return value are unaffected.
+   The `@protect` pre-flight still sends `estimated_tokens=1`, because
+   that path answers "is ANY budget left?" and not "what will THIS call
+   cost?".
+4. **`NullRunRuntime.track` gains `reservation_id`.** The reservation
+   travels with the cost event explicitly rather than through a
+   contextvar: the contextvar is one slot per task, so two concurrent
+   calls would swap reservations.
+5. **The zero-code LLM path now reserves BEFORE the provider request.**
+   A call that the ceiling rejects never reaches the provider — the
+   request is not sent at all. Previously the SDK could only report
+   the spend after the fact. This is visible: a capped zero-code
+   caller will now see refusals where it previously saw successful
+   calls that were billed anyway.
+
+### Fixed
+
+- **NR-058 (SDK half) — the MCP path could not complete an approval
+  round trip.** `MCPAdapter.call_tool` had no `approval_id`
+  parameter, so a retry after the operator approved landed in
+  `**passthrough` and was forwarded to the MCP SERVER — the gate never
+  saw the grant. The adapter also sent neither `business_impact` nor
+  `action_digest`, so the approval row was never digest-bound and the
+  backend could not detect a tampered payload at consume time. The
+  three parameters are now named keyword-only members of the public
+  signature and are forwarded into `runtime.execute(...)`, which
+  gained the matching `approval_id` parameter — `Transport.execute`
+  already accepted it and put it on the wire; the runtime was the only
+  missing link. Separately, `/api/v1/execute` runs an existence check
+  on the Redis binding `execution:{id}` and answers 404
+  EXECUTION_NOT_FOUND when no prior `/gate` minted it, so a DIRECT
+  `adapter.call_tool(...)` never reached the MCP server at all. The
+  adapter now runs the pre-flight itself when
+  `get_server_minted_execution_id()` is `None` and SKIPS it otherwise
+  — that path reserves money at the gate, and a second `/gate` would
+  charge the org twice for one logical call. The condition is the same
+  contextvar `runtime.execute` reads, so the two agree by construction.
+  A refusal from the pre-flight propagates and the MCP client is NOT
+  called. (`5021ed3`, +558/-4; test file
+  `tests/test_mcp_approval_wire.py`, 15 tests)
+- **NR-015 (SDK half) — the canonical argument bag never reached the
+  wire.** The tool arguments travelled only as the legacy `input`
+  field, while the backend resolves the canonical bag as
+  `tool_arguments` → `tool_params` → Null (ADR-060 §4) — so every
+  params-based rule saw "no bag", and the approval decision had no
+  argument snapshot to bind to. The same dict now reaches the wire as
+  BOTH `input` (the tool payload, unchanged) and `tool_arguments` (the
+  canonical bag). No new wire field is invented: `tool_arguments` is
+  the field the backend already resolves. (`5021ed3`)
+- **NR-059 — the zero-code LLM path booked the call after the provider
+  had already been paid.** On the zero-code path (httpx / requests
+  transport, no `@protect`, no `set_call_context`) the SDK sent the
+  `llm_call` event ONLY AFTER the provider's response. The event is
+  the only thing that moves the budget counter, so a call the cap
+  should have stopped was counted, not stopped. Now the httpx (sync
+  and async) and requests transports run the pre-flight BEFORE the
+  request leaves: they read the model, the prompt size and the output
+  cap out of the request body and reserve them, and a gate refusal is
+  raised outward so the provider request is never sent. The
+  reservation travels with the event explicitly
+  (`track(..., reservation_id=...)`), because the contextvar carrier is
+  one slot per task and two parallel calls would swap reservations. A
+  call that produced no usage (network error, empty body, no usage
+  block) releases its reservation with a zero-valued `/track` —
+  otherwise the reservation would hold budget until the reclaim worker
+  ran. When the scope already holds a fresh reservation (the
+  `@protect` path reserves once for the whole scope) the pre-flight is
+  SKIPPED: a second reservation would orphan the first. Token
+  estimation is ~3 characters per token, 1 token per CJK character,
+  base64 is not counted as text, and the estimate is capped at 32768
+  tokens. The output cap is declared ONLY if the caller declared one —
+  without it there is no upper bound, and pricing at the catalog
+  maximum would freeze a monthly budget on a single call. The README
+  now states, per path, what the ceiling stops and what only the NEXT
+  call can stop. (`4bc9322`, +1210/-35; test file
+  `tests/test_zero_code_preflight.py`, 20 tests)
+
+### Cleanup
+
+- **Lint hygiene in two test files** — `ruff check src tests` was red
+  on `origin/master`: `tests/test_websocket_extra_is_declared.py`
+  imported `sys` twice (F811 + I001), a duplicate left behind when the
+  3.10 `tomli` fallback was added in 0.22.2, and the new
+  `tests/test_zero_code_preflight.py` had one blank line too many
+  after its import block. CI only gates `ruff check src/`, so neither
+  was caught there; the local gate named in the release runbook is
+  `ruff check src tests`. Both edits are import-ordering only — no
+  behaviour changed.
+
+### Verification
+
+| Check | Result |
+|---|---|
+| `ruff check src tests` | All checks passed |
+| `mypy src/nullrun` | Success: no issues found in 39 source files |
+| `pytest -q` | **1948 passed, 12 skipped** in 192.05s (vs baseline 1913 / 12 — **+35 new tests** from `test_mcp_approval_wire` (15) and `test_zero_code_preflight` (20)) |
+| Scratch diff | clean (`dist_local/`, `*.defect*` absent) |
+| `nullrun.__version__` | `0.23.0` |
+| Wire-format compatibility | unchanged from 0.22.2 — no protocol change; `approval_id` and `tool_arguments` are the fields the backend already resolves, and each is sent only when set (absent ≠ null) |
+
+### Commits included
+
+```
+5021ed3 fix(sdk): MCP approval re-entry — approval_id on the gate, digest binding, canonical argument bag, missing /gate pre-flight (NR-058 / NR-015, SDK half)
+4bc9322 fix(budget): LLM-путь резервирует стоимость звонка ДО запроса к провайдеру (NR-059)
+```
+
 ## [0.22.2] - 2026-10-16
 
 Patch release, no protocol change. Three unrelated bugs closed in one

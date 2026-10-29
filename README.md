@@ -48,11 +48,13 @@ Existing observability tools tell you **after** the fact. NullRun enforces **bef
 
 | Without NullRun | With NullRun |
 |---|---|
-| Agent calls `gpt-4o` 10,000 times → surprise $5,000 invoice | Hard budget cap → SDK blocks at 402 before invocation |
+| Agent calls `gpt-4o` 10,000 times → surprise $5,000 invoice | Hard budget cap → the SDK reserves the call's expected cost at the gate and refuses at 402 before the provider is called |
 | Agent runs `bash rm -rf /` | Tool policy → SDK blocks at 403 before execution |
 | Sensitive action with no human in the loop | Approval flow → SDK pauses and waits for WS `approval_resolved` push |
 | Cost & calls scattered across 4 libraries | Single source of truth: per-org, per-workflow, per-execution |
 | Runaway SDK loop calling `/gate` without `/track` | Per-reservation rate cap → 402 budget error (see `docs/errors/NR-R001.md`) |
+
+> The budget cap is enforced **before** the action — but only on the paths where the SDK can reach the provider request before it leaves. [What the cap stops, per path](#what-the-hard-budget-cap-stops--and-what-it-does-not) says exactly which is which. The short version: the zero-code `httpx`/`requests` path and the `@protect` path stop the current call; a bare LangChain callback can only stop the next one, because the provider has already been called by then.
 
 ---
 
@@ -266,6 +268,44 @@ another way to spend.
 LangChain's own `handle_tool_error=True` is **not** an equivalent. It
 catches `ToolException` and stringifies it, and it does not know which
 exceptions are refusals — use `on_denied="message"`.
+
+---
+
+## What the hard budget cap stops — and what it does not
+
+NullRun enforces before the action. Which *action* depends on the path, and the
+difference is worth 5 minutes of reading before you rely on the cap.
+
+| Path | Where the gate runs | What the cap does |
+|---|---|---|
+| `@protect` (with or without `set_call_context`) | before the wrapped function body | reserves the declared model / token estimate / output cap; a refusal raises and the body never runs |
+| Zero-code `httpx` / `requests` transport | **before the provider request leaves the process** | the SDK reads the model, the prompt size and the caller's output cap out of the request body and reserves them; a refusal raises and the provider is never called |
+| Zero-code path where the caller declared **no** output cap | before the provider request leaves | the input side is reserved, the output side is not — there is no upper bound to reserve. The call still counts after the fact, and the cap stops the **next** call |
+| LangChain callback with no `@protect` | after the provider answered | the spend is counted correctly, but the cap can only stop the **next** call — a callback cannot un-send a request that already reached the provider |
+| Tool call | before the tool runs | reserved and refused before execution |
+
+**The SDK never sends a price.** It sends *usage* — how many tokens — and the
+server turns that into cents from its own catalog. A tampered client cannot
+inflate the bill by lying about cost (ADR-068).
+
+**The estimate is an estimate.** With no tokenizer dependency, the zero-code path
+estimates the prompt at ~3 characters per token, counts CJK/Hangul at one token
+per character, skips base64 image blobs (the provider bills those as tiles, not
+as text), and caps the input estimate at 32 768 tokens.
+
+**Under-estimating is money-safe; over-estimating is temporary.** If the real
+call costs more than the reserve, the backend books the **actual** spend on
+`/track` anyway and the org sees a `CONSUME_OVERBUDGET` warning — the money is
+counted, the cap still holds. If the reserve was larger than the call, the
+difference is refunded when the call settles.
+
+**A call that never billed does not hold your budget.** If the provider request
+fails, the answer carries no usage block, or the body is empty, the SDK releases
+the reserve immediately instead of leaving it on the period counter until the
+reclaim worker runs.
+
+**A refusal is a refusal.** The typed exceptions (`NullRunBudgetError` and
+friends) are raised from the pre-flight, so the provider request is never sent.
 
 ---
 

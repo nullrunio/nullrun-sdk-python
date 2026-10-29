@@ -131,11 +131,17 @@ class TestRuntimeMintSites:
         # require that string to be `op_id` (the contextvar value),
         # NOT `str(uuid.uuid4())`.
         runtime = _read(RUNTIME_PY)
-        # Locate the method body.
+        # Locate the method body. The signature is deliberately NOT
+        # pinned: ADR-101 gave check_workflow_budget keyword
+        # parameters and a return value, and a pin that hard-codes
+        # the old signature turns every signature change into a
+        # false red. The slice is anchored on the method boundary
+        # instead — from the `def` line to the next method or
+        # top-level class.
         m = re.search(
-            r"def check_workflow_budget\(self\) -> None:.*?(?=\n    def |\nclass |\Z)",
+            r"^    def check_workflow_budget\(.*?(?=\n    def |\nclass |\Z)",
             runtime,
-            re.DOTALL,
+            re.DOTALL | re.MULTILINE,
         )
         assert m, "could not locate check_workflow_budget method body"
         body = m.group(0)

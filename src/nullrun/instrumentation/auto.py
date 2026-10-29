@@ -40,10 +40,11 @@ import hashlib
 import json
 import logging
 import os
+import re
 import threading
 from collections import OrderedDict
 from collections.abc import Callable
-from typing import Any
+from typing import Any, NamedTuple
 
 import httpx
 
@@ -691,6 +692,352 @@ def _extract_model_from_request_body(request: httpx.Request) -> str | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# ADR-101 / NR-059 — the zero-code path declares what the call will cost
+# ---------------------------------------------------------------------------
+#
+# The pre-flight on this path has to answer "will THIS call fit?", and
+# the provider request body is the only place the answer exists: the
+# zero-code path never goes through `set_call_context(...)`, so the
+# model, the prompt size and the caller's output cap are all read off
+# the body the provider is about to receive.
+#
+# None of these numbers are PRICES. ADR-068: the server owns the price,
+# the client owns only the USAGE. What follows says how many tokens the
+# call is expected to use; the backend turns them into cents from its
+# own catalog.
+
+# Output-cap field names, per vendor dialect. OpenAI's chat API takes
+# `max_tokens` (legacy) or `max_completion_tokens` (current); Anthropic
+# takes `max_tokens`; the Google GenAI dialect takes `maxOutputTokens`.
+# The FIRST match wins, so the current OpenAI spelling is checked
+# before the legacy one.
+_MAX_OUTPUT_TOKEN_FIELDS = (
+    "max_completion_tokens",
+    "max_tokens",
+    "maxOutputTokens",
+)
+
+# Characters per token for latin-script text. 3 is deliberately
+# CONSERVATIVE (an over-estimate): the usual guidance is ~4 characters
+# per token for English prose, and code / JSON run denser. Over-reserving
+# is refunded when the call is settled; under-reserving costs a
+# CONSUME_OVERBUDGET refusal on the /track.
+_CHARS_PER_TOKEN = 3
+
+# Ceiling on the input estimate. A multimodal request carries the image
+# as a base64 blob — megabytes of characters the provider bills as image
+# tiles, not as text tokens. `_looks_like_data_blob` skips those, but a
+# ceiling keeps a pathological body from producing a reserve that would
+# strand a month's budget on one call. A prompt above the ceiling is
+# UNDER-estimated: the consume then overruns the reserve, the backend
+# books the real spend anyway (the overage path), and the caller sees
+# a CONSUME_OVERBUDGET warning rather than a wrong bill.
+_MAX_ESTIMATED_INPUT_TOKENS = 32_768
+
+# CJK / Hangul runs. Counted at one token per character — every major
+# vendor's vocabulary encodes a CJK character as one to two tokens, so
+# one is the safe side. Latin text is counted by characters instead.
+_CJK_RUN_RE = re.compile(
+    "["
+    "぀-ヿ"  # hiragana + katakana
+    "㐀-䶿"  # CJK extension A
+    "一-鿿"  # CJK unified ideographs
+    "가-힯"  # hangul syllables
+    "]+"
+)
+
+
+def _looks_like_data_blob(text: str) -> bool:
+    """True for a long, whitespace-free string — a base64 image payload,
+    a minified blob. NOT natural-language prompt text.
+
+    The provider bills an image as tiles, not as characters; counting a
+    megabyte of base64 as text tokens would inflate the reserve by
+    orders of magnitude and could strand a month's budget on one call.
+    The probe reads only the head and the tail, so the cost does not
+    scale with the payload.
+    """
+    if len(text) <= 4096:
+        return False
+    probe = text[:2048] + text[-2048:]
+    return not any(ch.isspace() for ch in probe)
+
+
+def _estimate_tokens(text: str) -> int:
+    """Estimate the token count of ``text`` without a tokenizer.
+
+    No tokenizer dependency is added: the number only sizes a
+    RESERVE, and the authoritative count arrives with the provider's
+    usage on /track.
+    """
+    if not text:
+        return 0
+    cjk = sum(len(run) for run in _CJK_RUN_RE.findall(text))
+    other = len(text) - cjk
+    return cjk + (other + _CHARS_PER_TOKEN - 1) // _CHARS_PER_TOKEN
+
+
+def _collect_prompt_text(value: Any, out: list[str]) -> None:
+    """Walk a decoded request body and collect the text the provider
+    will read: messages, system prompt, tool schemas, file contents.
+
+    The ``model`` key is skipped — the model id is not part of the
+    prompt.
+    """
+    if isinstance(value, str):
+        if not _looks_like_data_blob(value):
+            out.append(value)
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            if key == "model":
+                continue
+            _collect_prompt_text(item, out)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _collect_prompt_text(item, out)
+
+
+class LlmRequestProfile(NamedTuple):
+    """What a provider request body says about the call it announces."""
+
+    model: str
+    estimated_input_tokens: int
+    declared_max_output_tokens: int | None
+
+
+def _read_llm_request_profile(request: httpx.Request) -> LlmRequestProfile | None:
+    """Read the model, the prompt size and the caller's output cap out
+    of an httpx LLM request body.
+    """
+    try:
+        raw = request.content
+    except Exception:  # noqa: BLE001 — a streamed body we cannot read
+        return None
+    return _profile_from_body_bytes(raw)
+
+
+def _read_prepared_request_profile(request: Any) -> LlmRequestProfile | None:
+    """Same, for a ``requests.PreparedRequest`` — the `requests` path's
+    request object. Its body lives on ``.body`` (bytes or str), not on
+    ``.content``.
+    """
+    body = getattr(request, "body", None)
+    if isinstance(body, str):
+        raw: bytes | None = body.encode("utf-8", "replace")
+    elif isinstance(body, (bytes, bytearray)):
+        raw = bytes(body)
+    else:
+        raw = None
+    return _profile_from_body_bytes(raw)
+
+
+def _profile_from_body_bytes(raw: bytes | None) -> LlmRequestProfile | None:
+    """Read the model, the prompt size and the caller's output cap out
+    of an LLM request body.
+
+    Returns ``None`` when the body is not a JSON object carrying a
+    ``model`` — i.e. when the request is not a model invocation we can
+    price (a ``GET /v1/models``, a file upload). Those requests produce
+    no ``llm_call`` event either, so there is nothing to reserve for
+    them and nothing to price.
+    """
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    model = payload.get("model")
+    if not isinstance(model, str) or not model:
+        return None
+
+    declared_max_output_tokens: int | None = None
+    for field in _MAX_OUTPUT_TOKEN_FIELDS:
+        value = payload.get(field)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            declared_max_output_tokens = value
+            break
+
+    chunks: list[str] = []
+    _collect_prompt_text(payload, chunks)
+    estimated_input_tokens = min(
+        _estimate_tokens("".join(chunks)),
+        _MAX_ESTIMATED_INPUT_TOKENS,
+    )
+    return LlmRequestProfile(
+        model=model,
+        estimated_input_tokens=estimated_input_tokens,
+        declared_max_output_tokens=declared_max_output_tokens,
+    )
+
+
+def _ambient_reservation_in_scope() -> str | None:
+    """The reservation the CURRENT scope already holds, or ``None``.
+
+    The ``@protect`` path calls ``/gate`` once for the whole protected
+    scope, and the LLM call inside that scope settles THAT
+    reservation — the transport's cost event carries it as the
+    server-minted execution id. If the transport minted a second
+    reservation for the same call, the scope's reservation would never
+    be settled and would hold budget until the reclaim worker ran.
+
+    So: when the scope already holds a FRESH reservation, the transport
+    does not pre-flight a second time. The scope's own reservation is
+    the call's reservation.
+
+    "Fresh" is the same 295 s window the runtime uses to drop a stale
+    server-minted capture (``SERVER_MINTED_RESERVATION_MAX_AGE_SECONDS``)
+    — the two must agree, or the transport would skip a pre-flight for
+    a reservation the runtime considers stale.
+    """
+    try:
+        from nullrun.context import (
+            get_server_minted_execution_id,
+            get_server_minted_reservation_at,
+        )
+    except Exception:  # pragma: no cover — defensive
+        return None
+    smid = get_server_minted_execution_id()
+    if not smid:
+        return None
+    try:
+        import time as _time
+
+        from nullrun.runtime import SERVER_MINTED_RESERVATION_MAX_AGE_SECONDS
+
+        age = _time.monotonic() - get_server_minted_reservation_at()
+    except Exception:  # pragma: no cover — defensive
+        return None
+    if age >= SERVER_MINTED_RESERVATION_MAX_AGE_SECONDS:
+        return None
+    return smid
+
+
+def _preflight_llm_call(
+    runtime: Any,
+    profile: LlmRequestProfile | None,
+) -> tuple[str | None, str | None]:
+    """Reserve the money for ONE provider request before it leaves.
+
+    Returns ``(reservation_id, model)``. ``reservation_id`` is ``None``
+    when no reservation was made (the scope already holds one, no
+    workflow bound to the key, the gate failed open, or the body
+    carried nothing to price); ``model`` is the model's name when the
+    profile carried one, so the caller can release the reservation with
+    a model-bearing event.
+
+    A REFUSAL raises out of here, and that is the point: the provider
+    request must not be sent when the budget says no. The transport
+    failure posture is unchanged from the rest of the SDK — an
+    unreachable gate fails OPEN (a dead backend must not freeze the
+    agent), and the call is then unreserved and its cost event is
+    dropped, exactly as before this change.
+    """
+    if profile is None:
+        return (None, None)
+    ambient = _ambient_reservation_in_scope()
+    if ambient:
+        # The scope already holds a reservation (the `@protect` gate
+        # call). Reuse it — a second reserve would strand the first.
+        return (None, profile.model)
+    check = getattr(runtime, "check_workflow_budget", None)
+    if not callable(check):
+        # A test double or a runtime that predates the pre-flight.
+        return (None, profile.model)
+    reservation_id = check(
+        model=profile.model,
+        # 0 means "the body carried no prompt" — the historical
+        # one-token reserve is the smallest honest number then.
+        estimated_tokens=profile.estimated_input_tokens or None,
+        max_output_tokens=profile.declared_max_output_tokens,
+        # Each provider call needs its OWN reservation. The chain-mode
+        # cache replays a previous response — including its reservation
+        # id — so a cached "allow" would hand this call the previous
+        # call's reservation.
+        use_gate_cache=False,
+    )
+    if not isinstance(reservation_id, str) or not reservation_id:
+        return (None, profile.model)
+    return (reservation_id, profile.model)
+
+
+def _track_with_reservation(
+    runtime: Any,
+    event: dict[str, Any],
+    reservation_id: str | None,
+) -> None:
+    """``runtime.track`` with the reservation attached — but ONLY when
+    there is one.
+
+    The call shape is unchanged for the no-reservation case, so a
+    duck-typed runtime (a test double, an older SDK) that implements
+    ``track(event)`` keeps working. Passing a keyword it does not
+    accept would raise, and the transport swallows track failures —
+    which would silently drop the cost event.
+    """
+    if reservation_id:
+        runtime.track(event, reservation_id=reservation_id)
+    else:
+        runtime.track(event)
+
+
+def _release_reservation(
+    runtime: Any,
+    reservation_id: str | None,
+    model: str | None,
+    host: str,
+    reason: str,
+) -> None:
+    """Settle a reservation that no usage event will ever consume.
+
+    A reservation is MONEY: the backend books it into the period
+    counter when it is minted, and takes it back when the matching
+    /track consumes it. If the call failed, or the provider's answer
+    carried no usage block, no usage event follows — and the reserve
+    would sit on the counter until the reclaim worker runs, holding
+    budget the org never spent. One zero-token /track settles it now.
+
+    A release without a model is skipped: the backend refuses an
+    ``llm_call`` with no model, and a refused event settles nothing.
+    The reclaim worker is the backstop for that case.
+    """
+    if not reservation_id or not model:
+        return
+    try:
+        _track_with_reservation(
+            runtime,
+            {
+                "type": "llm_call",
+                "provider": _provider_label(host),
+                "host": host,
+                "model": model,
+                "tokens": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "has_usage": False,
+                "metadata": {
+                    "tracked": True,
+                    "reservation_released": True,
+                    "release_reason": reason,
+                },
+                # Deterministic in the reservation id, so a retry of the
+                # SAME call still collapses in the dedup LRU, while two
+                # different calls never share one.
+                "_fingerprint": f"nullrun-release-{reservation_id}",
+            },
+            reservation_id,
+        )
+    except Exception as e:  # pragma: no cover — defensive
+        logger.warning(
+            "NullRun transport: releasing reservation %s failed: %s",
+            reservation_id,
+            e,
+        )
+
+
 def _match_extractor(host: str) -> Callable[[bytes, int], ExtractedUsage | None] | None:
     """Return the extractor for `host`, or None if the host is not a known
     LLM endpoint. We match exact host first, then any subdomain (e.g.
@@ -807,7 +1154,24 @@ class NullRunSyncTransport(httpx.BaseTransport):
         extractor = _match_extractor(host)
         if extractor is None:
             return self._inner.handle_request(request)
-        response = self._inner.handle_request(request)
+        # ADR-101: reserve what THIS call is expected to cost BEFORE it
+        # reaches the provider. A refusal raises out of here, so the
+        # hard budget cap stops THIS call, not the next one.
+        reservation_id, reserved_model = _preflight_llm_call(
+            self._runtime, _read_llm_request_profile(request)
+        )
+        try:
+            response = self._inner.handle_request(request)
+        except Exception:
+            # The provider request failed. No usage event will follow,
+            # so the reservation would sit on the period counter until
+            # the reclaim worker runs — holding budget the org never
+            # spent. Settle it now.
+            _release_reservation(
+                self._runtime, reservation_id, reserved_model, host,
+                "request_failed",
+            )
+            raise
         try:
             # MAX_RESPONSE_BYTES for tracking purposes. Above the cap
             # we skip tracking (the user still gets the full body via
@@ -823,6 +1187,10 @@ class NullRunSyncTransport(httpx.BaseTransport):
                 # because usage wasn't extractable). Drain the body
                 # so callers don't see a half-consumed response.
                 _emit_streaming_skipped(self._runtime, request, host)
+                _release_reservation(
+                    self._runtime, reservation_id, reserved_model, host,
+                    "body_exceeded_cap",
+                )
                 logger.debug(
                     "NullRun transport: response from %s exceeded %d bytes; "
                     "skipping usage tracking",
@@ -834,14 +1202,31 @@ class NullRunSyncTransport(httpx.BaseTransport):
                     return response
         except Exception as e:  # pragma: no cover — defensive
             logger.debug("NullRun transport: failed to read body: %s", e)
+            _release_reservation(
+                self._runtime, reservation_id, reserved_model, host,
+                "body_unreadable",
+            )
             return response
         if not body:
+            _release_reservation(
+                self._runtime, reservation_id, reserved_model, host,
+                "empty_body",
+            )
             return response
         usage = extractor(body, response.status_code)
         if usage is None:
+            # The provider answered but its body carried no usage block.
+            # Nothing to bill, and no event will consume the reserve.
+            _release_reservation(
+                self._runtime, reservation_id, reserved_model, host,
+                "usage_not_extractable",
+            )
             # Reconstruct the response so callers can still consume the body.
             return self._rebuild(response, body, request)
-        self._emit(request, host, usage, body, response.status_code)
+        self._emit(
+            request, host, usage, body, response.status_code,
+            reservation_id=reservation_id,
+        )
         return self._rebuild(response, body, request)
 
     @staticmethod
@@ -859,6 +1244,8 @@ class NullRunSyncTransport(httpx.BaseTransport):
         usage: ExtractedUsage,
         body: bytes,
         status: int,
+        *,
+        reservation_id: str | None = None,
     ) -> None:
         # for ``model`` (response body lacked the field — observed for
         # some OpenAI Responses-API and Anthropic streaming edge cases)
@@ -877,8 +1264,10 @@ class NullRunSyncTransport(httpx.BaseTransport):
             or _extract_model_from_request_body(request)
         )
         try:
-            self._runtime.track(
-                _build_llm_call_event(host, usage, model_for_event)
+            _track_with_reservation(
+                self._runtime,
+                _build_llm_call_event(host, usage, model_for_event),
+                reservation_id,
             )
         except Exception as e:
             logger.debug("NullRun transport: track failed: %s", e)
@@ -912,7 +1301,19 @@ class NullRunAsyncTransport(httpx.AsyncBaseTransport):
         extractor = _match_extractor(host)
         if extractor is None:
             return await self._inner.handle_async_request(request)
-        response = await self._inner.handle_async_request(request)
+        # ADR-101: same pre-flight as the sync path — reserve the
+        # expected cost of THIS call before the provider request.
+        reservation_id, reserved_model = _preflight_llm_call(
+            self._runtime, _read_llm_request_profile(request)
+        )
+        try:
+            response = await self._inner.handle_async_request(request)
+        except Exception:
+            _release_reservation(
+                self._runtime, reservation_id, reserved_model, host,
+                "request_failed",
+            )
+            raise
         try:
             body = await _aread_body_with_cap(response, MAX_RESPONSE_BYTES)
             if body is None:
@@ -920,6 +1321,10 @@ class NullRunAsyncTransport(httpx.AsyncBaseTransport):
                 # so the call counts toward coverage (host known
                 # tracked: false because usage wasn't extractable).
                 _emit_streaming_skipped(self._runtime, request, host)
+                _release_reservation(
+                    self._runtime, reservation_id, reserved_model, host,
+                    "body_exceeded_cap",
+                )
                 logger.debug(
                     "NullRun transport: async response from %s exceeded %d bytes; "
                     "skipping usage tracking",
@@ -931,13 +1336,28 @@ class NullRunAsyncTransport(httpx.AsyncBaseTransport):
                     return response
         except Exception as e:  # pragma: no cover — defensive
             logger.debug("NullRun transport: failed to read async body: %s", e)
+            _release_reservation(
+                self._runtime, reservation_id, reserved_model, host,
+                "body_unreadable",
+            )
             return response
         if not body:
+            _release_reservation(
+                self._runtime, reservation_id, reserved_model, host,
+                "empty_body",
+            )
             return response
         usage = extractor(body, response.status_code)
         if usage is None:
+            _release_reservation(
+                self._runtime, reservation_id, reserved_model, host,
+                "usage_not_extractable",
+            )
             return self._rebuild(response, body, request)
-        self._emit(request, host, usage, body, response.status_code)
+        self._emit(
+            request, host, usage, body, response.status_code,
+            reservation_id=reservation_id,
+        )
         return self._rebuild(response, body, request)
 
     @staticmethod
@@ -955,6 +1375,8 @@ class NullRunAsyncTransport(httpx.AsyncBaseTransport):
         usage: ExtractedUsage,
         body: bytes,
         status: int,
+        *,
+        reservation_id: str | None = None,
     ) -> None:
         # request-body model fallback (lines 882-885) so async
         # Anthropic / OpenAI streaming clients without ``usage.model``
@@ -973,8 +1395,10 @@ class NullRunAsyncTransport(httpx.AsyncBaseTransport):
             or _extract_model_from_request_body(request)
         )
         try:
-            self._runtime.track(
-                _build_llm_call_event(host, usage, model_for_event)
+            _track_with_reservation(
+                self._runtime,
+                _build_llm_call_event(host, usage, model_for_event),
+                reservation_id,
             )
         except Exception as e:
             logger.debug("NullRun transport: async track failed: %s", e)

@@ -48,7 +48,11 @@ from typing import Any
 from nullrun.instrumentation.auto import (
     _fingerprint_for,
     _match_extractor,
+    _preflight_llm_call,
     _provider_label,
+    _read_prepared_request_profile,
+    _release_reservation,
+    _track_with_reservation,
 )
 
 logger = logging.getLogger(__name__)
@@ -87,6 +91,8 @@ def _emit_to_runtime(
     usage: dict[str, Any],
     body: bytes,
     status: int,
+    *,
+    reservation_id: str | None = None,
 ) -> None:
     """Single-source-of-truth for emitting an LLM call event from any
     transport. Kept in this module (rather than re-exported from
@@ -97,7 +103,8 @@ def _emit_to_runtime(
     the SDK's `_match_extractor` identified a known provider.
     """
     try:
-        runtime.track(
+        _track_with_reservation(
+            runtime,
             {
                 "type": "llm_call",
                 "provider": _provider_label(host),
@@ -112,7 +119,8 @@ def _emit_to_runtime(
                 },
                 "raw_usage": usage,
                 "_fingerprint": _fingerprint_for(host, body, status),
-            }
+            },
+            reservation_id,
         )
     except Exception as e:
         logger.debug("NullRun requests transport: track failed: %s", e)
@@ -222,14 +230,41 @@ def patch_requests(runtime: Any) -> bool:
             # tagged `metadata.streaming_skipped: true` so the
             # backend can still see the call in coverage.
             if _is_streaming_request(request, kwargs):
+                # ADR-101: the pre-flight still runs for a streamed
+                # call — that is what lets the budget cap stop THIS
+                # call before it leaves. The reserve is released right
+                # after: a streamed body is never read, so its usage
+                # is never known and nothing will settle it later.
+                stream_reservation: str | None = None
+                stream_model: str | None = None
+                if _match_extractor(host) is not None:
+                    stream_reservation, stream_model = _preflight_llm_call(
+                        runtime, _read_prepared_request_profile(request)
+                    )
                 _emit_streaming_skipped_to_runtime(runtime, request, host)
+                _release_reservation(
+                    runtime, stream_reservation, stream_model, host,
+                    "streaming_skipped",
+                )
                 return _orig_session_send(self, request, **kwargs)
 
             extractor = _match_extractor(host)
             if extractor is None:
                 return _orig_session_send(self, request, **kwargs)
 
-            response = _orig_session_send(self, request, **kwargs)
+            # ADR-101: reserve the expected cost of THIS call before the
+            # provider request leaves. A refusal raises out of here.
+            reservation_id, reserved_model = _preflight_llm_call(
+                runtime, _read_prepared_request_profile(request)
+            )
+            try:
+                response = _orig_session_send(self, request, **kwargs)
+            except Exception:
+                _release_reservation(
+                    runtime, reservation_id, reserved_model, host,
+                    "request_failed",
+                )
+                raise
             try:
                 # `response.content` is the fully-materialized bytes.
                 # For non-streaming responses this is the body; for
@@ -240,12 +275,24 @@ def patch_requests(runtime: Any) -> bool:
                 logger.debug(
                     "NullRun requests transport: failed to read body: %s", e
                 )
+                _release_reservation(
+                    runtime, reservation_id, reserved_model, host,
+                    "body_unreadable",
+                )
                 return response
             if not body:
+                _release_reservation(
+                    runtime, reservation_id, reserved_model, host,
+                    "empty_body",
+                )
                 return response
 
             usage = extractor(body, response.status_code)
             if usage is None:
+                _release_reservation(
+                    runtime, reservation_id, reserved_model, host,
+                    "usage_not_extractable",
+                )
                 return response
 
             # Mark BEFORE the track call so a track-failure (network
@@ -261,7 +308,8 @@ def patch_requests(runtime: Any) -> bool:
                 # is deduped by fingerprint at the track sink).
                 pass
             _emit_to_runtime(
-                runtime, request, host, usage, body, response.status_code
+                runtime, request, host, usage, body, response.status_code,
+                reservation_id=reservation_id,
             )
             return response
 
