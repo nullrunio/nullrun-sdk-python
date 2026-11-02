@@ -953,11 +953,9 @@ def _preflight_llm_call(
         # one-token reserve is the smallest honest number then.
         estimated_tokens=profile.estimated_input_tokens or None,
         max_output_tokens=profile.declared_max_output_tokens,
-        # Each provider call needs its OWN reservation. The chain-mode
-        # cache replays a previous response — including its reservation
-        # id — so a cached "allow" would hand this call the previous
-        # call's reservation.
-        use_gate_cache=False,
+        # Each provider call gets its OWN reservation: there is no
+        # in-process gate cache, so every call here is a separate
+        # /gate call that mints its own reservation id (SDK-1).
     )
     if not isinstance(reservation_id, str) or not reservation_id:
         return (None, profile.model)

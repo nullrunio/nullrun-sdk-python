@@ -1095,234 +1095,86 @@ class TestGateExecutionId:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# BUG #5 — In-process gate cache for chain-mode
-# ─────────────────────────────────────────────────────────────────────
-
-
-class TestGateCache:
-    """BUG #5 (2026-07-04): chain-mode /check calls should be served
-    from an in-process 5s TTL cache, not hit /gate every time.
-    Single-shot (Hard mode) callers MUST NOT cache.
-
-    These tests pin the cache data-structure invariants + opt-out
-    behavior. The runtime-level integration (10 chain-mode calls
-    collapse to 1 HTTP roundtrip) is covered by an end-to-end smoke
-    against the live API per docs/runbooks/budget-blue-green-smoke.sh
-    Invariant 12. The runtime construction needed for in-process
-    respx-mocked tests has its own env-bypass quirks; the data
-    structure tests below are the durable contract."""
-
-    def setup_method(self):
-        from nullrun import runtime
-        runtime._GATE_CACHE.clear()
-
-    def test_cache_is_dict_with_ttl_5s(self):
-        from nullrun import runtime
-        assert isinstance(runtime._GATE_CACHE, dict)
-        assert runtime._GATE_CACHE_TTL_SECONDS == 5.0
-
-    def test_store_and_retrieve_within_ttl(self):
-        import time as _time
-
-        from nullrun import runtime
-        k = ("wf-x", "chain-y", "model-z", 1)
-        runtime._GATE_CACHE[k] = (_time.monotonic(), {"decision": "allow"})
-        cached = runtime._GATE_CACHE.get(k)
-        assert cached is not None
-        assert cached[1]["decision"] == "allow"
-
-    def test_per_chain_cache_key_isolation(self):
-        import time as _time
-
-        from nullrun import runtime
-        k1 = ("wf-x", "chain-A", "model-z", 1)
-        k2 = ("wf-x", "chain-B", "model-z", 1)
-        runtime._GATE_CACHE[k1] = (_time.monotonic(), {"decision": "allow"})
-        runtime._GATE_CACHE[k2] = (_time.monotonic(), {"decision": "block"})
-        assert runtime._GATE_CACHE.get(k1)[1]["decision"] == "allow"
-        assert runtime._GATE_CACHE.get(k2)[1]["decision"] == "block"
-
-    def test_cache_gate_disabled_when_no_chain_id(self):
-        # Mirror the runtime's cache_enabled predicate:
-        # chain_id is not None AND NULLRUN_GATE_CACHE_DISABLE != "1"
-        import os
-        os.environ["NULLRUN_GATE_CACHE_DISABLE"] = ""
-        chain_id = None
-        cache_enabled = (
-            chain_id is not None
-            and not os.environ.get("NULLRUN_GATE_CACHE_DISABLE", "").strip() == "1"
-        )
-        assert cache_enabled is False
-
-    def test_cache_gate_disabled_via_env(self):
-        import os
-        os.environ["NULLRUN_GATE_CACHE_DISABLE"] = "1"
-        chain_id = "chain-y"
-        cache_enabled = (
-            chain_id is not None
-            and not os.environ.get("NULLRUN_GATE_CACHE_DISABLE", "").strip() == "1"
-        )
-        assert cache_enabled is False
-        os.environ.pop("NULLRUN_GATE_CACHE_DISABLE", None)
-
-    def test_invalidate_drops_only_matching_chain(self):
-        # 2026-09-12 (DEF-CACHE-STALE-ALLOW-AFTER-OVERBUDGET): the
-        # invalidation must drop ONLY entries whose chain_id matches.
-        # Pre-fix the invalidation read chain_id from
-        # ``wire_event.get("chain_id")`` which is always None
-        # (chain_id lives in the contextvar, not on the per-call
-        # wire_event dict). That bug over-invalidated to all chains
-        # for the same workflow_id — safe but wasteful, and it
-        # leaked cache pressure onto unrelated chains. Pin that
-        # the helper accepts an explicit chain_id and only drops
-        # entries with that exact chain_id.
-        import time as _time
-
-        from nullrun import runtime
-
-        k_failing = ("wf-x", "chain-fail", "model-z", 1)
-        k_other = ("wf-x", "chain-other", "model-z", 1)
-        runtime._GATE_CACHE[k_failing] = (_time.monotonic(), {"decision": "allow"})
-        runtime._GATE_CACHE[k_other] = (_time.monotonic(), {"decision": "allow"})
-
-        dropped = runtime._invalidate_gate_cache_for_chain("wf-x", "chain-fail")
-        assert dropped == 1
-        assert k_failing not in runtime._GATE_CACHE
-        assert k_other in runtime._GATE_CACHE  # unrelated chain preserved
-
-    def test_invalidate_with_none_chain_id_drops_all_for_workflow(self):
-        # 2026-09-12 (DEF-CACHE-STALE-ALLOW-AFTER-OVERBUDGET): the
-        # helper's ``chain_id is None`` branch drops EVERY entry
-        # for the matching workflow_id regardless of chain. This
-        # is the rare-but-defensive path — the caller chose not to
-        # scope by chain (e.g. transport-layer aggregate that
-        # doesn't know the chain). Pin the branch so a future
-        # refactor that breaks the None-OR-match predicate fails
-        # here before the wire layer regresses.
-        import time as _time
-
-        from nullrun import runtime
-
-        k_a = ("wf-y", "chain-a", "model-z", 1)
-        k_b = ("wf-y", "chain-b", "model-z", 1)
-        k_other_wf = ("wf-other", "chain-a", "model-z", 1)
-        runtime._GATE_CACHE[k_a] = (_time.monotonic(), {"decision": "allow"})
-        runtime._GATE_CACHE[k_b] = (_time.monotonic(), {"decision": "allow"})
-        runtime._GATE_CACHE[k_other_wf] = (_time.monotonic(), {"decision": "allow"})
-
-        dropped = runtime._invalidate_gate_cache_for_chain("wf-y", None)
-        assert dropped == 2
-        assert k_a not in runtime._GATE_CACHE
-        assert k_b not in runtime._GATE_CACHE
-        assert k_other_wf in runtime._GATE_CACHE  # unrelated workflow preserved
-
-    def test_invalidate_with_none_workflow_id_drops_all_for_chain(self):
-        # 2026-09-12 (DEF-CACHE-STALE-ALLOW-AFTER-OVERBUDGET): the
-        # mirror branch — ``workflow_id is None`` drops EVERY entry
-        # for the matching chain_id regardless of workflow. Same
-        # defensive-rationale as the chain_id=None case but in the
-        # opposite dimension.
-        import time as _time
-
-        from nullrun import runtime
-
-        k_a = ("wf-a", "chain-z", "model-z", 1)
-        k_b = ("wf-b", "chain-z", "model-z", 1)
-        k_other_chain = ("wf-a", "chain-other", "model-z", 1)
-        runtime._GATE_CACHE[k_a] = (_time.monotonic(), {"decision": "allow"})
-        runtime._GATE_CACHE[k_b] = (_time.monotonic(), {"decision": "allow"})
-        runtime._GATE_CACHE[k_other_chain] = (_time.monotonic(), {"decision": "allow"})
-
-        dropped = runtime._invalidate_gate_cache_for_chain(None, "chain-z")
-        assert dropped == 2
-        assert k_a not in runtime._GATE_CACHE
-        assert k_b not in runtime._GATE_CACHE
-        assert k_other_chain in runtime._GATE_CACHE  # unrelated chain preserved
-
-    def test_invalidate_with_both_none_drops_everything(self):
-        # 2026-09-12 (DEF-CACHE-STALE-ALLOW-AFTER-OVERBUDGET): both
-        # dimensions None → drop the whole cache. Reserved for the
-        # never-seen-in-prod "drop everything, the world is on fire"
-        # path (e.g. manual operator flush via debug API).
-        import time as _time
-
-        from nullrun import runtime
-
-        runtime._GATE_CACHE[("wf-1", "c-1", "m", 1)] = (_time.monotonic(), {"decision": "allow"})
-        runtime._GATE_CACHE[("wf-2", "c-2", "m", 1)] = (_time.monotonic(), {"decision": "allow"})
-
-        dropped = runtime._invalidate_gate_cache_for_chain(None, None)
-        assert dropped == 2
-        assert runtime._GATE_CACHE == {}
-
-    def test_invalidate_on_empty_cache_returns_zero(self):
-        # 2026-09-12 (DEF-CACHE-STALE-ALLOW-AFTER-OVERBUDGET): the
-        # ``if not _GATE_CACHE: return 0`` short-circuit when the
-        # cache is empty. Without this branch the helper would
-        # still scan an empty dict and return 0, but the early
-        # return avoids building the (empty) list comprehension
-        # at all. Pin the branch so a future refactor that drops
-        # the short-circuit (e.g. someone replaces it with a
-        # `len(...) == 0` check that's a different shape) is caught
-        # before it ships.
-        from nullrun import runtime
-
-        # Cache is empty (setup_method clears it).
-        assert runtime._GATE_CACHE == {}
-        dropped = runtime._invalidate_gate_cache_for_chain("wf-anything", "chain-anything")
-        assert dropped == 0
-
-
-# ─────────────────────────────────────────────────────────────────────
-# BUG #5 — chain-mode gate cache at the runtime level
-#`)
+# SDK-1 — the in-process gate cache is GONE (regression pins)
 # ─────────────────────────────────────────────────────────────────────
 #
-# The TestGateCache data-structure tests above pin the runtime's
-# `_GATE_CACHE` dict invariants in isolation; this class drives the
-# full NullRunRuntime.check_workflow_budget path so the
-# cache_enabled predicate + cache hit/miss branches in
-# ``runtime.py:1287-1310`` are actually exercised end-to-end. Without
-# these tests ``pytest-cov`` reports that exact range as uncovered
-# which dragged patch coverage on PR #52 below the 70% Codecov floor.
+# There was a chain-mode short-circuit keyed on
+# ``(workflow_id, chain_id, call_model, estimated_tokens)`` that served a
+# previous ``/gate`` answer for up to five seconds. It was not a cache,
+# it was a second authorisation path with no gate behind it:
+#
+#   * the key carried no org id, no api key id and no tool set, so one
+#     chain's "allow" could be served to another chain, or to a
+#     different tool inside the same chain, whose call was never
+#     checked;
+#   * the cached body carried call #1's ``reservation_id`` and the
+#     runtime re-captured it for every later step, so every step of a
+#     chain ran under ONE server-minted execution id. The backend
+#     settles an execution id at most once (``consume_v3.lua`` answers
+#     IDEMPOTENT_REPLAY for an execution that is already ``consumed``
+#     and books nothing), so a three-step chain performed three tool
+#     executions and produced ONE accounting event — the money for
+#     steps 2 and 3 was never billed;
+#   * the tool-block check never ran for a cached step either.
+#
+# The backend owns the chain: ``chain_op`` (start / continue / end) and
+# the chain TTL are enforced there, and every ``/gate`` inside a chain
+# reserves and settles its own envelope. The backend's own idempotency
+# store (``idempotency_key`` = the SDK's ``operation_id``) dedupes a
+# genuine RETRY of one logical action and nothing else.
+
+# Three distinct server-minted reservation ids (uuidv7 layout — the
+# version nibble is the first hex char of the third group).
+_SDK1_RESERVATIONS = [
+    "0190c5b5-7c9a-7def-8a1b-0123456789ab",
+    "0190c5b5-7c9a-7def-8a1b-fedcba987654",
+    "0190c5b5-7c9a-7def-8a1b-0123456789cd",
+]
 
 
-class TestGateCacheRuntimeFlow:
-    """Runtime-level chain-mode gate cache coverage.
+class TestNoInProcessGateCache:
+    """The gate cache must not come back in any shape."""
 
-    Drives ``NullRunRuntime.check_workflow_budget `` inside
-    ``with workflow(...) + with chain(...)`` and verifies the
-    /gate roundtrip count vs. expected after the 5s in-process
-    cache is applied.
+    def test_the_runtime_module_has_no_gate_cache(self):
+        from nullrun import runtime
+
+        assert not hasattr(runtime, "_GATE_CACHE"), (
+            "the in-process gate cache is gone (SDK-1): a client-side "
+            "short-circuit is a second authorisation path with no gate "
+            "behind it"
+        )
+        assert not hasattr(runtime, "_GATE_CACHE_TTL_SECONDS")
+        assert not hasattr(runtime, "_invalidate_gate_cache_for_chain")
+
+    def test_check_workflow_budget_has_no_use_gate_cache_switch(self):
+        import inspect
+
+        from nullrun.runtime import NullRunRuntime
+
+        params = inspect.signature(NullRunRuntime.check_workflow_budget).parameters
+        assert "use_gate_cache" not in params, (
+            "the cache switch is gone with the cache: a switch that "
+            "re-enables it is the same defect one level down"
+        )
+
+    def test_the_cache_disable_env_var_is_gone(self):
+        # The opt-out env var is dead. It must not linger as a way to
+        # re-enable (or, worse, to be mistaken for) the cache.
+        import inspect
+
+        from nullrun import runtime
+
+        source = inspect.getsource(runtime)
+        assert "NULLRUN_GATE_CACHE_DISABLE" not in source
+
+
+class TestChainStepsAreAdmittedIndividually:
+    """SDK-1 at the runtime level: every step of a chain is its own
+    ``/gate`` call and its own reservation.
     """
 
-    def setup_method(self):
-        from nullrun import runtime as rt_mod
-
-        rt_mod._GATE_CACHE.clear()
-
-    def teardown_method(self):
-        from nullrun import runtime as rt_mod
-
-        rt_mod._GATE_CACHE.clear()
-        # Always unset the gate-cache-disable opt-out so tests don't
-        # leak state between runs.
-        import os
-
-        os.environ.pop("NULLRUN_GATE_CACHE_DISABLE", None)
-
     @respx.mock
-    def test_chain_mode_collapses_three_checks_to_one_gate_call(self):
-        """3 consecutive check_workflow_budget inside `with chain(...)`
-        must hit /gate exactly ONCE — the 2nd and 3rd calls fall
-        into the cache hit branch (runtime.py:1302).
-
-        Covers:
-          runtime.py:1291-1310 (cache_enabled predicate)
-          runtime.py:1302 (cache hit `response = cached[1]`)
-          runtime.py:1306 (cache miss → transport.check + store).
-        """
-
+    def test_three_chain_checks_make_three_gate_calls(self):
         respx.post(f"{BASE_URL}/api/v1/gate").mock(
             return_value=Response(
                 200,
@@ -1336,20 +1188,16 @@ class TestGateCacheRuntimeFlow:
             polling=False,  # no background WS/HTTP poll thread
         )
         try:
-            with workflow("wf-runtime-cache") as _wf_id, chain(
-                str(uuid.uuid4())
-            ) as _cid:
-                # Direct calls in chain scope — bypasses @protect but
-                # exercises the same check_workflow_budget codepath.
+            with workflow("wf-sdk1"), chain(str(uuid.uuid4())):
                 rt_inst.check_workflow_budget()
                 rt_inst.check_workflow_budget()
                 rt_inst.check_workflow_budget()
             gate_calls = [
                 c for c in respx.calls if c.request.url.path.endswith("/gate")
             ]
-            assert len(gate_calls) == 1, (
-                f"chain-mode cache must collapse 3 calls into 1 /gate "
-                f"roundtrip; got {len(gate_calls)}"
+            assert len(gate_calls) == 3, (
+                f"each chain step must be admitted by its own /gate "
+                f"call; got {len(gate_calls)}"
             )
         finally:
             try:
@@ -1358,162 +1206,154 @@ class TestGateCacheRuntimeFlow:
                 pass
 
     @respx.mock
-    def test_chain_mode_emits_fresh_uuid7_execution_id_per_call(self):
-        """BUG #4 wire at the runtime level: every /gate payload must
-        carry a fresh execution_id == uuid7 (NOT workflow_id).
+    def test_each_chain_step_gets_its_own_server_minted_reservation(self):
+        # The money-relevant half of SDK-1. Pre-fix the cache served
+        # call #1's ``reservation_id`` to steps 2 and 3, so the
+        # backend settled ONE execution for THREE tool calls and the
+        # money for steps 2 and 3 was never billed.
+        respx.post(f"{BASE_URL}/api/v1/gate").mock(
+            side_effect=[
+                Response(
+                    200,
+                    json={
+                        "decision": "allow",
+                        "decision_source": "gateway",
+                        "reservation_id": reservation,
+                    },
+                )
+                for reservation in _SDK1_RESERVATIONS
+            ]
+        )
+        rt_inst = NullRunRuntime(
+            api_key="nr_live_abc123",
+            api_url=BASE_URL,
+            _test_mode=True,
+            polling=False,
+        )
+        try:
+            with workflow("wf-sdk1"), chain(str(uuid.uuid4())):
+                got = [
+                    rt_inst.check_workflow_budget() for _ in range(3)
+                ]
+            assert got == _SDK1_RESERVATIONS, (
+                "every chain step must carry the reservation the server "
+                "minted for THAT step; sharing one reservation id means "
+                "the backend settles the chain once and bills one step"
+            )
+        finally:
+            try:
+                rt_inst.shutdown()
+            except Exception:
+                pass
 
-        Disables the chain-mode cache so both ``check_workflow_budget``
-        calls actually POST a /gate body — the cache would otherwise
-        collapse the second call into a hit and we'd never see the
-        second payload.
-
-        Covers:
-          runtime.py:1247-1255 (execution_id = uuid7_str )
-          runtime.py:1310-1323 (no-cache branch — direct transport.check).
-        """
+    @respx.mock
+    def test_every_chain_step_carries_the_tool_list(self):
+        # The cache key had no tool set in it, so a cached step never
+        # ran the tool-block check. Each step must put its tools on the
+        # wire so the backend can block on them.
         import json as _json
-        import os
 
+        from nullrun.context import set_call_context
 
-        os.environ["NULLRUN_GATE_CACHE_DISABLE"] = "1"
-        try:
-            respx.post(f"{BASE_URL}/api/v1/gate").mock(
-                return_value=Response(
-                    200,
-                    json={"decision": "allow", "decision_source": "gateway"},
-                )
-            )
-            rt_inst = NullRunRuntime(
-                api_key="nr_live_abc123",
-                api_url=BASE_URL,
-                _test_mode=True,
-                polling=False,
-            )
-            try:
-                with workflow("wf-runtime-uuid7"), chain(str(uuid.uuid4())):
-                    rt_inst.check_workflow_budget()
-                    rt_inst.check_workflow_budget()
-                gate_calls = [
-                    c for c in respx.calls if c.request.url.path.endswith("/gate")
-                ]
-                assert len(gate_calls) == 2
-                first = _json.loads(gate_calls[0].request.content)["execution_id"]
-                second = _json.loads(gate_calls[1].request.content)["execution_id"]
-                assert first != second
-                assert uuid.UUID(first).version == 7
-                assert uuid.UUID(second).version == 7
-                assert first != "wf-runtime-uuid7"
-                assert second != "wf-runtime-uuid7"
-            finally:
-                try:
-                    rt_inst.shutdown()
-                except Exception:
-                    pass
-        finally:
-            os.environ.pop("NULLRUN_GATE_CACHE_DISABLE", None)
-
-    @respx.mock
-    def test_chain_mode_disabled_via_env_bypasses_cache(self):
-        """NULLRUN_GATE_CACHE_DISABLE=1 → cache_enabled=False → every
-        call hits /gate (runtime.py:1275-1277 fallback, runtime.py:1324
-        direct transport.check path).
-
-        Covers:
-          runtime.py:1294-1295 (cache_enabled=False exit)
-          runtime.py:1310-1323 (no-cache branch).
-        """
-        import os
-
-
-        os.environ["NULLRUN_GATE_CACHE_DISABLE"] = "1"
-        try:
-            respx.post(f"{BASE_URL}/api/v1/gate").mock(
-                return_value=Response(
-                    200,
-                    json={"decision": "allow", "decision_source": "gateway"},
-                )
-            )
-            rt_inst = NullRunRuntime(
-                api_key="nr_live_abc123",
-                api_url=BASE_URL,
-                _test_mode=True,
-                polling=False,
-            )
-            try:
-                with workflow("wf-no-cache"), chain(str(uuid.uuid4())):
-                    rt_inst.check_workflow_budget()
-                    rt_inst.check_workflow_budget()
-                gate_calls = [
-                    c for c in respx.calls if c.request.url.path.endswith("/gate")
-                ]
-                assert len(gate_calls) == 2, (
-                    f"with NULLRUN_GATE_CACHE_DISABLE=1 every call must "
-                    f"hit /gate; got {len(gate_calls)}"
-                )
-            finally:
-                try:
-                    rt_inst.shutdown()
-                except Exception:
-                    pass
-        finally:
-            os.environ.pop("NULLRUN_GATE_CACHE_DISABLE", None)
-
-    @respx.mock
-    def test_runtime_chain_end_invalidates_cache(self, make_runtime):
-        # 2026-09-12 (DEF-CACHE-STALE-ALLOW-AFTER-OVERBUDGET):
-        # ``Runtime.chain_end()`` must invalidate the gate cache
-        # for the closing chain AFTER the wire call succeeds.
-        # The chain is closed on the server; the in-process cache
-        # for that chain is no longer reachable, so dropping it
-        # frees memory and prevents any hypothetical re-use of
-        # the same (workflow_id, chain_id) UUID from hitting the
-        # cached entry. Pin that the invalidation happens after
-        # the wire call (not before) — invalidating before would
-        # free the cache even if the server-side chain-close
-        # failed, leaking cache state into a "chain is closed on
-        # the client side but still open on the server" half-state.
-        import time as _time
-        import uuid as _uuid
-
-        from nullrun import runtime as _rt_mod
-
-        rt = make_runtime()
-
-        # Mock /gate (chain_end uses the same endpoint) to return
-        # success.
         respx.post(f"{BASE_URL}/api/v1/gate").mock(
             return_value=Response(
                 200,
                 json={"decision": "allow", "decision_source": "gateway"},
             )
         )
-
-        workflow_id = rt.workflow_id
-        chain_id = str(_uuid.uuid4())
-        cache_key = (str(workflow_id), chain_id, "claude-sonnet-4-6", 1)
-        _rt_mod._GATE_CACHE[cache_key] = (_time.monotonic(), {"decision": "allow"})
-
-        # Set the chain_id contextvar so chain_end's post-wire
-        # invalidation helper can resolve it. Matches what
-        # ``with chain(...)`` would set.
-        from nullrun.context import set_chain_id
-
-        token = set_chain_id(chain_id)
+        rt_inst = NullRunRuntime(
+            api_key="nr_live_abc123",
+            api_url=BASE_URL,
+            _test_mode=True,
+            polling=False,
+        )
         try:
-            assert cache_key in _rt_mod._GATE_CACHE
-            rt.chain_end(chain_id)
-
-            # The chain is closed on the server and the wire call
-            # returned 200, so the cache must be dropped for
-            # this chain.
-            assert cache_key not in _rt_mod._GATE_CACHE, (
-                "Runtime.chain_end must invalidate the matching "
-                "chain's cache entry after the wire call succeeds "
-                "(DEF-CACHE-STALE-ALLOW-AFTER-OVERBUDGET)"
-            )
+            with workflow("wf-sdk1"), chain(str(uuid.uuid4())):
+                set_call_context(tools=["dangerous_tool"])
+                rt_inst.check_workflow_budget()
+                rt_inst.check_workflow_budget()
+            gate_calls = [
+                c for c in respx.calls if c.request.url.path.endswith("/gate")
+            ]
+            assert len(gate_calls) == 2
+            for call in gate_calls:
+                body = _json.loads(call.request.content)
+                assert body.get("tools") == ["dangerous_tool"], (
+                    "every step must present its tools to the gate"
+                )
         finally:
-            _rt_mod._GATE_CACHE.pop(cache_key, None)
-            _chain_id_var.reset(token)
+            try:
+                rt_inst.shutdown()
+            except Exception:
+                pass
+
+    @respx.mock
+    def test_the_dead_env_var_cannot_bring_the_cache_back(self):
+        # The old opt-out was "the cache is disabled". Now that the
+        # cache is gone, the variable must be inert: it may not change
+        # the number of /gate calls.
+        import os
+
+        os.environ["NULLRUN_GATE_CACHE_DISABLE"] = "1"
+        try:
+            respx.post(f"{BASE_URL}/api/v1/gate").mock(
+                return_value=Response(
+                    200,
+                    json={"decision": "allow", "decision_source": "gateway"},
+                )
+            )
+            rt_inst = NullRunRuntime(
+                api_key="nr_live_abc123",
+                api_url=BASE_URL,
+                _test_mode=True,
+                polling=False,
+            )
+            try:
+                with workflow("wf-sdk1"), chain(str(uuid.uuid4())):
+                    rt_inst.check_workflow_budget()
+                    rt_inst.check_workflow_budget()
+                gate_calls = [
+                    c for c in respx.calls if c.request.url.path.endswith("/gate")
+                ]
+                assert len(gate_calls) == 2
+            finally:
+                try:
+                    rt_inst.shutdown()
+                except Exception:
+                    pass
+        finally:
+            os.environ.pop("NULLRUN_GATE_CACHE_DISABLE", None)
+
+    @respx.mock
+    def test_chain_end_still_closes_the_chain_on_the_server(self):
+        # The cache invalidation that used to hang off ``chain_end``
+        # is gone with the cache. The server-side close must still
+        # happen — that is the part that was never the SDK's to skip.
+        rt_inst = NullRunRuntime(
+            api_key="nr_live_abc123",
+            api_url=BASE_URL,
+            _test_mode=True,
+            polling=False,
+        )
+        gate = respx.post(f"{BASE_URL}/api/v1/gate").mock(
+            return_value=Response(
+                200,
+                json={"decision": "allow", "decision_source": "gateway"},
+            )
+        )
+        try:
+            # `_test_mode` skips the auth handshake, so the org binding
+            # that ``chain_end`` forwards has to be set by hand.
+            rt_inst.organization_id = "org-1"
+            chain_id = str(uuid.uuid4())
+            result = rt_inst.chain_end(chain_id)
+            assert isinstance(result, dict)
+            assert gate.call_count == 1
+        finally:
+            try:
+                rt_inst.shutdown()
+            except Exception:
+                pass
 
 
 # ─── server-minted execution_id ──────────────────────────────────
@@ -2168,19 +2008,22 @@ class TestRouteTrack:
         assert batch_route.call_count == 1
 
     @respx.mock
-    def test_track_single_422_invalidates_chain_cache(self, make_runtime):
+    def test_track_single_422_refused_consume_propagates(self, make_runtime):
         # 2026-09-12 (DEF-CACHE-STALE-ALLOW-AFTER-OVERBUDGET): when
         # ``/track`` returns HTTP 422 (CONSUME_OVERBUDGET) the chain
-        # has hit its budget ceiling. Any cached ``allow`` for the
-        # same (workflow_id, chain_id) must NOT be served for the
-        # next 0–5 s — otherwise a chain firing faster than the
-        # cache TTL over-reserves against a budget the server has
-        # just rejected. _route_track's except handler invalidates
-        # the cache before logging the failure.
-        import time as _time
+        # has hit its budget ceiling.
+        #
+        # Pre-fix the SDK's answer to a refused consume was to drop
+        # an in-process gate cache, so the next step of the chain
+        # could not be served a stale "allow". That cache is gone
+        # (SDK-1) and the refusal is handled where it belongs: the
+        # server refuses the next step's own /gate call, and this
+        # refusal reaches the agent as a typed error.
+        #
+        # The property that matters is unchanged and is the one this
+        # test pins: a refused consume is NOT laundered into an
+        # allowed one (DEF-TC6-006).
         import uuid as _uuid
-
-        from nullrun import runtime as _rt_mod
 
         rt = make_runtime()
 
@@ -2201,22 +2044,11 @@ class TestRouteTrack:
             )
         )
 
-        # Pre-populate the cache so the invalidation has something
-        # to drop. The chain_id matches the contextvar we'll set
-        # below; the workflow_id matches the runtime's bound
-        # workflow. Use uuid4() so the chain_id validator accepts it
-        # (CLAUDE.md §6).
-        workflow_id = rt.workflow_id
-        chain_id = str(_uuid.uuid4())
-        cache_key = (str(workflow_id), chain_id, "claude-sonnet-4-6", 1)
-        _rt_mod._GATE_CACHE[cache_key] = (_time.monotonic(), {"decision": "allow"})
-        assert cache_key in _rt_mod._GATE_CACHE
-
         # Pin the chain_id in the contextvar (matches what
-        # ``with chain(...)`` would set) so the invalidation
-        # helper can resolve it without falling back to None.
+        # ``with chain(...)`` would set).
         from nullrun.context import set_chain_id
 
+        chain_id = str(_uuid.uuid4())
         token = set_chain_id(chain_id)
         try:
             # Capture a server-minted id so _route_track reaches
@@ -2225,14 +2057,6 @@ class TestRouteTrack:
                 {"reservation_id": SERVER_MINTED_V1}
             )
 
-            # DEF-TC6-006 (2026-10-02): the 422 CONSUME_OVERBUDGET
-            # now PROPAGATES to the caller as a typed
-            # NullRunConsumeOverbudgetError instead of being logged
-            # and swallowed. The invalidation this test was written
-            # to pin is unchanged -- it runs above the re-raise in
-            # the same handler -- so the assertion is strengthened,
-            # not relaxed: the blast radius is still closed, and the
-            # agent additionally learns its consume was refused.
             from nullrun.breaker.exceptions import NullRunConsumeOverbudgetError
 
             with pytest.raises(NullRunConsumeOverbudgetError):
@@ -2241,38 +2065,19 @@ class TestRouteTrack:
                     output_tokens=40,
                     model="claude-sonnet-4-6",
                 )
-
-            assert cache_key not in _rt_mod._GATE_CACHE, (
-                "422 from /track must invalidate the matching chain's "
-                "cache entry (DEF-CACHE-STALE-ALLOW-AFTER-OVERBUDGET)"
-            )
         finally:
-            # Reset the cache + the chain contextvar so we don't
-            # leak state into the next test.
-            _rt_mod._GATE_CACHE.pop(cache_key, None)
             _chain_id_var.reset(token)
 
     @respx.mock
-    def test_track_single_402_invalidates_chain_cache(self, make_runtime):
-        # 2026-09-12 (DEF-CACHE-STALE-ALLOW-AFTER-OVERBUDGET): the
-        # 402 path must trigger the same cache invalidation as 422.
-        # Pre-fix code only handled 422 — a 402 with the same
-        # chain-bleed blast radius would have silently kept the
-        # cached allow alive for 5 s while the backend was refusing
-        # consume. We use BUDGET_HARD_BLOCKED (catalog-mapped →
-        # NullRunBudgetError with status_code=402) so the
-        # ``getattr(exc, "status_code", None)`` branch in
-        # ``_route_track``'s except handler fires the same way
-        # the 422 path does. Note: REDIS_UNAVAILABLE is absent
-        # from the v3 catalog (removed 2026-09-10) and would
-        # fall through to the generic NullRunBackendError, whose
-        # status_code lives in ``details`` not as a direct
-        # attribute — a different shape than the runtime
-        # branch's getattr reads.
-        import time as _time
+    def test_track_single_402_refused_consume_propagates(self, make_runtime):
+        # Same shape as the 422 test above: a 402 on the consume path
+        # must reach the agent too. We use BUDGET_HARD_BLOCKED
+        # (catalog-mapped → NullRunBudgetError with status_code=402).
+        # Note: REDIS_UNAVAILABLE is absent from the v3 catalog
+        # (removed 2026-09-10) and would fall through to the generic
+        # NullRunBackendError, whose status_code lives in ``details``
+        # not as a direct attribute.
         import uuid as _uuid
-
-        from nullrun import runtime as _rt_mod
 
         rt = make_runtime()
 
@@ -2288,13 +2093,9 @@ class TestRouteTrack:
             )
         )
 
-        workflow_id = rt.workflow_id
-        chain_id = str(_uuid.uuid4())
-        cache_key = (str(workflow_id), chain_id, "claude-sonnet-4-6", 1)
-        _rt_mod._GATE_CACHE[cache_key] = (_time.monotonic(), {"decision": "allow"})
-
         from nullrun.context import set_chain_id
 
+        chain_id = str(_uuid.uuid4())
         token = set_chain_id(chain_id)
         try:
             _capture_server_minted_execution_id(
@@ -2303,8 +2104,7 @@ class TestRouteTrack:
 
             # DEF-TC6-006: same shape as the 422 test above --
             # NullRunBudgetError is a NullRunBlockedException, which
-            # is a NullRunDecision, so the 402 propagates too. The
-            # cache invalidation still runs before the raise.
+            # is a NullRunDecision, so the 402 propagates too.
             from nullrun.breaker.exceptions import NullRunBudgetError
 
             with pytest.raises(NullRunBudgetError):
@@ -2313,13 +2113,7 @@ class TestRouteTrack:
                     output_tokens=10,
                     model="claude-sonnet-4-6",
                 )
-
-            assert cache_key not in _rt_mod._GATE_CACHE, (
-                "402 from /track must invalidate the matching chain's "
-                "cache entry (DEF-CACHE-STALE-ALLOW-AFTER-OVERBUDGET)"
-            )
         finally:
-            _rt_mod._GATE_CACHE.pop(cache_key, None)
             _chain_id_var.reset(token)
 
 

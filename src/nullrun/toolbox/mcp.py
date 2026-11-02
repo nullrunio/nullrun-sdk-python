@@ -466,7 +466,24 @@ class MCPAdapter:
         # pre-flight → /execute → body).
         from nullrun.context import get_server_minted_execution_id
 
-        if get_server_minted_execution_id() is None:
+        # Via-edge. The BOX is the enforcement surface there: its
+        # ``/enforce`` call is what prices AND charges the call, and
+        # there is no cloud ``/track`` to book it through afterwards.
+        # So every tool call needs its own ask — one box call, one
+        # charge, per tool call.
+        #
+        # The "a /gate already ran for this action" short-circuit is
+        # correct for the cloud (one /gate reserves, one /execute
+        # reuses that reservation, one /track settles it) and wrong
+        # for the edge (one /enforce per tool call). Skipping the ask
+        # on the second tool call would leave the box unconsulted, and
+        # with the SDK-2 fix the /execute then fails CLOSED because
+        # nobody asked — so the second and later MCP calls in an edge
+        # scope must ask the box themselves.
+        _transport = getattr(runtime, "_transport", None)
+        edge_mode = getattr(_transport, "edge", None) is not None
+
+        if edge_mode or get_server_minted_execution_id() is None:
             runtime.check_workflow_budget()
 
         # Every MCP tool call routed through the runtime contacts

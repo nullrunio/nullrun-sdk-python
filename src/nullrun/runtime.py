@@ -113,7 +113,6 @@ from nullrun.breaker.exceptions import (
     NullRunBudgetError,
     NullRunDecision,
     NullRunDeniedError,
-    NullRunError,
     NullRunInfrastructureError,
     NullRunTransportError,
     NullRunWorkflowKilledError,
@@ -129,6 +128,8 @@ from nullrun.context import (
     get_workflow_id,
 )
 from nullrun.edge import EDGE_LEASE as EDGE_LEASE_DECISION_SOURCE
+from nullrun.edge import EDGE_NOT_ENFORCED as EDGE_NOT_ENFORCED_DECISION_SOURCE
+from nullrun.edge import EDGE_UNREACHABLE as EDGE_UNREACHABLE_DECISION_SOURCE
 from nullrun.observability import metrics
 from nullrun.transport import (
     HEADER_PROTOCOL,
@@ -150,66 +151,38 @@ logger = logging.getLogger(__name__)
 # Sentinel used when a gate fires outside a ``with workflow(...)``
 UNKNOWN_WORKFLOW_ID: str = "__nullrun_unknown__"
 
-# In-process gate cache for chain-mode. The cache key includes
-# ``estimated_tokens`` (currently hardcoded to 1 in
-# ``check_workflow_budget``) so two chain-mode calls with the same
-# (workflow_id, chain_id, call_model) but different cost_estimate
-# do not collide and silently serve a cheaper cached allow for
-# a more expensive call. The cache is also invalidated when
-# /track signals budget exhaustion (HTTP 422 from
-# CONSUME_OVERBUDGET) and when ``chain_end`` is called — without
-# this, a chain that exhausts its budget mid-loop could continue
-# serving cached "allow" decisions for up to the TTL after the
-# backend has actually blocked subsequent calls. Invalidations
-# use the active chain_id from the contextvar so unrelated
-# chains sharing the runtime instance are not affected.
-_GATE_CACHE: dict[tuple[str, str | None, str | None, int], tuple[float, dict[str, Any]]] = {}
-_GATE_CACHE_TTL_SECONDS: float = 5.0
-
-
-def _invalidate_gate_cache_for_chain(workflow_id: str | None, chain_id: str | None) -> int:
-    """Drop ``_GATE_CACHE`` entries whose ``(workflow_id, chain_id)``
-    match the supplied pair, regardless of ``call_model`` or
-    ``estimated_tokens``. Returns the number of entries removed.
-
-    Called from two sites:
-      1. ``_route_track`` after ``track_single`` raises HTTP 422
-         (CONSUME_OVERBUDGET) or HTTP 402 (REDIS_UNAVAILABLE for
-         consume-side authoritative check). The backend's
-         authoritative budget check has now said "no further
-         spend", so any cached "allow" for the same chain is stale
-         and must not be served until the chain ends or the
-         budget rolls over.
-      2. ``chain_end`` after the /gate body returns. The chain is
-         closed on the server; the SDK's in-process cache for that
-         chain is no longer reachable from subsequent calls, so
-         dropping it frees memory and prevents a hypothetical
-         re-use of the same (workflow_id, chain_id) UUID from
-         hitting the cached entry (UUID v4 collision risk is
-         negligible but the cleanup costs nothing).
-
-    Args:
-        workflow_id: The workflow whose entries should be dropped.
-            ``None`` matches every workflow with the same chain_id
-            (rare but defensive).
-        chain_id: The chain whose entries should be dropped.
-            ``None`` matches every chain with the same workflow_id.
-
-    Returns:
-        The number of cache entries removed. Useful for tests /
-        metric counters; not currently surfaced.
-    """
-    if not _GATE_CACHE:
-        return 0
-    keys_to_drop = [
-        k
-        for k in _GATE_CACHE
-        if (workflow_id is None or k[0] == workflow_id)
-        and (chain_id is None or k[1] == chain_id)
-    ]
-    for k in keys_to_drop:
-        _GATE_CACHE.pop(k, None)
-    return len(keys_to_drop)
+# There is deliberately NO in-process gate cache.
+#
+# There was one: a chain-mode short-circuit keyed on
+# ``(workflow_id, chain_id, call_model, estimated_tokens)`` that served
+# a previous ``/gate`` answer for up to five seconds. It is gone
+# because it was not a cache, it was a second authorisation path with
+# no gate behind it (SDK-1):
+#
+#   * The key carried no org id, no api key id and no tool set, so one
+#     chain's allow could be served to another chain — or to a
+#     different tool inside the same chain — whose call was never
+#     checked.
+#   * The cached body carried call #1's ``reservation_id``, and the
+#     runtime re-captured it for every later step of the chain. Every
+#     step of the chain therefore ran under ONE server-minted
+#     execution id. The backend settles an execution id at most once
+#     (``consume_v3.lua`` answers IDEMPOTENT_REPLAY for an execution
+#     that is already ``consumed``, and books nothing), so a three-step
+#     chain performed three tool executions and produced ONE
+#     accounting event: the money for steps 2 and 3 was never billed.
+#   * The tool-block check never ran for a cached step either — the key
+#     has no tool set in it.
+#
+# The chain feature it was written for does not need it. The backend
+# owns the chain: ``chain_op`` (start / continue / end) and the chain's
+# TTL are enforced there, and every ``/gate`` inside a chain reserves
+# and settles its own envelope. The backend's own idempotency store
+# (``idempotency_key`` = the SDK's ``operation_id``) is the safe
+# version of what the cache was reaching for: it dedupes a genuine
+# RETRY of one logical action and nothing else. A client-side cache
+# that cannot tell a retry from a new step is the wrong place to put
+# that decision.
 
 
 # Production-environment detection for security opt-out
@@ -2046,8 +2019,25 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
     # producer cannot drift into two different spellings of one value —
     # which is exactly how `is_fallback_decision_source` ended up with
     # two hand-maintained copies.
+    #
+    # `edge_unreachable` and `edge_not_enforced` are the two edge
+    # REFUSALS (the box did not answer / the box was never asked). They
+    # are here for the same reason `edge_lease` is, and with the same
+    # consequence: the runtime must recognise them as real verdicts and
+    # honour the block. They are deliberately NOT fallback sources —
+    # `fallback` means "the engine never answered, and the cloud's
+    # `/track` can still book the call later" (ADR-008), which is not
+    # true in edge mode. See `nullrun.edge.EDGE_UNREACHABLE`.
     _KNOWN_DECISION_SOURCES = frozenset(
-        {"gateway", "cached", "fallback", "local", EDGE_LEASE_DECISION_SOURCE}
+        {
+            "gateway",
+            "cached",
+            "fallback",
+            "local",
+            EDGE_LEASE_DECISION_SOURCE,
+            EDGE_UNREACHABLE_DECISION_SOURCE,
+            EDGE_NOT_ENFORCED_DECISION_SOURCE,
+        }
     )
 
     def _require_gate_decision(self, response: Any) -> str:
@@ -2241,7 +2231,6 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         model: str | None = None,
         estimated_tokens: int | None = None,
         max_output_tokens: int | None = None,
-        use_gate_cache: bool = True,
     ) -> str | None:
         """
         Pre-flight budget check via /api/v1/gate. Called from @protect
@@ -2265,11 +2254,12 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 zero-code path needs in order to reserve the call's own
                 cost instead of one token's worth of it.
             max_output_tokens: overrides the call-context output cap.
-            use_gate_cache: set False by a path that needs its OWN
-                reservation per call. The chain-mode cache replays a
-                previous response — including its reservation id — so a
-                cached "allow" would hand a second LLM call the FIRST
-                call's reservation.
+
+        Every call is a separate ``/gate`` call and mints its own
+        reservation. There is no in-process cache and no
+        ``use_gate_cache`` switch: a cached answer would hand a later
+        call an earlier call's reservation, and the backend settles a
+        reservation once (SDK-1).
 
         Decision → exception mapping:
             "allow" → return
@@ -2615,106 +2605,56 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # action by the backend's binding key.
         check_req["idempotency_key"] = check_req["operation_id"]
 
-        # In-process gate cache for chain-mode invocations. See
-        # module-top comment on _GATE_CACHE for full rationale.
+        # One /gate call per logical action. There is no in-process
+        # cache and no short-circuit for chain mode: a cached answer
+        # would carry an earlier call's reservation id, and the backend
+        # settles a reservation once — so the later steps of a chain
+        # would run tool calls that are never billed (SDK-1). See the
+        # module-top comment for the full mechanism.
         response: dict[str, Any]
-        cache_key: tuple[str, str | None, str | None, int] | None = None
-        cache_enabled = (
-            chain_id is not None
-            and use_gate_cache
-            and not os.environ.get("NULLRUN_GATE_CACHE_DISABLE", "").strip() == "1"
-        )
-        if cache_enabled:
-            cache_key = (str(workflow_id), chain_id, call_model, check_req.get("estimated_tokens", 1))
-            cached = _GATE_CACHE.get(cache_key)
-            if cached is not None and (time.monotonic() - cached[0]) < _GATE_CACHE_TTL_SECONDS:
-                # Cache hit within TTL — reuse the response without a
-                response = cached[1]
-            else:
-                # Cache miss or expired — go to the server, then store.
-                try:
-                    response = self._transport.check(check_req)
-                    # The backend ANSWERED. A refusal (402/403/429) is
-                    # still an answer and must not be read as
-                    # unreachable.
-                    self._note_backend_attempt(True)
-                except NullRunAuthenticationError:
-                    # DEF-MP-TS12-ENF-01 (RUN_ID 20260929T1338, 2026-09-29):
-                    # a 401 is a CREDENTIAL failure, not a transport
-                    # failure, and must NOT be read as "allowed".
-                    #
-                    # `_retry_with_backoff` raises `NullRunAuthError` (a
-                    # `NullRunAuthenticationError`) on any 401 and
-                    # re-raises it WITHOUT retrying. Pre-fix the
-                    # `except` clauses below swallowed it and returned
-                    # None, which the caller reads as "no block" — the
-                    # agent proceeded on a request the backend had
-                    # refused. Classification is by TYPE here, never by
-                    # inspecting the message.
-                    raise
-                except NullRunUnclassifiedRefusalError:
-                    # ADR-062 §2.2. The gate DID answer — it refused —
-                    # and the SDK cannot tell a policy decision from a
-                    # backend fault. That is not "gate unavailable":
-                    # failing OPEN here would read an unclassifiable
-                    # refusal as "allowed", which is the exact hole the
-                    # category work closes. Must precede the arm below
-                    # (a `NullRunError` superset).
-                    raise
-                except (httpx.HTTPError, NullRunError) as exc:
-                    # Narrow catch: fail-OPEN only on transport +
-                    # classified SDK errors. Internal bugs
-                    # (KeyError, AttributeError) surface rather
-                    # than silently allowing an unbounded call.
-                    self._note_backend_attempt(False)
-                    logger.warning(f"check_workflow_budget: /gate unavailable, failing open: {exc}")
-                    metrics.inc_runtime("gate_fail_open_total")
-                    return None
-                except ValueError as exc:
-                    # `Transport.check` ends in `response.json()`. A
-                    # body that is not JSON — proxy error page,
-                    # captive portal, TLS interception box — raises
-                    # JSONDecodeError, a ValueError. Pre-fix this
-                    # matched neither arm above and escaped as an
-                    # untyped crash; and had it matched the
-                    # fail-OPEN arm, a non-NULLRUN responder would
-                    # have been read as "gate unavailable, carry on",
-                    # which is precisely the authorisation-without-
-                    # policy hole the missing `decision` default
-                    # shares. It is a malformed ANSWER, not an
-                    # unreachable gate, so it raises.
-                    self._raise_malformed_gate_response(exc)
-                assert cache_key is not None  # narrowed by cache_enabled above
-                _GATE_CACHE[cache_key] = (time.monotonic(), response)
-        else:
-            try:
-                response = self._transport.check(check_req)
-                # Same rationale as the cached branch: a refusal is an
-                # answer, not an outage.
-                self._note_backend_attempt(True)
-            except NullRunAuthenticationError:
-                # Same rationale as the cached branch above. Ordering
-                # matters: this arm precedes the broad `except
-                # Exception`, which is a superset.
-                raise
-            except ValueError as exc:
-                # Same rationale as the cached branch: a body that is
-                # not JSON is a malformed answer, and must precede the
-                # broad `except Exception` below, which is a superset
-                # of this arm.
-                self._raise_malformed_gate_response(exc)
-            except NullRunUnclassifiedRefusalError:
-                # ADR-062 §2.2 — same rationale as the cached branch.
-                # This is a refusal the SDK cannot classify, not an
-                # unreachable gate, so it must not fail open. It is
-                # listed explicitly because the arm below is a bare
-                # ``except Exception``.
-                raise
-            except Exception as exc:  # noqa: BLE001
-                self._note_backend_attempt(False)
-                logger.warning(f"check_workflow_budget: /gate unavailable, failing open: {exc}")
-                metrics.inc_runtime("gate_fail_open_total")
-                return None
+        try:
+            response = self._transport.check(check_req)
+            # The backend ANSWERED. A refusal (402/403/429) is still an
+            # answer and must not be read as unreachable.
+            self._note_backend_attempt(True)
+        except NullRunAuthenticationError:
+            # DEF-MP-TS12-ENF-01 (RUN_ID 20260929T1338, 2026-09-29):
+            # a 401 is a CREDENTIAL failure, not a transport failure,
+            # and must NOT be read as "allowed".
+            #
+            # `_retry_with_backoff` raises `NullRunAuthError` (a
+            # `NullRunAuthenticationError`) on any 401 and re-raises it
+            # WITHOUT retrying. Pre-fix the `except` clauses below
+            # swallowed it and returned None, which the caller reads as
+            # "no block" — the agent proceeded on a request the backend
+            # had refused. Classification is by TYPE here, never by
+            # inspecting the message.
+            raise
+        except ValueError as exc:
+            # `Transport.check` ends in `response.json()`. A body that
+            # is not JSON — proxy error page, captive portal, TLS
+            # interception box — raises JSONDecodeError, a ValueError.
+            # Pre-fix this matched neither arm above and escaped as an
+            # untyped crash; and had it matched the fail-OPEN arm, a
+            # non-NULLRUN responder would have been read as "gate
+            # unavailable, carry on", which is precisely the
+            # authorisation-without-policy hole the missing `decision`
+            # default shares. It is a malformed ANSWER, not an
+            # unreachable gate, so it raises.
+            self._raise_malformed_gate_response(exc)
+        except NullRunUnclassifiedRefusalError:
+            # ADR-062 §2.2. The gate DID answer — it refused — and the
+            # SDK cannot tell a policy decision from a backend fault.
+            # That is not "gate unavailable": failing OPEN here would
+            # read an unclassifiable refusal as "allowed", which is the
+            # exact hole the category work closes. Listed explicitly
+            # because the arm below is a bare ``except Exception``.
+            raise
+        except Exception as exc:  # noqa: BLE001
+            self._note_backend_attempt(False)
+            logger.warning(f"check_workflow_budget: /gate unavailable, failing open: {exc}")
+            metrics.inc_runtime("gate_fail_open_total")
+            return None
 
         # The reservation id the backend minted for THIS call. It is
         # captured into the server-minted contextvar (the legacy
@@ -3317,11 +3257,10 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             organization_id=self.organization_id,
             trace_id=get_trace_id(),
         )
-        # Drop the in-process gate cache for this chain AFTER the wire
-        # call so a transient transport failure does not free the
-        # cache before the server confirms closure.
-        workflow_id_str = str(self.workflow_id) if self.workflow_id else None
-        _invalidate_gate_cache_for_chain(workflow_id_str, chain_id)
+        # There is no in-process gate cache to drop: every step of a
+        # chain is admitted by its own /gate call and holds its own
+        # reservation, so closing the chain frees nothing locally
+        # (SDK-1).
         return result
 
     def approximate_budget(self) -> dict[str, Any]:
@@ -4613,30 +4552,15 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             # DEF-CACHE-STALE-ALLOW-AFTER-OVERBUDGET: when the backend
             # refuses the consume with HTTP 422 (CONSUME_OVERBUDGET)
             # or HTTP 402 (REDIS_UNAVAILABLE on the consume path)
-            # the chain has hit its budget ceiling. Any cached
-            # "allow" for the same (workflow_id, chain_id) must NOT
-            # be served for the next 0–5 s — otherwise a chain firing
-            # faster than the cache TTL over-reserves against a
-            # budget the server has just rejected. Invalidate before
-            # logging so the order in logs matches the order in code.
+            # the chain has hit its budget ceiling.
             #
-            # chain_id lives in the contextvar (set by the
-            # ``with chain(...)`` contextmanager or
-            # ``set_chain_id(...)`` manual setter), NOT on the
-            # wire_event — wire_event is the per-call track dict
-            # and the chain_id is implicit (the backend re-derives
-            # it from the reservation binding on /track). Reading
-            # from ``get_chain_id()`` ensures we invalidate ONLY
-            # the failing chain's cache entries, not every chain
-            # for the same workflow.
-            from nullrun.context import get_chain_id
-
+            # Pre-fix the SDK also dropped an in-process gate cache
+            # here, so the next step of the chain could not be served
+            # a stale "allow". There is no such cache any more: every
+            # step is admitted by its own /gate call, and a refused
+            # consume is refused by the server, which is the only
+            # place the budget lives (SDK-1).
             status_code = getattr(exc, "status_code", None)
-            if status_code in (402, 422):
-                _invalidate_gate_cache_for_chain(
-                    wire_event.get("workflow_id"),
-                    get_chain_id(),
-                )
             _emit_for_transport_error(
                 exc,
                 stage="track_v3_single",

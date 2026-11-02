@@ -3278,14 +3278,31 @@ class Transport:
         # (defeating the mode) or ask the box a question it has no
         # endpoint for. Re-asking would also double-charge: the charge
         # and the decision are one event, done once.
+        #
+        # So the answer comes from the box's own call — the pre-flight
+        # (`Transport.check` → `edge.enforce`) recorded it under the
+        # event id, and it is read back here. What this branch must
+        # NOT do is DECIDE. It used to return a client-side
+        # `{"decision": "allow"}` without the box ever being asked
+        # (SDK-2): the whole edge decision surface was client-side
+        # only, so an expired, revoked or exhausted lease still
+        # allowed the call, and the caller could not tell the box's
+        # answer from the SDK's own.
+        #
+        # With no recorded answer the box was never asked about THIS
+        # call, and the answer is a refusal. The cloud has the same
+        # rule and the same reason: a direct `/execute` with no prior
+        # `/gate` is answered 404 EXECUTION_NOT_FOUND, because the
+        # backend's `execution:{id}` binding does not exist.
         if self.edge is not None:
-            from nullrun.edge import EDGE_LEASE
-            return {
-                "decision": "allow",
-                "decision_source": self.edge.last_source or EDGE_LEASE,
-                "execution_id": execution_id,
-                "via_edge": True,
-            }
+            from nullrun.context import get_operation_id
+
+            answer = self.edge.take_answer(get_operation_id())
+            if answer is None:
+                return self.edge.not_enforced(execution_id)
+            answer["via_edge"] = True
+            answer.setdefault("execution_id", execution_id)
+            return answer
 
         gate_request = {
             "organization_id": organization_id,
