@@ -565,6 +565,10 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
         "nullrun.breaker.exceptions",
         "NullRunApprovalToolDigestMismatchError",
     ),
+    "NullRunApprovalToolMismatchError": (
+        "nullrun.breaker.exceptions",
+        "NullRunApprovalToolMismatchError",
+    ),
     # Layer 2: on_error context type
     "ErrorContext": ("nullrun.observability.error_hooks", "ErrorContext"),
     # Layer 3: status dataclasses
@@ -759,6 +763,7 @@ __all__ = [
     "NullRunApprovalReplayRejectedError",
     "NullRunApprovalDigestMismatchError",
     "NullRunApprovalToolDigestMismatchError",
+    "NullRunApprovalToolMismatchError",
     # User-facing message catalog — the single entry point for
     # turning an SDK exception into a string safe to display to
     # end users. ``set_user_message`` lets a deployment brand its

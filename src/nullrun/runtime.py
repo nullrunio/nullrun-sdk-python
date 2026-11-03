@@ -4174,6 +4174,11 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             "NullRunApprovalReplayRejectedError": frozenset({"approval_id"}),
             "NullRunApprovalDigestMismatchError": frozenset({"approval_id"}),
             "NullRunApprovalToolDigestMismatchError": frozenset({"approval_id"}),
+            # DEC-5 / DEC-7: the approval binds a TOOL SET; the
+            # executing tool must be a member. Same promotion as the
+            # two digest siblings — ``approval_id`` lands as a
+            # first-class attr, not only inside ``details``.
+            "NullRunApprovalToolMismatchError": frozenset({"approval_id"}),
         }
 
         def _build_payload(

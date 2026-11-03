@@ -5190,6 +5190,7 @@ def _parse_v3_error_envelope_uncategorised(
         "APPROVAL_EXPIRED",
         "APPROVAL_DIGEST_MISMATCH",
         "APPROVAL_TOOL_DIGEST_MISMATCH",
+        "APPROVAL_TOOL_MISMATCH",
         "APPROVAL_REPLAY_REJECTED",
     ):
         # dispatch so callers can branch on the precise grant-consume
@@ -5207,11 +5208,16 @@ def _parse_v3_error_envelope_uncategorised(
         # NullRunApprovalNotYetApprovedError:`` for wait/poll,
         # ``except NullRunApprovalReplayRejectedError:`` for
         # retry-loop detection, etc.
+        #
+        # DEC-5 / DEC-7 added the seventh: ``APPROVAL_TOOL_MISMATCH``
+        # (NR-A017, HTTP 409 — a conflict, not a permission denial).
+        # The ``status_code`` passed through is the one the backend
+        # actually sent, so the 409 reaches the caller verbatim.
         catalog = _V3_ERROR_CODE_MAP[backend_code]
         return catalog(  # type: ignore[call-arg]
             workflow_id=str(details.get("workflow_id") or "unknown"),
             reason=full_message,
-            status_code=status,  # 403 per backend mapping
+            status_code=status,  # 403 per backend mapping (409 for APPROVAL_TOOL_MISMATCH)
             approval_id=details.get("approval_id"),
         )
 
@@ -5401,6 +5407,7 @@ def _build_v3_error_code_map() -> dict[str, type[Exception]]:
         NullRunApprovalNotYetApprovedError,
         NullRunApprovalReplayRejectedError,
         NullRunApprovalToolDigestMismatchError,
+        NullRunApprovalToolMismatchError,
         NullRunAuthError,
         NullRunBackendError,
         NullRunBlockedException,
@@ -5506,6 +5513,12 @@ def _build_v3_error_code_map() -> dict[str, type[Exception]]:
         "APPROVAL_EXPIRED": NullRunApprovalExpiredError,
         "APPROVAL_DIGEST_MISMATCH": NullRunApprovalDigestMismatchError,
         "APPROVAL_TOOL_DIGEST_MISMATCH": NullRunApprovalToolDigestMismatchError,
+        # DEC-5 / DEC-7 (audit 2026-11-02): the approval binds a TOOL
+        # SET, and the executing tool must be a member. The operator
+        # approved an action for one tool and the agent is running a
+        # different one — a money approval used to bind only the
+        # AMOUNT, so an approval for tool A authorised tool B.
+        "APPROVAL_TOOL_MISMATCH": NullRunApprovalToolMismatchError,
         "APPROVAL_REPLAY_REJECTED": NullRunApprovalReplayRejectedError,
         # Distinct from BUDGET_HARD_BLOCKED: the operator explicitly
         # approved the grant at /gate, but the period-bound counter

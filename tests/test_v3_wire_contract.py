@@ -2558,6 +2558,11 @@ backend copy changes.
         ("APPROVAL_DIGEST_MISMATCH", exc.NullRunApprovalDigestMismatchError),
         ("APPROVAL_TOOL_DIGEST_MISMATCH", exc.NullRunApprovalToolDigestMismatchError),
         ("APPROVAL_REPLAY_REJECTED", exc.NullRunApprovalReplayRejectedError),
+        # DEC-5 / DEC-7 (audit 2026-11-02): the approval binds a TOOL
+        # SET. The executing tool must be a member of the set the
+        # /gate request declared — a money approval used to bind only
+        # the AMOUNT, so an approval for tool A authorised tool B.
+        ("APPROVAL_TOOL_MISMATCH", exc.NullRunApprovalToolMismatchError),
     ],
 )
 def test_v3_error_code_map_covers_all_post_approval_outcomes(
@@ -2597,6 +2602,8 @@ def test_v3_error_code_map_covers_all_post_approval_outcomes(
         ("APPROVAL_DIGEST_MISMATCH", "NR-A013"),
         ("APPROVAL_TOOL_DIGEST_MISMATCH", "NR-A014"),
         ("APPROVAL_REPLAY_REJECTED", "NR-A015"),
+        # DEC-5 / DEC-7: the tool-binding refusal.
+        ("APPROVAL_TOOL_MISMATCH", "NR-A017"),
     ],
 )
 def test_post_approval_exceptions_carry_stable_nr_codes(wire_code, expected_nr_code):
@@ -2751,6 +2758,53 @@ def test_parse_v3_error_envelope_dispatches_approval_tool_digest_mismatch():
     assert err.error_code == "NR-A014"
 
 
+def test_parse_v3_error_envelope_dispatches_approval_tool_mismatch():
+    """``APPROVAL_TOOL_MISMATCH`` → ``NullRunApprovalToolMismatchError``.
+
+    DEC-5 / DEC-7 (audit 2026-11-02): the approval binds a TOOL SET,
+    and the executing tool must be a member. HTTP 409 — a conflict, not
+    a permission denial: the approval is valid, it just covers a
+    different tool than the one now running.
+    """
+    response = httpx.Response(
+        409,
+        json={
+            "error_code": "APPROVAL_TOOL_MISMATCH",
+            "error_message": "The executing tool is not covered by the operator's approval",
+            "details": {"approval_id": "apr-uuid-5555"},
+        },
+    )
+    err = _parse_v3_error_envelope(response, "execute")
+    assert isinstance(err, exc.NullRunApprovalToolMismatchError)
+    assert err.status_code == 409
+    assert err.error_code == "NR-A017"
+
+
+def test_approval_tool_mismatch_is_not_part_of_the_403_family():
+    """``APPROVAL_TOOL_MISMATCH`` is 409, NOT 403.
+
+    The other six grant-consume outcomes are 403 ("you are not allowed
+    to do this"). The tool mismatch is a CONFLICT: the operator's
+    approval is valid and unconsumed — it simply covers a different
+    tool. A cookbook recipe that branches on the status code (403 →
+    "permission problem", 409 → "state conflict") must be able to tell
+    them apart, so the 409 has to survive the dispatch verbatim.
+    """
+    response = httpx.Response(
+        409,
+        json={
+            "error_code": "APPROVAL_TOOL_MISMATCH",
+            "error_message": "tool not covered",
+            "details": {"approval_id": "apr-uuid-6666"},
+        },
+    )
+    err = _parse_v3_error_envelope(response, "execute")
+    assert err.status_code == 409, (
+        "APPROVAL_TOOL_MISMATCH must dispatch with status_code=409 — the "
+        f"approval covers a different tool. Got {err.status_code}."
+    )
+
+
 def test_approval_exceptions_inherit_from_nullrun_blocked_exception():
     """All six typed exceptions inherit from ``NullRunBlockedException``
     so legacy ``except NullRunBlockedException:`` clauses keep
@@ -2766,6 +2820,7 @@ def test_approval_exceptions_inherit_from_nullrun_blocked_exception():
         exc.NullRunApprovalDigestMismatchError,
         exc.NullRunApprovalToolDigestMismatchError,
         exc.NullRunApprovalReplayRejectedError,
+        exc.NullRunApprovalToolMismatchError,
     ):
         assert issubclass(cls, exc.NullRunBlockedException), (
             f"{cls.__name__} must inherit from NullRunBlockedException "
@@ -2784,6 +2839,7 @@ def test_approval_exceptions_inherit_from_nullrun_error():
         exc.NullRunApprovalDigestMismatchError,
         exc.NullRunApprovalToolDigestMismatchError,
         exc.NullRunApprovalReplayRejectedError,
+        exc.NullRunApprovalToolMismatchError,
     ):
         assert issubclass(cls, exc.NullRunError), (
             f"{cls.__name__} must inherit from NullRunError so "

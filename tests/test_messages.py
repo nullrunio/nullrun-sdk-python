@@ -38,6 +38,7 @@ _EXPECTED_CODES = {
     "NR-A014",
     "NR-A015",
     "NR-A016",  # B.1 (2026-09-10): APPROVAL_DB_* sibling family
+    "NR-A017",  # DEC-5 / DEC-7 (2026-11-02): approval tool mismatch
     "NR-B001",
     "NR-B002",
     "NR-B004",

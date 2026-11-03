@@ -130,6 +130,13 @@ DEFAULT_MESSAGES: dict[str, str] = {
     # call — replay / retry-loop signal. NOT a transient failure; the
     # same approval_id will never succeed twice. Inspect retry logic.
     "NR-A015": "Your request couldn't be completed because the approval has already been used. Please start a new request.",
+    # NR-A017: approval tool mismatch (DEC-5 / DEC-7). The operator
+    # approved an action for one tool; the agent is executing a
+    # DIFFERENT tool under that approval. The approval binds a tool
+    # SET, so the existing grant can never authorise a tool outside it
+    # — the user's next move is a fresh approval for the tool they
+    # actually want to run, not a retry of the same one.
+    "NR-A017": "Your request couldn't be completed because the approval was for a different tool. Please request a new approval and try again.",
     # ---- Workflow lifecycle (server-side state) ------------------------------
     # NR-W004: workflow soft-deleted or killed on the server. Distinct
     # from NR-W002 (BaseException path that bypasses ``nullrun.guard``)

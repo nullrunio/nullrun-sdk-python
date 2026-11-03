@@ -1333,6 +1333,37 @@ class NullRunApprovalToolDigestMismatchError(NullRunBlockedException):
     retryable = False
 
 
+class NullRunApprovalToolMismatchError(NullRunBlockedException):
+    """The executing tool is not covered by the operator's approval (DEC-5 / DEC-7).
+
+    Wire code ``APPROVAL_TOOL_MISMATCH`` (HTTP 409). The operator
+    approved an action for one tool; the agent is executing a DIFFERENT
+    tool under that approval. Before this code existed a money approval
+    bound only the AMOUNT (``BusinessImpact::Money`` carries no tool
+    name), so an approval for tool A authorised tool B.
+
+    The backend binds the approval to the tool set the matched approval
+    RULE covers (intersected with the tools the ``/gate`` request
+    declared), so the refusal is structural, not advisory.
+    Cookbook pattern: request a FRESH approval for the tool you
+    actually intend to run — the existing grant can never authorise a
+    tool outside its set.
+
+    Distinct from NR-A013 / NR-A014: those mean the PAYLOAD drifted
+    (business impact / capability digest). This means the TOOL is
+    different, and a fresh approval — not a re-derived digest — is the
+    remediation.
+    """
+
+    error_code = "NR-A017"
+    user_action = (
+        "Approval tool mismatch — the operator's approval covers a "
+        "different tool than the one currently executing. Request a "
+        "fresh approval for the tool you intend to run and retry."
+    )
+    retryable = False
+
+
 # ────────────────────────────────────────────────────────────────────────
 #
 # Pre-B.1 these three wire codes (``MCP_DESTRUCTIVE_BLOCKED``,
