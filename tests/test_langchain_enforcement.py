@@ -46,6 +46,15 @@ from nullrun.instrumentation.langgraph import (
     record_deferred_enforcement,
 )
 
+# SDK-14 (reliability audit 2026-11-02): this tuple used to be spelled
+# out HERE, in the test — a second copy of the production predicate. It
+# drifted: the production family was widened by SDK-4 (a
+# `TOOL_BLOCKED` refusal and a `RATE_LIMIT` refusal are enforcement
+# decisions too) while this copy stayed at three classes, so the test
+# asserted a predicate the code no longer used.
+#
+# The classes under test are still named here — they are the CASES, not
+# the predicate. The predicate itself is imported from production.
 ENFORCEMENT = (
     NullRunBudgetError,
     WorkflowKilledInterrupt,
@@ -65,10 +74,15 @@ class TestFrameworkContract:
     def test_langchain_swallows_callback_exceptions(self):
         """The premise of the whole fix, pinned against real langchain.
 
-        If a future langchain-core propagates callback exceptions, the
-        handoff becomes unnecessary (though still correct) — but the
-        test must fail loudly so someone re-evaluates the design rather
-        than the assumption silently rotting.
+        A DEFAULT handler's exception is swallowed: langchain-core logs
+        "Error in <handler> callback" and continues. That is why the
+        NullRun handler has to set `raise_error = True` explicitly
+        (SDK-4) — the swallow is the default, not the exception.
+
+        If a future langchain-core propagates callback exceptions even
+        without the flag, the handoff becomes unnecessary (though still
+        correct) — but the test must fail loudly so someone re-evaluates
+        the design rather than the assumption silently rotting.
         """
         pytest.importorskip("langchain_core")
         from langchain_core.callbacks import BaseCallbackHandler
@@ -122,7 +136,13 @@ def _excepted_types(method) -> list[list[str]]:
 class TestEnforcementClassification:
     @pytest.mark.parametrize("exc_cls", ENFORCEMENT)
     def test_real_decisions_are_classified_as_enforcement(self, exc_cls):
-        assert exc_cls in _ENFORCEMENT_EXCEPTIONS, (
+        # `issubclass`, not `in`: SDK-4 named the family by BASE class
+        # (`NullRunDecision` covers the budget / approval / tool-block
+        # refusals, `RateLimitError` covers the 429 refusal), so a
+        # concrete refusal class is covered by being a subclass of one
+        # of the named bases. `in` would only match the exact class and
+        # would fail for every subclass of a named base.
+        assert issubclass(exc_cls, _ENFORCEMENT_EXCEPTIONS), (
             f"{exc_cls.__name__} is a real gate decision and must be caught "
             "by the enforcement arm BEFORE the broad transport arm. If it "
             "is not, an exhausted budget / KILL becomes a fail-open "

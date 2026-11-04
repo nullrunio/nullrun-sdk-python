@@ -890,15 +890,16 @@ def protect(fn: F | None = None) -> F | Callable[[F], F]:
 def _raise_deferred_enforcement(tool_name: str) -> None:
     """Raise a gate decision a framework callback could not enforce.
 
-    LangChain discards exceptions raised from a callback handler — it
-    logs ``Error in <handler> callback`` and continues. So when
-    ``NullRunCallback.on_llm_start`` calls ``check_workflow_budget``
-    and gets a real block (budget exhausted, workflow KILL/PAUSE), it
-    cannot abort the LLM call from inside the callback.
+    A langchain-core handler's exception is swallowed BY DEFAULT — the
+    framework logs ``Error in <handler> callback`` and continues. The
+    NullRun handler opts out of that default by setting
+    ``raise_error = True`` (SDK-4), so a real refusal now reaches the
+    caller and aborts the LLM call.
 
-    The callback stashes the decision instead; this runs at the
-    ``@protect`` boundary, which can abort, and re-raises the oldest
-    unraised one.
+    This boundary is the SECOND channel: it drains a decision that was
+    recorded per-thread by a callback and re-raises it here, where the
+    SDK can abort on the boundary's own thread. It is the only channel
+    that survives a host framework which ignores ``raise_error``.
 
     The import is deliberately LAZY and failure-tolerant. The stashing
     side lives in ``instrumentation.langgraph``, which is only imported
