@@ -5757,7 +5757,9 @@ def _parse_error_envelope(
     endpoint: str,
 ) -> Exception:
     """Translate a non-2xx ``httpx.Response`` into the right exception
-    subclass per the canonical ``contracts/errors.ts`` envelope.
+    subclass per the control-plane ``ApiErrorResponse`` envelope
+    (``backend/src/proxy/http/errors.rs`` — the ``ErrorSlug`` values
+    the backend actually emits).
 
     4xx/5xx/429 are mapped to distinct ``RateLimitError`` /
     ``NullRunAuthenticationError`` / ``NullRunTransportError(GATEWAY_ERROR)``

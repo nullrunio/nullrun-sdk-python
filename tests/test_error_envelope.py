@@ -2,11 +2,10 @@
 tests/test_error_envelope.py.
 
 Verifies ``_parse_error_envelope`` maps 4xx / 5xx / 429 to the
-right exception subclass per the canonical ``contracts/errors.ts``
+right exception subclass per the control-plane ``ApiErrorResponse``
 envelope.
 
 Reference:
-    contracts/errors.ts:1-39
     backend/src/proxy/http/errors.rs:1-85
 """
 
