@@ -296,11 +296,21 @@ class WebSocketConnection:
         """
         try:
             data = json.loads(message)
-            msg_type = data.get("type", "")
+            if not isinstance(data, dict):
+                # A control-plane frame is a JSON object by contract. A
+                # non-object cannot carry a ``type`` and is not a
+                # message we know — drop it instead of crashing the
+                # receive loop on ``.get``.
+                logger.warning(
+                    "WS control frame is not a JSON object "
+                    f"({type(data).__name__}) — dropping"
+                )
+                return
 
             # Check for HMAC signature and verify if present
             signature = data.get("signature")
             timestamp = data.get("timestamp")
+            signed_payload_hex = data.get("signed_payload")
             if signature and timestamp and self.api_key and self.secret_key:
                 # This is a signed message - verify the signature
                 msg_timestamp = int(timestamp) if isinstance(timestamp, (int, str)) else 0
@@ -319,7 +329,6 @@ class WebSocketConnection:
                 #
                 # See memory/ws-signed-message-byte-mismatch for the
                 # original failure this design rule encodes.
-                signed_payload_hex = data.get("signed_payload")
                 if isinstance(signed_payload_hex, str) and signed_payload_hex:
                     try:
                         verify_payload = bytes.fromhex(signed_payload_hex)
@@ -391,7 +400,7 @@ class WebSocketConnection:
                     # or (b) something is forging traffic. Both are
                     # actionable and the operator needs to know.
                     logger.error(
-                        f"Invalid HMAC signature for {msg_type} message - "
+                        f"Invalid HMAC signature for {data.get('type', '')} message - "
                         "rejecting. This usually means the secret_key is out "
                         "of sync with the server (check for a key_rotated "
                         "event you may have missed) or the control plane is "
@@ -405,38 +414,73 @@ class WebSocketConnection:
                     metrics.inc_transport("hmac_verify_failures_total")
                     return
 
-            # FIX-C (counterpart of backend fix(ws-control) in
-            # NULLRUN): when the message is signed and carries a
-            # `signed_payload` field, dispatching from the outer
-            # body fields would let an attacker splice forged values
-            # into the outer body while reusing a captured
-            # (signed_payload, signature) pair. The signature is
-            # computed over the bytes inside signed_payload, not the
-            # outer body, so the *only* trusted source is signed_payload
-            # itself. We parse it once and use the parsed dict for all
-            # state-dispatch decisions.
+            # FIX-C / SDK-5: ONE source of truth.
             #
-            # For non-signed messages (legacy servers, or policy
-            # events that don't need per-payload signing) we fall back
-            # to the outer body — there is no signing, no attacker
-            # model.
+            # The HMAC covers the bytes inside ``signed_payload`` — NOT
+            # the flattened outer body. The outer body therefore carries
+            # a WRITABLE copy of every payload field, and the signature
+            # check still PASSES (it verifies bytes the attacker never
+            # touched). So the branch type and every field must be read
+            # from the VERIFIED payload, never from the outer body.
+            #
+            # ``authenticated`` says: this frame's contents were proven
+            # to come from the server. It is True only when the signature
+            # verified. It gates the privileged branch (the approval
+            # push, which releases a parked gate).
+            #
+            # For frames that could not be authenticated at all (an
+            # unsigned legacy frame) we fall back to the outer body —
+            # there is no signing to trust, and the branches that need
+            # authentication refuse such a frame explicitly.
             trusted: dict[str, Any] | None = None
+            authenticated = False
             if signature and timestamp and self.api_key and self.secret_key:
+                # The signature verified over the bytes we were given.
+                authenticated = True
                 if isinstance(signed_payload_hex, str) and signed_payload_hex:
                     try:
-                        trusted = json.loads(bytes.fromhex(signed_payload_hex).decode("utf-8"))
+                        parsed = json.loads(
+                            bytes.fromhex(signed_payload_hex).decode("utf-8")
+                        )
                     except (ValueError, json.JSONDecodeError):
-                        # Malformed signed_payload — the signature
-                        # check above will already have rejected this
-                        # message, so this branch should be unreachable
-                        # in practice. We keep the fall-through to
-                        # outer body to avoid a hard crash if the
-                        # two checks ever drift.
-                        trusted = None
+                        # The signature verified, but the signed bytes do
+                        # not parse. The outer body is NOT what was
+                        # signed, so it is NOT a fallback source — the
+                        # frame is dropped.
+                        #
+                        # (A legacy pre-FIX-C server signs the whole wire
+                        # body and publishes no ``signed_payload``; that
+                        # path verified over the body itself and is
+                        # handled by the branch below.)
+                        logger.error(
+                            "Signed WS frame carries an unparseable signed_payload "
+                            "— rejecting. The outer body is not what was signed, so "
+                            "it cannot be used as a source."
+                        )
+                        from nullrun.observability import metrics
+
+                        metrics.inc_transport("hmac_verify_failures_total")
+                        return
+                    if not isinstance(parsed, dict):
+                        logger.error(
+                            "Signed WS frame carries a non-object signed_payload "
+                            "— rejecting."
+                        )
+                        from nullrun.observability import metrics
+
+                        metrics.inc_transport("hmac_verify_failures_total")
+                        return
+                    trusted = parsed
+
+            # The ONE source of truth for the dispatch below: the
+            # verified payload when there is one, the outer body
+            # otherwise.
+            source: dict[str, Any] = trusted if trusted is not None else data
+            msg_type = source.get("type", "")
 
             if msg_type == "initial_state":
                 # Initial state with all workflow states
-                workflows = data.get("workflows", [])
+                workflows = source.get("workflows", [])
                 logger.debug(f"Received initial state: {len(workflows)} workflows")
                 for wf in workflows:
                     # Trust the inner workflows[] entries the same
@@ -461,13 +505,13 @@ class WebSocketConnection:
             elif msg_type == "state_change":
                 # Workflow state change notification
                 # Check if this message requires acknowledgment
-                await self._handle_state_change_with_ack(data, trusted)
+                await self._handle_state_change_with_ack(source, trusted)
 
             elif msg_type == "policy_invalidated":
                 # Policy was updated via dashboard - SDK should clear its cache
-                organization_id = data.get("organization_id", "")
-                policy_id = data.get("policy_id", "")
-                new_version = data.get("new_version", 0)
+                organization_id = source.get("organization_id", "")
+                policy_id = source.get("policy_id", "")
+                new_version = source.get("new_version", 0)
                 logger.info(
                     f"Policy invalidated: {policy_id} v{new_version}, org: {organization_id}"
                 )
@@ -479,9 +523,9 @@ class WebSocketConnection:
 
             elif msg_type == "key_rotated":
                 # HMAC secret key was rotated - SDK should re-fetch from /auth/verify
-                organization_id = data.get("organization_id", "")
-                key_id = data.get("key_id", "")
-                new_version = data.get("new_version", 0)
+                organization_id = source.get("organization_id", "")
+                key_id = source.get("key_id", "")
+                new_version = source.get("new_version", 0)
                 logger.info(f"Key rotated: {key_id} v{new_version}, org: {organization_id}")
                 if self.on_key_rotated:
                     try:
@@ -508,11 +552,36 @@ class WebSocketConnection:
                 #   resolved_at:   i64 Unix seconds,
                 #   message_id:    Option<String>,
                 # }
-                approval_id = data.get("approval_id", "")
-                outcome = data.get("outcome", "")
-                execution_id = data.get("execution_id", "")
-                workflow_id = data.get("workflow_id", "")
-                message_id = data.get("message_id")
+                #
+                # SDK-5: this branch RELEASES a parked gate, so it is the
+                # privileged branch. It runs ONLY on an authenticated
+                # frame: the fields below come from the verified
+                # ``signed_payload`` (via ``source``), never from the
+                # writable outer body, and a frame the SDK cannot
+                # authenticate is REFUSED — counted and logged — so the
+                # waiter stays parked and fails closed on the approval
+                # timeout.
+                if not authenticated:
+                    logger.error(
+                        "Refusing an unauthenticated approval_resolved frame — it "
+                        "would release a parked gate, and the SDK cannot tell it "
+                        "from a genuine one. If this is expected, the API key has "
+                        "no HMAC secret: rotate it (the backend counts the same "
+                        "frames as ws_unsigned_messages_total)."
+                    )
+                    # Local import to avoid a module-level cycle:
+                    # observability imports nothing from us, so this
+                    # is safe and lazy.
+                    from nullrun.observability import metrics
+
+                    metrics.inc_transport("ws_unverified_approval_total")
+                    return
+
+                approval_id = source.get("approval_id", "")
+                outcome = source.get("outcome", "")
+                execution_id = source.get("execution_id", "")
+                workflow_id = source.get("workflow_id", "")
+                message_id = source.get("message_id")
                 logger.info(
                     f"Approval {outcome}: id={approval_id} exec={execution_id} wf={workflow_id}"
                 )
@@ -542,7 +611,12 @@ class WebSocketConnection:
                     )
                 if self.on_approval_resolved:
                     try:
-                        self.on_approval_resolved(data)
+                        # The VERIFIED payload, not the outer body: the
+                        # runtime reads approval_id / outcome /
+                        # execution_id / note from this dict, and an
+                        # outer body can be spliced by anyone who can
+                        # inject bytes into the socket.
+                        self.on_approval_resolved(source)
                     except Exception as e:
                         logger.warning(f"Approval resolved callback error: {e}")
 
@@ -553,7 +627,7 @@ class WebSocketConnection:
                 # ``initial_state`` — there is no "catch up"
                 # semantics. We clear the version-dedup cache and
                 # let ``_reconnect_loop`` reopen the connection.
-                reason = data.get("reason", "overflow")
+                reason = source.get("reason", "overflow")
                 logger.warning(
                     f"Server requested resync (reason={reason}); "
                     "clearing local state and reconnecting"
@@ -574,13 +648,13 @@ class WebSocketConnection:
 
             elif msg_type == "subscribed":
                 # Subscription confirmation
-                organization_id = data.get("organization_id")
+                organization_id = source.get("organization_id")
                 logger.debug(f"Subscribed to organization: {organization_id}")
 
             elif msg_type == "error":
                 # Error message from server
-                code = data.get("code", "unknown")
-                message = data.get("message", "Unknown error")
+                code = source.get("code", "unknown")
+                message = source.get("message", "Unknown error")
                 logger.warning(f"WebSocket error: {code} - {message}")
 
             else:
@@ -603,7 +677,7 @@ class WebSocketConnection:
                     "SDK to handle this type if it's expected to be "
                     "in production soon.",
                     msg_type,
-                    sorted(data.keys()),
+                    sorted(source.keys()),
                 )
                 # Bump a metric so an SRE can alert on a spike of
                 # unknown-type messages — that signals a real

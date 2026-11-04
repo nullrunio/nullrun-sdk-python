@@ -76,6 +76,12 @@ class TransportMetrics:
     # We split it from hmac_verify_failures_total so the two
     # alert paths can have different runbooks.
     hmac_verify_expired_total: int = 0
+    # Approval frames on the control-plane WebSocket that the SDK
+    # could NOT authenticate. Such a frame is REFUSED — it never
+    # releases a parked gate (SDK-5). A non-zero value means
+    # somebody pushed an approval the SDK cannot verify: either a
+    # client that never got its HMAC secret, or a forged frame.
+    ws_unverified_approval_total: int = 0
     # --- WAL durability state (set by Transport, not incremented) ----------
     # These answer "what can this deployment actually promise?", which the
     # code cannot answer on your behalf across OSes and filesystems. A field
@@ -258,6 +264,7 @@ class MetricsRegistry:
                     "fallback_mode_activations": self.transport.fallback_mode_activations,
                     "hmac_verify_failures_total": self.transport.hmac_verify_failures_total,
                     "hmac_verify_expired_total": self.transport.hmac_verify_expired_total,
+                    "ws_unverified_approval_total": self.transport.ws_unverified_approval_total,
                     "wal_dir_fsync": self.transport.wal_dir_fsync,
                     "wal_lock": self.transport.wal_lock,
                     "wal_lock_timeouts_total": self.transport.wal_lock_timeouts_total,
