@@ -8,7 +8,7 @@ This is the main entry point for the SDK. It handles:
 - Local policy enforcement (instant, no network latency)
 - Pre-execution enforcement via /execute endpoint
 
-## Pre-execution gate fail-OPEN/CLOSED contract (ADR-008)
+## Pre-execution gate fail-OPEN/CLOSED contract (ADR-063 §2.4)
 
 The SDK enforces workflow safety through a set of *pre-execution gates*
 that run before a protected function body executes and may raise to halt
@@ -19,8 +19,10 @@ the authoritative table; deviations require an ADR amendment (Rule 5).
 |---|---|---|---|
 | `check_workflow_budget` | OPEN (skip check, log warning) for TRANSPORT errors; **CLOSED for authentication errors** (401 raises `NullRunAuthError` — see below) | silent post-hoc correction in `/track` events via `cost_correction_applied=true` | `NULLRUN_SKIP_BUDGET_CHECK=1` -- **full billing bypass**, not just check bypass (see docstring WARNING) |
 | `check_control_plane` | OPEN (treat state as `Normal`) | deferred enforcement -- next WS-push or `/status` poll sees the true state | none |
-| `_enforce_sensitive_tool` (default `_fallback_mode=strict` since v3.53) | CLOSED -- transport returns `decision=block, decision_source=FALLBACK_*` | n/a | none for the strict path; `NULLRUN_SENSITIVE_FAIL_OPEN=1` opts into the legacy permissive override |
-| `_enforce_sensitive_tool` (`_fallback_mode=permissive`, opt-in) | CLOSED -- body MUST NOT run when `decision_source` is any `FALLBACK_*` | n/a (body did not run) | `NULLRUN_SENSITIVE_FAIL_OPEN=1` -- explicitly documented as "OPEN-when-engine-unavailable" |
+| `_run_tool_policy_gate` (the `@protect` path) | CLOSED -- the body MUST NOT run when the policy engine is unreachable | n/a | `NULLRUN_SENSITIVE_FAIL_OPEN=1` **plus** a per-tool classification (`runtime.register_fail_open_tools([...])`) -- the switch alone opens NOTHING (ADR-126) |
+| `_run_tool_policy_gate` with the switch ON and the tool classified fail-open-allowed | OPEN for THAT tool only -- the body runs while the engine is unreachable | n/a | the two-step opt-out above; every tool that is not classified stays CLOSED (ADR-126) |
+| `runtime.execute` -> `Transport.execute` (the MCP path; `fallback_mode=strict` by default) | CLOSED -- transport returns `decision=block, decision_source=FALLBACK` and the MCP client is NOT called | n/a | none -- `NULLRUN_SENSITIVE_FAIL_OPEN` is NOT consulted on this path |
+| `runtime.execute` -> `Transport.execute` (`fallback_mode=permissive`, opt-in) | OPEN -- transport synthesises `decision=allow, decision_source=FALLBACK` | n/a (the body runs) | the constructor knob `NullRunRuntime(fallback_mode="permissive")` -- a code-level opt-in, not an env var |
 | `_emit_span_start` / `_emit_span_end` | n/a -- never blocks | n/a | n/a |
 | `/track` batch path (legacy) | OPEN-on-network-error (event dropped, no retry) | n/a -- circuit breaker backoff applies | none |
 | `/track` v3 single path (`track_single`) | OPEN-on-network-error and OPEN-on-5xx (event dropped, no retry); **CLOSED for enforcement rejections** — a typed `NullRunDecision` (`CONSUME_OVERBUDGET` 422, budget block 402) propagates to the caller | caller reconciles the delta from the exception's `reserved_millicents` / `max_allowed_millicents` / `actual_cost_cents` / `recorded` (the reservation is on the wire in millicents and the actual in cents; the backend does not send its configured epsilon, so `actual - reserved` is the only honest way to recover it); ADR-005 forbids implicit re-reserve, so there is nothing for the SDK to retry | none |
@@ -69,9 +71,18 @@ README claim must be updated in lockstep.
 The "Opt-out" column makes it explicit that `NULLRUN_SKIP_BUDGET_CHECK=1`
 is a **different category** of action than
 `NULLRUN_SENSITIVE_FAIL_OPEN=1` (bypass vs. change semantics), despite
-the similar naming. See `docs/adr/008-sdk-preflight-fail-policy.md`
-for the full rules, including transport error classification
-(`FALLBACK_NETWORK_ERROR` / `FALLBACK_GATEWAY_ERROR` / `FALLBACK_BREAKER_OPEN`).
+the similar naming. See ADR-063 §2.4 (in the NULLRUN repository,
+`docs/adr/ADR-063-pause-on-the-gate-and-the-fail-open-ledger.md`) for
+the full ledger of every fail-OPEN site in both repos, including the
+transport error classification (`FALLBACK_NETWORK_ERROR` /
+`FALLBACK_GATEWAY_ERROR` / `FALLBACK_BREAKER_OPEN`).
+
+The `NULLRUN_SENSITIVE_FAIL_OPEN` switch is a **whole-system switch**,
+and what it is allowed to open is decided **per tool** by the
+operator's classification (`runtime.register_fail_open_tools([...])`).
+The two are combined at the one call site (`decorators.py`), and the
+set is empty by default -- so the switch alone opens nothing and every
+tool stays fail-CLOSED. ADR-126.
 """
 
 from __future__ import annotations
@@ -907,6 +918,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # every value is lowercased at insertion time.
         self._sensitive_tools_lower: frozenset[str] = frozenset()
         self._strict_mode_tools_lower: frozenset[str] = frozenset()
+        self._fail_open_tools_lower: frozenset[str] = frozenset()
         self._sensitive_tools: set[str] = {
             # Financial operations
             "stripe.charge",
@@ -937,6 +949,24 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             "admin.disable_user",
         }
         self._strict_mode_tools: set[str] = set()
+        # Tools the operator has classified as FAIL-OPEN-ALLOWED.
+        #
+        # This is the per-tool classification that bounds the
+        # NULLRUN_SENSITIVE_FAIL_OPEN switch: the switch may let a
+        # tool's body run while the policy engine is unreachable ONLY
+        # for a tool in this set. It is EMPTY by default, so the switch
+        # on its own opens nothing.
+        #
+        # It is deliberately NOT the sensitivity registry above. That
+        # registry answers "is this tool destructive?" (the SDK's
+        # built-in list of financial / messaging / admin operations);
+        # a destructive tool is the last thing that should be allowed
+        # to run unchecked. This set answers the opposite question:
+        # "which tools may this agent run unchecked during an
+        # outage?". The two questions must not be merged -- merging
+        # them would make the SDK's own list of destructive operations
+        # an allowlist for running without a policy decision.
+        self._fail_open_tools: set[str] = set()
         # Snapshot the lowercase view of the built-in list so the
         # hot path is a single frozenset membership check (no set
         # comprehension per call). Subsequent add/remove/
@@ -2175,6 +2205,14 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         ``NULLRUN_ALLOW_SENSITIVE_FAIL_OPEN=1``, mirroring
         ``NULLRUN_ALLOW_SKIP_BUDGET_CHECK``.
 
+        **This method answers "is the switch on?", not "may this tool
+        fail open?"** The switch is a whole-system switch; what it is
+        allowed to open is decided per tool by the operator's
+        classification (``register_fail_open_tools`` /
+        ``is_fail_open_allowed``). The two are combined at the one
+        call site -- ``decorators.py`` -- and the tool's name is
+        needed for the second half, which is why it is not asked here.
+
         Lives here rather than in ``decorators`` so the environment
         policy stays in one module with
         :func:`_is_production_environment`, and so the two opt-outs
@@ -2206,11 +2244,13 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                     pass
                 return False
             logger.warning(
-                "sensitive tool gate: failing OPEN via "
-                "NULLRUN_SENSITIVE_FAIL_OPEN=1 in production "
-                "(NULLRUN_ALLOW_SENSITIVE_FAIL_OPEN=1 also set). This is an "
-                "explicit operator ack — ensure the incident-response runbook "
-                "drove it, and unset both vars when the incident closes."
+                "the sensitive fail-open switch is ON in production "
+                "(NULLRUN_SENSITIVE_FAIL_OPEN=1 + "
+                "NULLRUN_ALLOW_SENSITIVE_FAIL_OPEN=1). Only tools the "
+                "operator classified as fail-open-allowed may run "
+                "unchecked. This is an explicit operator ack — ensure the "
+                "incident-response runbook drove it, and unset both vars "
+                "when the incident closes."
             )
             try:
                 metrics.inc_runtime("sensitive_fail_open_allowed_in_prod")
@@ -2219,8 +2259,9 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             return True
 
         logger.debug(
-            "sensitive tool gate: failing OPEN via NULLRUN_SENSITIVE_FAIL_OPEN=1 "
-            "(non-production api_url=%r).",
+            "the sensitive fail-open switch is ON (non-production "
+            "api_url=%r). Only tools the operator classified as "
+            "fail-open-allowed may run unchecked.",
             self.api_url,
         )
         return True
@@ -3588,6 +3629,99 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             Set of sensitive tool names (includes both built-in and custom)
         """
         return self._sensitive_tools | self._strict_mode_tools
+
+    # =============================================================================
+    # Fail-open classification — the per-tool bound on
+    # NULLRUN_SENSITIVE_FAIL_OPEN
+    # =============================================================================
+
+    def register_fail_open_tools(self, tool_names: list[str]) -> None:
+        """Classify tools as ones the fail-open switch may open.
+
+        ``NULLRUN_SENSITIVE_FAIL_OPEN=1`` lets a protected tool's body
+        run while the policy engine is unreachable. Before this
+        classification existed the switch applied to EVERY protected
+        tool, so one operator decision (set the variable) removed
+        enforcement from the whole agent.
+
+        The switch is now bounded by this classification: it opens a
+        tool ONLY if that tool was registered here. The set is empty
+        by default, so the switch alone opens nothing and every tool
+        stays fail-CLOSED.
+
+        This is a code-level classification on purpose. It is not an
+        environment variable, so it cannot be inherited by a deploy
+        pipeline or a CI job that did not choose it — it is a
+        deliberate act by whoever writes the agent.
+
+        This is NOT the sensitivity registry (``add_sensitive_tool``
+        and friends). That registry answers "is this tool
+        destructive?"; this one answers "may this tool run unchecked
+        during an outage?". A tool may be in both, and the two
+        answers are independent.
+
+        Args:
+            tool_names: Names of the tools to classify. Match is
+                case-insensitive, like the sensitivity registry.
+
+        Example:
+            runtime = NullRunRuntime.get_instance()
+            runtime.register_fail_open_tools(["charge_card"])
+        """
+        with self._tools_lock:
+            for tool_name in tool_names:
+                self._fail_open_tools.add(tool_name)
+            # Rebuild the lowercase snapshot once after the batch
+            # insert (a single set comprehension beats N rebuilds
+            # in the loop).
+            self._fail_open_tools_lower = frozenset(
+                t.lower() for t in self._fail_open_tools
+            )
+
+    def remove_fail_open_tool(self, tool_name: str) -> None:
+        """Un-classify a tool: the fail-open switch stops applying to it.
+
+        Args:
+            tool_name: Name of the tool to remove from the fail-open
+                classification.
+
+        Example:
+            runtime = NullRunRuntime.get_instance()
+            runtime.remove_fail_open_tool("charge_card")
+        """
+        with self._tools_lock:
+            self._fail_open_tools.discard(tool_name)
+            self._fail_open_tools_lower = frozenset(
+                t.lower() for t in self._fail_open_tools
+            )
+
+    def get_fail_open_tools(self) -> set[str]:
+        """The tools currently classified as fail-open-allowed.
+
+        Returns:
+            A copy of the classified tool names, so a caller cannot
+            mutate the runtime's state through the returned set.
+        """
+        with self._tools_lock:
+            return set(self._fail_open_tools)
+
+    def is_fail_open_allowed(self, tool_name: str) -> bool:
+        """Whether the fail-open switch may open this tool.
+
+        This is the per-tool bound on ``NULLRUN_SENSITIVE_FAIL_OPEN``.
+        It is a pure classification lookup: it does not read the
+        environment and does not decide whether the switch is on.
+
+        Args:
+            tool_name: Name of the tool.
+
+        Returns:
+            True when the operator classified this tool as one that
+            may run unchecked while the policy engine is unreachable.
+        """
+        needle = tool_name.lower()
+        with self._tools_lock:
+            return needle in self._fail_open_tools_lower
 
     def execute(
         self,

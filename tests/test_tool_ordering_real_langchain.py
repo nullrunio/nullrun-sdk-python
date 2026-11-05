@@ -74,6 +74,11 @@ class _Deny:
     def sensitive_fail_open_enabled(self, *a, **k):
         return False
 
+    def is_fail_open_allowed(self, *a, **k):
+        """The per-tool bound on the switch (ADR-126) — nothing is
+        classified in this stub."""
+        return False
+
 
 class _Allow(_Deny):
     def check_workflow_budget(self, *a, **k):

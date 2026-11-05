@@ -954,9 +954,13 @@ def _run_tool_policy_gate(
     the outage.
 
     Opt-out: set ``NULLRUN_SENSITIVE_FAIL_OPEN=1`` to restore fail-
-    OPEN behavior on transport error (dev / test only). Real
-    ``decision=block`` from the gateway is still honored and still
-    raises ``NullRunBlockedException``.
+    OPEN behavior on transport error (dev / test only) — but only for
+    a tool the operator classified as fail-open-allowed
+    (``runtime.register_fail_open_tools([...])``). The switch alone
+    opens nothing: a tool that is not classified stays fail-CLOSED
+    even with the variable set. Real ``decision=block`` from the
+    gateway is still honored and still raises
+    ``NullRunBlockedException``.
 
     ## Wire contract
 
@@ -1005,7 +1009,9 @@ def _run_tool_policy_gate(
         TransportErrorSource,
     )
 
-    fail_open = runtime.sensitive_fail_open_enabled()
+    fail_open = runtime.sensitive_fail_open_enabled() and runtime.is_fail_open_allowed(
+        fn.__name__
+    )
     # *display* workflow_id via the runtime's precedence chain
     # (contextvar → self.workflow_id → None). Sentinel stays as the
     # last resort for never-bound keys (no workflow context).
@@ -1038,7 +1044,8 @@ def _run_tool_policy_gate(
             logger.warning(
                 f"tool policy gate unavailable for {fn.__name__!r}: "
                 f"{exc.source} on /{exc.endpoint}. "
-                f"NULLRUN_SENSITIVE_FAIL_OPEN=1 — body will run."
+                f"NULLRUN_SENSITIVE_FAIL_OPEN=1 and {fn.__name__!r} is "
+                f"classified as fail-open-allowed — body will run."
             )
             return
         _code = {
@@ -1056,8 +1063,12 @@ def _run_tool_policy_gate(
                 f"The NullRun policy engine is unreachable "
                 f"({exc.source.value}). The body of "
                 f"'{fn.__name__}' did NOT run (fail-CLOSED). "
-                f"Set NULLRUN_SENSITIVE_FAIL_OPEN=1 to opt out for "
-                f"tests / staging — production should leave it off."
+                f"To opt out for tests / staging: set "
+                f"NULLRUN_SENSITIVE_FAIL_OPEN=1 AND register the tool "
+                f"as fail-open-allowed "
+                f"(runtime.register_fail_open_tools(['{fn.__name__}'])) "
+                f"— the switch alone opens nothing. Production should "
+                f"leave both off."
             ),
         )
         runtime._emit_sdk_error(
@@ -1084,7 +1095,9 @@ def _run_tool_policy_gate(
         if fail_open:
             logger.warning(
                 f"tool policy gate unavailable for {fn.__name__!r}: "
-                f"{exc}. NULLRUN_SENSITIVE_FAIL_OPEN=1 — body will run."
+                f"{exc}. NULLRUN_SENSITIVE_FAIL_OPEN=1 and "
+                f"{fn.__name__!r} is classified as fail-open-allowed "
+                f"— body will run."
             )
             return
         err = NullRunBlockedException(
@@ -1129,7 +1142,9 @@ def _run_tool_policy_gate(
             if fail_open:
                 logger.warning(
                     f"tool policy gate for {fn.__name__!r} returned "
-                    f"{decision_source}; NULLRUN_SENSITIVE_FAIL_OPEN=1 — body will run."
+                    f"{decision_source}; NULLRUN_SENSITIVE_FAIL_OPEN=1 "
+                    f"and {fn.__name__!r} is classified as "
+                    f"fail-open-allowed — body will run."
                 )
                 return
             _code = {
@@ -1147,8 +1162,11 @@ def _run_tool_policy_gate(
                     f"The NullRun policy engine returned a fallback "
                     f"({decision_source}) for '{fn.__name__}'. The "
                     f"body did NOT run. Retry once the policy engine "
-                    f"is back — or set NULLRUN_SENSITIVE_FAIL_OPEN=1 "
-                    f"for tests / staging."
+                    f"is back — or, for tests / staging, set "
+                    f"NULLRUN_SENSITIVE_FAIL_OPEN=1 AND register the "
+                    f"tool as fail-open-allowed "
+                    f"(runtime.register_fail_open_tools(['{fn.__name__}'])) "
+                    f"— the switch alone opens nothing."
                 ),
             )
             runtime._emit_sdk_error(

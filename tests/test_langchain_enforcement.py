@@ -294,6 +294,15 @@ class _StubRuntime:
         """
         return False
 
+    def is_fail_open_allowed(self, *a, **k):
+        """The per-tool bound on the switch (ADR-126).
+
+        The stub reports "not classified" — the same default as a fresh
+        runtime. With the flag OFF the decorator never asks, so this
+        only matters if the order of the two halves ever changes.
+        """
+        return False
+
 
 @pytest.fixture
 def stub_runtime(monkeypatch):
