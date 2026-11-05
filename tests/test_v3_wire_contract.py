@@ -1564,21 +1564,44 @@ class TestCaptureServerMintedExecutionId:
         assert result is None
         assert get_server_minted_execution_id() is None
 
-    def test_drops_malformed_uuid_with_warning(self, caplog):
+    def test_refuses_a_malformed_uuid(self, caplog):
+        """SDK-10 — STRENGTHENED, not weakened.
+
+        This test used to pin the old behaviour: a ``reservation_id``
+        that is not a UUID was DROPPED with a warning, and the capture
+        returned ``None``. Dropping it read "the server reserved
+        nothing" when the truth was "the server reserved something I
+        cannot bind" — so the call proceeded with no reservation, the
+        ``/track`` event was dropped, and the spend was never booked.
+
+        The backend's ``/gate`` Allow arm always carries the Step-9
+        reserve's server-minted ``uuidv7`` (and the ``/execute`` arm
+        reuses the SAME id, ADR-073), so a real answer never lands
+        here. A present-but-unusable id is an answer the SDK cannot
+        act on, and it is REFUSED.
+
+        The full money path is in ``test_sdk10_malformed_reservation.py``.
+        """
         import logging
 
-        # Pre-seed so we can verify clear happens even on
-        # malformed input.
+        from nullrun.breaker.exceptions import NullRunMalformedGateResponseError
+
+        # Pre-seed so we can verify the refusal does not leave a
+        # previous scope's id in place.
         set_server_minted_execution_id(SERVER_MINTED_V1)
 
-        with caplog.at_level(logging.WARNING, logger="nullrun.runtime"):
-            result = _capture_server_minted_execution_id(
-                {"reservation_id": "not-a-uuid"}
-            )
-        assert result is None
-        assert get_server_minted_execution_id() is None
+        with caplog.at_level(logging.ERROR, logger="nullrun.runtime"):
+            with pytest.raises(NullRunMalformedGateResponseError):
+                _capture_server_minted_execution_id(
+                    {"reservation_id": "not-a-uuid"}
+                )
+        assert get_server_minted_execution_id() == SERVER_MINTED_V1, (
+            "a refusal must not silently clear the scope's id — the "
+            "caller is about to abort, and the id belongs to whoever "
+            "set it"
+        )
         assert any(
-            "is not a valid UUID" in record.message
+            "cannot be bound" in record.message
             for record in caplog.records
         )
 
@@ -1589,14 +1612,20 @@ class TestCaptureServerMintedExecutionId:
         assert result is None
         assert get_server_minted_execution_id() is None
 
-    def test_drops_non_string_field(self):
-        # Backend is the source of truth and only emits strings
-        # but a buggy proxy could echo an int. Defensive parse.
-        result = _capture_server_minted_execution_id(
-            {"reservation_id": 123456}  # type: ignore[dict-item]
-        )
-        assert result is None
-        assert get_server_minted_execution_id() is None
+    def test_refuses_a_non_string_field(self):
+        """SDK-10 — STRENGTHENED, not weakened.
+
+        Was: "a buggy proxy could echo an int → drop it". The drop is
+        the hole — a dropped reservation id means the call runs with no
+        reservation and its cost event is dropped, so the spend is
+        never billed. A present-but-unusable id is REFUSED.
+        """
+        from nullrun.breaker.exceptions import NullRunMalformedGateResponseError
+
+        with pytest.raises(NullRunMalformedGateResponseError):
+            _capture_server_minted_execution_id(
+                {"reservation_id": 123456}  # type: ignore[dict-item]
+            )
 
 
 # ─────────────────────────────────────────────────────────────────

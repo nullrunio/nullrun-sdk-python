@@ -4043,9 +4043,13 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # then echoes the new id back via ``reservation_id``
         # (mirrored by the backend's GateResponse::require_approval
         # constructor — see backend/src/enforcement/gate_wire_adapter.rs).
-        # Capture here is fail-OPEN (drops malformed values
-        # silently via the helper's UUID parse), matching
-        # ``check_workflow_budget``'s behaviour.
+        #
+        # The capture REFUSES a present-but-unusable id (SDK-10) —
+        # it is not fail-OPEN. The old comment here said "fail-OPEN
+        # (drops malformed values silently via the helper's UUID
+        # parse)", which described the defect: a dropped reservation id
+        # meant the tool ran with no reservation, so its spend was
+        # never booked.
         _capture_server_minted_execution_id(result)
 
         # Sync the kwargs dict to the captured id so the post-approval
@@ -4992,15 +4996,66 @@ def __getattr__(name):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+def _refuse_malformed_reservation(reason: str) -> None:
+    """Refuse an answer whose ``reservation_id`` cannot be bound.
+
+    SDK-10 (reliability audit 2026-11-02). The capture used to log a
+    warning and return ``None`` for a ``reservation_id`` that is not a
+    UUID — reading "the server handed back an id I cannot use" as
+    "the server reserved nothing". Those are two different facts, and
+    the difference is money:
+
+    * the backend's ``/gate`` Allow arm threads the Step-9 Lua
+      reserve's server-minted ``uuidv7`` into ``GateResponse``
+      ``reservation_id`` (the dispatcher's third tuple position), and
+      the ``/execute`` arm reuses the same id (ADR-073), so a REAL
+      answer always carries a UUID there;
+    * an id that is present and NOT a UUID therefore did not come from
+      the reserve path — a non-NULLRUN responder (captive portal,
+      TLS-interception box), a corrupted proxy hop, or a backend that
+      minted something else.
+
+    Dropping it silently let the call run with NO reservation: the
+    ``/track`` event had no ``execution_id`` to carry, so the spend
+    was never booked, and the backend's reserve sat on the period
+    counter until its TTL ran out. The agent got the call for free.
+
+    So the answer is REFUSED, not downgraded. The class is the one the
+    SDK already uses for "something answered, and what it said was not
+    a verdict" (``_require_gate_decision``): the reservation id is part
+    of the verdict, because it is what binds the money.
+
+    Always raises; the ``-> None`` return type lets the call sites use
+    it as the tail of an arm.
+    """
+    from nullrun.breaker.exceptions import NullRunMalformedGateResponseError
+
+    logger.error(
+        "_capture_server_minted_execution_id: response.reservation_id "
+        "cannot be bound (%s) — refusing the call",
+        reason,
+    )
+    metrics.inc_runtime("gate_malformed_reservation_total")
+    raise NullRunMalformedGateResponseError(
+        f"/gate returned a reservation_id that cannot be bound: {reason}. "
+        f"That id is what ties this call's spend to the reservation the "
+        f"server minted, so the SDK refuses the call instead of running it "
+        f"unbilled."
+    )
+
+
 # The module-level slot is a proxy over the registry. The
 def _capture_server_minted_execution_id(response: dict[str, Any]) -> str | None:
     """Capture ``response["reservation_id"]`` into the server-minted
     execution_id contextvar.
 
-    Returns the captured id (or ``None`` on miss / malformed) so the
-    caller can log it on debug paths. The contextvar itself is the
-    authoritative side-effect — readers consult
-    ``get_server_minted_execution_id`` from ``nullrun.context``.
+    Returns the captured id, or ``None`` when the answer carries NO
+    reservation (a block reserves nothing). A reservation id that is
+    PRESENT but unusable is a different case — it is an answer the SDK
+    cannot act on, and it REFUSES (SDK-10, ``_refuse_malformed_reservation``).
+
+    The contextvar itself is the authoritative side-effect — readers
+    consult ``get_server_minted_execution_id`` from ``nullrun.context``.
 
     Import is lazy (inside the function) to keep
     ``nullrun.runtime`` import order stable: ``context`` itself
@@ -5017,37 +5072,33 @@ def _capture_server_minted_execution_id(response: dict[str, Any]) -> str | None:
     )
 
     raw = response.get("reservation_id") if isinstance(response, dict) else None
-    if not raw:
+    if raw is None:
         # Block response with no reservation_id; clear so the
-        # previous scope's value can't leak.
+        # previous scope's value can't leak. An ABSENT id means the
+        # server reserved nothing — that is a fact, not a fault.
         clear_server_minted_execution_id()
         return None
 
     if not isinstance(raw, str):
-        clear_server_minted_execution_id()
-        logger.warning(
-            "_capture_server_minted_execution_id: response.reservation_id "
-            "is %s, expected str — dropping",
-            type(raw).__name__,
+        _refuse_malformed_reservation(
+            f"it is {type(raw).__name__}, expected a string"
         )
-        return None
 
-    # Defence-in-depth UUID parse — backend's mint_execution_id
-    # emits RFC-4122 uuidv7 but a buggy proxy could echo garbage.
-    # Drop without raising (fail-OPEN on capture; the backend will
-    # still reject malformed ids with 400 on /track).
+    if not raw:
+        _refuse_malformed_reservation("it is an empty string")
+
+    # The backend's ``/gate`` Allow arm threads the Step-9 reserve's
+    # server-minted ``uuidv7`` into ``reservation_id``, and the
+    # ``/execute`` arm reuses that same id (ADR-073) — so a real
+    # answer always carries a UUID here. A present-but-unparseable id
+    # did not come from the reserve path, and the spend it would have
+    # paid for cannot be bound to it. Refuse (SDK-10).
     import uuid as _uuid
 
     try:
         _uuid.UUID(raw)
     except (ValueError, AttributeError):
-        clear_server_minted_execution_id()
-        logger.warning(
-            "_capture_server_minted_execution_id: response.reservation_id=%r "
-            "is not a valid UUID — dropping",
-            raw,
-        )
-        return None
+        _refuse_malformed_reservation(f"{raw!r} is not a valid UUID")
 
     set_server_minted_execution_id(raw)
     set_server_minted_reservation_at(_time.monotonic())

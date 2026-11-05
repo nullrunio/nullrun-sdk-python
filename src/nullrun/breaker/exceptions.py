@@ -1667,8 +1667,23 @@ class NullRunWorkflowKilledError(WorkflowKilledInterrupt):
 #   * ``WorkflowKilledInterrupt`` — the dashboard KILL switch. It
 #     derives from ``NullRunError`` directly, NOT from
 #     ``NullRunDecision``.
+#   * ``NullRunMalformedGateResponseError`` — the gate ANSWERED, and
+#     what it said was not a verdict (SDK-10). It is a protocol error
+#     by class, but the SDK's only safe answer to it is to REFUSE:
+#     the runtime already decided that a body without a usable
+#     decision fails CLOSED (``_require_gate_decision``), and the
+#     reservation id is part of that decision — it is what binds the
+#     spend to the reservation the server minted. Before this member
+#     existed, the instrumentation's blanket arms downgraded it to a
+#     fail-OPEN transport error, so an unusable answer let the call
+#     run with no reservation and its cost event was DROPPED — the
+#     agent got the call for free. It is in the family because the
+#     operational rule the family encodes is the one that matters
+#     here: none of these may be downgraded to "the gate was
+#     unreachable, carry on".
 ENFORCEMENT_EXCEPTIONS: tuple[type[BaseException], ...] = (
     NullRunDecision,
     RateLimitError,
     WorkflowKilledInterrupt,
+    NullRunMalformedGateResponseError,
 )
