@@ -52,7 +52,7 @@ The codes follow a `NR-<CATEGORY><NNN>` pattern:
 | Code | When | See |
 |---|---|---|
 | `NR-P001` | Wire-protocol version mismatch (`X-NULLRUN-PROTOCOL` too old / too new) | [NR-P001](NR-P001.md) |
-| `NR-P004` | The gate's decision could not be determined — the gate call failed for a reason that is NOT a transport failure, so the SDK refused the call | [NR-P004](NR-P004.md) |
+| `NR-P004` | The decision could not be determined — a `/gate` or `/execute` call failed for a reason that is NOT a transport failure, so the SDK refused the call | [NR-P004](NR-P004.md) |
 | `NR-P005` | The control plane sent an action type this SDK does not know — the action was NOT executed (the workflow is not blocked) | [NR-P005](NR-P005.md) |
 
 ### Workflow state (NR-W)
