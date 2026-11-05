@@ -71,6 +71,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 import uuid
 from collections.abc import Mapping
@@ -186,6 +187,23 @@ class EdgeTransport:
         # gets "no answer" and is refused rather than allowed on the
         # strength of somebody else's decision.
         self._answers: dict[str, dict[str, Any]] = {}
+        # The lock that guards `_answers`.
+        #
+        # There is one EdgeTransport per runtime and one runtime per
+        # agent, but an agent's tool calls share the runtime — so this
+        # dict is genuinely multi-threaded. Without the lock a thread
+        # that evicts from it can be resized by another thread between
+        # the `iter()` and the `next()`, and CPython raises
+        # `RuntimeError: dictionary changed size during iteration`
+        # (or the eviction's `pop` raises `KeyError` when the other
+        # thread took the key first).
+        #
+        # Why that is more than a crash: the exception escapes
+        # `enforce`, and the gate's fail-OPEN arm catches it and
+        # returns "no decision" — so the tool body runs with no policy
+        # decision at all, while the box has already charged the
+        # lease. SDK-9.
+        self._answers_lock = threading.Lock()
         # Bound on the cache. Entries are popped on use; the cap only
         # matters for a pre-flight that is never followed by an
         # /execute, and it exists so a long-lived transport cannot grow
@@ -256,7 +274,8 @@ class EdgeTransport:
         """
         if not event_id:
             return None
-        return self._answers.pop(event_id, None)
+        with self._answers_lock:
+            return self._answers.pop(event_id, None)
 
     def not_enforced(self, execution_id: str | None = None) -> dict[str, Any]:
         """No answer from the box for this call. Fail CLOSED.
@@ -287,9 +306,16 @@ class EdgeTransport:
         }
 
     def _record(self, event_id: str, answer: dict[str, Any]) -> None:
-        self._answers[event_id] = answer
-        while len(self._answers) > self._answer_cap:
-            self._answers.pop(next(iter(self._answers)))
+        with self._answers_lock:
+            self._answers[event_id] = answer
+            while len(self._answers) > self._answer_cap:
+                # Copy the key list before evicting. The oldest entry is
+                # chosen from the snapshot, never from a live iteration
+                # of a dict another thread may be resizing.
+                keys = list(self._answers)
+                if not keys:
+                    break
+                self._answers.pop(keys[0], None)
 
     def _ask(self, body: dict[str, Any], on_transport_error: Any) -> dict[str, Any]:
         """One round trip to the box. Returns a gate-shaped dict."""
