@@ -45,6 +45,7 @@ import logging
 import threading
 from typing import Any
 
+from nullrun.breaker.exceptions import ENFORCEMENT_EXCEPTIONS
 from nullrun.instrumentation.auto import (
     _fingerprint_for,
     _match_extractor,
@@ -122,6 +123,13 @@ def _emit_to_runtime(
             },
             reservation_id,
         )
+    except ENFORCEMENT_EXCEPTIONS:
+        # SDK-6 (reliability audit 2026-11-02): the backend REFUSED to
+        # book this call. ADR-008's /track row is CLOSED for
+        # enforcement rejections — the refusal propagates to the
+        # caller. The broad arm below used to swallow it, so a refused
+        # track looked like a success to the application.
+        raise
     except Exception as e:
         logger.debug("NullRun requests transport: track failed: %s", e)
 

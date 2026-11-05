@@ -70,18 +70,15 @@ from nullrun.tracing import (
 #   * `RateLimitError` — the 429 refusal, which is transport-shaped.
 #   * `WorkflowKilledInterrupt` — the dashboard KILL switch. It derives
 #     from `NullRunError` directly, NOT from `NullRunDecision`.
+#
+# The family itself now lives in ONE place —
+# `nullrun.breaker.exceptions.ENFORCEMENT_EXCEPTIONS`. The /track path
+# needs the SAME rule (SDK-6), and two hand-written copies of the
+# family are two places to forget a refusal subclass.
 try:  # pragma: no cover - import shape, not behaviour
-    from nullrun.breaker.exceptions import (
-        NullRunDecision,
-        RateLimitError,
-        WorkflowKilledInterrupt,
-    )
+    from nullrun.breaker.exceptions import ENFORCEMENT_EXCEPTIONS
 
-    _ENFORCEMENT_EXCEPTIONS: tuple[type[BaseException], ...] = (
-        NullRunDecision,
-        RateLimitError,
-        WorkflowKilledInterrupt,
-    )
+    _ENFORCEMENT_EXCEPTIONS: tuple[type[BaseException], ...] = ENFORCEMENT_EXCEPTIONS
 except ImportError:  # pragma: no cover
     # The SDK is unusable without its own exception types, but never
     # let their absence break `import nullrun` for a consumer who
@@ -1025,6 +1022,29 @@ class NullRunCallback(BaseCallbackHandler):
             else:
                 logger.debug(f"LLM tracked: model={model}, NO usage data available")
 
+        except _ENFORCEMENT_EXCEPTIONS as e:
+            # SDK-6 (reliability audit 2026-11-02): the backend REFUSED
+            # to book this call's money (CONSUME_OVERBUDGET, a budget
+            # block, a 429). ADR-008's /track row is CLOSED for
+            # enforcement rejections — the refusal propagates to the
+            # caller. The broad arm below used to swallow it here, so
+            # the refusal never even reached
+            # ``@_only_a_gate_refusal_escapes`` and the run finished
+            # as if the money had been booked.
+            #
+            # It is ALSO recorded for the ``@protect`` boundary: that
+            # is the channel that can abort on the boundary's own
+            # thread when the host framework ignores ``raise_error``.
+            logger.error(
+                "NullRunCallback.on_llm_end: the backend refused to book "
+                "this LLM call (%s: %s). The refusal is re-raised so it "
+                "reaches the caller; it is also recorded for the "
+                "@protect boundary.",
+                type(e).__name__,
+                e,
+            )
+            record_deferred_enforcement(e)
+            raise
         except Exception as e:
             logger.warning(f"Failed to track LLM event: {e}")
         finally:

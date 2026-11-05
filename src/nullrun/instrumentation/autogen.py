@@ -20,6 +20,8 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
+from nullrun.breaker.exceptions import ENFORCEMENT_EXCEPTIONS
+
 logger = logging.getLogger(__name__)
 
 _autogen_patched = False
@@ -136,6 +138,13 @@ def patch_autogen(runtime: Any) -> bool:
                             if model:
                                 event["model"] = model
                             runtime.track(event)
+                        except ENFORCEMENT_EXCEPTIONS:
+                            # SDK-6 (reliability audit 2026-11-02): the
+                            # backend REFUSED to book this call. The
+                            # refusal propagates to the caller — a
+                            # refused track must not look like a
+                            # success.
+                            raise
                         except Exception as e:  # pragma: no cover
                             logger.debug("autogen create emit failed: %s", e)
                 return result

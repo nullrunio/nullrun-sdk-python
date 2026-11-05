@@ -16,6 +16,8 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
+from nullrun.breaker.exceptions import ENFORCEMENT_EXCEPTIONS
+
 logger = logging.getLogger(__name__)
 
 _llama_index_patched = False
@@ -79,6 +81,12 @@ def patch_llama_index(runtime: Any) -> bool:
             if model:
                 event_dict["model"] = model
             runtime.track(event_dict)
+        except ENFORCEMENT_EXCEPTIONS:
+            # SDK-6 (reliability audit 2026-11-02): the backend REFUSED
+            # to book this call. ADR-008's /track row is CLOSED for
+            # enforcement rejections — the refusal propagates to the
+            # caller, so a refused track cannot look like a success.
+            raise
         except Exception as e:  # pragma: no cover - defensive
             logger.debug("llama_index on_chat_end: %s", e)
 

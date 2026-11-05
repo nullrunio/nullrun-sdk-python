@@ -1635,3 +1635,40 @@ class NullRunWorkflowKilledError(WorkflowKilledInterrupt):
         "or inspect the reason before retrying."
     )
     retryable = False
+
+
+# ---------------------------------------------------------------------------
+# The enforcement-refusal family
+# ---------------------------------------------------------------------------
+# ONE tuple that means "the enforcement path said NO" — as opposed to
+# "the enforcement path could not be reached".
+#
+# The distinction is the whole point. ADR-008's fail-OPEN policy
+# covers the SECOND: a dead backend must not freeze the agent. It
+# explicitly does NOT cover the FIRST: conflating "the gate refused"
+# with "the gate was unreachable" is what let a real budget block
+# through as a debug log line (SDK-4, and the same defect on the
+# /track path — SDK-6).
+#
+# All of these derive from ``Exception``, so an ordering-sensitive
+# ``except`` clause is required: this tuple must be caught BEFORE the
+# broad transport arm, or the block is silently downgraded to a
+# fail-OPEN transport error.
+#
+# The family is named by BASE class, so a refusal subclass added later
+# cannot silently fall back into the fail-OPEN arm:
+#   * ``NullRunDecision`` — every "the gate said no" refusal:
+#     tool-block, budget, the approval family, chain,
+#     workflow-inactive, PAUSE.
+#   * ``RateLimitError`` — the 429 refusal. It is NOT a
+#     ``NullRunDecision``: the gate refused, but the refusal wears a
+#     transport-shaped class because the wire code is a 429. Naming
+#     ``NullRunDecision`` alone would still have swallowed it.
+#   * ``WorkflowKilledInterrupt`` — the dashboard KILL switch. It
+#     derives from ``NullRunError`` directly, NOT from
+#     ``NullRunDecision``.
+ENFORCEMENT_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    NullRunDecision,
+    RateLimitError,
+    WorkflowKilledInterrupt,
+)
