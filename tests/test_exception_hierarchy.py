@@ -39,6 +39,7 @@ from nullrun.breaker.exceptions import (
     # Config / auth
     NullRunConfigError,
     NullRunError,
+    NullRunGateIndeterminateError,
     NullRunToolBlockedError,
     # Transport
     NullRunTransportError,
@@ -236,6 +237,32 @@ class TestErrorCodeCatalog:
             )
         assert info.value.error_code == "NR-R001"
         assert info.value.retryable is True
+
+    def test_indeterminate_gate_is_NR_P004(self):
+        """SDK-11 — the refusal for a decision the SDK could not obtain.
+
+        The code is the operator's only handle on this class, so it is
+        pinned like every other one. ``retryable`` is True: the fault
+        is the SDK's own and may be transient.
+        """
+        with pytest.raises(NullRunGateIndeterminateError) as info:
+            raise NullRunGateIndeterminateError("no decision")
+        assert info.value.error_code == "NR-P004"
+        assert info.value.retryable is True
+
+    def test_indeterminate_gate_is_not_a_transport_error(self):
+        """ADR-126's two-step opt-in opens TRANSPORT errors.
+
+        An indeterminate decision must not be convertible into "the
+        body runs" by flipping a switch, so it must not be a
+        transport error.
+        """
+        assert not issubclass(
+            NullRunGateIndeterminateError, NullRunTransportError
+        ), (
+            "the indeterminate refusal must not be a transport error — "
+            "that is the one class ADR-126's opt-in can open"
+        )
 
 
 # ---------------------------------------------------------------------------

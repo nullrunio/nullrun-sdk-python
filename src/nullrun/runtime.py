@@ -17,7 +17,7 @@ the authoritative table; deviations require an ADR amendment (Rule 5).
 
 | Gate | Transport-error behavior | Recovery behavior | Opt-out |
 |---|---|---|---|
-| `check_workflow_budget` | OPEN (skip check, log warning) for TRANSPORT errors; **CLOSED for authentication errors** (401 raises `NullRunAuthError` — see below) | silent post-hoc correction in `/track` events via `cost_correction_applied=true` | `NULLRUN_SKIP_BUDGET_CHECK=1` -- **full billing bypass**, not just check bypass (see docstring WARNING) |
+| `check_workflow_budget` | OPEN (skip check, log warning) for TRANSPORT errors ONLY; **CLOSED for everything else** — a 401 raises `NullRunAuthError`, a malformed answer raises `NullRunMalformedGateResponseError`, and a non-transport fault raises `NullRunGateIndeterminateError` (ADR-129) | silent post-hoc correction in `/track` events via `cost_correction_applied=true` | `NULLRUN_SKIP_BUDGET_CHECK=1` -- **full billing bypass**, not just check bypass (see docstring WARNING) |
 | `check_control_plane` | OPEN (treat state as `Normal`) | deferred enforcement -- next WS-push or `/status` poll sees the true state | none |
 | `_run_tool_policy_gate` (the `@protect` path) | CLOSED -- the body MUST NOT run when the policy engine is unreachable | n/a | `NULLRUN_SENSITIVE_FAIL_OPEN=1` **plus** a per-tool classification (`runtime.register_fail_open_tools([...])`) -- the switch alone opens NOTHING (ADR-126) |
 | `_run_tool_policy_gate` with the switch ON and the tool classified fail-open-allowed | OPEN for THAT tool only -- the body runs while the engine is unreachable | n/a | the two-step opt-out above; every tool that is not classified stays CLOSED (ADR-126) |
@@ -53,6 +53,14 @@ fall-OPEN on a wire 4xx/5xx that names an enforcement failure.
   OPEN here means the agent proceeds on a request the backend never
   approved. Added 2026-09-29 (DEF-MP-TS12-ENF-01) — this NARROWS the
   fail-OPEN set, it does not widen enforcement.
+* **Indeterminate decision (SDK-11, ADR-129)** → fail-CLOSED.
+  ``NullRunGateIndeterminateError`` propagates. The gate call failed
+  for a reason that is NOT a transport failure, so the SDK cannot
+  tell "the backend said no" from "the SDK never found out". The
+  fail-OPEN above covers a gate that could not be REACHED; this is
+  the case where the SDK itself faulted while asking. Failing OPEN
+  here turned an SDK bug into "allowed" — the call ran with no
+  reservation and its cost event was dropped.
 * **Backend-side budget-enforcement failure** (the /gate or /track
   handler actually returned a wire response, just one indicating a
   Redis outage or aggregate rate-limit Redis unavailable) → the
@@ -114,6 +122,7 @@ from nullrun.breaker.categories import (
     NullRunUnclassifiedRefusalError,
 )
 from nullrun.breaker.exceptions import (
+    ENFORCEMENT_EXCEPTIONS,
     NullRunApprovalDeniedError,
     NullRunApprovalExpiredError,
     NullRunApprovalReplayRejectedError,
@@ -124,6 +133,7 @@ from nullrun.breaker.exceptions import (
     NullRunBudgetError,
     NullRunDecision,
     NullRunDeniedError,
+    NullRunGateIndeterminateError,
     NullRunInfrastructureError,
     NullRunTransportError,
     NullRunWorkflowKilledError,
@@ -2338,17 +2348,34 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             - Credential failure (``NullRunAuthenticationError``),
               malformed body, and ``NullRunUnclassifiedRefusalError``
               all `raise` rather than fail open. Ordering matters:
-              each precedes the bare ``except Exception`` arm, which is
-              a superset of all three.
+              each precedes the transport arm below.
+            - A refusal the gate NAMED (``ENFORCEMENT_EXCEPTIONS``)
+              `raise`s, and the family arm comes FIRST — a
+              ``RateLimitError`` is a ``NullRunTransportError``, so a
+              later transport arm would swallow the 429 and fail OPEN
+              on it.
             - A non-fallback synthetic source is likewise treated as a
               transport error and fails open.
 
-        The rationale for the fail-open arms is that a transient backend
+        The transport arm is the ONLY fail-OPEN class (ADR-129). Anything
+        else that faults inside the gate call — the SDK's own code
+        raising while it asks the gate a question — leaves the decision
+        INDETERMINATE, and that raises ``NullRunGateIndeterminateError``
+        instead of proceeding. The distinction is the whole point:
+
+            - UNREACHABLE (transport failure): there is no answer to
+              honour, and nothing downstream can produce one.
+            - INDETERMINATE (any other fault): the backend may have
+              answered and the SDK cannot read it. An unanswered
+              question is not a yes.
+
+        The rationale for the fail-open arm is that a transient backend
         outage must never freeze the user's agent, and `/track` does not
         gate on budget, so the worst case while `/gate` is unreachable is
         that enforcement is advisory until the gateway recovers. That
         rationale covers UNREACHABLE, not REFUSING — which is why the
-        ADR-062 arms were split out above.
+        ADR-062 arms were split out above — and not INDETERMINATE, which
+        is why the residual arm refuses (SDK-11).
 
         Uses `estimated_tokens=1` (the minimum the API accepts). Goal
         is the binary question "is there any budget left?", not cost
@@ -2658,6 +2685,16 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             # The backend ANSWERED. A refusal (402/403/429) is still an
             # answer and must not be read as unreachable.
             self._note_backend_attempt(True)
+        except ENFORCEMENT_EXCEPTIONS:
+            # ADR-063 §2.4 row 2, as amended by ADR-129. A refusal the
+            # gate NAMED is never downgraded to "the gate was
+            # unreachable, carry on".
+            #
+            # The family arm comes FIRST because the ordering is
+            # load-bearing: `RateLimitError` is a
+            # `NullRunTransportError`, so the transport arm below would
+            # swallow the 429 and fail OPEN on it.
+            raise
         except NullRunAuthenticationError:
             # DEF-MP-TS12-ENF-01 (RUN_ID 20260929T1338, 2026-09-29):
             # a 401 is a CREDENTIAL failure, not a transport failure,
@@ -2689,13 +2726,52 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             # That is not "gate unavailable": failing OPEN here would
             # read an unclassifiable refusal as "allowed", which is the
             # exact hole the category work closes. Listed explicitly
-            # because the arm below is a bare ``except Exception``.
+            # because the arm below catches transport errors by TYPE.
             raise
-        except Exception as exc:  # noqa: BLE001
+        except (httpx.HTTPError, NullRunTransportError) as exc:
+            # ADR-008's fail-OPEN — and the ONLY class it covers. The
+            # gate could not be REACHED, so there is no answer to
+            # honour: the enforcement path is un-decidable, not
+            # undecided. A dead backend must not freeze the agent.
+            #
+            # Everything that is NOT a transport failure falls through
+            # to the arm below, which refuses. That is the whole point
+            # of the split (ADR-129): pre-fix this arm was a bare
+            # ``except Exception``, so an SDK-internal fault was
+            # laundered into "allowed" and the call ran with no
+            # reservation.
             self._note_backend_attempt(False)
             logger.warning(f"check_workflow_budget: /gate unavailable, failing open: {exc}")
             metrics.inc_runtime("gate_fail_open_total")
             return None
+        except Exception as exc:  # noqa: BLE001
+            # NOT a transport failure. The backend may have answered;
+            # the SDK's own code faulted while asking it a question
+            # (a request body that cannot be serialised, a decode
+            # error, a fault in the edge path's token split). The
+            # decision is INDETERMINATE, and an indeterminate decision
+            # is not permission.
+            #
+            # ADR-063 §2.4's governing rule: a fail-OPEN is acceptable
+            # only when the check is genuinely un-decidable AND
+            # something downstream can correct it. This is neither:
+            # the check is decidable in principle, and the only thing
+            # downstream is `/track` — which does not gate on budget.
+            #
+            # The refusal is typed and counted, not logged and
+            # forgotten: a log line is not a control, and the operator
+            # needs to see that the fleet is refusing calls.
+            self._note_backend_attempt(False)
+            metrics.inc_runtime("gate_indeterminate_total")
+            logger.error(
+                "check_workflow_budget: /gate failed with a non-transport "
+                f"error, refusing the call: {exc!r}"
+            )
+            raise NullRunGateIndeterminateError(
+                "the /gate call failed with a non-transport error, so the "
+                f"SDK could not determine a decision: {exc!r}",
+                cause=exc,
+            ) from exc
 
         # The reservation id the backend minted for THIS call. It is
         # captured into the server-minted contextvar (the legacy

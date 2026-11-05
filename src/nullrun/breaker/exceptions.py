@@ -423,6 +423,80 @@ class NullRunMalformedGateResponseError(NullRunProtocolError):
     retryable = True
 
 
+class NullRunGateIndeterminateError(NullRunInfrastructureError):
+    """The gate's decision could not be determined — and the SDK will not guess.
+
+    Raised when the ``/gate`` call fails with something that is NOT a
+    transport failure: the SDK's OWN code faulted while asking the gate
+    a question (a request body that cannot be serialised, a decoding
+    error, a programming error in the request builder, a fault in the
+    edge path's token split).
+
+    Why this is not a transport error
+    ---------------------------------
+    ADR-008's fail-OPEN covers ONE thing: the gate could not be
+    REACHED, so there is no answer to honour and the agent must not
+    freeze. That is a fact about the world — the backend is down.
+
+    This class is the opposite. The backend may well have answered; the
+    SDK simply cannot read what it got, or never got as far as asking.
+    The question "may this call proceed?" therefore has no answer, and
+    an unanswered question is not a yes. ADR-063 §2.4's governing rule
+    says it exactly: *"a fail-OPEN where the answer is known and merely
+    inconvenient to obtain is a bug"* — and the sharper form: an
+    enforcement failure must never become implicit permission.
+
+    Before this class existed, the runtime's gate handler ended in a
+    bare ``except Exception`` that failed OPEN for every fault, so an
+    SDK-internal ``KeyError`` was logged and the call proceeded with no
+    reservation (SDK-11). That is the same shape as the SDK-10 hole one
+    class away: the call ran, and its cost event was dropped.
+
+    It is deliberately NOT a :class:`NullRunTransportError` subclass.
+    The ``@protect`` boundary treats a transport error as the one class
+    ADR-126's two-step opt-in can open; an indeterminate decision must
+    not be convertible into "the body runs". Deriving from
+    :class:`NullRunInfrastructureError` puts it in the boundary's
+    ``except NullRunInfrastructureError: raise`` arm instead.
+    """
+
+    error_code = "NR-P004"
+    user_action = (
+        "The SDK could not obtain a decision from the NullRun gate: the "
+        "call failed for a reason that is not a network failure, so the "
+        "SDK stopped rather than assume the call was allowed. This is "
+        "usually an SDK-side fault — retry, and if it persists, report "
+        "the exception's cause with the SDK version."
+    )
+    retryable = True
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_code: str | None = None,
+        user_action: str | None = None,
+        retryable: bool | None = None,
+        docs_url: str | None = None,
+        cause: BaseException | None = None,
+    ) -> None:
+        # ``cause`` is the original fault. It is what makes this class
+        # actionable: the message says the decision was indeterminate,
+        # and the cause says WHY (a bad request body, a decode error).
+        #
+        # The other keywords mirror the base class: a caller may
+        # override the class-level values per instance, and the base
+        # never mutates the class attribute.
+        super().__init__(
+            message,
+            error_code=error_code,
+            user_action=user_action,
+            retryable=retryable,
+            docs_url=docs_url,
+            cause=cause,
+        )
+
+
 class NullRunChainError(NullRunDecision):
     """Chain-related failure.
 
@@ -1681,9 +1755,18 @@ class NullRunWorkflowKilledError(WorkflowKilledInterrupt):
 #     operational rule the family encodes is the one that matters
 #     here: none of these may be downgraded to "the gate was
 #     unreachable, carry on".
+#   * ``NullRunGateIndeterminateError`` — the decision is
+#     INDETERMINATE (SDK-11): the gate call produced no decision the
+#     SDK can act on, and the failure was NOT a transport failure, so
+#     the SDK cannot tell "the backend said no" from "the SDK never
+#     found out". Same operational rule: it must not be downgraded to
+#     a fail-OPEN transport error, because an SDK-internal fault was
+#     being laundered into "allowed" — the call ran with no
+#     reservation and its cost event was dropped.
 ENFORCEMENT_EXCEPTIONS: tuple[type[BaseException], ...] = (
     NullRunDecision,
     RateLimitError,
     WorkflowKilledInterrupt,
     NullRunMalformedGateResponseError,
+    NullRunGateIndeterminateError,
 )

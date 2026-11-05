@@ -133,8 +133,10 @@ def test_the_scan_actually_found_something():
     # them and must not drift upward by accident either.
     # 40 = 39 + NullRunApprovalToolMismatchError (DEC-5 / DEC-7,
     # 2026-11-02 — the approval tool-binding refusal).
-    assert len(RAISABLE) == 40, (
-        f"expected the exception scan to find exactly 40 classes, found "
+    # 41 = 40 + NullRunGateIndeterminateError (SDK-11, 2026-11-05 —
+    # the refusal for a gate decision the SDK could not determine).
+    assert len(RAISABLE) == 41, (
+        f"expected the exception scan to find exactly 41 classes, found "
         f"{len(RAISABLE)}. The scan is the premise of every test in "
         f"this module — if it silently stopped matching, they would "
         f"all pass vacuously."
@@ -143,6 +145,7 @@ def test_the_scan_actually_found_something():
         "NullRunError",
         "NullRunApprovalDeniedError",
         "NullRunUnclassifiedRefusalError",
+        "NullRunGateIndeterminateError",
         "WorkflowKilledInterrupt",
     ):
         assert must_exist in RAISABLE, (

@@ -172,6 +172,14 @@ class RuntimeMetrics:
     # counter, the failure mode was invisible at INFO log level on
     # the FALLBACK path.
     gate_fail_open_total: int = 0
+    # The gate's decision was INDETERMINATE and the SDK REFUSED
+    # (SDK-11). A separate counter from ``gate_fail_open_total``
+    # because this one does NOT fail open: the call is stopped. It is
+    # the signal that the SDK itself is broken (a request body that
+    # cannot be serialised, a decode error, a fault in the edge
+    # path) — an SDK-side incident, not a backend outage, so it must
+    # not be alerted on as one.
+    gate_indeterminate_total: int = 0
     # `/track/batch` with `llm_call` events missing `reservation_id`
     # is now fail-CLOSED at the backend (whole-batch 503 BUDGET_RECHECK_FAILED).
     # Pre-0.16.0 the SDK fell back to that path for calls without a
@@ -289,6 +297,7 @@ class MetricsRegistry:
                     "timeouts": self.runtime.timeouts,
                     "loop_detections": self.runtime.loop_detections,
                     "gate_fail_open_total": self.runtime.gate_fail_open_total,
+                    "gate_indeterminate_total": self.runtime.gate_indeterminate_total,
                 },
             }
 

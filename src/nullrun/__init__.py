@@ -519,6 +519,10 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
         "nullrun.breaker.exceptions",
         "NullRunMalformedGateResponseError",
     ),
+    "NullRunGateIndeterminateError": (
+        "nullrun.breaker.exceptions",
+        "NullRunGateIndeterminateError",
+    ),
     "NullRunRateLimitRedisError": ("nullrun.breaker.exceptions", "NullRunRateLimitRedisError"),
     "NullRunBudgetRecheckFailedError": ("nullrun.breaker.exceptions", "NullRunBudgetRecheckFailedError"),
     "NullRunExecutionNotFoundError": ("nullrun.breaker.exceptions", "NullRunExecutionNotFoundError"),
@@ -747,6 +751,7 @@ __all__ = [
     "InsecureTransportError",
     "NullRunProtocolError",
     "NullRunMalformedGateResponseError",
+    "NullRunGateIndeterminateError",
     "NullRunRateLimitRedisError",
     "NullRunBudgetRecheckFailedError",
     "NullRunExecutionNotFoundError",
