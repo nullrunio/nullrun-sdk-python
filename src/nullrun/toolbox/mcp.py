@@ -54,10 +54,15 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable, Iterable
+from contextvars import Token
 from dataclasses import dataclass
 from typing import Any
 
+from nullrun.business_impact import BusinessImpact, compute_action_digest
 from nullrun.context import (
+    get_call_impact,
+    reset_call_impact,
+    set_call_impact,
     set_mcp_tool_context,
 )
 
@@ -129,6 +134,47 @@ def _normalize_annotation(tool: Any) -> _CachedTool:
         destructive=read_ann("destructiveHint"),
         open_world=read_ann("openWorldHint"),
     )
+
+
+def _derive_mcp_impact(
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> tuple[BusinessImpact, dict[str, Any], str] | None:
+    """Derive the ONE envelope that describes one MCP tool call.
+
+    ADR-125. The envelope is a ``tool_call`` impact carrying the tool
+    name and the EXACT argument dict the adapter forwards as the
+    canonical bag (``tool_arguments``). The backend re-derives the
+    digest from the live payload, compares it with the digest stored
+    on the approval row, and then compares the envelope's ``params``
+    with the live bag — so the params MUST be that same dict, not a
+    masked or reshaped copy of it. A reshaped copy would bind the
+    operator's approval to arguments nobody approved.
+
+    Returns ``(impact, wire_dict, digest)``, or ``None`` when the
+    envelope cannot be built: the digest layer cannot round-trip the
+    arguments (an f64, a non-ASCII tool name, an over-long parameter
+    name). The caller then sends the ``no_impact`` digest with NO
+    envelope, which the backend refuses at consume time — the
+    fail-CLOSED arm, not the legacy "no digest at all" arm that binds
+    an approval to nothing.
+    """
+    if not isinstance(arguments, dict):
+        # A non-mapping argument bag is not a tool payload this
+        # envelope can describe.
+        return None
+    try:
+        impact = BusinessImpact.tool_call(tool_name, arguments)
+    except (ValueError, TypeError, AttributeError) as exc:
+        logger.warning(
+            "MCPAdapter: could not derive a tool_call BusinessImpact for %r (%s); "
+            "the call goes on the wire with the no_impact digest and NO envelope, "
+            "so an operator approval for it cannot be consumed.",
+            tool_name,
+            exc,
+        )
+        return None
+    return impact, impact.to_wire_dict(), compute_action_digest(impact)
 
 
 class MCPAdapter:
@@ -354,6 +400,17 @@ class MCPAdapter:
           consume time, so a tampered payload is refused (NR-015,
           SDK half).
 
+          **When the caller supplies NEITHER, the adapter derives
+          both from the tool call itself** (ADR-125): a ``tool_call``
+          envelope carrying the tool name and the exact argument bag
+          it forwards, plus that envelope's digest. Without them the
+          approval row carries no digest at all, and the backend's
+          post-approval ``/execute`` re-entry cannot server-derive
+          one — it refuses the consume with ``BUSINESS_IMPACT_INVALID``
+          (NR-010), so an operator approval for an MCP tool could
+          never be spent, and even where it could, the approval would
+          bind the tool NAME but not the ARGUMENTS.
+
         Gate enforcement: ``call_tool`` ALWAYS routes the invocation
         through ``runtime.execute(...)`` (the /api/v1/execute gate
         endpoint) BEFORE the underlying MCP client is called. The
@@ -441,6 +498,102 @@ class MCPAdapter:
         runtime = self._resolve_runtime()
         execute_input = arguments if arguments is not None else {}
 
+        # ── The ONE envelope for this logical action (ADR-125) ─────
+        #
+        # The adapter derives the envelope from the tool call it is
+        # about to make: the tool name and the EXACT argument dict it
+        # forwards as the canonical bag. Without it the approval row
+        # carries NO digest, and the backend's post-approval
+        # /execute re-entry cannot server-derive the digest at all —
+        # it refuses the consume with BUSINESS_IMPACT_INVALID (NR-010),
+        # so an operator approval for an MCP tool could never be
+        # spent. See ADR-125 §1.
+        business_impact, action_digest, impact_token = self._resolve_impact(
+            tool_name=tool_name,
+            arguments=execute_input,
+            business_impact=business_impact,
+            action_digest=action_digest,
+        )
+        try:
+            return self._call_tool_gated(
+                runtime=runtime,
+                tool_name=tool_name,
+                arguments=arguments,
+                execute_input=execute_input,
+                approval_id=approval_id,
+                business_impact=business_impact,
+                action_digest=action_digest,
+                passthrough=passthrough,
+            )
+        finally:
+            if impact_token is not None:
+                reset_call_impact(impact_token)
+
+    def _resolve_impact(
+        self,
+        *,
+        tool_name: str,
+        arguments: dict[str, Any],
+        business_impact: dict[str, Any] | None,
+        action_digest: str | None,
+    ) -> tuple[dict[str, Any] | None, str | None, Token["BusinessImpact | None"] | None]:
+        """Resolve the envelope this call goes on the wire with.
+
+        Returns ``(business_impact, action_digest, impact_token)``.
+
+        * A caller that brought its OWN envelope (or its own digest)
+          keeps it: the SDK cannot reconstruct the caller's envelope,
+          so inventing a digest for it would be a claim the backend
+          cannot verify. Forward it verbatim.
+        * Otherwise the adapter derives the envelope from the call
+          itself and installs it on the call context, so the
+          pre-flight ``/gate`` hashes the SAME bytes this ``/execute``
+          carries (ADR-065: one envelope per logical action).
+        * An envelope already in scope (the ``@protect`` path) is NOT
+          overwritten — that path's own ``/gate`` and ``/execute`` must
+          keep agreeing with each other.
+        * When no envelope can be built at all, the digest still goes
+          on the wire (over the ``no_impact`` sentinel) and the
+          envelope stays ABSENT. The backend then takes its
+          fail-CLOSED arm ("cannot recompute") instead of the legacy
+          "no digest at all" arm, which is a grant bound to nothing.
+        """
+        if business_impact is not None or action_digest is not None:
+            return business_impact, action_digest, None
+
+        derived = _derive_mcp_impact(tool_name, arguments)
+        if derived is None:
+            return (
+                None,
+                compute_action_digest(BusinessImpact.no_impact()),
+                None,
+            )
+
+        impact, wire, digest = derived
+        token: Token["BusinessImpact | None"] | None = None
+        if get_call_impact() is None:
+            token = set_call_impact(impact)
+        return wire, digest, token
+
+    def _call_tool_gated(
+        self,
+        *,
+        runtime: Any,
+        tool_name: str,
+        arguments: dict[str, Any] | None,
+        execute_input: dict[str, Any],
+        approval_id: str | None,
+        business_impact: dict[str, Any] | None,
+        action_digest: str | None,
+        passthrough: dict[str, Any],
+    ) -> Any:
+        """The gated half of :meth:`call_tool`.
+
+        Split out so the caller can hold ONE envelope for the whole
+        logical action: the envelope is installed on the call context
+        before the pre-flight ``/gate`` runs and released after this
+        method returns, whatever it returns.
+        """
         # ── Pre-flight: /execute needs a prior /gate ───────────────
         #
         # The backend's ``/api/v1/execute`` runs an existence check on

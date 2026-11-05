@@ -10,7 +10,11 @@ adapter could not complete an approval round trip at all:
   saw the grant.
 * The adapter sent neither ``business_impact`` nor ``action_digest``,
   so the approval row was never digest-bound and the backend could not
-  detect a tampered payload when the grant was consumed.
+  detect a tampered payload when the grant was consumed. **ADR-125
+  closed this one**: the adapter now DERIVES both from the tool call
+  it is about to make — the deep properties live in
+  ``tests/test_mcp_action_binding.py``, and the "absent impact" test
+  below now asserts the derived envelope instead of its absence.
 * The tool arguments reached the wire only as the legacy ``input``
   field. The backend's canonical argument bag (ADR-060 §4) is
   ``tool_arguments`` → ``tool_params`` → Null, so with
@@ -251,10 +255,22 @@ class TestImpactReachesTheGate:
 
         assert runtime.execute_calls[0]["action_digest"] == "cd" * 32
 
-    def test_absent_impact_is_not_invented_on_the_wire(self):
-        """The adapter must not fabricate a digest the caller did not
-        supply — a made-up one would be a claim the backend cannot
-        verify."""
+    def test_the_absent_impact_is_derived_from_the_call_itself(self):
+        """ADR-125 supersedes the old "do not invent a digest" rule.
+
+        The adapter now derives the envelope from the call it is about
+        to make, so the digest on the wire is the digest OF that
+        envelope — not a made-up hex. The backend re-derives it from
+        the live payload and compares it with the digest stored on the
+        approval row, so a tampered payload is still refused; and
+        without an envelope the post-approval re-entry was refused
+        outright (BUSINESS_IMPACT_INVALID), so an operator approval
+        for an MCP tool could never be spent.
+
+        The deep properties live in ``tests/test_mcp_action_binding.py``.
+        """
+
+        from nullrun.business_impact import BusinessImpact, compute_action_digest
 
         runtime = _RecordingRuntime()
         adapter, _ = _adapter(runtime)
@@ -262,8 +278,9 @@ class TestImpactReachesTheGate:
         adapter.call_tool("create_issue", {"repo": "acme/api"})
 
         body = runtime.execute_calls[0]
-        assert "business_impact" not in body
-        assert "action_digest" not in body
+        envelope = BusinessImpact.tool_call("create_issue", {"repo": "acme/api"})
+        assert body["business_impact"] == envelope.to_wire_dict()
+        assert body["action_digest"] == compute_action_digest(envelope)
 
 
 # ---------------------------------------------------------------------------
