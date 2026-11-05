@@ -29,37 +29,98 @@ So the fix is a handoff: the callback stashes the decision, and the
 ``@protect`` boundary — which can abort — raises it. This module pins
 all three links in that chain: the swallow behaviour, the stash, and
 the raise.
+
+SDK-14 (reliability audit 2026-11-02)
+-------------------------------------
+This file used to define its OWN copy of the enforcement family::
+
+    ENFORCEMENT = (NullRunBudgetError, WorkflowKilledInterrupt, WorkflowPausedException)
+
+and assert ``issubclass(case, production_family)`` — one direction
+only. Two consequences, both measured:
+
+* **Widening the production family was invisible.** A refusal class
+  added to ``ENFORCEMENT_EXCEPTIONS`` and then mishandled by the
+  callback (dropped into the broad fail-OPEN arm) changed nothing in
+  this suite: the three hand-written cases were still subclasses of
+  the family, so every assertion still held. The family is the
+  mechanism that keeps a refusal from being laundered into "the gate
+  was unreachable, carry on" — and a member nobody drives is a promise
+  nobody checks.
+* **The copy could rot silently.** Nothing tied the three named
+  classes to the refusals the SDK actually raises.
+
+The family now lives in ONE place — the production tuple — and this
+file holds only what cannot be derived: the CONSTRUCTORS (every
+exception class has its own signature) and the correspondence
+INVARIANTS that keep the two in step. A drift in EITHER direction is
+RED, never silent.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import pytest
 
 from nullrun.breaker.exceptions import (
+    ENFORCEMENT_EXCEPTIONS,
+    NullRunBackendError,
     NullRunBudgetError,
+    NullRunDecision,
+    NullRunGateIndeterminateError,
+    NullRunMalformedGateResponseError,
+    NullRunToolBlockedError,
+    RateLimitError,
+    TransportErrorSource,
     WorkflowKilledInterrupt,
     WorkflowPausedException,
 )
 from nullrun.instrumentation.langgraph import (
     _ENFORCEMENT_EXCEPTIONS,
+    NullRunCallback,
     drain_deferred_enforcement,
     record_deferred_enforcement,
 )
 
-# SDK-14 (reliability audit 2026-11-02): this tuple used to be spelled
-# out HERE, in the test — a second copy of the production predicate. It
-# drifted: the production family was widened by SDK-4 (a
-# `TOOL_BLOCKED` refusal and a `RATE_LIMIT` refusal are enforcement
-# decisions too) while this copy stayed at three classes, so the test
-# asserted a predicate the code no longer used.
+# SDK-14: the CONSTRUCTORS, not the predicate.
 #
-# The classes under test are still named here — they are the CASES, not
-# the predicate. The predicate itself is imported from production.
-ENFORCEMENT = (
-    NullRunBudgetError,
-    WorkflowKilledInterrupt,
-    WorkflowPausedException,
-)
+# A case needs an INSTANCE, and every exception class has its own
+# signature — so the list of what to drive cannot be derived from the
+# production tuple mechanically. What CAN be derived is the PREDICATE,
+# and it is not written here: the production tuple
+# (`ENFORCEMENT_EXCEPTIONS`) is the only copy of it, and the
+# correspondence invariants in `TestTheFamilyAndTheCasesCorrespond`
+# are what keep this registry and that tuple in step. A drift in
+# EITHER direction is red.
+_CASE_BUILDERS: dict[type[BaseException], Callable[[], BaseException]] = {
+    # -- the production family's own members ---------------------------
+    NullRunDecision: lambda: NullRunDecision("the gate said no"),
+    RateLimitError: lambda: RateLimitError(
+        "rate limit exceeded",
+        TransportErrorSource.GATEWAY_ERROR,
+        "gate",
+    ),
+    WorkflowKilledInterrupt: lambda: WorkflowKilledInterrupt(
+        workflow_id="w-sdk14", reason="killed by the dashboard"
+    ),
+    NullRunMalformedGateResponseError: lambda: NullRunMalformedGateResponseError(
+        "the gate answered with something that is not a decision"
+    ),
+    NullRunGateIndeterminateError: lambda: NullRunGateIndeterminateError(
+        "the SDK could not determine a decision"
+    ),
+    # -- the concrete refusals the gate actually raises ----------------
+    NullRunBudgetError: lambda: NullRunBudgetError(
+        workflow_id="w-sdk14", reason="budget exhausted"
+    ),
+    WorkflowPausedException: lambda: WorkflowPausedException(
+        workflow_id="w-sdk14", reason="paused by the operator"
+    ),
+    NullRunToolBlockedError: lambda: NullRunToolBlockedError(
+        workflow_id="w-sdk14", reason="tool is on the block list", tool_name="shell"
+    ),
+}
 
 
 @pytest.fixture(autouse=True)
@@ -133,27 +194,200 @@ def _excepted_types(method) -> list[list[str]]:
     return found
 
 
-class TestEnforcementClassification:
-    @pytest.mark.parametrize("exc_cls", ENFORCEMENT)
-    def test_real_decisions_are_classified_as_enforcement(self, exc_cls):
-        # `issubclass`, not `in`: SDK-4 named the family by BASE class
-        # (`NullRunDecision` covers the budget / approval / tool-block
-        # refusals, `RateLimitError` covers the 429 refusal), so a
-        # concrete refusal class is covered by being a subclass of one
-        # of the named bases. `in` would only match the exact class and
-        # would fail for every subclass of a named base.
-        assert issubclass(exc_cls, _ENFORCEMENT_EXCEPTIONS), (
-            f"{exc_cls.__name__} is a real gate decision and must be caught "
-            "by the enforcement arm BEFORE the broad transport arm. If it "
-            "is not, an exhausted budget / KILL becomes a fail-open "
-            "transport error."
-        )
-        assert issubclass(exc_cls, Exception), (
-            f"{exc_cls.__name__} must subclass Exception — the transport arm "
-            "catches Exception, so a BaseException-only type would escape "
-            "the split entirely."
+class TestTheFamilyAndTheCasesCorrespond:
+    """SDK-14: the suite must assert the PRODUCTION predicate.
+
+    The defect this file used to carry was a COPY of the predicate.
+    These tests are what make the copy impossible to keep: they
+    compare the production family with the cases this suite actually
+    drives, in BOTH directions, and they pin that the instrumentation
+    uses the production tuple itself.
+    """
+
+    def test_every_family_member_has_a_case(self):
+        missing = [
+            member.__name__
+            for member in ENFORCEMENT_EXCEPTIONS
+            if member not in _CASE_BUILDERS
+        ]
+        assert not missing, (
+            "the production enforcement family has members this suite does "
+            f"not drive: {missing}. A family member is a promise that the "
+            "refusal REACHES the caller; a member nobody drives is a "
+            "promise nobody checks. Drive it here before the class ships "
+            "— or take the class out of the family with a decision."
         )
 
+    def test_every_case_is_covered_by_the_family(self):
+        uncovered = [
+            case.__name__
+            for case in _CASE_BUILDERS
+            if not any(issubclass(case, member) for member in ENFORCEMENT_EXCEPTIONS)
+        ]
+        assert not uncovered, (
+            f"these cases are no longer covered by the production family: "
+            f"{uncovered}. The family was narrowed, or the case is stale — "
+            "either way the refusal these classes represent would now fall "
+            "into the broad fail-OPEN arm and be swallowed."
+        )
+
+    def test_every_family_member_is_an_exception(self):
+        """A BaseException-only member would escape the split entirely."""
+        not_exceptions = [
+            member.__name__
+            for member in ENFORCEMENT_EXCEPTIONS
+            if not issubclass(member, Exception)
+        ]
+        assert not not_exceptions, (
+            f"{not_exceptions} derive from BaseException only — the broad "
+            "arm catches Exception, so such a member would never be "
+            "classified at all."
+        )
+
+    def test_the_instrumentation_uses_the_production_tuple(self):
+        """Identity, not a copy.
+
+        `instrumentation/langgraph.py` imports the production tuple and
+        falls back to an EMPTY tuple if that import fails. An empty
+        tuple means "no refusal is an enforcement refusal" — every
+        refusal is downgraded to a transport error and swallowed by the
+        broad arm. The alias must BE the production object, so the two
+        can never drift apart and the fallback can never be in effect.
+        """
+        assert _ENFORCEMENT_EXCEPTIONS is ENFORCEMENT_EXCEPTIONS, (
+            "the instrumentation's enforcement alias is not the production "
+            f"tuple — it is {_ENFORCEMENT_EXCEPTIONS!r}. An empty alias "
+            "means every refusal is treated as a transport error and "
+            "swallowed by the broad fail-OPEN arm."
+        )
+
+
+class _GateRefuses:
+    """A runtime whose budget pre-flight raises one fixed refusal."""
+
+    def __init__(self, exc: BaseException) -> None:
+        self.exc = exc
+        self.checks = 0
+
+    def check_workflow_budget(self, *a, **k):
+        self.checks += 1
+        raise self.exc
+
+    def track_event(self, *a, **k):
+        return None
+
+    def track_tool(self, *a, **k):
+        return None
+
+
+class TestEveryCaseIsDriven:
+    """SDK-14: a family member must be PROVEN, not asserted.
+
+    `issubclass` says the class is named by the family. It does not say
+    the refusal REACHES the caller. That difference is the whole point
+    of the family: a member the callback mishandles is downgraded to a
+    fail-OPEN transport error, and the call proceeds with no
+    reservation — the agent gets the call for free.
+
+    So every case is driven through the REAL callback, and the refusal
+    must (a) escape to the caller and (b) be recorded for the
+    ``@protect`` boundary.
+    """
+
+    @pytest.mark.parametrize(
+        "case",
+        list(_CASE_BUILDERS),
+        ids=[c.__name__ for c in _CASE_BUILDERS],
+    )
+    def test_the_refusal_reaches_the_caller(self, case):
+        pytest.importorskip("langchain_core")
+        from langchain_core.callbacks.manager import CallbackManager
+
+        exc = _CASE_BUILDERS[case]()
+        cb = NullRunCallback(runtime=_GateRefuses(exc))
+
+        with pytest.raises(type(exc)) as caught:
+            CallbackManager([cb]).on_llm_start({}, ["hi"])
+
+        assert caught.value is exc, (
+            f"{case.__name__}: the caller must receive the refusal itself, "
+            f"got {type(caught.value).__name__}"
+        )
+
+    @pytest.mark.parametrize(
+        "case",
+        list(_CASE_BUILDERS),
+        ids=[c.__name__ for c in _CASE_BUILDERS],
+    )
+    def test_the_refusal_reaches_the_async_caller(self, case):
+        """The async path is a DIFFERENT code path in langchain-core."""
+        import asyncio
+
+        pytest.importorskip("langchain_core")
+        from langchain_core.callbacks.manager import AsyncCallbackManager
+
+        exc = _CASE_BUILDERS[case]()
+        cb = NullRunCallback(runtime=_GateRefuses(exc))
+
+        with pytest.raises(type(exc)) as caught:
+            asyncio.run(AsyncCallbackManager([cb]).on_llm_start({}, ["hi"]))
+
+        assert type(caught.value) is type(exc), (
+            f"{case.__name__}: the async caller must receive the gate "
+            f"refusal, got {type(caught.value).__name__}"
+        )
+
+    @pytest.mark.parametrize(
+        "case",
+        list(_CASE_BUILDERS),
+        ids=[c.__name__ for c in _CASE_BUILDERS],
+    )
+    def test_the_refusal_is_recorded_for_the_protect_boundary(self, case):
+        """The secondary channel: a host framework that ignores
+        ``raise_error`` still gets the decision at the ``@protect``
+        boundary, on the boundary's own thread.
+        """
+        exc = _CASE_BUILDERS[case]()
+        cb = NullRunCallback(runtime=_GateRefuses(exc))
+
+        with pytest.raises(type(exc)):
+            # `run_id` is required: without it the callback returns early
+            # (it cannot open a span it would never close) and never
+            # reaches the budget pre-flight.
+            cb.on_llm_start({}, ["hi"], run_id="run-sdk14")
+
+        assert drain_deferred_enforcement() is exc, (
+            f"{case.__name__}: the refusal must also be recorded — it is "
+            "the only channel that can abort on the @protect boundary's "
+            "own thread"
+        )
+
+    def test_a_transport_failure_still_fails_open(self):
+        """ADR-008: a dead backend must NOT freeze the agent.
+
+        The counter-test for the family: an exception the family does
+        NOT name is a transport failure, and fail-OPEN is the
+        documented policy for it. Without this, "widen the family" would
+        look like a free improvement — and the family would grow until
+        a dead backend froze every agent.
+        """
+        boom = NullRunBackendError("boom", endpoint="gate", status_code=500)
+        assert not isinstance(boom, ENFORCEMENT_EXCEPTIONS), (
+            "a transport failure is not a decision — if this ever becomes "
+            "true the family's rule has changed and this control is no "
+            "longer a control"
+        )
+
+        cb = NullRunCallback(runtime=_GateRefuses(boom))
+        cb.on_llm_start({}, ["hi"], run_id="run-sdk14")  # must not raise
+
+        assert drain_deferred_enforcement() is None, (
+            "a transport failure is not a decision — it must not abort a "
+            "later @protect call either"
+        )
+
+
+class TestEnforcementClassification:
     def test_enforcement_arm_precedes_transport_arm(self):
         """The except-ordering is load-bearing, so pin it in the AST.
 
