@@ -63,6 +63,7 @@ from nullrun.context import (
     set_span_id,
     set_trace_id,
 )
+from nullrun.observability import metrics
 from nullrun.runtime import NullRunRuntime, get_runtime
 from nullrun.transport import is_fallback_decision_source
 
@@ -1003,6 +1004,7 @@ def _run_tool_policy_gate(
         NullRunBlockedException,
         NullRunDecision,
         NullRunExecutionNotFoundError,
+        NullRunGateIndeterminateError,
         NullRunInfrastructureError,
         NullRunTransportError,
         RateLimitError,
@@ -1092,26 +1094,51 @@ def _run_tool_policy_gate(
         # first-class attributes.
         raise
     except Exception as exc:  # noqa: BLE001
-        if fail_open:
-            logger.warning(
-                f"tool policy gate unavailable for {fn.__name__!r}: "
-                f"{exc}. NULLRUN_SENSITIVE_FAIL_OPEN=1 and "
-                f"{fn.__name__!r} is classified as fail-open-allowed "
-                f"— body will run."
-            )
-            return
-        err = NullRunBlockedException(
-            workflow_id=workflow_id,
-            reason=f"policy engine unavailable: {exc}",
-            tool_name=fn.__name__,
-            error_code="NR-B001",
-            user_action=(
-                f"The NullRun policy engine raised an unexpected "
-                f"exception during the @protect pre-check of "
-                f"'{fn.__name__}'. The body did NOT run. Check the "
-                f"chained exception (raise ... from exc) for the "
-                f"root cause."
-            ),
+        # NOT a transport failure, and NOT a decision the gateway
+        # named. Every class the arms above recognise is already
+        # classified, so what lands here is a fault in the SDK's OWN
+        # code — a request body that cannot be serialised, a bug in
+        # the signer, a TypeError in the transport's request builder.
+        #
+        # The decision is INDETERMINATE, and an indeterminate decision
+        # is not permission. ADR-063 §2.4's governing rule: a
+        # fail-OPEN is acceptable only when the check is genuinely
+        # un-decidable (no network) AND something downstream can
+        # correct it. Neither holds here: the policy engine WAS
+        # reachable, and the only thing downstream is `/track` — which
+        # does not gate on the policy answer, so a lost decision stays
+        # lost.
+        #
+        # Pre-fix this arm did three wrong things at once (SDK-13):
+        #   (a) it reported the fault as NR-B001 — a NETWORK code —
+        #       even though every network failure is classified by
+        #       the arm above and never reaches here;
+        #   (b) it typed the refusal as a policy BLOCK
+        #       (``NullRunBlockedException`` ⊂ ``NullRunDecision``),
+        #       so the FastAPI integration rendered it HTTP 429 /
+        #       category "decision" — the operator was told the policy
+        #       refused (or rate-limited) when the truth is that the
+        #       SDK has a bug;
+        #   (c) under the two-step opt-out it RETURNED, so the body
+        #       ran. That is what the audit's "proceeds" line
+        #       describes, and it is reachable ONLY for SDK-internal
+        #       faults: the /execute path converts every transport
+        #       failure into ``NullRunTransportError``, which the arm
+        #       above owns. The opt-out is documented as covering
+        #       "the policy engine is UNREACHABLE"; an SDK bug is a
+        #       different fact, and nothing downstream corrects it.
+        #
+        # This is the /execute twin of ADR-129's row 29: same fact,
+        # same class, same counter discipline.
+        metrics.inc_runtime("policy_gate_indeterminate_total")
+        logger.error(
+            f"tool policy gate for {fn.__name__!r} failed with a "
+            f"non-transport error, refusing the call: {exc!r}"
+        )
+        err = NullRunGateIndeterminateError(
+            "the /execute call failed with a non-transport error, so the "
+            f"SDK could not determine a decision for {fn.__name__!r}: {exc!r}",
+            cause=exc,
         )
         runtime._emit_sdk_error(
             err,

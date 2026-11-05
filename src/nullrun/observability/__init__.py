@@ -188,6 +188,16 @@ class RuntimeMetrics:
     # not follow). Expected rate: zero — a non-zero rate means the
     # control plane is sending instructions this SDK cannot run.
     unknown_action_total: int = 0
+    # The /execute policy decision was INDETERMINATE and the SDK
+    # REFUSED (SDK-13). The twin of ``gate_indeterminate_total`` on
+    # the /execute side: the SDK's own code faulted while asking the
+    # policy engine, so the SDK could not tell "the engine refused
+    # this" from "the SDK never found out" — and the decorated body
+    # did NOT run. A SEPARATE counter from ``gate_indeterminate_total``
+    # because the two are different seams: this one is the /execute
+    # request path, that one is the /gate path, and an operator
+    # chasing an SDK bug needs to know which one moved.
+    policy_gate_indeterminate_total: int = 0
     # `/track/batch` with `llm_call` events missing `reservation_id`
     # is now fail-CLOSED at the backend (whole-batch 503 BUDGET_RECHECK_FAILED).
     # Pre-0.16.0 the SDK fell back to that path for calls without a
@@ -278,6 +288,7 @@ class MetricsRegistry:
                     "circuit_half_open_count": self.transport.circuit_half_open_count,
                     "circuit_closed_count": self.transport.circuit_closed_count,
                     "fallback_mode_activations": self.transport.fallback_mode_activations,
+                    "events_recorded_overage": self.transport.events_recorded_overage,
                     "hmac_verify_failures_total": self.transport.hmac_verify_failures_total,
                     "hmac_verify_expired_total": self.transport.hmac_verify_expired_total,
                     "ws_unverified_approval_total": self.transport.ws_unverified_approval_total,
@@ -306,6 +317,13 @@ class MetricsRegistry:
                     "loop_detections": self.runtime.loop_detections,
                     "gate_fail_open_total": self.runtime.gate_fail_open_total,
                     "gate_indeterminate_total": self.runtime.gate_indeterminate_total,
+                    "unknown_action_total": self.runtime.unknown_action_total,
+                    "policy_gate_indeterminate_total": (
+                        self.runtime.policy_gate_indeterminate_total
+                    ),
+                    "dropped_llm_call_no_reservation": (
+                        self.runtime.dropped_llm_call_no_reservation
+                    ),
                 },
             }
 

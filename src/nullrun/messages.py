@@ -185,6 +185,14 @@ DEFAULT_MESSAGES: dict[str, str] = {
     # support" — the host code needs an SDK upgrade, which only the
     # operator / developer can perform.
     "NR-P001": "This service needs an update. Please contact support.",
+    # NR-P004: the SDK could not OBTAIN a decision — the gate call
+    # failed for a reason that is NOT a network failure, so the SDK
+    # stopped rather than assume the call was allowed (ADR-129 for
+    # the /gate seam, ADR-131 for the /execute seam). The fault is the
+    # SDK's own and may be transient, so the end-user copy is the
+    # "try again" cluster — the same shape as NR-B001, because the
+    # user's action is identical: retry.
+    "NR-P004": "I'm unable to check this request right now. Please try again in a moment.",
     # ---- Chain (multi-leg conversation state) -------------------------------
     # NR-CH001: chain context invalid — chain_id is unknown, belongs to
     # a different org, or exceeded max_duration. End-user outcome is
