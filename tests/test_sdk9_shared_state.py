@@ -9,11 +9,28 @@ lock ever existed for that cache.
 
 The subject survives elsewhere, and this file pins it where it does.
 
-The money consequence, stated once: a crash inside the enforcement
-path is caught by the gate's fail-OPEN arm, which returns ``None`` —
-and ``None`` means "nothing was decided", which the caller reads as
-"no block". So the defect is not a crash. It is a tool call that runs
-with NO policy decision, while the box has already charged the lease.
+The money consequence, stated once and MEASURED: a crash inside the
+enforcement path is caught by the gate's fail-OPEN arm, which returns
+``None`` — and ``None`` means "nothing was decided". So the defect is
+not a crash. It is a verdict that is LOST.
+
+The direction of the loss is the opposite of the audit's. The audit
+said "stale allows in the cache". The measured loss is a **lost
+REFUSAL**: the box refuses (lease dead, budget exhausted), the crash
+swallows the verdict, the fail-OPEN arm answers "nothing was decided",
+and the caller PROCEEDS on a call the box said no to.
+
+Which path loses it depends on whether a SECOND gate stands behind
+the pre-flight:
+
+* the ``@protect`` tool path (pre-flight → ``/execute`` → body) does
+  NOT lose it — the crash happens AFTER the answer is stored, so the
+  ``/execute`` half reads the box's refusal back out of the same
+  cache and blocks. Measured: 576/576 blocked, before and after;
+* the LLM-span path (``on_llm_start`` → ``check_workflow_budget``) has
+  NO ``/execute`` behind it, so nothing recovers the verdict. Measured
+  on the real callback with a refusing box: **35–43 of 576 LLM calls
+  proceeded on a refused lease** before the fix, 0 after.
 
 Every test here says which direction it fails in.
 """
@@ -79,6 +96,11 @@ def _allowing_box(body):
             "remaining_millicents": 499_990,
         }
     )
+
+
+def _refusing_box(body):
+    """A box that says no — the lease is dead, or the budget is gone."""
+    return _FakeResponse({"allowed": False, "error_code": "EDGE_LEASE_EXHAUSTED"})
 
 
 def _edge_transport(responder=None, *, answer_cap=None):
@@ -240,6 +262,49 @@ def test_a_concurrent_preflight_and_consume_never_trip(fast_gil):
     assert all(c is None or c.get("decision") == "allow" for c in consumed)
 
 
+def test_the_eviction_never_drops_a_live_answer_first(fast_gil):
+    """The eviction's ORDER is money, and nothing else pins it.
+
+    The cache holds two kinds of answer: a LIVE one (recorded by a
+    pre-flight, consumed by the ``/execute`` half moments later) and an
+    ORPHANED one (recorded by an LLM span, which has no ``/execute``
+    behind it and is never consumed).
+
+    The FIFO eviction drops the OLDEST. That is the right order for the
+    shape that occurs in production: the cache is already full of
+    orphans, the pre-flight records the LIVE answer, and the eviction
+    fires on that very record. Evicting the OLDEST drops an orphan;
+    evicting the NEWEST drops the answer that was just recorded — the
+    one the in-flight call is about to consume.
+
+    Measured: evicting the newest instead of the oldest passes every
+    other test in this file — the crash is gone either way, so the
+    order was unpinned. This test pins it.
+
+    No thread is needed: the order is pure insertion order, so the
+    failure is deterministic rather than a race.
+    """
+    t = _edge_transport(answer_cap=4)
+
+    # The cache is full of orphans — the LLM-span shape.
+    for i in range(t._answer_cap):
+        t._record(f"orphan-{i}", {"decision": "allow"})
+
+    assert len(t._answers) == t._answer_cap
+
+    # The pre-flight now records the answer the in-flight call will
+    # consume. This record tips the cache over the cap, so the
+    # eviction fires ON THE LIVE ANSWER.
+    live = "LIVE-answer"
+    t._record(live, {"decision": "allow"})
+
+    assert t.take_answer(live) is not None, (
+        "the eviction dropped the LIVE answer it had just recorded: the "
+        "FIFO must evict the oldest entry, or a call the box allowed and "
+        "charged is refused with EDGE_NOT_ENFORCED"
+    )
+
+
 def test_a_concurrent_gate_call_never_falls_into_the_fail_open_arm(monkeypatch, fast_gil):
     """The consequence, at the level the agent sees it.
 
@@ -288,6 +353,70 @@ def test_a_concurrent_gate_call_never_falls_into_the_fail_open_arm(monkeypatch, 
         "a gate call returned None: the enforcement path crashed and the "
         "fail-OPEN arm swallowed it, so the tool would run with no policy "
         "decision at all"
+    )
+
+
+def test_a_refused_box_never_becomes_a_failed_open(monkeypatch, fast_gil):
+    """The MONEY direction: a refusal must never read as "no decision".
+
+    This is the direction the audit got backwards. The audit said the
+    crash leaves "stale allows in the cache". The measured loss is the
+    opposite: the box REFUSES, the crash swallows the verdict, the
+    fail-OPEN arm returns ``None`` — "nothing was decided" — and the
+    caller PROCEEDS on a call the box said no to.
+
+    Measured on the real LLM-span path with a refusing box (96 threads
+    x 6 calls): **35–43 of 576 LLM calls proceeded on a refused lease**
+    before the fix. After the fix: 0.
+
+    So the invariant this test pins is not "no crash" — it is "a
+    refusal is never converted into a fail-OPEN".
+
+    ``check_workflow_budget`` returns ``None`` for exactly two things:
+    a fail-OPEN, and a soft_pass. Neither can happen here — the box
+    REFUSES every time — so a ``None`` here means the verdict was
+    destroyed, not that the gate was unreachable.
+    """
+    from nullrun.breaker.exceptions import NullRunBlockedException
+    from nullrun.context import workflow
+    from nullrun.runtime import NullRunRuntime
+
+    monkeypatch.setenv("NULLRUN_EDGE_URL", "http://127.0.0.1:18090")
+    monkeypatch.setenv("NULLRUN_EDGE_LEASE_ID", "0195f0c0-0000-7000-8000-000000000001")
+    monkeypatch.setenv("NULLRUN_EDGE_TOKEN", "box-token")
+    monkeypatch.setenv("NULLRUN_API_KEY", "nr_org_key")
+
+    rt = NullRunRuntime(
+        api_key="nr_org_key",
+        api_url="https://api.nullrun.io",
+        _test_mode=True,
+        polling=False,
+    )
+    rt._transport.edge._post = _refusing_box  # type: ignore[method-assign]
+    rt._transport.edge._answer_cap = 4
+
+    verdicts: list[object] = []
+
+    def worker(n):
+        for _ in range(40):
+            with workflow("wf-edge"):
+                try:
+                    verdicts.append(rt.check_workflow_budget())
+                except NullRunBlockedException:
+                    # The refusal reached the caller: correct.
+                    verdicts.append("refused")
+
+    _, errors = _run_threads([lambda n=n: worker(n) for n in range(8)])
+
+    assert errors == [], (
+        "the gate raised something that is not a refusal: "
+        f"{[type(e).__name__ for e in errors[:3]]}"
+    )
+    assert verdicts, "no gate call completed"
+    assert None not in verdicts, (
+        "a REFUSED box was converted into a failed-open: the enforcement "
+        "path crashed, the fail-OPEN arm swallowed the refusal, and the "
+        "caller proceeded on a call the box said no to"
     )
 
 
