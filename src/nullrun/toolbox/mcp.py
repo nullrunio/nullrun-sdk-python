@@ -536,7 +536,7 @@ class MCPAdapter:
         arguments: dict[str, Any],
         business_impact: dict[str, Any] | None,
         action_digest: str | None,
-    ) -> tuple[dict[str, Any] | None, str | None, Token["BusinessImpact | None"] | None]:
+    ) -> tuple[dict[str, Any] | None, str | None, Token[BusinessImpact | None] | None]:
         """Resolve the envelope this call goes on the wire with.
 
         Returns ``(business_impact, action_digest, impact_token)``.
@@ -570,7 +570,7 @@ class MCPAdapter:
             )
 
         impact, wire, digest = derived
-        token: Token["BusinessImpact | None"] | None = None
+        token: Token[BusinessImpact | None] | None = None
         if get_call_impact() is None:
             token = set_call_impact(impact)
         return wire, digest, token
