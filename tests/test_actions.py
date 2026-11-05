@@ -17,7 +17,10 @@ from nullrun.actions import (
     handle_action,
     register_action_handler,
 )
-from nullrun.breaker.exceptions import NullRunBlockedException
+from nullrun.breaker.exceptions import (
+    NullRunBlockedException,
+    NullRunUnknownActionError,
+)
 
 
 class TestActionHandlerInit:
@@ -262,32 +265,58 @@ class TestSnapshotAndBlock:
 
 
 # ===========================================================================
-# B14: unknown action type must NOT silently BLOCK
+# B14 + SDK-12: an unknown action type must NOT silently BLOCK, and
+# must not be silently RETURNED either
 # ===========================================================================
-# Pre-fix: an unknown action type (e.g. server schema regression
+# Pre-B14: an unknown action type (e.g. server schema regression,
 # version mismatch, or attacker-controlled input) silently degraded
 # to ``ActionType.BLOCK`` and triggered ``_default_block``, which
 # raises ``NullRunBlockedException``. That made the SDK into a DoS
 # amplifier: one malformed message stopped the whole workflow.
-# Post-fix: log at ERROR, record a forensic event with the unknown
-# action type, and DO NOT invoke any handler. Workflow continues.
+#
+# B14's fix kept the DoS property but left the action neither executed
+# nor refused — it was logged and RETURNED, so the caller believed it
+# had run. SDK-12 closes that: the unknown type now RAISES a typed
+# infrastructure error (``NullRunUnknownActionError``). It is
+# deliberately NOT a block, so B14's property survives.
+#
+# The full contract is pinned in tests/test_sdk12_unknown_action.py.
+# What follows is the in-place rewrite of the B14-era pins: they
+# asserted "must not raise", which is now the opposite of the truth,
+# so they are REPLACED by the stronger pair ("raises the typed error"
+# AND "is not a block"), never relaxed.
 
 
-class TestUnknownActionTypeFailOpen:
-    """Unknown action types must fail open, not silently BLOCK."""
+class TestUnknownActionTypeRefused:
+    """An unknown action type must be REFUSED — and must not BLOCK."""
 
-    def test_unknown_action_does_not_raise_blocked_exception(self):
-        """Unknown action type must not raise NullRunBlockedException.
+    def test_unknown_action_raises_a_typed_error(self):
+        """SDK-12: the action was neither executed nor refused before.
 
-        Pre-fix this raised ``NullRunBlockedException`` because
-        ``ActionType(action.lower )`` raised ``ValueError`` which
-        was caught and silently fell through to ``ActionType.BLOCK``
-        → ``_default_block`` → raise. Post-fix the method returns
-        cleanly and the workflow continues.
+        The caller must be able to tell "it ran" from "it could not
+        run", so the unknown type raises.
         """
         handler = ActionHandler()
-        # Must not raise.
-        handler.handle("totally_made_up_action", "wf-mystery", "test reason")
+        with pytest.raises(NullRunUnknownActionError):
+            handler.handle("totally_made_up_action", "wf-mystery", "test reason")
+
+    def test_unknown_action_does_not_raise_blocked_exception(self):
+        """B14's property survives: an unknown type must not BLOCK.
+
+        Pre-B14 this raised ``NullRunBlockedException`` because
+        ``ActionType(action.lower )`` raised ``ValueError`` which
+        was caught and silently fell through to ``ActionType.BLOCK``
+        → ``_default_block`` → raise. That made the SDK into a DoS
+        amplifier: one malformed message stopped the whole workflow.
+        The refusal is therefore an infrastructure error, not a block.
+        """
+        handler = ActionHandler()
+        with pytest.raises(NullRunUnknownActionError) as info:
+            handler.handle("totally_made_up_action", "wf-mystery", "test reason")
+        assert not isinstance(info.value, NullRunBlockedException), (
+            "an unknown action type must not become a block — that was "
+            "the DoS amplifier B14 removed"
+        )
 
     def test_unknown_action_records_forensic_event(self):
         """Unknown action type is still recorded in action history.
@@ -298,7 +327,8 @@ class TestUnknownActionTypeFailOpen:
         event in history.
         """
         handler = ActionHandler()
-        handler.handle("not_a_real_action", "wf-mystery", "real reason")
+        with pytest.raises(NullRunUnknownActionError):
+            handler.handle("not_a_real_action", "wf-mystery", "real reason")
 
         history = handler.get_action_history()
         assert len(history) == 1
@@ -317,7 +347,8 @@ class TestUnknownActionTypeFailOpen:
         handler = ActionHandler()
 
         with caplog.at_level(logging.ERROR, logger="nullrun.actions"):
-            handler.handle("bogus", "wf-x", "r")
+            with pytest.raises(NullRunUnknownActionError):
+                handler.handle("bogus", "wf-x", "r")
 
         error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
         assert any("bogus" in r.getMessage() for r in error_records), (
@@ -331,12 +362,10 @@ class TestUnknownActionTypeFailOpen:
 
         Regression guard: a malformed action in the stream must not
         prevent subsequent KILL/PAUSE/etc. from being delivered.
-        Pre-fix the silent-BLOCK raised an exception that the
-        ``except BaseException`` swallowed, but a future change to
-        that catch could break this — pin it.
         """
         handler = ActionHandler()
-        handler.handle("malformed_first", "wf-mix", "first")
+        with pytest.raises(NullRunUnknownActionError):
+            handler.handle("malformed_first", "wf-mix", "first")
         # Now a real KILL — must still be recorded and still raise.
         handler.handle(ActionType.KILL, "wf-mix", "second")
 
@@ -413,15 +442,16 @@ def test_clear_history_empties_list():
 
 
 def test_handle_unknown_action_does_not_invoke_handler():
-    """B14: unknown action logs ERROR + records BLOCK but
-    does NOT invoke any handler (fail-open). Pre-fix this degraded
-    to BLOCK → DoS amplifier.
+    """B14 + SDK-12: an unknown action logs ERROR, records a forensic
+    event, invokes NO handler, and refuses with a typed error.
+    Pre-B14 this degraded to BLOCK → DoS amplifier.
     """
     h = ActionHandler()
     handler_mock = MagicMock()
     h.register_handler(ActionType.BLOCK, handler_mock)
-    # ``"weird"`` is not in ActionType — should fail-open.
-    h.handle("weird", "wf-1", reason="x")
+    # ``"weird"`` is not in ActionType — it must not run a handler.
+    with pytest.raises(NullRunUnknownActionError):
+        h.handle("weird", "wf-1", reason="x")
     handler_mock.assert_not_called()
 
 
@@ -431,7 +461,8 @@ def test_handle_unknown_action_records_block_event(caplog):
 
     h = ActionHandler()
     with caplog.at_level(logging.ERROR, logger="nullrun.actions"):
-        h.handle("unknown_action_type", "wf-1", reason="x")
+        with pytest.raises(NullRunUnknownActionError):
+            h.handle("unknown_action_type", "wf-1", reason="x")
     history = h.get_action_history()
     assert any(e.action_type == "block" for e in history)
 
@@ -455,9 +486,15 @@ def test_handle_action_lowercases_input():
 
 def test_handle_kill_does_not_propagate_killed_interrupt():
     """``WorkflowKilledInterrupt`` from the handler is SWALLOWED by the
-    dispatch loop (BaseException caught and logged). The kill signal
-    has already been recorded in history by the time the dispatch
-    wraps the handler call — re-raising would lose the audit entry.
+    dispatch loop.
+
+    The old rationale for the swallow — "re-raising would lose the
+    audit entry" — was factually wrong: the history entry is written
+    BEFORE the handler is called, so a raise cannot lose it. The real
+    reason the refusal is swallowed is that the authoritative
+    enforcement of a kill is the GATE (ADR-063 §3 — the gate refuses
+    the next /check); re-raising here would abort the caller's action
+    loop over an action that was delivered correctly.
     """
     h = ActionHandler()
     h.handle("kill", "wf-1", reason="x")  # no raise

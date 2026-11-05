@@ -9,7 +9,7 @@ The codes follow a `NR-<CATEGORY><NNN>` pattern:
 | `NR-C` | **C**onfiguration | Missing or invalid SDK config (no api_key, no workflow, etc.) |
 | `NR-A` | **A**uthentication | API key rejected, auth response malformed, approval flow anomaly |
 | `NR-B` | **B**ackend | 5xx, network error, budget exhausted, sensitive-tool extraction failure |
-| `NR-P` | **P**rotocol | Wire-protocol version mismatch (X-NULLRUN-PROTOCOL too old / too new), or a gate decision the SDK could not determine |
+| `NR-P` | **P**rotocol | Wire-protocol version mismatch (X-NULLRUN-PROTOCOL too old / too new), a gate decision the SDK could not determine, or a control-plane action the SDK cannot execute |
 | `NR-W` | **W**orkflow state | Workflow killed, paused, soft-deleted |
 | `NR-CH` | **Ch**ain | Chain context invalid (not found, org/key mismatch, parent execution mismatch) |
 | `NR-T` | **T**ool | Tool in block list |
@@ -53,6 +53,7 @@ The codes follow a `NR-<CATEGORY><NNN>` pattern:
 |---|---|---|
 | `NR-P001` | Wire-protocol version mismatch (`X-NULLRUN-PROTOCOL` too old / too new) | [NR-P001](NR-P001.md) |
 | `NR-P004` | The gate's decision could not be determined — the gate call failed for a reason that is NOT a transport failure, so the SDK refused the call | [NR-P004](NR-P004.md) |
+| `NR-P005` | The control plane sent an action type this SDK does not know — the action was NOT executed (the workflow is not blocked) | [NR-P005](NR-P005.md) |
 
 ### Workflow state (NR-W)
 

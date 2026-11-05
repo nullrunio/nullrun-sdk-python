@@ -42,6 +42,7 @@ from nullrun.breaker.exceptions import (
     NullRunMcpDestructiveBlockedError,
     NullRunMcpReadonlyBypassBlockedError,
     NullRunTransportError,
+    NullRunUnknownActionError,
     RateLimitError,
     TransportErrorSource,
 )
@@ -3161,6 +3162,22 @@ class Transport:
                     reason = action.get("reason", "")
                     if action_type:
                         handle_action(action_type, workflow_id, reason)
+                except NullRunUnknownActionError as item_err:
+                    # The control plane sent an action type this SDK
+                    # cannot execute (SDK-12). That is a control-plane
+                    # INTEGRITY event, not a malformed payload: it is
+                    # logged at ERROR so it is not filed under "skipped
+                    # malformed action", and the loop continues so one
+                    # unknown action cannot abort the rest of the batch.
+                    logger.error(
+                        "Control plane sent an action type this SDK cannot "
+                        "execute: %r (workflow=%s). The action was NOT "
+                        "executed — this is a server/SDK version mismatch. "
+                        "(%s)",
+                        action.get("type"),
+                        action.get("workflow_id"),
+                        item_err,
+                    )
                 except Exception as item_err:
                     logger.warning("Skipping malformed action %r: %s", action, item_err)
             for msg in (data or {}).get("messages", []) or []:

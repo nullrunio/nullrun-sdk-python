@@ -180,6 +180,14 @@ class RuntimeMetrics:
     # path) — an SDK-side incident, not a backend outage, so it must
     # not be alerted on as one.
     gate_indeterminate_total: int = 0
+    # A control-plane action arrived whose type this SDK does not know
+    # (SDK-12). The action was NOT executed; the SDK raised
+    # ``NullRunUnknownActionError`` and the caller was told. This
+    # counter is the operator's signal that the server and the SDK are
+    # out of step (the server grew its action vocabulary, the SDK did
+    # not follow). Expected rate: zero — a non-zero rate means the
+    # control plane is sending instructions this SDK cannot run.
+    unknown_action_total: int = 0
     # `/track/batch` with `llm_call` events missing `reservation_id`
     # is now fail-CLOSED at the backend (whole-batch 503 BUDGET_RECHECK_FAILED).
     # Pre-0.16.0 the SDK fell back to that path for calls without a

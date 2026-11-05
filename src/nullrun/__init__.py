@@ -523,6 +523,13 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
         "nullrun.breaker.exceptions",
         "NullRunGateIndeterminateError",
     ),
+    # The control plane sent an action type this SDK cannot execute
+    # (SDK-12). Infrastructure, not a decision: the workflow is NOT
+    # blocked, but the action did NOT run and the caller is told.
+    "NullRunUnknownActionError": (
+        "nullrun.breaker.exceptions",
+        "NullRunUnknownActionError",
+    ),
     "NullRunRateLimitRedisError": ("nullrun.breaker.exceptions", "NullRunRateLimitRedisError"),
     "NullRunBudgetRecheckFailedError": ("nullrun.breaker.exceptions", "NullRunBudgetRecheckFailedError"),
     "NullRunExecutionNotFoundError": ("nullrun.breaker.exceptions", "NullRunExecutionNotFoundError"),
@@ -752,6 +759,7 @@ __all__ = [
     "NullRunProtocolError",
     "NullRunMalformedGateResponseError",
     "NullRunGateIndeterminateError",
+    "NullRunUnknownActionError",
     "NullRunRateLimitRedisError",
     "NullRunBudgetRecheckFailedError",
     "NullRunExecutionNotFoundError",

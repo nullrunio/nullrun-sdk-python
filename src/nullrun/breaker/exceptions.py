@@ -497,6 +497,65 @@ class NullRunGateIndeterminateError(NullRunInfrastructureError):
         )
 
 
+class NullRunUnknownActionError(NullRunInfrastructureError):
+    """The control plane sent an action type this SDK does not know.
+
+    Raised when a control-plane action arrives whose ``type`` is not
+    in the SDK's ``ActionType`` enum — a wire value the SDK cannot
+    interpret, and therefore cannot execute.
+
+    Why this raises instead of returning quietly (SDK-12)
+    -----------------------------------------------------
+    The action dispatcher used to log the unknown type at ERROR, record
+    a forensic history event, and RETURN. The caller then had no way
+    to tell "the action ran" from "the action could not be run": the
+    action was neither executed nor refused, while the caller's own
+    bookkeeping said it had been handled. A control-plane instruction
+    that is silently dropped is a control-plane instruction that does
+    not exist.
+
+    The refusal is deliberately NOT a :class:`NullRunBlockedException`.
+    An unknown action type must not degrade into "the workflow is
+    blocked": that is what made the SDK a DoS amplifier in the first
+    place (B14) — one unrecognised value from the control plane would
+    stop every subsequent tool call in the workflow. This class is an
+    INFRASTRUCTURE error: the control plane sent something the SDK
+    cannot execute, and the fix is a version alignment, not a policy
+    verdict.
+
+    It is deliberately NOT a :class:`NullRunTransportError` subclass,
+    for the same reason as :class:`NullRunGateIndeterminateError`:
+    ADR-126's two-step opt-in opens transport errors, and "the body
+    runs" is not an acceptable answer to "the control plane sent an
+    instruction this SDK cannot execute".
+    """
+
+    error_code = "NR-P005"
+    user_action = (
+        "The NullRun control plane sent an action type this SDK version "
+        "does not know, so the action was NOT executed. This is a "
+        "server/SDK version mismatch — upgrade the SDK to a version that "
+        "understands the control plane's action vocabulary. The "
+        "workflow itself is not blocked."
+    )
+    retryable = False
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        action: str | None = None,
+        workflow_id: str | None = None,
+        reason: str | None = None,
+        cause: BaseException | None = None,
+        **kwargs: Any,
+    ) -> None:
+        self.action = action
+        self.workflow_id = workflow_id
+        self.reason = reason
+        super().__init__(message, cause=cause, **kwargs)
+
+
 class NullRunChainError(NullRunDecision):
     """Chain-related failure.
 
