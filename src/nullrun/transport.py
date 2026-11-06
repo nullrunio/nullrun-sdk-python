@@ -5098,12 +5098,11 @@ def _parse_v3_error_envelope_uncategorised(
     Mapping table lives at ``_V3_ERROR_CODE_MAP`` below — keep the
     helper as a thin dispatcher.
 
-    DEF-NR-TOOLBLOCKED-PARSER: the ``catalog is
-    NullRunToolBlockedError or catalog is NullRunBlockedException``
-    arm further down is the dedicated branch for the typed v3
-    envelope. It used to be documented by a comment inside
-    ``Transport.check``, which never had such a branch — the tag was
-    filed against the wrong function for as long as it existed.
+    DEF-NR-TOOLBLOCKED-PARSER: the subclass test on
+    NullRunBlockedException further down is the dedicated branch for
+    the typed v3 envelope. It used to be documented by a comment
+    inside ``Transport.check``, which never had such a branch — the tag
+    was filed against the wrong function for as long as it existed.
     Re-filed here, on the function that actually holds the code.
     """
     # Lazy imports: the exception classes import the transport
@@ -5120,7 +5119,6 @@ def _parse_v3_error_envelope_uncategorised(
         NullRunConsumeOverbudgetError,
         NullRunProtocolError,
         NullRunRateLimitRedisError,
-        NullRunToolBlockedError,
         NullRunWorkflowInactiveError,
         RateLimitError,
     )
@@ -5318,6 +5316,44 @@ def _parse_v3_error_envelope_uncategorised(
             return catalog(full_message)
         if catalog is NullRunProtocolError:
             return catalog(full_message)
+        if catalog is RateLimitError:
+            # RateLimitError has NO message-only form: it requires
+            # ``source`` + ``endpoint``. The generic
+            # ``catalog(full_message, **forwarded)`` fallback below
+            # would raise TypeError, and the TypeError escapes the
+            # parser into the catch-all in Transport.execute — the
+            # refusal would be swallowed into a synthetic
+            # ``{"decision": "block"}`` dict and the caller would see
+            # a block where the backend said "you are rate limited".
+            #
+            # The 429 codes that reach this arm are RATE_LIMIT_PLAN_TIER
+            # (the PLAN's aggregate per-org cap — ADR-029 §13) and
+            # WAITLIST_RATE_LIMITED. ``upgrade_url`` is the plan-change
+            # link the backend sends for the plan tier; the caller
+            # surfaces it instead of guessing the pricing page.
+            retry_after = retry_after_ms / 1000.0 if retry_after_ms else None
+            return RateLimitError(
+                full_message,
+                source=TransportErrorSource.GATEWAY_ERROR,
+                endpoint=endpoint,
+                retry_after=retry_after,
+                upgrade_url=body.get("upgrade_url") if isinstance(body, dict) else None,
+                body=body,
+            )
+        if catalog is NullRunChainError:
+            # The chain family carries its own attributes (chain_id,
+            # backend_code). The generic fallback drops them: the base
+            # constructor only accepts error_code / user_action /
+            # retryable / docs_url / cause, and everything else in the
+            # wire ``details`` is filtered out before the call.
+            # ``backend_code`` keeps the wire string, which is what
+            # tells CHAIN_NOT_FOUND (404) from CHAIN_ENDED (409).
+            return NullRunChainError(
+                full_message,
+                chain_id=details.get("chain_id"),
+                backend_code=backend_code,
+                status_code=status,
+            )
         # NullRunAuthError — surface the wire error_code (one of
         # v3.38's API_KEY_REVOKED / API_KEY_EXPIRED / API_KEY_DISABLED
         # / API_KEY_INVALID / API_KEY_MISSING / API_KEY_MALFORMED) on
@@ -5359,27 +5395,38 @@ def _parse_v3_error_envelope_uncategorised(
         # as BaseException (the helper declares -> Exception).
         allowed = {"error_code", "user_action", "retryable", "docs_url", "cause"}
         forwarded = {k: v for k, v in details.items() if k in allowed}
-        if (
-            catalog is NullRunToolBlockedError
-            or catalog is NullRunBlockedException
-        ):
-            # subclasses require positional ``workflow_id`` + ``reason``
-            # (no defaults), so the generic ``catalog(full_message, ...)``
-            # fallback below raises TypeError when given a string for
-            # ``workflow_id``. Affects 7 catalog entries: TOOL_BLOCKED,
-            # LOOP_DETECTED, MODEL_REQUIRED, POLICY_UNCONFIGURED,
-            # TOO_MANY_PENDING_APPROVALS, BUSINESS_IMPACT_INVALID,
-            # VALIDATION_FAILED. Pre-fix the TypeError escaped the parser
-            # and got swallowed by the catch-all ``except Exception: pass``
-            # in Transport.execute, surfacing the synthetic-block dict
+        if issubclass(catalog, NullRunBlockedException):
+            # Every NullRunBlockedException subclass requires
+            # ``workflow_id`` + ``reason`` (no defaults), so the generic
+            # ``catalog(full_message, ...)`` fallback below raises
+            # TypeError when given a string for ``workflow_id``.
+            #
+            # The test is ``issubclass``, not identity, and that is the
+            # whole point of this arm. An identity test
+            # (``catalog is NullRunBlockedException``) matched only the
+            # two exact classes — NullRunToolBlockedError and the base —
+            # so EVERY typed subclass of the blocked family fell through
+            # to the generic fallback and raised TypeError:
+            # NullRunApprovalDbUnavailableError (8 catalog entries),
+            # NullRunApprovalReplayRejectedError (via
+            # APPROVAL_ALREADY_DECIDED), and the three NullRunMcp*Error
+            # classes. The TypeError escaped the parser and got swallowed
+            # by the catch-all ``except Exception: pass`` in
+            # Transport.execute, surfacing the synthetic-block dict
             # ``{"decision": "block", "explanation": "Gateway returned
-            # 403"}`` instead of the typed NR-T001 / NR-Lxxx catalog line.
-            # ``tool_name`` is forwarded for NullRunToolBlockedError
-            # (the only BlockedException subclass that surfaces it on the
-            # wire envelope); the parent constructor drops it for plain
-            # NullRunBlockedException so it's a no-op there. ``forwarded``
-            # (error_code / user_action / retryable / docs_url / cause) is
-            # passed through so the catalog value's defaults win.
+            # 403"}`` instead of the typed NR-Axxx / NR-MCPxx catalog
+            # line. The caller could not branch on the refusal at all.
+            #
+            # ``tool_name`` is forwarded for the subclasses that surface
+            # it on the wire envelope; the parent constructor drops it
+            # for plain NullRunBlockedException so it's a no-op there.
+            # ``forwarded`` (error_code / user_action / retryable /
+            # docs_url / cause) is passed through so the catalog value's
+            # defaults win.
+            #
+            # Order matters: NullRunBudgetError is a subclass of
+            # NullRunBlockedException and has its OWN arm above, so the
+            # budget family keeps its dedicated constructor.
             instance = catalog(  # type: ignore[call-arg]
                 workflow_id=str(details.get("workflow_id") or "unknown"),
                 reason=full_message,
@@ -5778,6 +5825,173 @@ def _build_v3_error_code_map() -> dict[str, type[Exception]]:
         # catch-all hiding drift: previously every one of the eleven
         # codes above landed here untyped.
         "INTERNAL_ERROR": NullRunBackendError,
+        # -----------------------------------------------------------------
+        # 2026-11-07 (SDK-15) — thirty-four codes the backend registers and
+        # this catalog never learned about.
+        #
+        # The parity guard in
+        # ``backend/tests/nr007_sdk_error_code_parity.rs`` could not see
+        # them: it was not wired into any workflow, so the drift grew from
+        # the twelve the audit named to thirty-four by the time the guard
+        # was finally run against a live backend enum. Every one of them
+        # fell through to the status-based fallback, so the refusal
+        # arrived as a generic ``NullRunBackendError`` (or, on a 4xx, as
+        # an authentication error) with no diagnostic class at all.
+        #
+        # The mapping is by WIRE BUCKET, and the bucket comes from the
+        # backend's own registry — ``GateErrorCode::http_status`` — so the
+        # SDK's class and the backend's status cannot disagree:
+        #
+        #   - 402/429 money       → NullRunBudgetError ("stop spending")
+        #   - 403 refusal         → the refusal's own class
+        #   - 429 rate limit      → RateLimitError (retry_after and
+        #                           upgrade_url ride along)
+        #   - 4xx client contract → NullRunProtocolError / the typed
+        #                           binding class
+        #   - 5xx "the store did
+        #     not answer"        → NullRunBackendError (retryable), or
+        #                           the subsystem's own typed infra class
+        # -----------------------------------------------------------------
+        # 402 — the anti-DoS reserve scan could not enumerate the org's
+        # reservations, so the reservation was refused. The wire puts it
+        # in the money bucket: the call did not get its money. It is NOT
+        # an outage, so it belongs to the budget family and not to the
+        # infra family.
+        "RESERVED_SCANNED_PARTIAL": NullRunBudgetError,
+        # 429 — the period budget was exhausted between reserve and
+        # consume. The caller must stop and wait for the period, exactly
+        # like every other exhausted-boundary code — a money outcome, so a
+        # budget error and not a rate limit.
+        "BUDGET_EXCEEDED": NullRunBudgetError,
+        # 429 — the PLAN's aggregate per-org cap refused the call
+        # (ADR-029 §13). Same 429 bucket as RATE_LIMIT_EXCEEDED and the
+        # same client behaviour (back off and retry), with a distinct wire
+        # string so the OPERATOR can tell the two caps apart. The
+        # caller's own remedy is a plan change, which is what the
+        # exception's ``upgrade_url`` is for.
+        "RATE_LIMIT_PLAN_TIER": RateLimitError,
+        # 429 — the address waitlist refused the call. Same 429 bucket.
+        "WAITLIST_RATE_LIMITED": RateLimitError,
+        # 503 — the rate limiter's store could not be reached, so the gate
+        # could not decide. Fail-CLOSED, and the rate-limit subsystem's
+        # own typed infra class — NOT the generic backend error, so a
+        # caller can tell "the limiter is down" from "the backend is
+        # down".
+        "RATE_LIMITER_UNAVAILABLE": NullRunRateLimitRedisError,
+        # 503 — the AUTH store could not be reached. The registry says
+        # 503, not 401: the store did not answer, so this is an outage
+        # and not a rejection. NullRunAuthError means "the key was
+        # REJECTED", which is a different fact with a different remedy,
+        # so the generic infra class is the honest one here.
+        "AUTH_BACKEND_UNAVAILABLE": NullRunBackendError,
+        # 503 — the org context could not be resolved (the key's org
+        # binding could not be read). Same shape as the code above: the
+        # store did not answer.
+        "ORG_CONTEXT_UNRESOLVED": NullRunBackendError,
+        # 403 — the key authenticates but lacks the scope this endpoint
+        # needs (ADR-143 / P2-08). The auth family, and the granular wire
+        # code is preserved on ``exc.wire_code``, so a caller can tell
+        # "wrong scope" from "bad key".
+        "INSUFFICIENT_SCOPE": NullRunAuthError,
+        # 404 — the chain_id names no live chain. The same "no binding
+        # exists" class as EXECUTION_NOT_FOUND: the client mints a new id
+        # and carries on.
+        "CHAIN_NOT_FOUND": NullRunChainError,
+        # 409 — the chain ENDED (duration cap, or an explicit end). A new
+        # chain_id is the remedy. Same class as the chain family: the
+        # lineage context is what is wrong.
+        "CHAIN_ENDED": NullRunChainError,
+        # 422 — the execution has no binding. Only the server can mint an
+        # execution_id, so the remedy is "re-issue /gate" — the same
+        # remedy NullRunExecutionNotFoundError already names. The class
+        # carries the status, so the 422 reaches the caller verbatim.
+        "EXECUTION_NOT_BOUND": NullRunExecutionNotFoundError,
+        # 500 — the binding VANISHED (the state is gone). A server-side
+        # fault: the class that says "the backend could not produce a
+        # determinate answer", and it is retryable.
+        "EXECUTION_BINDING_MISSING": NullRunBackendError,
+        # 503 — Redis could not be READ for the binding.
+        "EXECUTION_BINDING_READ_FAILED": NullRunBackendError,
+        # 503 — Redis could not be WRITTEN for the binding.
+        "EXECUTION_BINDING_WRITE_FAILED": NullRunBackendError,
+        # 503 — Redis errored while resolving the binding.
+        "EXECUTION_RESOLVE_REDIS_ERROR": NullRunBackendError,
+        # 409 — a prior request with this idempotency_key is still being
+        # processed. The remedy is "retry after the in-flight call
+        # settles" — a transient race, so the retryable infra class. The
+        # wire's ``retry_after_ms`` rides along in the details.
+        "IDEMPOTENCY_IN_FLIGHT": NullRunBackendError,
+        # 409 — the same key replayed with a different payload. A
+        # client-side contract violation, the same class as
+        # IDEMPOTENCY_KEY_MISMATCH: mint a fresh key.
+        "IDEMPOTENCY_CONFLICT": NullRunProtocolError,
+        # 503 — the ingestion queue is applying backpressure.
+        "INGESTION_BACKPRESSURE": NullRunBackendError,
+        # 503 — the ingestion queue is closed.
+        "INGESTION_CLOSED": NullRunBackendError,
+        # 413 — the batch is too large. The transport halves and resends
+        # on this status before the failure ever reaches the exception
+        # path; the entry exists so the catalog is complete.
+        "BATCH_TOO_LARGE": NullRunBackendError,
+        # 422 — a /track field carries control characters. A payload-shape
+        # defect on the client's side, the same family as
+        # WORKFLOW_ID_BODY_MISMATCH.
+        "CONTROL_CHARS_IN_FIELD": NullRunBackendError,
+        # 503 — the /track reservation envelope is gone. The /track path
+        # surfaces this per event as a deterministic refusal; the entry
+        # keeps the catalog complete.
+        "RESERVATION_NOT_FOUND": NullRunBackendError,
+        # 403 — the executed tool arguments DRIFTED from the
+        # operator-approved ToolCall.params. The same family as the
+        # business-impact digest mismatch: the operator approved a
+        # different action than the one now bound, and the remedy is a
+        # fresh approval.
+        "APPROVAL_TOOL_ARGUMENT_MISMATCH": NullRunApprovalDigestMismatchError,
+        # 403 — the server could not obtain the executed payload to
+        # compare against the approval, so the approval boundary could
+        # not be verified at all. The closest typed home is the
+        # approval-infra class: the refusal stays in the approval family
+        # instead of collapsing into the generic infra class.
+        "APPROVAL_TOOL_ARGUMENT_UNAVAILABLE": NullRunApprovalDbUnavailableError,
+        # 403 — the org's MCP registry says this tool does not run. The
+        # generic tool-block class: "this tool is blocked" is exactly what
+        # the caller has to act on.
+        "MCP_TOOL_BLOCKED": NullRunToolBlockedError,
+        # 403 — the registry's decision is "ask", so the tool needs an
+        # operator approval that is not there yet. Retryable: the operator
+        # can still decide.
+        "MCP_TOOL_APPROVAL_REQUIRED": NullRunMcpApprovalRequiredError,
+        # 403 — nobody has decided about this tool yet. The same remedy
+        # as the code above (wait for a decision), so the same class; the
+        # wire string is what tells the two apart for an operator.
+        "MCP_TOOL_DECISION_REQUIRED": NullRunMcpApprovalRequiredError,
+        # 403 — the tool's definition moved under the approval. The same
+        # family as APPROVAL_TOOL_DIGEST_MISMATCH: the operator approved a
+        # different capability surface.
+        "MCP_DEFINITION_DRIFTED": NullRunApprovalToolDigestMismatchError,
+        # 403 — the tool is gone from the registry. The tool does not run:
+        # the generic tool-block class.
+        "MCP_TOOL_REMOVED": NullRunToolBlockedError,
+        # 503 — the per-org MCP registry could not be read, so the gate
+        # could not determine whether the operator allows this tool.
+        # Fail-CLOSED and retryable: ask again.
+        "MCP_REGISTRY_UNAVAILABLE": NullRunBackendError,
+        # 503 — the call could not be RESERVED, so the budget was never
+        # enforced for it. Deliberately NOT a budget error: 402 means
+        # "your budget is exhausted", this says "this server could not
+        # check the budget", and the remedy (fix the config) and the SDK
+        # behaviour (retry, do not stop) are both different.
+        "RESERVE_DISABLED": NullRunBackendError,
+        # 503 — the budget projection (the estimate) could not be read.
+        # The same shape as RESERVE_DISABLED.
+        "BUDGET_PROJECTION_UNAVAILABLE": NullRunBackendError,
+        # 500 — the workflow's budget configuration is invalid. A
+        # server-side defect: the call cannot be priced.
+        "WORKFLOW_BUDGET_CONFIG_INVALID": NullRunBackendError,
+        # 503 — the ToolBlock backstop's policy cache could not be read,
+        # so the gate could not determine whether to block. Fail-CLOSED
+        # and retryable.
+        "TOOL_BLOCKED_BACKSTOP_UNAVAILABLE": NullRunBackendError,
     }
 
 
