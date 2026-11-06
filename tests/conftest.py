@@ -254,19 +254,18 @@ def _fast_sleep(monkeypatch, request):
         monkeypatch.setattr(_transport_mod, "_wait_on", _fast_wait_on)
     except Exception:
         pass
-    # Stub the modules that captured a module-level reference at import time.
-    try:
-        import nullrun.transport as _transport_mod
-
-        monkeypatch.setattr(_transport_mod.time, "sleep", _fast_sleep)
-    except Exception:
-        pass
-    try:
-        import nullrun.breaker.circuit_breaker as _cb_mod
-
-        monkeypatch.setattr(_cb_mod.time, "sleep", _fast_sleep)
-    except Exception:
-        pass
+    # ONE patch site for the global sleep. `nullrun.transport.time` and
+    # `nullrun.breaker.circuit_breaker.time` ARE the stdlib `time`
+    # module — the same object — so patching through those paths patched
+    # the attribute patched above, a second and a third time. Measured:
+    # `nullrun.transport.time is time` is True, and no module in src/ or
+    # tests/ does `from time import sleep` — every one of them does
+    # `import time` and calls `time.sleep(...)`, so the single patch
+    # above already reaches all of them. A test that needs the
+    # TRANSPORT's own wait patches the transport's seam
+    # (`nullrun.transport._sleep`), never the global: the global carries
+    # the sleep of every thread in the process, and a foreign value in a
+    # retry-delay list is a flake with no cause in the retry path.
     yield
 
 

@@ -23,6 +23,7 @@ These tests pin the new contract:
 from __future__ import annotations
 
 import threading
+import time
 
 import httpx
 import pytest
@@ -131,7 +132,7 @@ def test_a_429_is_not_retried_before_the_server_said_it_may_be(monkeypatch):
     """
     delays: list[float] = []
     monkeypatch.setattr(
-        "nullrun.transport.time.sleep", lambda s: delays.append(s)
+        "nullrun.transport._sleep", lambda s: delays.append(s)
     )
 
     calls = {"n": 0}
@@ -168,7 +169,7 @@ def test_retry_after_jitter_never_reduces_the_wait_but_does_spread_it(monkeypatc
     """
     samples: list[float] = []
     monkeypatch.setattr(
-        "nullrun.transport.time.sleep", lambda s: samples.append(s)
+        "nullrun.transport._sleep", lambda s: samples.append(s)
     )
 
     for _ in range(12):
@@ -193,6 +194,50 @@ def test_retry_after_jitter_never_reduces_the_wait_but_does_spread_it(monkeypatc
     assert len(set(samples)) > 1, f"every client retried at the same instant: {samples}"
 
 
+def test_another_threads_sleep_does_not_land_in_the_retry_delays(monkeypatch):
+    """The retry-delay list must hold the transport's waits and nothing else.
+
+    ``time.sleep`` is ONE attribute on ONE module object, so a test that
+    patches it there captures every thread's sleep in the process. The
+    webhook-delivery singleton idles on ``time.sleep(0.5)``; when that
+    value lands in this list, the floor assertion below fails for a
+    reason that has nothing to do with the retry path — the same flake
+    the webhook tests documented, one file over.
+    """
+    delays: list[float] = []
+    monkeypatch.setattr(
+        "nullrun.transport._sleep", lambda s: delays.append(s)
+    )
+
+    # Another thread in this process sleeps while the patch is live.
+    foreign = threading.Thread(target=lambda: time.sleep(0.5))
+    foreign.start()
+    foreign.join()
+
+    calls = {"n": 0}
+
+    def _always_429() -> httpx.Response:
+        calls["n"] += 1
+        resp = httpx.Response(
+            200 if calls["n"] >= 2 else 429,
+            **({} if calls["n"] >= 2 else {"headers": {"Retry-After": "5"}}),
+            json={},
+        )
+        resp.request = httpx.Request(
+            "POST", "https://api.test.nullrun.io/api/v1/track/batch"
+        )
+        resp.raise_for_status()
+        return resp
+
+    _retry_with_backoff(_always_429, max_retries=1, base_delay=0.5, max_delay=10.0)
+
+    assert delays, "the retry happened without sleeping"
+    assert 0.5 not in delays, (
+        f"another thread's sleep landed in the retry delays: {delays}"
+    )
+    assert min(delays) >= 5.0, f"a retry went out before the server's floor: {delays}"
+
+
 def test_a_429_without_the_header_falls_back_to_exponential_backoff(monkeypatch):
     """No header is not an instruction to wait forever.
 
@@ -203,7 +248,7 @@ def test_a_429_without_the_header_falls_back_to_exponential_backoff(monkeypatch)
     """
     delays: list[float] = []
     monkeypatch.setattr(
-        "nullrun.transport.time.sleep", lambda s: delays.append(s)
+        "nullrun.transport._sleep", lambda s: delays.append(s)
     )
     calls = {"n": 0}
 
@@ -227,7 +272,7 @@ def test_retry_after_as_an_http_date_is_honoured(monkeypatch):
 
     delays: list[float] = []
     monkeypatch.setattr(
-        "nullrun.transport.time.sleep", lambda s: delays.append(s)
+        "nullrun.transport._sleep", lambda s: delays.append(s)
     )
     when = format_datetime(
         datetime.now(timezone.utc) + timedelta(seconds=4), usegmt=True
@@ -255,7 +300,7 @@ def test_a_retry_after_already_in_the_past_is_not_a_floor(monkeypatch):
     """A stale date means "no floor stated", not "wait negative seconds"."""
     delays: list[float] = []
     monkeypatch.setattr(
-        "nullrun.transport.time.sleep", lambda s: delays.append(s)
+        "nullrun.transport._sleep", lambda s: delays.append(s)
     )
     calls = {"n": 0}
 
@@ -309,7 +354,7 @@ def _reply(status: int, headers: dict | None = None) -> httpx.Response:
 def test_a_retry_after_of_a_day_does_not_sit_through_the_day(monkeypatch):
     """`Retry-After: 86400` must not park a flush thread for 24 hours."""
     slept: list[float] = []
-    monkeypatch.setattr("nullrun.transport.time.sleep", lambda s: slept.append(s))
+    monkeypatch.setattr("nullrun.transport._sleep", lambda s: slept.append(s))
     monkeypatch.setattr("nullrun.transport.threading.Event.wait", lambda self, t=None: False)
 
     calls = {"n": 0}
@@ -375,7 +420,7 @@ def test_a_retry_after_under_the_ceiling_is_still_honoured(monkeypatch):
     exists to pin. A 5s floor must still produce a >=5s wait.
     """
     delays: list[float] = []
-    monkeypatch.setattr("nullrun.transport.time.sleep", lambda s: delays.append(s))
+    monkeypatch.setattr("nullrun.transport._sleep", lambda s: delays.append(s))
     calls = {"n": 0}
 
     def _then_ok() -> httpx.Response:
@@ -398,7 +443,7 @@ def test_a_retry_after_under_the_ceiling_is_still_honoured(monkeypatch):
 def test_the_ceiling_is_configurable(monkeypatch):
     """An operator whose backend rate-limits for 5 minutes needs to say so."""
     slept: list[float] = []
-    monkeypatch.setattr("nullrun.transport.time.sleep", lambda s: slept.append(s))
+    monkeypatch.setattr("nullrun.transport._sleep", lambda s: slept.append(s))
     monkeypatch.setenv("NULLRUN_RETRY_AFTER_CEILING", "600")
     before = metrics.transport.retry_after_deferred
     calls = {"n": 0}
@@ -439,7 +484,7 @@ def test_a_retry_wait_is_cut_short_by_shutdown(monkeypatch):
         return real_wait(self, 0.02)
 
     monkeypatch.setattr("nullrun.transport.threading.Event.wait", _wait_then_cancel)
-    monkeypatch.setattr("nullrun.transport.time.sleep", lambda s: pytest.fail("slept"))
+    monkeypatch.setattr("nullrun.transport._sleep", lambda s: pytest.fail("slept"))
 
     calls = {"n": 0}
 

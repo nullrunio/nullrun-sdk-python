@@ -671,6 +671,21 @@ def _wait_on(cancel: threading.Event, seconds: float) -> bool:
     return not cancel.wait(seconds)
 
 
+def _sleep(seconds: float) -> None:
+    """The clock seam for the non-cancel sleep path.
+
+    A module-level function, like ``_wait_on``, for one reason:
+    ``time.sleep`` is ONE attribute on ONE module object, so a test that
+    patches it — anywhere — captures the sleep of EVERY thread in the
+    process. The webhook-delivery singleton idles on ``time.sleep(0.5)``,
+    and that value lands in a retry-delay list that is supposed to hold
+    the transport's own waits, turning a floor assertion into a
+    load-sensitive flake. This seam lets a test observe or stub the
+    transport's wait and only the transport's wait.
+    """
+    time.sleep(seconds)
+
+
 def _interruptible_sleep(seconds: float, cancel: threading.Event | None) -> bool:
     """Sleep, but wake early when the SDK is shutting down.
 
@@ -687,7 +702,7 @@ def _interruptible_sleep(seconds: float, cancel: threading.Event | None) -> bool
     misbehaving, which is when someone is most likely to be killing it.
     """
     if cancel is None:
-        time.sleep(seconds)
+        _sleep(seconds)
         return True
     return _wait_on(cancel, seconds)
 
