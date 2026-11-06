@@ -25,6 +25,7 @@ The cells drive the real ``WebSocketConnection._handle_message``.
 from __future__ import annotations
 
 import json
+import logging
 import time
 from typing import Any
 
@@ -226,6 +227,27 @@ class TestAnUnsignedFrameIsRefusedWhenTheClientCanVerify:
             "the approval refusal must stay countable"
         )
         assert stub.sent == [], "a refused frame must not be ACKed"
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_log_names_the_frame_code(self, caplog):
+        """The operator keeps the server's reason.
+
+        The server's own refusal frame is unsigned BY DESIGN: it is
+        sent before the connection is authenticated, so there is no
+        secret to sign it with yet. The SDK refuses that frame — and
+        the log must still say what the server said.
+        """
+        conn, _ = _conn()
+
+        with caplog.at_level(logging.ERROR):
+            await conn._handle_message(
+                json.dumps({"type": "error", "code": "ORGANIZATION_MISMATCH"})
+            )
+
+        assert "ORGANIZATION_MISMATCH" in caplog.text, (
+            "the refusal log lost the server's reason — the operator sees "
+            "the refusal but not why the server closed the socket"
+        )
 
 
 class TestTheKillSwitchStillWorks:

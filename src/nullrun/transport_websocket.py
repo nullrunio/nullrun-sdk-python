@@ -339,10 +339,17 @@ class WebSocketConnection:
                     # able to see that somebody pushed an approval this
                     # client cannot verify.
                     metrics.inc_transport("ws_unverified_approval_total")
+                # The server's own refusal frame is unsigned BY DESIGN:
+                # it is sent before the connection is authenticated, so
+                # there is no secret to sign it with yet. Naming its code
+                # keeps the operator's reason visible even though the
+                # frame itself is refused.
+                claimed_code = data.get("code", "")
                 logger.error(
                     "Refusing an unauthenticated WS frame — this client can "
                     "verify signatures, so an unsigned frame did not come "
-                    f"from the server (type={claimed_type!r})"
+                    f"from the server (type={claimed_type!r}, "
+                    f"code={claimed_code!r})"
                 )
                 return
 
