@@ -91,6 +91,31 @@ logger = logging.getLogger(__name__)
 # point of E2.
 EDGE_LEASE = "edge_lease"
 
+# `last_source` marker for "the box answered, and the answer was NO".
+#
+# NOT a wire `decision_source`. The refusal path still puts
+# `EDGE_LEASE` in the returned body's `decision_source`, and that is
+# deliberate: `decision_source` says WHO decided, and on a refusal the
+# lease was the authority that spoke — the box answered, with "no".
+# The direction is carried by `decision`, which is `block`. Changing
+# the wire value would need a new name in the runtime's known-source
+# set, and until the runtime knows it, a body carrying it is a
+# MALFORMED response: a clean refusal would become a crash.
+#
+# What this constant is for is `last_source`, which answers a
+# different question — "which way did the box go on the last call?".
+# Before it existed, the allow path and the refusal path both wrote
+# `EDGE_LEASE` there, so the two collapsed into one string and a
+# caller reading the attribute could not tell a box ALLOW from a box
+# REFUSAL.
+#
+# Deliberately not a fallback source (`is_fallback_decision_source` is
+# False for it): a box that said no is a VERDICT, not a degraded
+# transport. Reading it as synthetic would discard the refusal before
+# the caller saw it — the same hole SDK-3 closed for the other edge
+# sources.
+EDGE_LEASE_REFUSED = "edge_lease_refused"
+
 # Decision source for "the box did not answer".
 #
 # Deliberately NOT `DecisionSource.FALLBACK`, and that is the whole
@@ -172,6 +197,11 @@ class EdgeTransport:
         # Named source instead of a bool, because a bare flag here
         # would be indistinguishable from "the box said no" at every
         # call site, and those two must not collapse.
+        #
+        # It answers "which way did the box go on the last call?":
+        # `EDGE_LEASE` for an allow, `EDGE_LEASE_REFUSED` for a
+        # refusal, `EDGE_UNREACHABLE` for no answer, and
+        # `EDGE_NOT_ENFORCED` for a box that was never asked.
         self.last_source: str | None = None
         # The box's answers, keyed by the event id they were asked for.
         #
@@ -244,6 +274,12 @@ class EdgeTransport:
         `EDGE_LEASE` is the source for every answer the box actually
         gave; `EDGE_UNREACHABLE` is the source for the absence of one.
         The `decision` field says which way the box went.
+
+        The transport's own `last_source` says the same thing at a
+        finer grain: `EDGE_LEASE` for an allow, `EDGE_LEASE_REFUSED`
+        for a refusal. The two paths used to write the same string
+        there, so a caller reading `last_source` could not tell a box
+        ALLOW from a box REFUSAL.
 
         The answer is recorded under the event id, so the `/execute`
         half of the same logical action can read back exactly what the
@@ -370,7 +406,13 @@ class EdgeTransport:
             }
 
         code = payload.get("error_code") or "EDGE_DENIED"
-        self.last_source = EDGE_LEASE
+        # The refusal path reports its OWN source. It used to write
+        # `EDGE_LEASE` here — the same string the allow path writes —
+        # so `last_source` could not tell a box ALLOW from a box
+        # REFUSAL. The wire `decision_source` below stays `EDGE_LEASE`
+        # on purpose: the lease was the authority that spoke either
+        # way, and `decision` says which way it went.
+        self.last_source = EDGE_LEASE_REFUSED
         logger.info("Edge refused the call: %s", code)
         return {
             "decision": "block",
@@ -590,6 +632,7 @@ def _int_env(source: Mapping[str, str], name: str, default: int) -> int:
 
 __all__ = [
     "EDGE_LEASE",
+    "EDGE_LEASE_REFUSED",
     "EDGE_UNREACHABLE",
     "EDGE_NOT_ENFORCED",
     "DEFAULT_EDGE_TIMEOUT_SECONDS",
