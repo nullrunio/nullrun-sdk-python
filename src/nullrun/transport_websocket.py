@@ -311,6 +311,41 @@ class WebSocketConnection:
             signature = data.get("signature")
             timestamp = data.get("timestamp")
             signed_payload_hex = data.get("signed_payload")
+
+            # This client CAN verify a signature: it holds the API key
+            # and the HMAC secret. The server signs EVERY control-plane
+            # frame it sends for such a key
+            # (``ws_control.rs::send_signed_or_raw``), so a frame that
+            # arrives unsigned — or with a signature but no timestamp —
+            # did not come from the server. It is refused here, before
+            # any branch reads a field out of it.
+            #
+            # A client WITHOUT a secret (a legacy key) cannot verify
+            # anything, so the unsigned path stays open for it: the kill
+            # switch must keep working even without HMAC, and the
+            # privileged branch refuses unauthenticated frames on its
+            # own.
+            if self.api_key and self.secret_key and not (signature and timestamp):
+                # Local import to avoid a module-level cycle:
+                # observability imports nothing from us, so this
+                # is safe and lazy.
+                from nullrun.observability import metrics
+
+                claimed_type = data.get("type", "")
+                metrics.inc_transport("ws_unverified_frame_total")
+                if claimed_type == "approval_resolved":
+                    # Keep the approval-specific signal. The frame is
+                    # refused either way, but the operator has to be
+                    # able to see that somebody pushed an approval this
+                    # client cannot verify.
+                    metrics.inc_transport("ws_unverified_approval_total")
+                logger.error(
+                    "Refusing an unauthenticated WS frame — this client can "
+                    "verify signatures, so an unsigned frame did not come "
+                    f"from the server (type={claimed_type!r})"
+                )
+                return
+
             if signature and timestamp and self.api_key and self.secret_key:
                 # This is a signed message - verify the signature
                 msg_timestamp = int(timestamp) if isinstance(timestamp, (int, str)) else 0

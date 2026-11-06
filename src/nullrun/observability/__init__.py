@@ -82,6 +82,13 @@ class TransportMetrics:
     # somebody pushed an approval the SDK cannot verify: either a
     # client that never got its HMAC secret, or a forged frame.
     ws_unverified_approval_total: int = 0
+    # Control-plane frames the SDK REFUSED because it could verify
+    # signatures (it holds the API key and the HMAC secret) and the
+    # frame was not verifiably signed. The server signs every frame it
+    # sends for such a key, so an unsigned frame did not come from the
+    # server. A non-zero value means somebody injected frames into the
+    # socket, or the client and the server disagree about the secret.
+    ws_unverified_frame_total: int = 0
     # --- WAL durability state (set by Transport, not incremented) ----------
     # These answer "what can this deployment actually promise?", which the
     # code cannot answer on your behalf across OSes and filesystems. A field
@@ -292,6 +299,7 @@ class MetricsRegistry:
                     "hmac_verify_failures_total": self.transport.hmac_verify_failures_total,
                     "hmac_verify_expired_total": self.transport.hmac_verify_expired_total,
                     "ws_unverified_approval_total": self.transport.ws_unverified_approval_total,
+                    "ws_unverified_frame_total": self.transport.ws_unverified_frame_total,
                     "wal_dir_fsync": self.transport.wal_dir_fsync,
                     "wal_lock": self.transport.wal_lock,
                     "wal_lock_timeouts_total": self.transport.wal_lock_timeouts_total,
