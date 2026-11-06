@@ -428,11 +428,23 @@ class MCPAdapter:
         EXECUTION_NOT_FOUND when the ``execution:{id}`` binding is
         missing. The ``@protect`` path gets that ``/gate`` from its own
         pre-flight; a DIRECT ``adapter.call_tool(...)`` has no such
-        wrapper, so the adapter runs the pre-flight ITSELF when no
-        server-minted execution id is in scope. When one IS in scope
-        the pre-flight is SKIPPED: that path reserves money at the
-        gate, and a second ``/gate`` would charge the org twice for
-        one logical tool call.
+        wrapper, so the adapter runs the pre-flight ITSELF.
+
+        The pre-flight runs for EVERY tool call, because every tool
+        call is its own action with its own budget. Two cases skip it,
+        and only those two:
+
+        * the approval re-entry — the caller carries an
+          ``approval_id``, so the ambient server-minted id IS the
+          approval row's execution id, and a second ``/gate`` would
+          mint a different one;
+        * the ``@protect`` scope — the scope already reserved for
+          itself, and a second ``/gate`` would reserve twice and
+          orphan the first (NR-059).
+
+        A second tool call in the same scope is NOT one of those two.
+        It gets its own ``/gate``, its own reservation, its own
+        execution id. The backend settles a reservation once (SDK-1).
 
         B2 (2026-09-30): there is no ungated path. ``runtime=None``
         used to mean "skip the round-trip entirely"; it now means
@@ -498,6 +510,18 @@ class MCPAdapter:
         runtime = self._resolve_runtime()
         execute_input = arguments if arguments is not None else {}
 
+        # Is a scope-level envelope ALREADY in scope? Read BEFORE the
+        # adapter resolves its own envelope below, because the adapter
+        # installs one of its own and that would make this answer
+        # "yes" for every call.
+        #
+        # The ``@protect`` path is the only thing in the SDK that
+        # installs one, and it installs it for the WHOLE scope — after
+        # its own ``/gate`` reserved for that scope. So "an envelope
+        # was already here" is the marker of a scope that already
+        # gated itself.
+        scope_already_gated = get_call_impact() is not None
+
         # ── The ONE envelope for this logical action (ADR-125) ─────
         #
         # The adapter derives the envelope from the tool call it is
@@ -524,6 +548,7 @@ class MCPAdapter:
                 business_impact=business_impact,
                 action_digest=action_digest,
                 passthrough=passthrough,
+                scope_already_gated=scope_already_gated,
             )
         finally:
             if impact_token is not None:
@@ -586,6 +611,7 @@ class MCPAdapter:
         business_impact: dict[str, Any] | None,
         action_digest: str | None,
         passthrough: dict[str, Any],
+        scope_already_gated: bool,
     ) -> Any:
         """The gated half of :meth:`call_tool`.
 
@@ -605,13 +631,30 @@ class MCPAdapter:
         # has no such wrapper, so without this pre-flight the /execute
         # round trip was refused and the MCP server was never called.
         #
-        # The pre-flight is CONDITIONAL, and the condition is the
-        # server-minted execution id: when one is already in scope a
-        # ``/gate`` has already run for this logical action, and
-        # running it again would reserve the budget a second time
-        # (that path charges money at the gate). The contextvar is
-        # exactly what ``runtime.execute`` reads to decide whether to
-        # reuse the id, so the two agree by construction.
+        # The pre-flight runs for EVERY tool call. A tool call is its
+        # own action with its own budget, so it gets its own ``/gate``,
+        # its own reservation and its own execution id.
+        #
+        # The condition used to be "no server-minted execution id in
+        # scope". That id is set by ``/gate`` and by ``/execute`` and is
+        # NEVER reset in ``src/``, so the second and later tool calls
+        # in one scope ran NO ``/gate``: no budget check, no
+        # reservation, no spend reserved for those calls. The id says
+        # "some action was gated", not "THIS action was gated".
+        #
+        # Two cases are genuinely covered by an ambient reservation,
+        # and both are about THIS action:
+        #
+        # * the approval re-entry — the caller carries an
+        #   ``approval_id``, and the backend's require_approval arm
+        #   echoes the approval row's execution id into
+        #   ``reservation_id``. The ambient id IS the approval's
+        #   execution, so a second ``/gate`` would mint a DIFFERENT
+        #   id and the approval's consume (``WHERE execution_id =
+        #   $3``) would miss its row (APPROVAL_REPLAY_REJECTED).
+        # * the ``@protect`` scope — the scope reserved for itself,
+        #   and a second ``/gate`` inside it would reserve twice and
+        #   orphan the first (NR-059).
         #
         # A refusal from the pre-flight propagates: the MCP client is
         # NOT called. Same ordering and same error handling as the
@@ -636,7 +679,10 @@ class MCPAdapter:
         _transport = getattr(runtime, "_transport", None)
         edge_mode = getattr(_transport, "edge", None) is not None
 
-        if edge_mode or get_server_minted_execution_id() is None:
+        ambient_id = get_server_minted_execution_id()
+        covered = (approval_id is not None) or scope_already_gated
+
+        if edge_mode or ambient_id is None or not covered:
             runtime.check_workflow_budget()
 
         # Every MCP tool call routed through the runtime contacts

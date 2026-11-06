@@ -340,9 +340,21 @@ class TestGatePreflight:
         assert runtime.gate_calls == 1, "no /gate ran"
         assert order == ["gate", "execute"]
 
-    def test_the_preflight_is_skipped_when_a_gate_already_ran(self):
-        """The pre-flight RESERVES money at the gate. Running it twice
-        for one logical call would charge the org twice."""
+    def test_an_ambient_execution_id_alone_does_not_cover_this_tool_call(self):
+        """An execution id in scope says "some action was gated", not
+        "THIS action was gated".
+
+        The id is set by ``/gate`` and by ``/execute`` and is never
+        reset in ``src/``, so after the first tool call in a scope it
+        is still set. Skipping the pre-flight on that basis ran NO
+        ``/gate`` for the second tool call: no budget check, no
+        reservation, no spend reserved for it (P2-18).
+
+        The pre-flight RESERVES money at the gate, so running it twice
+        for ONE logical call would charge the org twice — which is
+        what the two cells below pin, for the two cases where the
+        ambient reservation really does cover THIS action.
+        """
 
         set_server_minted_execution_id("0192f0c1-1111-7000-8000-000000000001")
 
@@ -352,9 +364,69 @@ class TestGatePreflight:
 
         adapter.call_tool("create_issue", {"repo": "acme/api"})
 
-        assert runtime.gate_calls == 0, "a second /gate would charge twice"
+        assert runtime.gate_calls == 1, (
+            "the tool call ran no /gate — its budget was never checked "
+            "and its spend was never reserved"
+        )
+        assert len(runtime.execute_calls) == 1
+        assert order == ["gate", "execute"]
+
+    def test_the_approval_re_entry_skips_the_preflight(self):
+        """The approval's own execution id must survive the re-fire.
+
+        The backend's require_approval arm echoes the approval row's
+        execution id into ``reservation_id``, so the ambient id IS the
+        approval's execution. A second ``/gate`` would mint a DIFFERENT
+        id and the approval's consume (``WHERE execution_id = $3``)
+        would miss its row (APPROVAL_REPLAY_REJECTED).
+        """
+
+        set_server_minted_execution_id("0192f0c1-1111-7000-8000-000000000001")
+
+        order: list[str] = []
+        runtime = _RecordingRuntime(order=order)
+        adapter, _ = _adapter(runtime)
+
+        adapter.call_tool(
+            "create_issue",
+            {"repo": "acme/api"},
+            approval_id="appr-1",
+        )
+
+        assert runtime.gate_calls == 0, (
+            "the approval re-entry ran a second /gate — a second reserve "
+            "for one logical call charges the org twice"
+        )
         assert len(runtime.execute_calls) == 1
         assert order == ["execute"]
+
+    def test_the_protect_scope_skips_the_preflight(self):
+        """The scope reserved for itself, and only for itself.
+
+        The ``@protect`` path runs its own ``/gate`` for the whole
+        scope. A second ``/gate`` inside the scope reserves twice and
+        orphans the first (NR-059).
+        """
+        from nullrun.business_impact import BusinessImpact
+        from nullrun.context import reset_call_impact, set_call_impact
+
+        set_server_minted_execution_id("0192f0c1-1111-7000-8000-000000000001")
+        token = set_call_impact(BusinessImpact.no_impact())
+        try:
+            order: list[str] = []
+            runtime = _RecordingRuntime(order=order)
+            adapter, _ = _adapter(runtime)
+
+            adapter.call_tool("create_issue", {"repo": "acme/api"})
+
+            assert runtime.gate_calls == 0, (
+                "the protected scope ran a second /gate — the second "
+                "reserve orphans the first"
+            )
+            assert len(runtime.execute_calls) == 1
+            assert order == ["execute"]
+        finally:
+            reset_call_impact(token)
 
     def test_a_blocked_preflight_never_reaches_the_mcp_client(self):
         """The pre-flight is a gate, not a formality: a block there
