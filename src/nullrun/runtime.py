@@ -28,6 +28,14 @@ the authoritative table; deviations require an ADR amendment (Rule 5).
 | `/track` batch path (legacy) | OPEN-on-network-error (event dropped, no retry) | n/a -- circuit breaker backoff applies | none |
 | `/track` v3 single path (`track_single`) | OPEN-on-network-error and OPEN-on-5xx (event dropped, no retry); **CLOSED for enforcement rejections** — a typed `NullRunDecision` (`CONSUME_OVERBUDGET` 422, budget block 402) propagates to the caller | caller reconciles the delta from the exception's `reserved_millicents` / `max_allowed_millicents` / `actual_cost_cents` / `recorded` (the reservation is on the wire in millicents and the actual in cents; the backend does not send its configured epsilon, so `actual - reserved` is the only honest way to recover it); ADR-005 forbids implicit re-reserve, so there is nothing for the SDK to retry | none |
 
+**The LangChain/LangGraph callback obeys the `check_workflow_budget` row.**
+`NullRunCallback` calls the same gate. It fails OPEN for a transport error and
+CLOSED for every other fault. It raises the same class the runtime raises, so
+one refusal produces one outcome on every path (SDK-16).
+
+**The `@protect` boundary is a different gate.** It fails CLOSED for every
+fault. The two-step opt-out in its own row is the only way it fails OPEN.
+
 **Fail-OPEN policy** — SDK-side transport failure (network timeout,
 5xx, breaker open) is fail-OPEN on the *check* path so a dead
 backend doesn't freeze the user's agent loop. Backend-side

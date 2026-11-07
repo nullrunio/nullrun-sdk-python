@@ -63,13 +63,17 @@ from collections.abc import Callable
 
 import pytest
 
+from nullrun.breaker.categories import NullRunUnclassifiedRefusalError
 from nullrun.breaker.exceptions import (
     ENFORCEMENT_EXCEPTIONS,
+    NullRunAuthenticationError,
     NullRunBackendError,
     NullRunBudgetError,
     NullRunDecision,
     NullRunGateIndeterminateError,
+    NullRunInfrastructureError,
     NullRunMalformedGateResponseError,
+    NullRunRateLimitRedisError,
     NullRunToolBlockedError,
     RateLimitError,
     TransportErrorSource,
@@ -78,6 +82,8 @@ from nullrun.breaker.exceptions import (
 )
 from nullrun.instrumentation.langgraph import (
     _ENFORCEMENT_EXCEPTIONS,
+    _INFRASTRUCTURE_ERRORS,
+    _TRANSPORT_ERRORS,
     NullRunCallback,
     drain_deferred_enforcement,
     record_deferred_enforcement,
@@ -119,6 +125,28 @@ _CASE_BUILDERS: dict[type[BaseException], Callable[[], BaseException]] = {
     ),
     NullRunToolBlockedError: lambda: NullRunToolBlockedError(
         workflow_id="w-sdk14", reason="tool is on the block list", tool_name="shell"
+    ),
+    # -- SDK-16: the classes the RUNTIME raises on purpose and the
+    #    enforcement FAMILY does not name -----------------------------
+    # A 401 is a credential failure, not a transport condition: no
+    # retry can fix a revoked key. The SDK's own table says
+    # fail-CLOSED for it, and the @protect boundary obeyed that while
+    # the callback swallowed it.
+    NullRunAuthenticationError: lambda: NullRunAuthenticationError(
+        "the backend rejected the key (401)"
+    ),
+    # The gate ANSWERED and refused, but without a category the SDK
+    # trusts. ADR-062 §2.2: an unclassifiable refusal must RAISE.
+    NullRunUnclassifiedRefusalError: lambda: NullRunUnclassifiedRefusalError(
+        "the gate refused without a category the SDK understands",
+        wire_category=None,
+        error_code_wire="NR-UNKNOWN",
+    ),
+    # The rate-limit backend is down. The SDK's table calls this a
+    # named enforcement failure and says the SDK does NOT silently
+    # fail-OPEN on it.
+    NullRunRateLimitRedisError: lambda: NullRunRateLimitRedisError(
+        "the backend cannot reach Redis for the aggregate rate limit (503)"
     ),
 }
 
@@ -164,6 +192,26 @@ class TestFrameworkContract:
             "correct, but the rationale comment and the ERROR log are now "
             "over-cautious — revisit, do not silently drift."
         )
+
+
+def _fails_closed(case: type[BaseException]) -> bool:
+    """Whether the CALLBACK must re-raise this class.
+
+    The production predicate, read from the instrumentation's own
+    constants — never spelled out here (SDK-14 removed the copy of the
+    family for exactly that reason). It models the ORDER of the
+    callback's arms, and that order is pinned separately in the AST
+    (`TestEnforcementClassification`):
+
+    1. the family          -> re-raised
+    2. a transport failure -> swallowed (ADR-008's fail-OPEN)
+    3. other infra errors  -> re-raised (fail-CLOSED)
+    """
+    if any(issubclass(case, member) for member in _ENFORCEMENT_EXCEPTIONS):
+        return True
+    if any(issubclass(case, member) for member in _TRANSPORT_ERRORS):
+        return False
+    return any(issubclass(case, member) for member in _INFRASTRUCTURE_ERRORS)
 
 
 def _excepted_types(method) -> list[list[str]]:
@@ -222,13 +270,16 @@ class TestTheFamilyAndTheCasesCorrespond:
         uncovered = [
             case.__name__
             for case in _CASE_BUILDERS
-            if not any(issubclass(case, member) for member in ENFORCEMENT_EXCEPTIONS)
+            if not _fails_closed(case)
         ]
         assert not uncovered, (
-            f"these cases are no longer covered by the production family: "
-            f"{uncovered}. The family was narrowed, or the case is stale — "
-            "either way the refusal these classes represent would now fall "
-            "into the broad fail-OPEN arm and be swallowed."
+            f"these cases are no longer covered by the production "
+            f"fail-CLOSED set: {uncovered}. The set was narrowed, or the "
+            "case is stale — either way the refusal these classes "
+            "represent would now fall into the broad fail-OPEN arm and "
+            "be swallowed, and the same refusal would kill the call "
+            "through the @protect path and vanish through the "
+            "callback path."
         )
 
     def test_every_family_member_is_an_exception(self):
@@ -370,12 +421,26 @@ class TestEveryCaseIsDriven:
         documented policy for it. Without this, "widen the family" would
         look like a free improvement — and the family would grow until
         a dead backend froze every agent.
+
+        SDK-16 sharpened this: a transport failure IS an
+        infrastructure error, so the callback's new infrastructure arm
+        would catch it and refuse — unless the transport arm comes
+        first. The ORDER is pinned in the AST
+        (`test_the_transport_arm_precedes_the_infrastructure_arm`); this
+        test pins the BEHAVIOUR it exists to protect.
         """
         boom = NullRunBackendError("boom", endpoint="gate", status_code=500)
         assert not isinstance(boom, ENFORCEMENT_EXCEPTIONS), (
             "a transport failure is not a decision — if this ever becomes "
             "true the family's rule has changed and this control is no "
             "longer a control"
+        )
+        assert isinstance(boom, NullRunInfrastructureError), (
+            "a transport failure IS an infrastructure error — that is why "
+            "the callback needs a transport arm of its own, listed "
+            "before the infrastructure one. If this ever becomes false "
+            "the arm order stops mattering and the pin below would be "
+            "asserting nothing."
         )
 
         cb = NullRunCallback(runtime=_GateRefuses(boom))
@@ -385,6 +450,75 @@ class TestEveryCaseIsDriven:
             "a transport failure is not a decision — it must not abort a "
             "later @protect call either"
         )
+
+    def test_a_cosmetic_failure_is_still_swallowed(self):
+        """The other half of the widening: a BUG must not abort the agent.
+
+        ADR-122 §3 rejected "widen the family to every class" partly
+        because a cosmetic failure — a span bookkeeping bug, a broken
+        runtime double — must not break the user's agent. The callback
+        keeps that contract: a fault that is not a NullRun error is
+        logged at debug and swallowed.
+
+        Without this test, "re-raise everything" would look like a free
+        improvement too, and a typo in the SDK would freeze every
+        agent that uses LangChain.
+        """
+        cb = NullRunCallback(runtime=_GateRefuses(RuntimeError("a bug in the SDK")))
+        cb.on_llm_start({}, ["hi"], run_id="run-sdk14")  # must not raise
+
+        assert drain_deferred_enforcement() is None, (
+            "a cosmetic failure is not a decision — it must not abort a "
+            "later @protect call either"
+        )
+
+
+class TestTheTableTheCallbackObeys:
+    """SDK-16: the callback must obey the SDK's OWN fail-OPEN/CLOSED table.
+
+    The table is the module docstring of `nullrun/runtime.py` — the
+    authoritative statement of what each gate does when it cannot be
+    reached (ADR-063 §2.4). Its row for `check_workflow_budget` says
+    the gate fails OPEN for TRANSPORT errors ONLY, and CLOSED for
+    everything else.
+
+    This is a DRIFT tripwire, not the proof. The proof is the
+    behavioural tests above, which drive the real callback with the
+    real classes. The tripwire exists so that editing the table
+    without editing the callback is a RED test instead of a silent
+    contradiction — the contradiction SDK-16 was.
+    """
+
+    def test_the_table_still_says_closed_for_everything_else(self):
+        import nullrun.runtime as runtime_mod
+
+        table = runtime_mod.__doc__ or ""
+        assert (
+            "OPEN (skip check, log warning) for TRANSPORT errors ONLY" in table
+        ), (
+            "the fail-OPEN/CLOSED table in nullrun/runtime.py no longer "
+            "states the check_workflow_budget row this suite enforces. "
+            "The table is authoritative (ADR-063 §2.4) — if the row "
+            "changed, the callback's posture must be re-decided, not "
+            "left to drift."
+        )
+
+    def test_the_table_still_names_the_four_classes(self):
+        import nullrun.runtime as runtime_mod
+
+        table = runtime_mod.__doc__ or ""
+        for name in (
+            "NullRunAuthError",
+            "NullRunMalformedGateResponseError",
+            "NullRunGateIndeterminateError",
+            "NullRunRateLimitRedisError",
+        ):
+            assert name in table, (
+                f"{name} is no longer named in the SDK's fail-OPEN/CLOSED "
+                "table. The table is what the callback is measured "
+                "against, so a class that leaves the table leaves the "
+                "posture undecided."
+            )
 
 
 class TestEnforcementClassification:
@@ -423,6 +557,46 @@ class TestEnforcementClassification:
             f"transport failure (fail-OPEN is correct) with a real gate "
             f"decision (fail-OPEN is a bug). Arms: {arms}"
         )
+
+    def test_the_transport_arm_precedes_the_infrastructure_arm(self):
+        """SDK-16: the ORDER is what keeps a dead backend fail-OPEN.
+
+        `NullRunTransportError` is a `NullRunInfrastructureError`, so an
+        infrastructure arm listed BEFORE the transport arm would catch
+        every network failure and turn it into a refusal: a dead
+        backend would freeze the agent instead of letting it through.
+        The transport arm must come first, in both places that
+        classify an exception — the callback's check path and the
+        guard around every callback method.
+        """
+        from nullrun.instrumentation.langgraph import (
+            NullRunCallback,
+            _only_a_gate_refusal_escapes,
+        )
+
+        for where, arms in (
+            ("on_llm_start", _excepted_types(NullRunCallback.on_llm_start)),
+            (
+                "_only_a_gate_refusal_escapes",
+                _excepted_types(_only_a_gate_refusal_escapes),
+            ),
+        ):
+            assert ["_TRANSPORT_ERRORS"] in arms, (
+                f"{where} must classify a transport failure explicitly; "
+                f"arms: {arms}"
+            )
+            assert ["_INFRASTRUCTURE_ERRORS"] in arms, (
+                f"{where} must re-raise a non-transport infrastructure "
+                f"error (SDK-16); arms: {arms}"
+            )
+            assert arms.index(["_TRANSPORT_ERRORS"]) < arms.index(
+                ["_INFRASTRUCTURE_ERRORS"]
+            ), (
+                f"{where}: the transport arm must come FIRST. "
+                "NullRunTransportError is a NullRunInfrastructureError, so "
+                "the other order turns every network failure into a "
+                f"refusal and freezes the agent. Arms: {arms}"
+            )
 
 
 class TestDeferredHandoff:
