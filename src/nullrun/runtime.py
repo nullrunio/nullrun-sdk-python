@@ -222,20 +222,49 @@ UNKNOWN_WORKFLOW_ID: str = "__nullrun_unknown__"
 # NULLRUN_SKIP_BUDGET_CHECK в production env"); the SDK refuses
 # it outside dev / test environments.
 #
-# Two signals combine to flag a production environment:
+# Two signals flag a production environment:
 # 1. The configured ``api_url`` hostname matches the prod host
 #    (``api.nullrun.io``) — the SDK's hard-coded default per the
 #    constructor docstring.
 # 2. The operator set ``NULLRUN_ENV`` to ``production`` / ``prod``
-#    (explicit override for non-standard deployments that point at
+#    (explicit declaration for non-standard deployments that point at
 #    a custom URL but still serve prod traffic).
 #
+# A host is dev ONLY when it says so in a way that cannot be an
+# accident: an exact loopback, a ``.localhost`` suffix, or an explicit
+# dev-environment LABEL (``staging.`` / ``test.``). NEVER by substring.
+# SDK-2 (2026-11-06): the old check asked "is any marker a SUBSTRING of
+# the hostname?". ``"test"`` is a substring of ``latest``, ``contest``,
+# ``attest``; ``"localhost"`` is a substring of ``notlocalhost.example.com``.
+# So a host that merely CONTAINED a dev marker was classified non-prod
+# and the operator's ``NULLRUN_ENV=production`` was suppressed — the
+# billing bypass ran against production with a WARNING instead of a
+# refusal.
+#
 # Test / dev harnesses that override ``api_url`` to a local /
-# staging host are NOT flagged as production regardless of
-# ``NULLRUN_ENV`` — operators who DO want the bypass in prod can
-# set ``NULLRUN_ALLOW_SKIP_BUDGET_CHECK=1`` to acknowledge the
-# risk explicitly (analogous to ``NULLRUN_SENSITIVE_FAIL_OPEN``).
+# staging host are NOT flagged as production — operators who DO want
+# the bypass in prod can set ``NULLRUN_ALLOW_SKIP_BUDGET_CHECK=1`` to
+# acknowledge the risk explicitly (analogous to
+# ``NULLRUN_SENSITIVE_FAIL_OPEN``).
 _PROD_API_HOST: str = "api.nullrun.io"
+
+# Hosts that are local by construction. ``0.0.0.0`` is the
+# "unspecified" address a dev harness binds to; it is a marker string
+# here, never a bind address (S104).
+_LOOPBACK_HOSTS: frozenset[str] = frozenset(
+    # "0.0.0.0" is a marker string compared against a hostname, never a
+    # bind address (S104).
+    {"localhost", "127.0.0.1", "0.0.0.0", "::1"}  # noqa: S104
+)
+
+# A leading label that declares a dev environment. Compared as a
+# LABEL, so ``api.test.nullrun.io`` keeps its own meaning and
+# ``staging.internal`` is a dev host while ``latest.nullrun.io`` is
+# not.
+_DEV_HOST_LABELS: frozenset[str] = frozenset({"staging", "test"})
+
+# Values of ``NULLRUN_ENV`` that declare production.
+_PROD_ENV_VALUES: frozenset[str] = frozenset({"production", "prod"})
 
 
 def _is_production_environment(api_url: str | None = None) -> bool:
@@ -243,21 +272,28 @@ def _is_production_environment(api_url: str | None = None) -> bool:
     NullRun backend.
 
     Used by ``check_workflow_budget`` to refuse
-    ``NULLRUN_SKIP_BUDGET_CHECK=1`` outside dev / test environments.
-    Detection rules (in order):
+    ``NULLRUN_SKIP_BUDGET_CHECK=1`` outside dev / test environments,
+    and by ``sensitive_fail_open_enabled`` to refuse the second
+    fail-open switch.
 
-    1. ``api_url`` is None or matches the prod host
-       (``api.nullrun.io``) — the default constructor value.
-    2. ``NULLRUN_ENV`` is set to ``production`` / ``prod`` (case
-       insensitive) AND the api_url is not explicitly pointed at a
-       known non-prod host (``localhost``, ``127.0.0.1``,
-       ``staging``, ``test``).
+    Detection rules, in order:
 
-    Local / staging / test deployments are NOT flagged so the dev
-    bypass keeps working. Operators who insist on the bypass in
-    prod can set ``NULLRUN_ALLOW_SKIP_BUDGET_CHECK=1`` — but the
-    env var is then surfaced in audit / telemetry so it's not a
-    silent fail-OPEN.
+    1. The host EXACTLY a loopback (``localhost``, ``127.0.0.1``,
+       ``0.0.0.0``, ``::1``) or ending in ``.localhost`` → NOT
+       production. A local machine does not serve prod traffic, and
+       no env var may arm the guard for it.
+    2. The host's FIRST label is a dev label (``staging.``,
+       ``test.``) → NOT production. This is an explicit environment
+       marker, not a name accident.
+    3. The host is exactly ``api.nullrun.io`` → production.
+    4. ``NULLRUN_ENV`` is ``production`` / ``prod`` (case insensitive)
+       → production for every other host. The operator's declaration
+       wins over the host heuristic; the substring test that used to
+       suppress it is gone.
+
+    A host the SDK does not recognise, with no ``NULLRUN_ENV``, stays
+    non-production: that is the pre-existing behaviour for a custom
+    deployment and it keeps the documented dev escape hatch working.
     """
     from urllib.parse import urlparse
 
@@ -272,20 +308,30 @@ def _is_production_environment(api_url: str | None = None) -> bool:
     host = parsed.hostname if parsed is not None else None
     host_lc = (host or "").lower()
 
-    # Signal 1: explicit prod host. ``api.nullrun.io`` is the
+    # Rule 1: exact loopback / ``.localhost`` suffix. Never production,
+    # whatever NULLRUN_ENV says — a loopback is a local machine.
+    if host_lc in _LOOPBACK_HOSTS or host_lc.endswith(".localhost"):
+        return False
+
+    # Rule 2: an explicit dev-environment LABEL. Compared label by
+    # label, never as a substring: ``staging.internal`` is dev,
+    # ``latest.nullrun.io`` and ``notlocalhost.example.com`` are not.
+    first_label = host_lc.split(".")[0]
+    if first_label in _DEV_HOST_LABELS:
+        return False
+
+    # Rule 3: explicit prod host. ``api.nullrun.io`` is the
     # canonical production endpoint; the constructor's default
     # value is exactly this URL so any caller that did not
     # override ``api_url`` lands here.
     if host_lc == _PROD_API_HOST:
         return True
 
-    # Signal 2: explicit NULLRUN_ENV=production (or "prod") AND
-    # the api_url does not point at a known dev/staging host.
+    # Rule 4: the operator declared production. This wins over every
+    # remaining host heuristic — SDK-2: the old substring match used
+    # to suppress it.
     explicit_env = os.getenv("NULLRUN_ENV", "").strip().lower()
-    non_prod_hosts = ("localhost", "127.0.0.1", "0.0.0.0", "staging", "test")  # noqa: S104  -- string marker, not a bind address
-    if explicit_env in {"production", "prod"} and not any(
-        marker in host_lc for marker in non_prod_hosts
-    ):
+    if explicit_env in _PROD_ENV_VALUES:
         return True
 
     return False
