@@ -1376,6 +1376,23 @@ class Transport:
         """Path of the advisory lock guarding mutations of the WAL files."""
         return f"{self._wal_path()}.lock"
 
+    def _wal_v3_path(self) -> str:
+        """Path of the v3 single-shot consume WAL.
+
+        SDK-1 (security audit 2026-11-06). A SEPARATE file from the
+        base WAL because the two are replayed through DIFFERENT
+        endpoints.
+
+        The base WAL holds legacy events, and they are replayed through
+        ``/api/v1/track/batch``. A v3 consume payload must go to
+        ``/api/v1/track``: the batch path does not run the CONSUME
+        script, so a reservation replayed through it is never settled
+        and the money is never booked. Replaying a v3 payload through
+        the batch path is the same loss as dropping it, with more
+        machinery.
+        """
+        return f"{self._wal_path()}.v3"
+
     @property
     def _dlq_max_bytes(self) -> int:
         """Effective DLQ size cap. Same shape as ``_wal_max_bytes``."""
@@ -1917,6 +1934,186 @@ class Transport:
             + (" (unflushed remainder re-persisted)" if repersisted else "")
         )
 
+    # ------------------------------------------------------------------
+    # SDK-1 (security audit 2026-11-06): the v3 consume WAL.
+    #
+    # The money path. A v3 `/track` carries a CONSUME: it settles the
+    # reservation the matching `/gate` made. If that call is refused or
+    # never reaches the backend, the tool call has ALREADY run and the
+    # money has ALREADY been spent — but nothing booked it. That gap is
+    # what this file closes.
+    #
+    # The invariant: after the call, the event is either BOOKED or
+    # RECOVERABLE. Never dropped.
+    # ------------------------------------------------------------------
+
+    def persist_v3_track(self, payload: dict[str, Any]) -> bool:
+        """Durably record a v3 /track payload that could not be delivered.
+
+        The payload is written VERBATIM — ``reservation_id`` and
+        ``idempotency_key`` included — because the replay sends it back
+        exactly as it was built.
+
+        The ``idempotency_key`` is not decoration. The backend DELETEs
+        the reservation key after the first successful consume, so a
+        replay that arrives WITHOUT the key is answered with 503
+        ``RESERVATION_NOT_FOUND`` and the row could never leave the
+        file. With the key the backend replays its stored answer (200,
+        ``idempotent_replay: true``) and the row clears.
+
+        APPENDED, never rewritten: the file holds every undelivered
+        payload, and a rewrite would drop the ones an earlier failure
+        left behind.
+
+        Returns True when the payload is durably on disk.
+        """
+        row = _v3_wal_row(payload)
+        path = self._wal_v3_path()
+        if not self._write_events_atomic(path, [row], mode="a"):
+            logger.error(
+                "Could not persist the v3 consume payload for reservation_id=%s "
+                "to %s. The spend is NOT recoverable — it is lost.",
+                payload.get("reservation_id"),
+                path,
+            )
+            return False
+        logger.warning(
+            "v3 consume for reservation_id=%s was not delivered; the payload is "
+            "recoverable in %s and will be replayed to /api/v1/track.",
+            payload.get("reservation_id"),
+            path,
+        )
+        return True
+
+    def _read_wal_rows(self, path: str) -> list[dict[str, Any]]:
+        """Read the JSON lines of a WAL file under the cross-process lock.
+
+        A line that does not parse is skipped: it was never durable (a
+        torn tail) and there is nothing to recover from it.
+        """
+        with self._wal_file_lock() as acquired:
+            if not acquired:
+                logger.warning(
+                    "WAL read skipped: another process holds the WAL lock."
+                )
+                return []
+            try:
+                with open(path) as f:
+                    lines = f.readlines()
+            except FileNotFoundError:
+                return []
+            except OSError as e:
+                logger.warning(f"Failed to read WAL {path}: {e}")
+                return []
+        rows: list[dict[str, Any]] = []
+        for line in lines:
+            try:
+                row = json.loads(line.strip())
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
+        return rows
+
+    def _replay_v3_from_wal(self) -> None:
+        """Replay the v3 consumes that could not be delivered.
+
+        Each payload is re-sent to ``/api/v1/track`` (single) — NOT to
+        the batch endpoint. The batch path does not run the CONSUME
+        script, so a reservation replayed through it is never settled
+        and the money is never booked.
+
+        A row is removed ONLY when the backend accepted it. A payload
+        that is refused again stays in the file: an undelivered spend
+        that nobody retries is a lost spend. The loop stops at the
+        first refusal so the spends keep their order.
+        """
+        path = self._wal_v3_path()
+        rows = self._read_wal_rows(path)
+        if not rows:
+            return
+        delivered: set[str] = set()
+        for row in rows:
+            payload = row.get("payload")
+            if not isinstance(payload, dict):
+                # Not a row this SDK wrote. Leave it alone — it is
+                # evidence, and the SDK cannot know what it means.
+                logger.warning(
+                    "WAL replay: %s holds a row this SDK cannot read; leaving it "
+                    "in place.",
+                    path,
+                )
+                continue
+            try:
+                self.track_single(payload)
+            except (NullRunBackendError, NullRunDecision) as exc:
+                # The backend ANSWERED and refused this row. The refusal
+                # is about this consume, not about the backend, so the
+                # next row still gets its chance — one stuck row must
+                # not block every spend behind it.
+                #
+                # A `NullRunDecision` (a budget verdict, e.g.
+                # CONSUME_OVERBUDGET) is a refusal too, and it used to
+                # fall through to the arm below, which STOPS the replay
+                # — so one overbudget row blocked every spend behind it
+                # from being booked. The rows are independent
+                # reservations; one stuck row must not block the rest.
+                logger.error(
+                    "WAL replay: /track still refuses the consume for "
+                    "reservation_id=%s (%s). The payload stays in %s and is "
+                    "retried on the next start.",
+                    payload.get("reservation_id"),
+                    exc,
+                    path,
+                )
+                continue
+            except Exception as exc:  # noqa: BLE001 — every failure is a keep
+                # The backend did not answer (unreachable, timeout). Every
+                # remaining row would fail the same way, so the replay
+                # stops here and the file keeps every payload.
+                logger.error(
+                    "WAL replay: /track is unreachable (%s). The payloads stay "
+                    "in %s and are retried on the next start.",
+                    exc,
+                    path,
+                )
+                break
+            delivered.add(_v3_row_key(row))
+            metrics.inc_transport("v3_track_replayed")
+        if delivered:
+            self._remove_v3_rows(delivered, path)
+        logger.info(
+            "Replayed %d of %d v3 consume payload(s) from WAL",
+            len(delivered),
+            len(rows),
+        )
+
+    def _remove_v3_rows(self, delivered: set[str], path: str) -> None:
+        """Drop the rows the backend accepted. Everything else stays.
+
+        The file is re-read before the rewrite so a row another process
+        appended in the meantime survives.
+        """
+        rows = self._read_wal_rows(path)
+        kept = [row for row in rows if _v3_row_key(row) not in delivered]
+        if len(kept) == len(rows):
+            return
+        if not kept:
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                return
+            except OSError as e:
+                logger.warning(f"Failed to remove emptied v3 WAL {path}: {e}")
+            return
+        if not self._write_events_atomic(path, kept, mode="w"):
+            logger.warning(
+                "WAL replay: could not rewrite %s. The accepted payloads stay "
+                "in the file; the next replay re-sends them and the backend "
+                "answers them from its idempotency record.",
+                path,
+            )
+
     def track(self, event: dict[str, Any]) -> None:
         """
         Add event to buffer. Non-blocking.
@@ -1947,6 +2144,9 @@ class Transport:
         self._warn_about_legacy_wal()
         # Replay any events from WAL that were persisted due to previous crash
         self._replay_from_wal()
+        # SDK-1: replay the v3 consumes that could not be delivered. They
+        # go to /api/v1/track (single), not to the batch endpoint.
+        self._replay_v3_from_wal()
         # Held refusals are recovered separately and are NOT replayed onto the
         # send path. `_replay_from_wal` recovers undelivered events, which is
         # the right thing for them; these were already refused, so re-sending
@@ -5113,6 +5313,30 @@ def _safe_json(response: httpx.Response, endpoint: str) -> Any:
         ) from exc
 
 
+def _v3_wal_row(payload: dict[str, Any]) -> dict[str, Any]:
+    """Wrap a v3 consume payload into a WAL row.
+
+    The wrapper marks the row's KIND. The base WAL and the v3 WAL are
+    separate files with separate replay routes, so the kind is
+    belt-and-braces — but it costs nothing and it means a row can
+    never be mistaken for a legacy event.
+    """
+    return {"_nullrun_wal": "v3_track", "_v": 1, "payload": payload}
+
+
+def _v3_row_key(row: dict[str, Any]) -> str:
+    """The identity of a v3 WAL row: the reservation it settles.
+
+    Two rows for the same reservation are the same consume. The
+    idempotency key is part of the identity because two attempts at the
+    same consume can carry different keys.
+    """
+    payload = row.get("payload")
+    if not isinstance(payload, dict):
+        return ""
+    return f"{payload.get('reservation_id')}|{payload.get('idempotency_key')}"
+
+
 def _parse_v3_error_envelope(
     response: httpx.Response,
     endpoint: str,
@@ -5131,6 +5355,26 @@ def _parse_v3_error_envelope(
         body = response.json()
     except Exception:
         body = None
+    # The backend's OWN error code, as the wire spelled it.
+    #
+    # `_extract_error_envelope` is the single normaliser for the three
+    # envelope shapes the backend emits, and the uncategorised parser
+    # dispatched on its result — so this is the same string the class
+    # was chosen from. It is exposed on the exception because the
+    # decision "is this refusal fail-closed?" is made BY CODE, not by
+    # exception class: the class hierarchy puts a backend refusal
+    # (`NullRunBackendError`) under `NullRunInfrastructureError`, which
+    # is a SIBLING of `NullRunDecision`, so no `isinstance` check can
+    # tell them apart.
+    backend_code, _message, _details = _extract_error_envelope(
+        body if isinstance(body, dict) else {}, response.text
+    )
+    exc.backend_error_code = backend_code or None  # type: ignore[attr-defined]
+    # The HTTP status of the ANSWER. This attribute is the marker that
+    # separates "the backend refused" from "the backend never answered":
+    # the network path raises `NullRunTransportError` without it.
+    # ADR-008's fail-OPEN covers the second case only.
+    exc.wire_status_code = response.status_code  # type: ignore[attr-defined]
     if isinstance(body, dict):
         # ADR-062 §2.2. A refusal whose category is ABSENT is left
         # absent, not defaulted: the runtime's strict rule reads the
@@ -5140,10 +5384,17 @@ def _parse_v3_error_envelope(
         category = body.get("category")
         if category is not None:
             exc.wire_category = category  # type: ignore[attr-defined]
+        # The TOP LEVEL first. The `/track` envelope carries the code
+        # there and NOT inside `details`
+        # (``handlers.rs::track_handler``), so the old details-first
+        # order reported `None` for every /track refusal — the one
+        # place the SDK most needs to read the code. The gate's own
+        # envelope carries it in BOTH places, so the order does not
+        # change what that path reports.
+        details_block = body.get("details")
+        details_block = details_block if isinstance(details_block, dict) else {}
         exc.wire_error_code = (  # type: ignore[attr-defined]
-            (body.get("details") or {}).get("error_code")
-            if isinstance(body.get("details"), dict)
-            else body.get("error_code")
+            body.get("error_code") or details_block.get("error_code")
         )
         # Server-authored text, carried the same way ``check()``
         # carries it on the dict it returns. ADR-063 §1.3(e):
@@ -6084,6 +6335,89 @@ def _build_v3_error_code_map() -> dict[str, type[Exception]]:
 
 
 _V3_ERROR_CODE_MAP: dict[str, type[Exception]] = _build_v3_error_code_map()
+
+
+# SDK-1 (security audit 2026-11-06). The refusal rule for the /track
+# path.
+#
+# WHERE THE VOCABULARY COMES FROM. The backend owns the error
+# vocabulary: every refusal it can emit is a variant of `GateErrorCode`
+# (`backend/src/proxy/http/gate/error_codes.rs`), and that registry
+# classifies each one as Denied / Budget / Halt / Infra. The SDK's own
+# catalog (`_V3_ERROR_CODE_MAP`) is the projection of that registry, and
+# the backend keeps the two in sync with a parity test that reads
+# `GateErrorCode::all()` — `backend/tests/nr007_sdk_error_code_parity.rs`
+# (green). So the codes in the catalog are not a hand-kept list in the
+# SDK: they are the classes the registry maps its `Infra` family onto.
+#
+# The catalog still decides the CLASS a refusal raises as — a
+# `NullRunBackendError` for RESERVATION_NOT_FOUND, a
+# `NullRunRateLimitRedisError` for a limiter Redis that did not answer,
+# a `NullRunAuthenticationError` for a request refused before it could
+# be judged, a `NullRunDecision` for a budget or approval verdict. The
+# catalog does NOT decide whether the SDK may report the consume as
+# booked. That question is answered by the wire, one function below.
+#
+# A refusal means the CONSUME DID NOT LAND. The spend is real and
+# unbooked, so the SDK must not report it as a successful track.
+#
+# NOT a refusal: `NullRunDecision` is a verdict — but it is one, and it
+# raises in its own branch. NOT a refusal: a request that never reached
+# the backend. That is a transport failure, and the ADR-008 fail-open
+# row for the network case applies.
+#
+# ---------------------------------------------------------------------------
+# SDK-1 (security audit 2026-11-06) — the class list above was WRONG.
+#
+# It named three classes and left nine backend codes OUTSIDE them, so
+# those nine were dropped exactly like a network error: the
+# `PROTOCOL_*` family, `IDEMPOTENCY_CONFLICT`, `IDEMPOTENCY_KEY_MISMATCH`
+# and the three `RATE_LIMIT_*` codes. The backend rate-limits `/track`,
+# so a 429 there is LIVE, and a 429 was a dropped spend.
+#
+# The list was also the wrong SHAPE. A refusal is not a class — it is
+# the fact that the backend ANSWERED. The taxonomy of the answer (a
+# budget verdict, a rate limit, a protocol error) does not change what
+# the SDK owes the caller: the consume did not land, so the spend is
+# unbooked, and reporting that as a successful track is a lost spend
+# with a success label on it.
+#
+# So the rule is now ONE question — "did the backend answer?" — asked of
+# the WIRE, not of the exception class. ADR-008's fail-OPEN covers
+# exactly one thing: the gate could not be REACHED. There is then no
+# answer to honour and a dead backend must not freeze the agent loop.
+# Every other case is a refusal.
+# ---------------------------------------------------------------------------
+
+
+def is_backend_refusal(exc: BaseException) -> bool:
+    """True when the backend ANSWERED the consume and refused it.
+
+    ADR-008's fail-OPEN covers exactly ONE thing: the gate could not be
+    REACHED. There is then no answer to honour, and a dead backend must
+    not freeze the agent loop. Every other case is a refusal, and a
+    refusal the SDK reports as a successful track is a lost spend with a
+    success label on it.
+
+    The marker is the WIRE, never the exception class. The class
+    hierarchy puts a backend refusal (`NullRunBackendError`) under
+    `NullRunInfrastructureError`, a SIBLING of `NullRunDecision`, so no
+    `isinstance` check can tell a 503 ``RESERVATION_NOT_FOUND`` from a
+    budget verdict. The wire status is stamped on the exception by
+    `_parse_v3_error_envelope`; the network path raises
+    `NullRunTransportError` without it.
+
+    A named error code counts as an answer even when no status was
+    stamped: the backend named a refusal, so there IS an answer.
+
+    The function answers ONE question. `NullRunDecision` is a refusal
+    too, so the caller must test that class FIRST.
+    """
+    status = getattr(exc, "wire_status_code", None)
+    if isinstance(status, int):
+        return True
+    code = getattr(exc, "backend_error_code", None) or getattr(exc, "wire_error_code", None)
+    return bool(code) and isinstance(code, str)
 
 
 def _parse_error_envelope(

@@ -34,11 +34,32 @@ money would be lost with nothing in the logs to show for it.
 | `sdk.wal.holdover` | refusals the full DLQ had no room for | same — as a hold, never as a send |
 | `sdk.wal.dlq` | events the backend refused | **a human**, via `nullrun-wal` |
 | `sdk.wal.lock` | the advisory lock, 0 bytes | `flock` |
+| `sdk.wal.v3` | v3 consume payloads that were not delivered | the next `Transport.start()` |
 
 The first three self-heal. The DLQ does not, and cannot: a refusal is by
 definition not something a retry fixes, so re-sending a dead-lettered event
 would be refused again. Automatic DLQ replay is the poison pill the DLQ
 exists to break out of.
+
+### The v3 file
+
+`sdk.wal.v3` holds the **v3 consume payload** — the `/api/v1/track` body
+that settles a reservation — for calls whose tool ran but whose consume was
+not delivered. It is a separate file from `sdk.wal` because the two replay
+through different endpoints: the base WAL goes to `/api/v1/track/batch`, and
+the batch path does not run the CONSUME script. A v3 payload replayed
+through the batch path is never settled, so the money is never booked — the
+same loss as dropping it, with more machinery.
+
+The payload is stored **verbatim**, `idempotency_key` included. The backend
+deletes the reservation key after the first successful consume, so a replay
+without the key is answered with 503 `RESERVATION_NOT_FOUND` and the row
+could never leave the file. With the key the backend replays its stored
+answer (200, `idempotent_replay: true`) and the row clears.
+
+A row leaves the file only when the backend accepted it. A payload the
+backend refuses again stays on disk: an undelivered spend nobody retries is
+a lost spend.
 
 ### The legacy file
 

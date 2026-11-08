@@ -50,6 +50,7 @@ import httpx
 
 from nullrun.breaker.exceptions import ENFORCEMENT_EXCEPTIONS
 from nullrun.instrumentation.langgraph import NullRunCallback
+from nullrun.transport import is_backend_refusal
 
 logger = logging.getLogger(__name__)
 
@@ -1279,6 +1280,17 @@ class NullRunSyncTransport(httpx.BaseTransport):
             # looked like a success to the application.
             raise
         except Exception as e:
+            # SDK-1 (security audit 2026-11-06). The family above is a
+            # list of CLASSES, and a backend refusal that is not a
+            # verdict — a 503 `RESERVATION_NOT_FOUND`, a 500
+            # `INTERNAL_ERROR` — is not in it. The backend ANSWERED and
+            # refused to book the money, so the refusal has to reach
+            # the caller exactly like a verdict does.
+            #
+            # The test is the WIRE, not the class: the exception
+            # carries the HTTP status of the answer.
+            if is_backend_refusal(e):
+                raise
             logger.debug("NullRun transport: track failed: %s", e)
 
     def close(self) -> None:
@@ -1415,6 +1427,11 @@ class NullRunAsyncTransport(httpx.AsyncBaseTransport):
             # caller.
             raise
         except Exception as e:
+            # SDK-1 (security audit 2026-11-06) — see the sync
+            # transport above. A backend answer that refused the
+            # consume is not a transport failure either.
+            if is_backend_refusal(e):
+                raise
             logger.debug("NullRun transport: async track failed: %s", e)
 
     async def aclose(self) -> None:
@@ -2078,6 +2095,11 @@ def _emit_from_agents_result(runtime: Any, result: Any) -> None:
             # successful one.
             raise
         except Exception as e:  # pragma: no cover — defensive
+            # SDK-1 (security audit 2026-11-06) — see the sync
+            # transport above. A backend answer that refused the
+            # consume is not a transport failure either.
+            if is_backend_refusal(e):
+                raise
             logger.debug("NullRun: agents track failed: %s", e)
 
 

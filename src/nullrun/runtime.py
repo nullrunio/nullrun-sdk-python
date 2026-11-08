@@ -26,7 +26,7 @@ the authoritative table; deviations require an ADR amendment (Rule 5).
 | `runtime.execute` -> `Transport.execute` (`fallback_mode=permissive`, opt-in) | OPEN -- transport synthesises `decision=allow, decision_source=FALLBACK` | n/a (the body runs) | the constructor knob `NullRunRuntime(fallback_mode="permissive")` -- a code-level opt-in, not an env var |
 | `_emit_span_start` / `_emit_span_end` | n/a -- never blocks | n/a | n/a |
 | `/track` batch path (legacy) | OPEN-on-network-error (event dropped, no retry) | n/a -- circuit breaker backoff applies | none |
-| `/track` v3 single path (`track_single`) | OPEN-on-network-error and OPEN-on-5xx (event dropped, no retry); **CLOSED for enforcement rejections** — a typed `NullRunDecision` (`CONSUME_OVERBUDGET` 422, budget block 402) propagates to the caller | caller reconciles the delta from the exception's `reserved_millicents` / `max_allowed_millicents` / `actual_cost_cents` / `recorded` (the reservation is on the wire in millicents and the actual in cents; the backend does not send its configured epsilon, so `actual - reserved` is the only honest way to recover it); ADR-005 forbids implicit re-reserve, so there is nothing for the SDK to retry | none |
+| `/track` v3 single path (`track_single`) | OPEN-on-network-error ONLY — the payload is written to the v3 WAL (`<wal>.v3`) BEFORE the caller's view drops it, and it is replayed on the next start; **CLOSED for every ANSWER that refused the consume** — any non-2xx, whether or not the body names an enforcement failure (SDK-1, ADR-183). A typed `NullRunDecision` (`CONSUME_OVERBUDGET` 422, budget block 402) propagates to the caller | the durable v3 WAL, replayed to `/api/v1/track` (SINGLE — the batch path does not run the CONSUME script, so a reservation replayed through it is never settled). The caller also reconciles the delta from the exception's `reserved_millicents` / `max_allowed_millicents` / `actual_cost_cents` / `recorded` (the reservation is on the wire in millicents and the actual in cents; the backend does not send its configured epsilon, so `actual - reserved` is the only honest way to recover it); ADR-005 forbids implicit re-reserve, so there is nothing for the SDK to retry | none |
 
 **The LangChain/LangGraph callback obeys the `check_workflow_budget` row.**
 `NullRunCallback` calls the same gate. It fails OPEN for a transport error and
@@ -54,6 +54,15 @@ fall-OPEN on a wire 4xx/5xx that names an enforcement failure.
 * **SDK-side transport failure** (network timeout, 5xx, breaker open)
   → fail-OPEN on the *check* path so a dead backend doesn't freeze
   the user's agent loop (this is what the README describes).
+* **A backend ANSWER that refused a consume** (`/track`, the money path)
+  → fail-CLOSED, even when the body names no enforcement failure.
+  SDK-1 (ADR-183): the question is not "what did the body say?" but
+  "did the backend ANSWER?". The consume did not land, the tool call
+  has already run and the money has already been spent, so reporting
+  the refusal as a successful track is a lost spend with a success
+  label on it. A request that never REACHED the backend keeps the
+  fail-OPEN row above — and its payload is durable in the v3 WAL, so
+  it is not dropped either.
 * **Authentication failure (401)** → fail-CLOSED.
   ``NullRunAuthError`` propagates. A 401 is a CREDENTIAL/CONFIG
   failure, not a transient transport condition: no retry can fix a
@@ -173,6 +182,7 @@ from nullrun.transport import (
     _emit_for_transport_error,
     _protocol_header_value,
     _safe_json,
+    is_backend_refusal,
     is_fallback_decision_source,
 )
 from nullrun.uuid7 import uuid7_str
@@ -4761,10 +4771,25 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                Failure mode
                ------------
                ``track_single`` raises on 422 / 503 / 5xx (see
-               ``nullrun.breaker.exceptions``). We catch and log at
-               WARNING level; the event is dropped (NOT retried via
-               the batch path — that would risk double-billing the
-               idempotency contract).
+               ``nullrun.breaker.exceptions``).
+
+               A backend ANSWER raises. The consume did not land, so
+               the caller must not be told the track succeeded. The
+               payload goes to the v3 WAL first, so the refusal is
+               raised AND recoverable (ADR-183).
+
+               An enforcement verdict also raises, and it is NOT
+               written to the WAL. The backend will answer the same
+               way next time.
+
+               A request that never reached the backend keeps the
+               ADR-008 fail-OPEN row. The payload still goes to the
+               v3 WAL, the failure is logged at WARNING, and the
+               caller is not blocked.
+
+               The event is never retried via the batch path. That
+               endpoint does not run the CONSUME script, so a
+               reservation replayed through it is never settled.
         """
         from nullrun.context import get_server_minted_execution_id
 
@@ -4838,6 +4863,29 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 correlation_id=smid,
                 status_code=status_code,
             )
+            # SDK-1 (security audit 2026-11-06). The tool call has
+            # ALREADY run and the money has ALREADY been spent. The
+            # only thing that keeps that spend from being lost is a
+            # durable copy of the consume payload, so it is written
+            # BEFORE anything decides whether to raise.
+            #
+            # The payload is written VERBATIM — `reservation_id` and
+            # `idempotency_key` included — and the WAL replay sends it
+            # back to `/api/v1/track` (single). The batch endpoint is
+            # NOT a recovery route: it does not run the CONSUME
+            # script, so a reservation replayed through it is never
+            # settled and the money is never booked.
+            #
+            # A determinate verdict is NOT persisted. A
+            # `NullRunDecision` (budget, approval, chain,
+            # consume-overbudget) is the backend's ANSWER: re-sending
+            # it produces the same answer and a row that could never
+            # leave the WAL.
+            if not isinstance(exc, NullRunDecision):
+                if self._transport.persist_v3_track(single_payload):
+                    metrics.inc_runtime("v3_track_persisted_to_wal")
+                else:
+                    metrics.inc_runtime("v3_track_wal_persist_failed")
             # DEF-TC6-006 (2026-10-02, QA RUN_ID 20261002T0826):
             # a bare `except Exception` here laundered an ADR-005
             # enforcement rejection into a transport warning. The
@@ -4866,15 +4914,58 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             # plain 5xx stay in the transport class and keep
             # dropping, because they name no enforcement failure
             # and raising on them would be the over-correction.
+            # (PRE-SDK-1 RULE. Superseded by SDK-1 below — a
+            # protocol error and a plain 5xx on /track are refusals
+            # of the CONSUME, not of the check.)
             # The invalidation above runs first either way — the
             # cached-allow blast radius (DEF-CACHE-STALE-ALLOW-
             # AFTER-OVERBUDGET) is closed before the raise, not
             # traded away for it.
+            #
+            # SDK-1 (security audit 2026-11-06) changes this. The
+            # scope above was WRONG on the money path, and the
+            # exception hierarchy is why it was wrong: a backend
+            # refusal (`NullRunBackendError`) sits under
+            # `NullRunInfrastructureError`, a SIBLING of
+            # `NullRunDecision`, so `isinstance(exc, NullRunDecision)`
+            # never caught a 503 `RESERVATION_NOT_FOUND` or a 500
+            # `INTERNAL_ERROR`. Those are refusals of the CONSUME:
+            # the tool call has already run, the money has already been
+            # spent, and the backend refused to book it. Reporting
+            # `{"allowed": True}` for that is a lost spend with a
+            # success label on it.
+            #
+            # The refusal is now decided BY THE WIRE (see
+            # `transport.is_backend_refusal`), not by the exception
+            # class: the question is "did the backend ANSWER?", and the
+            # answer is on the exception as the HTTP status of the
+            # response. A request that never reached the backend stays
+            # a transport failure and keeps dropping — that is the
+            # ADR-008 fail-open row, and it is unchanged.
+            #
+            # The class list this replaced named three classes and left
+            # nine backend codes outside them: the `PROTOCOL_*` family,
+            # `IDEMPOTENCY_CONFLICT`, `IDEMPOTENCY_KEY_MISMATCH` and
+            # the three `RATE_LIMIT_*` codes. The backend rate-limits
+            # `/track`, so a 429 there is LIVE — and it was a dropped
+            # spend. The taxonomy of an answer does not change what the
+            # SDK owes the caller: the consume did not land.
             if isinstance(exc, NullRunDecision):
                 logger.warning(
                     "_route_track: /track refused the consume for "
                     "execution_id=%s (%s) — propagating (ADR-008: an "
                     "enforcement rejection is not a transport error)",
+                    smid,
+                    exc,
+                )
+                raise
+            if is_backend_refusal(exc):
+                logger.warning(
+                    "_route_track: /track refused the consume for "
+                    "execution_id=%s (%s) — propagating (SDK-1: the "
+                    "backend answered and refused, so the consume did "
+                    "not land and the refusal must not be reported as "
+                    "a successful track)",
                     smid,
                     exc,
                 )

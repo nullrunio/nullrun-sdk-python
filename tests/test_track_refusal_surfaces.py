@@ -27,6 +27,14 @@ What these tests pin:
    and the caller still gets its response.
 4. The refusal the caller sees is the SAME object the runtime raised —
    no laundering into a generic error on the way out.
+
+SDK-1 (security audit 2026-11-06) widened the set of things that
+surface. The rule is now one question asked of the WIRE: did the
+backend ANSWER? A refusal is any answer the backend gave that was not
+an acceptance — a 5xx with no enforcement code in it included, because
+the consume did not land either way. A request that never reached the
+backend keeps the fail-OPEN posture: the agent must not freeze on a
+dead backend, and the undelivered payload goes to the WAL.
 """
 
 from __future__ import annotations
@@ -729,7 +737,41 @@ class TestTheEndToEndPath:
 
     def test_a_transport_failure_is_still_swallowed(self, make_runtime):
         """The fail-OPEN half, end to end: a dead backend must not
-        freeze the agent."""
+        freeze the agent.
+
+        "A dead backend" is a request that never got an answer. A 5xx
+        is an ANSWER, and it is in the other half — see the test below.
+        """
+        import respx
+        from httpx import Response
+
+        from nullrun.instrumentation.auto import NullRunSyncTransport
+        from nullrun.runtime import _capture_server_minted_execution_id
+
+        rt = make_runtime()
+        _capture_server_minted_execution_id({"reservation_id": "0190c5b5-7c9a-7def-8a1b-0123456789ab"})
+
+        respx.post("https://api.openai.com/v1/chat/completions").mock(
+            return_value=Response(200, json=json.loads(_openai_body()))
+        )
+        respx.post("https://api.test.nullrun.io/api/v1/track").mock(
+            side_effect=httpx.ConnectError("boom")
+        )
+
+        transport = NullRunSyncTransport(_RecordingTransport(_openai_body()), rt)
+
+        response = transport.handle_request(_request())
+
+        assert response.status_code == 200
+
+    def test_a_refused_track_surfaces_through_the_auto_layer(self, make_runtime):
+        """SDK-1 (security audit 2026-11-06).
+
+        The backend ANSWERED and refused the consume. The application
+        must not see an ordinary LLM call: the spend the backend
+        refused to book is not a success, and the auto layer that
+        swallows transport failures must not swallow a refusal.
+        """
         import respx
         from httpx import Response
 
@@ -748,6 +790,7 @@ class TestTheEndToEndPath:
 
         transport = NullRunSyncTransport(_RecordingTransport(_openai_body()), rt)
 
-        response = transport.handle_request(_request())
+        with pytest.raises(Exception) as ei:
+            transport.handle_request(_request())
 
-        assert response.status_code == 200
+        assert "track" in str(ei.value).lower()

@@ -68,11 +68,35 @@ re-presented to the caller as a successful transport.
 ## The fix
 
 Re-raise ``NullRunDecision`` after the existing invalidation and
-telemetry. Everything else — network errors, 5xx, protocol errors —
-keeps the drop-and-log behavior the table documents.
+telemetry.
+
+## SDK-1 (security audit 2026-11-06) widened it
+
+The rule above was scoped to ``NullRunDecision`` alone, and the scope
+was wrong on the money path: a backend refusal
+(``NullRunBackendError``) sits under ``NullRunInfrastructureError``, a
+SIBLING of ``NullRunDecision``, so ``isinstance(exc,
+NullRunDecision)`` never caught a 503 ``RESERVATION_NOT_FOUND`` or a
+500 ``INTERNAL_ERROR``. Those are refusals of the CONSUME: the tool
+call has already run, the money has already been spent, and the
+backend refused to book it.
+
+The rule is now one question asked of the WIRE: **did the backend
+answer?** ADR-008's fail-OPEN covers exactly one thing — the gate
+could not be REACHED, so there is no answer to honour and a dead
+backend must not freeze the agent loop. A 5xx is an answer, so it
+raises.
+
+So this file's last test changed contract: a bare 5xx used to be
+asserted to drop, and that assertion encoded the defect. It now
+asserts that the 5xx raises AND that the payload is recoverable in the
+WAL — the fail-OPEN half moves to the case it was always about, a
+request that never reached the backend.
 """
 
 from __future__ import annotations
+
+from pathlib import Path
 
 import httpx
 import pytest
@@ -185,6 +209,9 @@ class TestTransportFailureStillDrops:
     errors — so it must keep dropping. Widening the fix to
     ``Exception`` would freeze the agent loop on a dead backend,
     which is the exact failure the fail-OPEN rows exist to prevent.
+
+    "A dead backend" is a request that never got an answer. A 5xx is
+    an ANSWER, and it is in the other half.
     """
 
     @respx.mock
@@ -197,17 +224,53 @@ class TestTransportFailureStillDrops:
         rt._transport.flush_now()
 
     @respx.mock
-    def test_server_5xx_does_not_raise(self, make_runtime):
-        """A 5xx names no enforcement failure, so it stays in the
-        transport class. The ADR-008 text scopes the "raises the
-        corresponding exception" rule to responses that *name* an
-        enforcement failure.
+    def test_a_connection_error_still_leaves_the_payload_recoverable(
+        self, make_runtime, tmp_path, monkeypatch
+    ):
+        """The fail-OPEN half is not a silent drop.
+
+        The backend never answered, so the consume may or may not have
+        landed. The SDK must not freeze the agent (ADR-008), and it
+        must not throw the only copy of the spend away either: the
+        payload goes to the WAL and the next process replays it.
         """
+        wal = tmp_path / "sdk.wal"
+        monkeypatch.setenv("NULLRUN_WAL_PATH", str(wal))
+
+        rt = make_runtime()
+        respx.post(TRACK_URL).mock(side_effect=httpx.ConnectError("boom"))
+        _capture_smid()
+
+        rt.track_llm(input_tokens=60, output_tokens=40, model="claude-sonnet-4-6")
+        rt._transport.flush_now()
+
+        rows = [
+            line
+            for line in Path(f"{wal}.v3").read_text().splitlines()
+            if line.strip()
+        ]
+        assert len(rows) == 1, "the undelivered consume was dropped"
+
+
+class TestAnAnswerIsARefusal:
+    """SDK-1 (security audit 2026-11-06).
+
+    The pre-fix rule asked "does this response NAME an enforcement
+    failure?". A bare 5xx names none — and it dropped, so the SDK
+    reported a spend the backend had refused as a successful track.
+    The rule is now "did the backend ANSWER?", asked of the wire.
+    """
+
+    @respx.mock
+    def test_server_5xx_raises(self, make_runtime):
+        from nullrun.breaker.exceptions import NullRunBackendError
+
         rt = make_runtime()
         respx.post(TRACK_URL).mock(
             return_value=Response(500, json={"error_message": "internal"})
         )
         _capture_smid()
 
-        rt.track_llm(input_tokens=60, output_tokens=40, model="claude-sonnet-4-6")
+        with pytest.raises(NullRunBackendError):
+            rt.track_llm(input_tokens=60, output_tokens=40, model="claude-sonnet-4-6")
         rt._transport.flush_now()
