@@ -161,6 +161,7 @@ from nullrun.edge import EDGE_LEASE as EDGE_LEASE_DECISION_SOURCE
 from nullrun.edge import EDGE_NOT_ENFORCED as EDGE_NOT_ENFORCED_DECISION_SOURCE
 from nullrun.edge import EDGE_UNREACHABLE as EDGE_UNREACHABLE_DECISION_SOURCE
 from nullrun.observability import metrics
+from nullrun.observability.redaction import api_key_fingerprint
 from nullrun.transport import (
     HEADER_PROTOCOL,
     DecisionSource,
@@ -1082,7 +1083,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
 
         # --- Auth state ---
         api_key_valid: bool | None = None
-        api_key_prefix: str | None = self.api_key[:10] if self.api_key else None
+        api_key_prefix: str | None = api_key_fingerprint(self.api_key)
         if self.organization_id is not None:
             # If we have an org, auth at least started — it
             # may have failed (we'd be in misconfigured), but
@@ -1359,7 +1360,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 stage=stage,
                 workflow_id=resolved_workflow_id,
                 tool_name=tool_name,
-                api_key_prefix=(self.api_key[:10] if self.api_key else None),
+                api_key_prefix=api_key_fingerprint(self.api_key),
                 correlation_id=correlation_id,
                 extra=extra or {},
             ),
@@ -1423,11 +1424,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 self.workflow_id = data.get("workflow_id")
 
                 if self.workflow_id is None:
-                    masked_key = (
-                        (self.api_key[:8] + "***")
-                        if self.api_key and len(self.api_key) >= 8
-                        else "***"
-                    )
+                    masked_key = api_key_fingerprint(self.api_key) or "unknown"
                     logger.warning(
                         f"API key {masked_key!s} is a legacy key with no "
                         f"workflow binding; remote kill/pause will not be "

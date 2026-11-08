@@ -47,6 +47,7 @@ from nullrun.breaker.exceptions import (
     TransportErrorSource,
 )
 from nullrun.observability import metrics
+from nullrun.observability.redaction import api_key_fingerprint
 
 if TYPE_CHECKING:
     # Forward-referenced to avoid transport.py ⇄ transport_websocket.py cycle.
@@ -1198,8 +1199,13 @@ class Transport:
         )
         self._stopped = False  # Track if stop was called
         # 0.7.0 thin client: no local policy cache. Backend is authoritative.
-        _masked = api_key[:8] + "***" if api_key and len(api_key) >= 8 else "***"
-        logger.debug(f"Transport initialized: api_url={self.api_url}, api_key={_masked}")
+        # SDK-5: a fingerprint, not a prefix. The transport and the
+        # status string used to print different numbers of key
+        # characters; they now print the same fingerprint.
+        _fingerprint = api_key_fingerprint(api_key) or "unknown"
+        logger.debug(
+            f"Transport initialized: api_url={self.api_url}, api_key_fp={_fingerprint}"
+        )
 
         # OpenTelemetry tracer (lazy-loaded: only if opentelemetry is installed)
         self._tracer = None
