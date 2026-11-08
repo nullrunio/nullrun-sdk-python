@@ -1,3 +1,765 @@
+## [0.24.0] - 2026-11-08
+
+Minor release. The SDK had a shape it could not keep: the enforcement
+path swallowed refusals. A gate that said "no" could be turned into a
+`None`, and `None` is read by every caller as "yes"; a `/track` the
+backend refused could be logged at DEBUG and returned as an ordinary
+call; a LangChain callback dropped the refusal on the floor so the
+agent got the call for free. Nine of the defects below are this one
+defect seen from nine angles — an indeterminate gate answer, an
+unbindable reservation id, a refused `/track`, a swallowed callback
+refusal, an SDK-internal fault in the decorator — and each of them
+ended the same way: the agent ran the call, the money was never
+booked, and nobody was told.
+
+The second theme is the control plane. The approval push read the
+UNSIGNED outer body — the bytes the HMAC never covered — and handed
+them to the handler that releases a gate parked waiting for a human.
+The WebSocket receiver verified a signature only when all four of
+`signature`, `timestamp`, `api_key` and `secret_key` were present, so
+a frame missing any one of them skipped verification entirely. Both
+are closed: the privileged branch now requires an AUTHENTICATED frame
+and reads the verified payload only.
+
+The third theme is honesty about the surface. The SDK's error-code
+catalogue lagged the backend's registry by 34 codes; the blocked-family
+dispatch arm tested the class by IDENTITY, so every typed SUBCLASS fell
+through to a generic fallback that raised `TypeError` — nineteen codes
+were flattened into a synthetic `{"decision": "block"}` dict. The
+surface also advertised `DecisionSource.CACHED`, `cache_ttl` and
+`cache_max_size` for a cache that no longer existed. All of it is now
+either true or pinned.
+
+The release is 33 commits, 15 295 insertions and 1 213 deletions across
+77 files, +644 tests. There is no wire-format change: every new error
+code the SDK names is a code the backend already sends, and the one
+place the SDK speaks a NEW code (`APPROVAL_TOOL_MISMATCH`, HTTP 409)
+landed together with the backend half.
+
+### Migration
+
+Nine things differ from 0.23.0. The first is breaking; the second and
+third change what an operator's configuration does; the rest are
+behavioural changes that are visible only when something goes wrong,
+which is precisely when they are visible.
+
+1. **`check_workflow_budget` lost its `use_gate_cache` parameter.**
+   The in-process gate cache is gone (ADR: SDK-1/2/3). A caller that
+   passed `use_gate_cache=False` now gets a `TypeError` — remove the
+   argument. There is no replacement: every call is its own `/gate`
+   call with its own reservation, and the backend's own idempotency
+   store (keyed by the SDK's `operation_id`) is the correct retry
+   dedup. A client-side cache that spans calls also spans principals,
+   which is why it was deleted rather than re-keyed.
+2. **`NULLRUN_SENSITIVE_FAIL_OPEN` opens nothing on its own.** The
+   switch is still a whole-system switch, but what it may open is now
+   decided per tool by an explicit, code-level classification. The set
+   is EMPTY by default, so the switch alone opens nothing and every
+   tool stays fail-CLOSED:
+
+   ```python
+   runtime.register_fail_open_tools(["charge_card"])
+   runtime.remove_fail_open_tool("charge_card")
+   runtime.get_fail_open_tools()
+   runtime.is_fail_open_allowed("charge_card")
+   ```
+
+   Before this release, enabling the switch for one tool disabled
+   enforcement for EVERY tool. The classification is deliberately NOT
+   the SDK's built-in sensitivity registry: reusing that list would
+   make the SDK's own list of destructive operations an allowlist for
+   running without a policy decision.
+3. **A gate refusal now escapes the LangChain / LangGraph callback.**
+   The callback used to classify refusals with a three-class
+   allow-list and drop everything else into a blanket `except
+   Exception` — so `TOOL_BLOCKED` and `RATE_LIMIT_EXCEEDED` were
+   swallowed and the agent carried on. The family is now named by BASE
+   class (`NullRunDecision`, `RateLimitError`, `WorkflowKilledInterrupt`
+   — `RateLimitError` is named explicitly because it is NOT a
+   `NullRunDecision`), the refusal is re-raised, and the handler sets
+   `raise_error = True` so langchain-core does not swallow it. A
+   cosmetic failure is still swallowed at DEBUG — only a refusal may
+   escape. ADR-008's fail-OPEN for a transport failure (the gate could
+   not be REACHED) is unchanged; "the gate could not be reached" and
+   "the gate said no" stay different categories. The canonical family
+   now lives in `nullrun.breaker.exceptions.ENFORCEMENT_EXCEPTIONS`;
+   the langchain module's private copy is gone.
+4. **An indeterminate gate decision is now a REFUSAL, not a
+   permission.** When the gate call fails for a reason that is NOT a
+   transport failure — the SDK's own code faulted while asking — the
+   SDK raises `NullRunGateIndeterminateError` (NR-P004) instead of
+   failing open and returning `None`. `None` meant "no decision, carry
+   on", and every caller read it as ALLOW. The new class is an
+   infrastructure error, NOT a transport error, so ADR-126's two-step
+   opt-in cannot convert it into "the body runs". A new counter,
+   `gate_indeterminate_total`, records it — counting it as
+   `gate_fail_open_total` would send an operator to the backend
+   dashboard when the fault is in the SDK.
+5. **The write-ahead log moved.** The default path is now
+   `<tempdir>/nullrun-<user>-<key>.wal` — both scope tokens reduced to
+   SHA-256 digests, so the API key never reaches a path every user on
+   the host can list. The legacy `<tempdir>/nullrun.wal` is reported
+   and left alone: it is never read, never migrated and never deleted,
+   because its rows may belong to another tenant. The operator's CLI
+   lists every scoped WAL this user owns, and `replay` refuses to guess
+   between them. `NULLRUN_WAL_PATH` still wins outright, and it is
+   documented as the operator's responsibility to keep unique per
+   runtime.
+6. **`api_key_prefix` now renders as a fingerprint.** The public field
+   keeps its legacy name; its VALUE changes. It is now the first eight
+   hex characters of the SHA-256 digest of the key, and the log label
+   changed from `api_key_prefix=` to `api_key_fp=`. A prefix of a
+   credential is the part an attacker brute-forces the rest from, so
+   three sites that each printed a different length of it are now one
+   helper. The eight characters are a prefix of the backend's own
+   `compute_fingerprint` (32 characters), so a client log line and a
+   backend row correlate on both sides without either side holding a
+   fragment of the secret. **Log parsers that matched the old raw
+   prefix must change.**
+7. **The MCP tool-annotation cache window is 30 seconds, not 300.**
+   The annotations the MCP adapter stamps on `/check` are a POLICY
+   INPUT — the gate's `mcp_destructive_policy` and
+   `mcp_readonly_policy` umbrella policies are evaluated against them —
+   so a stale snapshot is a stale policy. The window is now the 30
+   second floor the constructor already enforced, and an operator who
+   cannot accept any staleness passes `cache_seconds=0`. A FAILED
+   refresh no longer presents the previous snapshot to the gate at
+   all: the gate gets the unknown shape the adapter already uses for a
+   tool it has never seen, and falls back to its own classifier. The
+   deliberate cost: the default window buys ten `tools/list` calls
+   instead of one per five minutes.
+8. **Three new public exceptions.** `NullRunGateIndeterminateError`
+   (NR-P004), `NullRunUnknownActionError` (NR-P005) and
+   `NullRunApprovalToolMismatchError` (NR-A017) are exported from the
+   package root and carry an end-user message in the catalogue.
+   `NullRunChainError` now covers the backend's `CHAIN_KEY_MISMATCH`
+   (403) instead of the refusal landing in the generic 403 auth
+   bucket.
+9. **Six new metric counters.** `gate_indeterminate_total`,
+   `unknown_action_total`, `policy_gate_indeterminate_total`,
+   `ws_unverified_approval_total`, `ws_unverified_frame_total`, and
+   `dropped_llm_call_no_reservation` are exported in `to_dict()` — a
+   counter the operator cannot read is invisible.
+
+Two members of the public surface deliberately did NOT move:
+`DecisionSource.CACHED`, `ExecuteConfig.cache_ttl` and
+`ExecuteConfig.cache_max_size` stay, because removing them would break
+importers for no safety gain. What was missing was a check that they
+stay producer-less, so an AST walk over the package now proves that
+nothing references `DecisionSource.CACHED`, that the string `"cached"`
+appears exactly twice and both times as surface, and that nothing
+reads `cache_ttl` or `cache_max_size`. The pin is textual and honest
+about that: it proves the absence of a producer in THIS tree, not the
+absence of a decision cache in some future version.
+
+### Fixed
+
+#### Money that was never booked
+
+- **SDK-1 (High) — the money path asked the wrong question.** `/gate`
+  RESERVEs the budget, the tool call runs and costs real money, then
+  `POST /api/v1/track` carries the CONSUME. `_route_track` wrapped
+  `track_single` in `except Exception`; a `NullRunDecision` was
+  re-raised, everything else was logged "event dropped" and the
+  function returned normally — so the caller returned `{"allowed":
+  True}` to the agent. The CONSUME never ran, the period-bound
+  counter never moved and no `cost_events` row existed: the spend was
+  free and the agent was told `allowed`. The taxonomy was the sharp
+  edge — the SDK decided open-vs-closed by exception CLASS and the
+  backend by error CODE, and `NullRunDecision` and
+  `NullRunInfrastructureError` are SIBLINGS, so
+  `isinstance(exc, NullRunDecision)` could never catch a backend
+  refusal. A later narrowing to three classes still left nine codes
+  outside it, among them the three `RATE_LIMIT_*` codes, and the
+  backend rate-limits `/track`. The rule now asks the WIRE one
+  question: did the backend answer? A request that never REACHED the
+  backend keeps ADR-008's fail-OPEN row, unchanged; a refusal raises,
+  and the auto-instrumentation layer stops swallowing it. The payload
+  is written to the v3 WAL before the raise, so a refusal is raised
+  AND recoverable. A determinate verdict is not persisted — it is the
+  backend's answer, and re-sending it produces the same answer.
+  (`a4fbed2`, +1090/-19; new test file `tests/test_v3_track_recovery.py`
+  — two existing tests changed contract: a 500 that used to be
+  swallowed now raises, and the "transport failure" mock became a real
+  `ConnectError`)
+- **SDK-1/2/3 — the in-process gate cache made chain steps 2..N free.**
+  `runtime.py` kept a module-level `_GATE_CACHE` keyed
+  `(workflow_id, chain_id, call_model, estimated_tokens)` — a key with
+  no org id, no api-key id and no tool set, so the cached answer
+  belonged to no particular tenant or principal. It re-captured call
+  #1's server-minted `reservation_id`, so every chain step ran under
+  ONE execution id; `consume_v3.lua` answers `IDEMPOTENT_REPLAY` for
+  an already-consumed execution and books nothing — steps 2..N were
+  never billed. And the tool-block check never ran for a cached step.
+  The cache is deleted; every step is its own `/gate` call with its
+  own reservation. The same commit closed the edge branch of
+  `Transport.execute`, which returned a client-side `{"decision":
+  "allow"}` without ever asking the box: `EdgeTransport` now records
+  the box's answer per event id, `take_answer()` POPS it, and
+  `/execute` with no recorded answer returns `not_enforced()` — a
+  block carrying `EDGE_NOT_ENFORCED`. The third defect was the edge's
+  unreachable answer, which used `decision_source=FALLBACK` and was
+  therefore read as a degraded transport and failed OPEN — but ADR-067
+  §3 requires deny, because the edge has no cloud to book the spend
+  through. The new `EDGE_UNREACHABLE` is not a fallback source and the
+  runtime honours the block. (`87a4c2b`, +846/-648)
+- **SDK-9 — the box's answer cache was read and written without a
+  lock.** `EdgeTransport._answers` is shared by every thread of the
+  agent's tool calls, and the eviction walked it LIVE:
+  `self._answers[event_id] = answer` then `while len(...) > cap:
+  self._answers.pop(next(iter(self._answers)))`. `iter(d)` and `next()`
+  are two bytecodes apart, so a thread that resizes the dict in
+  between makes CPython raise `RuntimeError: dictionary changed size
+  during iteration`. That is more than a crash: the exception escapes
+  `enforce`, the gate's fail-OPEN arm catches it and returns "no
+  decision" — and "no decision" is read by the caller as "no block".
+  The shared dict is now read and written under a lock, and the
+  eviction picks its victim from a snapshot of the key list rather
+  than from a live iteration. The cap is now an EXACT promise: before,
+  two threads could both decide to evict and drop two entries for one
+  insert — and an answer evicted too early is a refusal, so an
+  over-eager eviction turns a paid-for call into a spurious block.
+  (`0964705`, +387/-4; new test file `tests/test_sdk9_shared_state.py`,
+  6 cells — mutation-proved, and the first version of the file was
+  VACUOUS: 6/6 green against the unfixed code until the
+  `sys.setswitchinterval(1e-5)` fixture made the race land)
+- **SDK-10 — a reservation id the SDK cannot bind is a REFUSAL.** The
+  capture dropped a `reservation_id` that is not a UUID with a warning
+  and returned `None`. That reads "the server reserved nothing" when
+  the truth is "the server reserved something I cannot bind" — so the
+  call proceeded with NO reservation, the `/track` event had no
+  `execution_id` to carry, the cost event was DROPPED, and the agent
+  got the call for free. The capture now refuses a present-but-
+  unusable id with `NullRunMalformedGateResponseError`; an ABSENT id
+  stays clear-and-`None`, because a block reserves nothing and that is
+  a fact, not a fault. The refusal also had to REACH the caller — the
+  instrumentation's blanket arms re-raise the enforcement family and
+  swallow everything else, so the class joins
+  `ENFORCEMENT_EXCEPTIONS`. ADR-008's fail-OPEN posture is untouched:
+  an unreachable gate still fails open; an ANSWER the SDK cannot use is
+  the opposite case. (`dc197a9`, +721/-44; new test file
+  `tests/test_sdk10_malformed_reservation.py`)
+- **SDK-11 — an indeterminate gate decision is a REFUSAL, not a
+  permission.** The audit's words: "the same check is implemented twice
+  with different handlers... the fail-open path is the simpler one, so
+  it is the one users hit first." The two arms were the CACHED
+  branch's narrow arm and the UNCACHED branch's broad one, inside ONE
+  handler — so the narrow twin is gone and what is left is the BROAD
+  arm: a bare `except Exception` that logged, counted
+  `gate_fail_open_total`, and returned `None`. Three facts were
+  conflated and are now separated by TYPE: the gate NAMED a refusal →
+  honour it (the enforcement family is re-raised FIRST, and the
+  ordering is load-bearing — `RateLimitError` IS a
+  `NullRunTransportError`, so a later transport arm would swallow the
+  429 and fail OPEN on it); the gate could not be REACHED → ADR-008's
+  fail-OPEN, and only that; anything else → the SDK's OWN code
+  faulted while asking, so the decision is INDETERMINATE, and an
+  unanswered question is not a yes → `NullRunGateIndeterminateError`
+  (NR-P004). (`9dcb22d`, +884/-10; 21 new tests)
+- **SDK-6 — a refused `/track` must reach the application.** The
+  runtime already re-raised a `NullRunDecision` when the backend
+  refused to book the money (CONSUME_OVERBUDGET 422, a budget block
+  402). The auto-instrumentation layer then caught that refusal with a
+  blanket `except Exception` and logged it at DEBUG. The application
+  saw a perfectly ordinary LLM call while the backend had just refused
+  to book it: a refused track looked like a SUCCESS. One family, named
+  by BASE class, now lives in `nullrun.breaker.exceptions`, and every
+  billable emission site the layer installs re-raises that family
+  BEFORE the broad arm — the httpx sync and async transports, the
+  OpenAI-Agents tracer, the requests transport, the crewai / autogen /
+  llama_index integrations, and the LangChain callback's `on_llm_end`
+  (whose inner blanket arm had defeated the SDK-4 decorator, so the
+  refusal never even reached it). The fail-OPEN posture is UNCHANGED
+  for everything else. (`22f8d77`, +876/-12; 20 tests)
+- **SDK-4 (callback) — a gate refusal leaves the callback; only a
+  refusal may escape.** The LangChain callback classified a gate
+  refusal with a three-class allow-list, so every OTHER refusal —
+  `TOOL_BLOCKED`, `RATE_LIMIT_EXCEEDED` — fell into the broad arm, was
+  logged at DEBUG and dropped. The family is named by BASE class so a
+  refusal subclass added later cannot rot back into the fail-OPEN arm,
+  the refusal is re-raised, the handler sets `raise_error = True`
+  (langchain-core swallows a handler's exception by default and
+  re-raises it only when the flag is set — in BOTH the sync and the
+  async dispatch path), and `_only_a_gate_refusal_escapes` guards
+  every callback method. The deferred stash stays as the SECONDARY
+  channel: the one that survives a host framework which ignores
+  `raise_error`, and the one that can abort on the `@protect`
+  boundary's own thread. ADR-122. (`28f1b00`, +490/-44)
+- **SDK-16 — the callback obeys the same fail-OPEN/CLOSED table as
+  `@protect`.** The LangChain/LangGraph callback swallowed every
+  refusal the runtime raises on purpose:
+  `NullRunAuthenticationError`, `NullRunUnclassifiedRefusalError` and
+  `NullRunRateLimitRedisError` fell into its broad arm. The same
+  refusal stopped the call through the `@protect` boundary and
+  vanished through the callback, so the LLM call ran with no
+  reservation and its cost event was dropped: the agent got the call
+  for free. The callback now classifies like the `@protect` boundary —
+  the family raises, a transport failure fails OPEN (ADR-008), and
+  every other fault fails CLOSED. The transport arm comes FIRST,
+  because a transport failure is also an infrastructure error and the
+  order decides whether a dead backend freezes the agent. The
+  `/track` path is untouched. (`1bb76dd`, +522/-13)
+- **SDK-13 — an SDK-internal fault in the `@protect` gate is a
+  REFUSAL.** The decorator's catch-all turned a fault in the SDK's OWN
+  code into a refusal that wore the network code NR-B001 and the
+  policy-block type; the FastAPI integration mapped that through the
+  decision table and rendered HTTP 429 / category "decision" — the
+  operator was told the policy refused when the truth is that the SDK
+  has a bug. Under the two-step opt-out the same arm RETURNED, so the
+  body ran with no policy decision at all. The catch-all now raises
+  `NullRunGateIndeterminateError` (NR-P004) — the `/execute` twin of
+  ADR-129's `/gate` class — and the two-step opt-out no longer opens
+  an SDK-internal fault: what reaches the catch-all is by construction
+  NOT a transport failure, because `/execute` converts every transport
+  failure into `NullRunTransportError`, which the arm above owns. The
+  refusal is counted (`policy_gate_indeterminate_total`, a counter of
+  its own — it is an SDK incident, not a backend outage), logged at
+  ERROR with the tool name, and carries the original exception as its
+  cause. Three counters that were counted but never exported in
+  `to_dict()` are now exported. (`ac62e10`, +561/-20; 17 new tests)
+- **SDK-8 — the fail-open switch is bounded per tool.**
+  `NULLRUN_SENSITIVE_FAIL_OPEN` was one global boolean, read in
+  exactly ONE place, and turning it on opened EVERY protected tool:
+  "enabling it for one tool disables enforcement for every tool". The
+  switch is still a whole-system switch, but what it may open is now
+  decided per tool by an explicit, code-level classification — an env
+  var can be inherited by a deploy pipeline or a CI environment, a
+  code-level classification cannot. The set is EMPTY by default. The
+  authoritative fail-OPEN/CLOSED table also named a gate
+  (`_enforce_sensitive_tool`) that no longer exists, and claimed the
+  env switch was the opt-out for the permissive fallback — false, the
+  switch is never read there. The table is split into the `@protect`
+  path and the `/execute` path, and the README's "What does fail open"
+  section moves with it. The MCP path is unchanged and still fails
+  CLOSED through `fallback_mode=STRICT`. (`b519481`, +635/-28)
+- **P2-18 — every MCP tool call runs its own `/gate` pre-flight.**
+  `MCPAdapter.call_tool` ran `runtime.check_workflow_budget()` only
+  when `get_server_minted_execution_id()` was `None`. That contextvar
+  is set by `/gate` and by `/execute` and is NEVER reset in `src/`, so
+  the second and later MCP tool calls in one scope ran NO `/gate`: no
+  budget check, no reservation, no spend reserved for those calls. Both
+  `/execute` bodies also carried the FIRST call's execution id, so the
+  second call settled against a reservation that was already spent.
+  The condition cannot simply become "always pre-flight" — two cases
+  legitimately skip it, and both are about THIS action: the approval
+  re-entry (the backend's `require_approval` arm echoes the approval
+  row's execution id into `reservation_id`, so the ambient id IS the
+  approval's execution) and the `@protect` scope (which reserved for
+  itself, and a second `/gate` inside it would reserve twice and
+  orphan the first, NR-059). So the pre-flight runs unless the ambient
+  reservation is known to cover THIS action: `approval_id is not None`
+  or an envelope was already in scope. The envelope marker is read
+  BEFORE the adapter installs its own envelope — otherwise every call
+  would read as "already gated". (`1b9ef6d`, +445/-17; new test file
+  `tests/test_p2_18_mcp_preflight_scope.py`)
+- **SDK-7 — the MCP adapter derives ONE envelope from the tool
+  call.** The MCP path went to `/execute` with NO `business_impact` and
+  NO `action_digest`. That is not "the approval binds the tool name but
+  not the arguments" — on the MCP path the approval could not be spent
+  at all: `/execute` with an `approval_id` runs Step 9.5, which
+  SERVER-DERIVES the action digest from the live `business_impact`, and
+  with no envelope the derive returns `Ok(None)` and the orchestrator
+  fails CLOSED with BUSINESS_IMPACT_INVALID (NR-010). The row was
+  created, the operator approved it, and the re-execute was refused.
+  The adapter now derives one envelope from the call it is about to
+  make — a tool_call impact carrying the tool name and the EXACT
+  argument dict it forwards as the canonical bag — plus that envelope's
+  digest, and puts both on the wire. The params MUST be that same
+  dict: the backend compares `BusinessImpact::ToolCall.params` with the
+  live `tool_arguments` canonically, so a masked or reshaped copy
+  would bind the operator's approval to arguments nobody approved. The
+  envelope is installed on the call context BEFORE the pre-flight
+  `/gate` runs, so the two hops hash the SAME bytes (ADR-065), and it
+  is released in a `finally` so it cannot leak into the NEXT action.
+  When no envelope can be built (an f64 argument, a non-ASCII tool
+  name) the digest still goes on the wire over the `no_impact` sentinel
+  and the envelope stays ABSENT, so the backend takes its fail-CLOSED
+  arm ("cannot recompute") instead of the legacy "no digest at all"
+  arm, which is a grant bound to nothing. (`776eb01`, +686/-7; 20 new
+  behavioural tests, the digest pinned against the BACKEND's golden
+  hex so the two repos cannot drift apart here without this going red)
+- **P2-17 — the edge refusal reports its OWN `last_source`.**
+  `EdgeTransport.last_source` was the single constant `EDGE_LEASE` on
+  BOTH the allow path and the refusal path, so the two collapsed into
+  one string and a caller reading the attribute could not tell which
+  way the box went: it said "the lease spoke" when the truth was "the
+  lease said no". The new named marker `EDGE_LEASE_REFUSED` is a
+  `last_source` marker only and never reaches the wire — the refusal's
+  `decision_source` stays `EDGE_LEASE`, because the lease was the
+  authority that spoke either way and `decision` says which way it
+  went. Changing it would need a new name in the runtime's known-source
+  set, and until the runtime knows it, a body carrying it is a
+  MALFORMED response: a clean refusal would become a crash. The new
+  marker is also NOT a fallback source — a box that said no is a
+  VERDICT, not a degraded transport. (`946a3a2`, +261/-1; new test file
+  `tests/test_p2_17_edge_last_source.py`, 9 cells, mutation-proved)
+- **SDK-4 (WAL) — the write-ahead log is scoped per user and per
+  key.** The WAL path was `os.path.join(tempfile.gettempdir(),
+  "nullrun.wal")` — the same string for every user and every org on
+  the host — and `_persist_to_wal` writes with a tmp file, an fsync
+  and an `os.replace` that puts only this runtime's buffer in place of
+  the whole file. Two runtimes on one file do not queue: the second one
+  destroys the first one's undelivered events, so spend that already
+  happened is never booked, and the flush path's availability is
+  coupled across tenants. The default is now
+  `<tempdir>/nullrun-<user>-<key>.wal`, both scope tokens reduced to
+  SHA-256 digests. The path is resolved once, in the constructor, and
+  never moves: the org id is only known after authentication, and a
+  path that changed there would orphan the file written before it. One
+  API key belongs to exactly one org, so a key-scoped WAL is an
+  org-scoped WAL in money terms. (`90bc05a`, +787/-20; new test file
+  `tests/test_wal_scope.py`)
+
+#### The control plane
+
+- **SDK-5 (approval push) — the approval push reads the VERIFIED
+  payload, not the outer body.** The control-plane WebSocket HMAC
+  covers the bytes inside `signed_payload`, NOT the flattened outer wire
+  body. The outer body is therefore writable by anyone who can inject
+  bytes into the socket: they rewrite `type`, `outcome` and
+  `execution_id` while keeping a captured `(signed_payload,
+  signature)` pair — and the signature check still PASSES, because it
+  verifies bytes the attacker never touched. The `approval_resolved`
+  branch was the one dispatch branch that read the outer body, and it
+  hands that dict to `on_approval_resolved`, which pops the pending
+  approval and sets its threading.Event — releasing a gate that was
+  parked waiting for a human. The branch type and every field are now
+  read from the verified payload; the outer body is a fallback only
+  for frames that could not be authenticated at all. A signed frame
+  whose payload does not parse is DROPPED, because the outer body is
+  not what was signed. The privileged branch requires an AUTHENTICATED
+  frame: an unauthenticated approval is refused, counted
+  (`ws_unverified_approval_total`) and logged at ERROR, and the waiter
+  stays parked and fails closed on the approval timeout. The safety
+  direction is unchanged: an unsigned state_change (kill / pause) is
+  still delivered, so the kill switch is not weakened. (`c4e8c4a`,
+  +698/-44; 13 tests, five mutations each red for its own reason)
+- **P2-19 — a control-plane frame the client COULD have verified is
+  refused.** The WebSocket receiver verified the signature only when
+  all four of `signature`, `timestamp`, `api_key` and `secret_key` were
+  present. A frame missing any one of them skipped the verification
+  block entirely and was then read from its outer body — the body the
+  server never signed. A client that holds the API key and the HMAC
+  secret can verify EVERY frame the server sends it: the server signs
+  every frame it sends for such a key. A frame that arrives at such a
+  client unsigned — or with a signature but no timestamp — did not come
+  from the server, so it is refused before any branch reads a field out
+  of it. The refusal is counted (`ws_unverified_frame_total`) and
+  logged. An approval frame keeps bumping
+  `ws_unverified_approval_total`, so the operator still sees that
+  somebody pushed an approval this client cannot verify. A client
+  WITHOUT a secret (a legacy key) can verify nothing, so the unsigned
+  path stays open for it — the kill switch must keep working there.
+  A refused frame also cannot poison the per-workflow version dedup, so
+  a forged frame cannot silence the next real kill. (`2a79524`, +312;
+  7 new cells driving the real `_handle_message`)
+- **P2-19 (log) — the refusal log names the refused frame's code.**
+  The server's own refusal frame is unsigned BY DESIGN: it is sent
+  before the connection is authenticated, so there is no secret to sign
+  it with yet. The refusal dropped such a frame, so the operator saw
+  the refusal but not the server's reason. The log now names the
+  frame's code as well as its type, read from the UNSIGNED outer body
+  — so it is a hint, not a source of truth: the log line says the frame
+  was refused, and the code only tells the operator what the server
+  claimed. (`b0f5645`, +30/-1)
+- **SDK-12 — an unknown control-plane action is REFUSED, not silently
+  dropped.** The action dispatcher logged an unknown action type at
+  ERROR, recorded a forensic history event, and RETURNED. The action
+  was then neither executed nor refused, while the caller's own
+  bookkeeping said it had been handled: a control-plane instruction
+  that is silently dropped is a control-plane instruction that does not
+  exist. An unknown action type now RAISES
+  `NullRunUnknownActionError` (NR-P005) — an infrastructure error, NOT
+  a block, so B14's anti-DoS property survives: the workflow keeps
+  running, the action does not. The refusal is not a transport error,
+  so ADR-126's two-step opt-in cannot convert it into "the body runs".
+  `except BaseException` was narrowed to `except Exception`, so a
+  Ctrl-C or a SystemExit reaches the caller again. The handler's own
+  refusal (kill / pause / block) is now logged at INFO, not ERROR: a
+  delivered kill is the action working, not a fault (every server-side
+  kill used to raise a false alarm). (`5d1e5e0`, +756/-57; 22
+  new/rewritten tests)
+- **DEC-5 / DEC-7 — a money approval must bind a tool.** The backend
+  now refuses an approval consume whose live tool is not a member of the
+  tool set the approval covers. Before this, a money approval bound
+  only the AMOUNT — `BusinessImpact::Money` carries no tool name and
+  `tool_digest` is NULL for non-MCP tools — so an approval for tool A
+  authorised tool B. The new wire code `APPROVAL_TOOL_MISMATCH`
+  (HTTP 409) dispatches to `NullRunApprovalToolMismatchError`
+  (NR-A017). 409, not 403: the approval is valid and unconsumed, it
+  just covers a different tool, so the remedy is a FRESH approval
+  rather than a retry. (`5adc309`, +124/-4)
+- **ADR-180 — the chain-key refusal carries the chain class.** The
+  backend refuses a chain presented by an API key of the same
+  organization with `CHAIN_KEY_MISMATCH` (403). The SDK had no entry
+  for it: the dispatcher fell through to the 403 auth bucket, so a
+  caller branching on `NullRunChainError` never caught it. The code is
+  now in the typed catalog and in the envelope parser, and the
+  frozen-catalog test carries it so the entry cannot be dropped again.
+  (`2d19f45`, +35)
+
+#### The surface says what the SDK does
+
+- **SDK-15 — the error-code catalog names a class the dispatcher can
+  build.** The SDK's v3 error-code catalog lagged the backend's
+  registry by 34 codes, and the parity guard in the backend's
+  `nr007_sdk_error_code_parity.rs` could not see the drift because it
+  was wired into no workflow. Every missing code fell through to the
+  status-based fallback, so the refusal arrived as a generic
+  `NullRunBackendError` (or, on a 4xx, as an authentication error) with
+  no diagnostic class at all. Two defects, one symptom: the catalog
+  was incomplete (34 codes added, each mapped by its WIRE BUCKET — the
+  bucket the backend's own registry gives the code — so the SDK class
+  and the backend status cannot disagree), and the catalog named
+  classes the dispatcher could not build. The blocked-family arm
+  tested the class by IDENTITY, so every typed SUBCLASS of
+  `NullRunBlockedException` fell through to the generic fallback, which
+  calls `catalog(full_message, **forwarded)` against a constructor that
+  requires `workflow_id` and `reason`: a `TypeError`, which escaped
+  the parser into the transport's catch-all and surfaced as a
+  synthetic `{"decision": "block"}` dict. Nineteen codes were
+  flattened that way (eleven approval, eight MCP). The arm now
+  matches by SUBCLASS, and two dispatch arms were added for the
+  families whose constructors the generic fallback cannot satisfy:
+  `RateLimitError` (requires source + endpoint) and
+  `NullRunChainError` (drops `chain_id` / `backend_code`). The new
+  test holds the property over the WHOLE catalog: for every code, the
+  real dispatcher returns an instance of the catalog's class, for every
+  status — and it pins the 34 codes by NAME, because a removal is
+  invisible to a test parametrized over the map's own keys. (`e1ec87c`,
+  +518/-65; mutation-proved — reverting the arm to the identity test
+  turns 35 cells red)
+- **SDK minor 2 — the SDK has no decision cache, and its surface says
+  it has one.** `DecisionSource.CACHED` and `ExecuteConfig.cache_ttl` /
+  `cache_max_size` sat in the public surface with no producer anywhere
+  in `src/`. The surface reads as a live decision cache, and that is
+  the shape of NR-116, which was closed. A future "restore the cache"
+  change would land green, and a reader would assume a decision can be
+  reused. The members stay — they are public and removing them breaks
+  importers for no safety gain — but what was missing was a check that
+  they stay producer-less, so an AST walk over the package now proves
+  it. (`c78ef32`, +216/-2; new test file
+  `tests/test_decision_cache_surface_has_no_producer.py`)
+- **SDK-14 — the suite must drive the PRODUCTION enforcement family.**
+  The SDK's own tests re-implemented the production predicate:
+  `tests/test_langchain_enforcement.py` spelled out its own
+  `ENFORCEMENT` tuple and asserted `issubclass` against the production
+  family — one direction only. Measured on the pristine tree: with the
+  production family WIDENED by one member, the whole suite stayed
+  GREEN. The production predicate changed and the suite noticed
+  nothing — the hole, measured, not argued. The hand-written tuple is
+  gone; `_CASE_BUILDERS` holds CONSTRUCTORS; and
+  `TestTheFamilyAndTheCasesCorrespond` compares the production family
+  with the cases actually driven, in BOTH directions — a family member
+  nobody drives is red, and a case the family no longer covers is red.
+  The instrumentation's alias must BE the production tuple, so its
+  `except ImportError` fallback (an empty tuple = every refusal
+  downgraded to a transport error and swallowed) can never be in
+  effect. (`4d386bb`, +265/-31; mutation-proved across five mutations)
+- **SDK-9 (test) — pin the money direction: a refusal is never a
+  failed-open.** The SDK-9 fix was committed with a docstring that
+  named the wrong consequence. The measurement says the opposite: the
+  crash lands in the gate's bare `except Exception` fail-OPEN arm, so a
+  REFUSED box becomes "nothing was decided" and the caller PROCEEDS.
+  Measured on the real LLM-span path (96 threads × 6 calls, a box that
+  refuses every time): 35–43 of 576 LLM calls proceeded on a refused
+  lease before the fix, 0 after. Two tests added — one pinning the
+  money invariant directly, one pinning the eviction's ORDER, because
+  evicting the newest instead of the oldest passed every other test in
+  the file and the order decides whether a live answer is dropped
+  before its `/execute` half consumes it. (`0d1186e`, +134/-5)
+
+#### Secrets, environment, and the supply chain
+
+- **SDK minor 3 — redaction follows the credential, not only the
+  argument name.** The SDK redacted arguments by NAME.
+  `SENSITIVE_ARG_KEYS` knows which argument names someone listed; it
+  cannot catch a secret that arrives under a name nobody listed:
+  `{"note": "<api key>"}` printed the key in full. A value-shaped pass
+  now runs beside it. `scrub_secret_values` matches the credential
+  itself, whatever key it travels under: this product's own `nr_live_` /
+  `nr_test_` keys, a JSON Web Token, an AWS access key id, an
+  OpenAI-style `sk-` key, a PEM private key block, and an HTTP bearer
+  credential. The patterns are narrow on purpose — a shape that cannot
+  be told apart from ordinary data is a guess, and a guess that scrubs
+  real data is a bug of its own, so the near misses are test cases:
+  `risk-assessment-report` and `task-abcdef0123456789abcdef0123456789`
+  survive, and so does ordinary SQL. Most of the shapes carry no
+  leading word boundary, because a boundary would make the pattern miss
+  a credential that sits right after a letter — the one exception is
+  `sk-`, whose boundary keeps a hyphenated word out of the scrub. The
+  pass runs BEFORE the truncation, so a credential that straddles the
+  cut is caught whole. (`1ad95d0`, +154; new test file
+  `tests/test_value_level_redaction.py`)
+- **SDK-5 (fingerprint) — no character of the API key reaches a log
+  line.** Three places printed a fragment of the key: the status
+  snapshot (`self.api_key[:10]`), the runtime's error context (the same
+  ten characters) and the transport's debug log (`api_key[:8] + "***"`).
+  A prefix of a credential is the part an attacker brute-forces the
+  rest from, and because the three places disagreed about how much they
+  printed, "the full key never leaves the SDK" was not a statement
+  anyone could check. One helper now answers it:
+  `api_key_fingerprint` returns the first eight hex characters of the
+  SHA-256 digest of the key, or `None` for a missing key, and all
+  three sites call it, so the disagreement is gone by construction.
+  (`66de8f5`, +233/-21; new test file
+  `tests/test_api_key_fingerprint.py`)
+- **SDK-2 — the production detector is not a substring test.**
+  `_is_production_environment` decided whether the two fail-open guards
+  arm by asking one question: is any marker a SUBSTRING of the
+  hostname? `"test"` is a substring of `latest`, `contest` and
+  `attest`; `"localhost"` is a substring of `notlocalhost.example.com`.
+  So a host that merely CONTAINED a dev marker was classified non-prod.
+  Worse, the operator's `NULLRUN_ENV=production` was suppressed by the
+  `and not any(marker in host_lc ...)` clause, and
+  `NULLRUN_SKIP_BUDGET_CHECK=1` then bypassed the budget gate, the rate
+  limit and the tool-block check with a WARNING rather than a refusal.
+  Four ordered rules now: an exact loopback or a `.localhost` suffix is
+  dev; the host's FIRST LABEL being `staging` or `test` is dev; the
+  host being exactly `api.nullrun.io` is prod; and
+  `NULLRUN_ENV=production` or `prod` is prod for every other host, so
+  the operator's declaration is no longer vetoed by a spelling. Rule 2
+  compares label by label, never as a substring: `staging.internal` is
+  dev and `latest.nullrun.io` is not. (`249df35`, +283/-28; new test
+  file `tests/test_production_environment_detection.py`)
+- **SDK minor 1 — a failed `tools/list` refresh is not a policy
+  input.** The MCP adapter caches the tool annotations it stamps on
+  `/check`, and the gate's `mcp_destructive_policy` and
+  `mcp_readonly_policy` umbrella policies are evaluated against them,
+  so the cache is a policy input and not a convenience. The window was
+  300 seconds. A FAILED refresh was worse than the window: the handler
+  kept the previous snapshot and the adapter kept presenting it as the
+  server's current answer, so an upstream that went down left the
+  client stamping a stale `destructive=False` with no bound on the
+  staleness at all. The window is 30 seconds now, the floor the
+  constructor already enforced, and a failed refresh no longer presents
+  the snapshot to the gate: the gate gets the unknown shape the adapter
+  already uses for a tool it has never seen, and falls back to its own
+  classifier. (`6ab5a2c`, +321/-18; new test file
+  `tests/test_mcp_annotation_staleness.py`)
+- **SDK-3 — the CI installs from the lock and pins every action.**
+  `uv.lock` existed and pinned the dependencies, but no workflow
+  consumed it: all four install sites ran `pip install -e ".[dev]"`,
+  and the publish job ran `pip install --upgrade build`. The build
+  backend was unpinned, and it is not part of uv's resolution, so no
+  lock-based job could see it. The publish job holds the PyPI Trusted
+  Publishing token (`permissions: id-token: write`), and EVERY `uses:`
+  in it named a branch or a tag: a moved tag executes in the job that
+  can mint an upload token, and the wheel it produces carries the
+  payload to every `pip install nullrun`. What changed: every `uses:`
+  names a 40-hex commit SHA (26 references, six actions, the old tag
+  kept in a trailing comment); the build backend is pinned exactly
+  (`hatchling==1.32.4`); every install comes from the lock
+  (`uv sync --frozen --extra dev`, and `--frozen` fails the job when
+  the lock and `pyproject.toml` disagree); and the publish tooling
+  moves into a PEP 735 `[dependency-groups]` entry resolved from the
+  lock, which carries the hashes. `scripts/check_supply_chain.py` lints
+  the workflows — it runs inside the token-holding job, before the
+  build and the upload, plus a local pre-commit hook and a `make`
+  target — and it has no third-party dependency: PyYAML when it is
+  importable, a text scanner otherwise, and the two scanners are proven
+  to agree. The pre-commit chain could not start at all: it pointed at
+  a mirror of `pre-commit/mypy` that no longer exists, and pre-commit
+  installs every repository in the file before it runs any hook, so the
+  whole run aborted and no hook in the file executed. The dead
+  reference is gone; the mypy check is not lost, because CI runs
+  `mypy src/` and `make type-check` runs `mypy src/nullrun --strict`.
+  (`06e8fce`, +1988/-83; new test file `tests/test_supply_chain_lint.py`)
+
+### Cleanup
+
+- **Redundant quotes dropped** — `ruff check src tests` was RED at the
+  SDK-7 commit: UP037 twice in `toolbox/mcp.py`. The quotes are
+  unnecessary — the module has `from __future__ import annotations` and
+  imports `BusinessImpact` at runtime — so removing them is a no-op at
+  runtime and turns the SDK's own lint gate green again. A red gate in
+  the tree is a red gate for the next release too. (`fc1666e`, +2/-2)
+- **Docstrings that named a module that no longer exists** — the
+  error-envelope notes pointed at `contracts/errors.ts`, which was
+  deleted in the backend repo (WIRE-8 / ADR-113): a fourth error
+  dialect with zero importers, 16 lowercase-slug codes with 0 overlap
+  against the 116 machine codes, a misspelled `seats_limit_reached`,
+  and a status map wrong for 400 and 422. The envelope this module
+  actually parses is the control-plane `ApiErrorResponse`. Docstrings
+  only, no behaviour change. (`db7e776`, +4/-3)
+- **NR-P004 documented on both seams** — the error-code catalogue
+  described NR-P004 as a `/gate`-only refusal. After SDK-13 the same
+  class is raised on the `/execute` seam, and the page would have been
+  stale: it named only `gate_indeterminate_total`, and it did not say
+  that the `/execute` seam used to wear NR-B001 and a policy-decision
+  type. Doc-only. (`f49aa7c`, +25/-15)
+
+### Tooling
+
+- **The retry clock is a seam, not the global `time.sleep`** — `time.sleep`
+  is ONE attribute on ONE module object, and the suite patched that
+  attribute in three places (the conftest cap, plus the same attribute
+  again through `nullrun.transport.time` and
+  `nullrun.breaker.circuit_breaker.time`, which ARE the stdlib module
+  — measured: `nullrun.transport.time is time` is True). A patch on
+  that attribute captures the sleep of EVERY thread in the process, so
+  the webhook-delivery singleton's 0.5 s idle poll landed in a
+  retry-delay list and broke the floor assertion for a reason that has
+  nothing to do with the retry path. The transport now has a `_sleep`
+  seam next to `_wait_on`, and the retry tests patch the seam instead
+  of the global. The conftest keeps ONE patch site for the global (the
+  1 ms cap) and stops repeating it through the module aliases.
+  (`e572403`, +82/-23; mutation-proved — a foreign 0.5 s in the delays
+  was red before the fix, and 8 cells turn red when the seam is
+  bypassed)
+- **A new supply-chain linter for the workflows** — see SDK-3 above.
+  `scripts/check_supply_chain.py` has no third-party dependency and
+  runs in CI, in the pre-commit chain and as a `make` target.
+
+### Verification
+
+| Check | Result |
+|---|---|
+| `ruff check src tests` | All checks passed |
+| `mypy src/nullrun` | 5 errors, all in `src/nullrun/instrumentation/auto.py` — **identical on a pristine `origin/master` checkout in the same interpreter** (measured: 5 errors in 39 files there, 5 in 41 here). Pre-existing, not introduced by this diff. They are `attr-defined` / `call-overload` against `langgraph`'s `Pregel` overloads; `langgraph` is **not** in `uv.lock`, so CI's `mypy src/` (which installs from the lock) never imports it and sees none of them. |
+| `pytest -q` | **2592 passed, 12 skipped** in 82.18s (local baseline on `origin/master` in the same interpreter: **1948 passed, 12 skipped** — **+644 new tests**) |
+| Scratch diff | clean (`dist_local/`, `*.defect*` absent — both already in `.gitignore`) |
+| `nullrun.__version__` | `0.24.0` |
+| Wire-format compatibility | unchanged from 0.23.0 for the SDK→backend contract. The SDK's error-code catalog grew by 34 entries, each mapped to a code the backend already sends. One code is NEW in both repos and landed together: `APPROVAL_TOOL_MISMATCH` (HTTP 409). The SDK's own request payloads are unchanged — the MCP envelope puts `business_impact` + `action_digest` on the wire, which are fields the backend already resolves. |
+
+### Commits included
+
+```
+1ad95d0 fix(sdk): redaction follows the credential, not only the argument name (SDK minor 3)
+c78ef32 fix(sdk): the SDK has no decision cache, and its surface says it has one (SDK minor 2)
+6ab5a2c fix(sdk): a failed tools/list refresh is not a policy input (SDK minor 1)
+a4fbed2 fix(sdk): the money path asks one question: did the backend answer? (SDK-1)
+90bc05a fix(sdk): the write-ahead log is scoped per user and per key (SDK-4)
+249df35 fix(sdk): the production detector is not a substring test (SDK-2)
+66de8f5 fix(sdk): no character of the API key reaches a log line (SDK-5)
+06e8fce build(sdk): the CI installs from the lock and pins every action (SDK-3)
+2d19f45 fix(sdk): the chain-key refusal carries the chain class (ADR-180)
+1bb76dd fix(sdk): the callback obeys the same fail-OPEN/CLOSED table as @protect (SDK-16)
+e1ec87c fix(sdk): the error-code catalog names a class the dispatcher can build (SDK-15)
+e572403 fix(sdk): the retry clock is a seam, not the global time.sleep (P3-10)
+b0f5645 fix(sdk): name the refused frame's code in the log (P2-19)
+2a79524 fix(sdk): refuse a control-plane frame the client could have verified (P2-19)
+1b9ef6d fix(sdk): every MCP tool call runs its own /gate pre-flight (P2-18)
+946a3a2 fix(sdk): the edge refusal reports its OWN last_source (P2-17)
+4d386bb test(sdk): the suite must drive the PRODUCTION enforcement family (SDK-14)
+f49aa7c docs(sdk): NR-P004 covers the /execute seam too (SDK-13)
+ac62e10 fix(sdk): an SDK-internal fault in the @protect gate is a REFUSAL (SDK-13)
+5d1e5e0 fix(sdk): an unknown control-plane action is REFUSED, not silently dropped (SDK-12)
+9dcb22d fix(sdk): an indeterminate gate decision is a REFUSAL, not a permission (SDK-11)
+dc197a9 fix(sdk): a reservation id the SDK cannot bind is a REFUSAL (SDK-10)
+0d1186e test(sdk9): pin the money direction — a refusal is never a failed-open
+0964705 fix(sdk): the box's answer cache is read and written under a lock (SDK-9)
+b519481 fix(sdk): the fail-open switch is bounded per tool (SDK-8)
+fc1666e style(sdk): drop the redundant quotes ruff flags (SDK-7 leftover)
+776eb01 fix(sdk): the MCP adapter derives one envelope from the tool call (SDK-7)
+22f8d77 fix(sdk): a refused /track must reach the application (SDK-6)
+c4e8c4a fix(sdk): the approval push reads the VERIFIED payload, not the outer body (SDK-5)
+28f1b00 fix(sdk): a gate refusal leaves the callback — only a refusal may escape (SDK-4)
+db7e776 docs(sdk): point the error-envelope notes at the real catalogue
+5adc309 fix(sdk): APPROVAL_TOOL_MISMATCH — a money approval must bind a tool (DEC-5/DEC-7)
+87a4c2b fix(sdk): no in-process gate cache, edge /execute never invents an allow (SDK-1/2/3)
+```
+
 ## [0.23.0] - 2026-10-29
 
 Minor release. Two enforcement paths that could not complete their own
