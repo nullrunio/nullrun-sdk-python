@@ -11,7 +11,6 @@ import json
 import logging
 import os
 import random
-import tempfile
 import threading
 import time
 import uuid
@@ -48,6 +47,11 @@ from nullrun.breaker.exceptions import (
 )
 from nullrun.observability import metrics
 from nullrun.observability.redaction import api_key_fingerprint
+from nullrun.wal_paths import (
+    WAL_PATH_ENV_VAR,
+    default_wal_path,
+    legacy_wal_path,
+)
 
 if TYPE_CHECKING:
     # Forward-referenced to avoid transport.py ⇄ transport_websocket.py cycle.
@@ -1049,6 +1053,7 @@ class Transport:
         secret_key: str | None = None,
         config: FlushConfig | None = None,
         redis_client: Any = None,
+        organization_id: str | None = None,
     ):
         self.api_url = api_url.rstrip("/")
 
@@ -1077,6 +1082,27 @@ class Transport:
 
         self.api_key = api_key
         self.secret_key = secret_key  # HMAC signing key
+        # Metadata only. The WAL path is scoped by the API KEY, not by
+        # this value — see `_resolve_wal_path` and `nullrun.wal_paths`.
+        self.organization_id = organization_id
+        # SDK-4 (security audit 2026-11-06). The WAL path is resolved
+        # ONCE, here, and NEVER changes for the life of this transport.
+        #
+        # It used to be re-derived on every call, and the default was a
+        # FIXED path in the shared temp directory: every user and every
+        # org on the host resolved to `<tempdir>/nullrun.wal`. Two
+        # runtimes then wrote to the same file and the atomic
+        # whole-file replace in `_persist_to_wal` destroyed the other
+        # runtime's undelivered events — money that had already been
+        # spent was never booked.
+        #
+        # Resolving it once is what makes the scope safe. A path that
+        # changed when the org id arrived (it arrives AFTER
+        # authentication, which happens after construction) would
+        # orphan every file written before that moment, and no test
+        # would catch it: the path is "correct" at every instant and
+        # the spend is lost anyway.
+        self._wal_base_path = self._resolve_wal_path()
         self.config = config or FlushConfig()
         # Allow env-var override of batch size and flush interval.
         if "NULLRUN_BATCH_SIZE" in os.environ:
@@ -1254,12 +1280,57 @@ class Transport:
         except ValueError:
             return self._WAL_MAX_BYTES_DEFAULT
 
-    def _wal_path(self) -> str:
-        """Resolve WAL path. Honours ``NULLRUN_WAL_PATH``; defaults to platform tempdir."""
-        env_path = os.environ.get("NULLRUN_WAL_PATH")
+    def _resolve_wal_path(self) -> str:
+        """Resolve the WAL base path. Called ONCE, from the constructor.
+
+        ``NULLRUN_WAL_PATH`` wins outright — it is the operator's
+        explicit choice. Otherwise the default is scoped per user AND
+        per api key, so two runtimes on one host do not share a file
+        (SDK-4, security audit 2026-11-06).
+        """
+        env_path = os.environ.get(WAL_PATH_ENV_VAR)
         if env_path:
             return env_path
-        return os.path.join(tempfile.gettempdir(), "nullrun.wal")
+        return default_wal_path(api_key=self.api_key, org_id=self.organization_id)
+
+    def _wal_path(self) -> str:
+        """The WAL base path of this transport. Fixed for its lifetime.
+
+        Resolved once in the constructor on purpose: a path that changed
+        mid-life would orphan the files written under the previous one.
+        """
+        return self._wal_base_path
+
+    def _warn_about_legacy_wal(self) -> None:
+        """Report the unscoped WAL an older SDK left in the temp dir.
+
+        The file is NOT read, NOT migrated and NOT deleted. It was
+        shared by every user and every org on the host, so its rows may
+        belong to another tenant — replaying them into this org's WAL
+        would book a stranger's spend against this account. Reporting
+        the path is the only safe thing to do with it; an operator with
+        the right credentials decides what it holds.
+        """
+        if os.environ.get(WAL_PATH_ENV_VAR):
+            # The operator pinned the path. The legacy file is not ours.
+            return
+        legacy = legacy_wal_path()
+        try:
+            size = os.path.getsize(legacy)
+        except OSError:
+            return
+        if size == 0:
+            return
+        logger.warning(
+            "Legacy unscoped WAL found at %s (%d bytes). It is NOT read, NOT "
+            "migrated and NOT deleted: it was shared by every user and org on "
+            "this host, so its events may belong to another tenant. Inspect it "
+            "with `nullrun-wal --wal %s status` and replay it under the org "
+            "that owns it.",
+            legacy,
+            size,
+            legacy,
+        )
 
     def _rotate_wal_if_needed(self) -> None:
         """Rotate ``<path>`` to ``<path>.1`` if it exceeds the size cap."""
@@ -1871,6 +1942,9 @@ class Transport:
         """Start background flush thread."""
         if self._running:
             return
+        # SDK-4: report the unscoped WAL an older SDK left behind. It is
+        # not read and not migrated — see `_warn_about_legacy_wal`.
+        self._warn_about_legacy_wal()
         # Replay any events from WAL that were persisted due to previous crash
         self._replay_from_wal()
         # Held refusals are recovered separately and are NOT replayed onto the

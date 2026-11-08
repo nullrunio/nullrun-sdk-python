@@ -8,8 +8,23 @@ someone money.
 
 ## The files
 
-One base path (`NULLRUN_WAL_PATH`, else `<tempdir>/nullrun.wal`) and five
-files:
+One base path, and the files listed below it. The base path is:
+
+1. `NULLRUN_WAL_PATH`, when the operator set it. It wins outright.
+2. Otherwise `<tempdir>/nullrun-<user>-<key>.wal` — scoped per OS user and
+   per **API key**.
+
+The key scope is the point. Before SDK-4 (security audit 2026-11-06) every
+runtime on the host resolved to the same fixed `<tempdir>/nullrun.wal`, and
+the atomic whole-file replace in `Transport._persist_to_wal` replaced another
+runtime's undelivered events with its own buffer — spend that had already
+happened was never booked. One API key belongs to exactly one organisation,
+so a key-scoped WAL is an org-scoped WAL in money terms.
+
+The path is resolved **once**, when the transport is constructed, and never
+changes. The organisation id is only known after authentication; a path that
+changed at authentication would orphan every file written before it, and the
+money would be lost with nothing in the logs to show for it.
 
 | File | Holds | Read by |
 |---|---|---|
@@ -24,6 +39,16 @@ The first three self-heal. The DLQ does not, and cannot: a refusal is by
 definition not something a retry fixes, so re-sending a dead-lettered event
 would be refused again. Automatic DLQ replay is the poison pill the DLQ
 exists to break out of.
+
+### The legacy file
+
+`<tempdir>/nullrun.wal` — the unscoped path the SDK used before SDK-4 — is
+never written to any more. If it exists and is not empty, the SDK reports it
+at startup and then leaves it alone: it was shared by every user and every
+org on the host, so its rows may belong to another tenant, and replaying
+them into this org's WAL would book a stranger's spend against this account.
+Inspect it with `nullrun-wal --wal <tempdir>/nullrun.wal status` and decide
+under the org that owns it.
 
 ## What is guaranteed
 
@@ -128,14 +153,26 @@ volume, each worker has its own in-memory buffer and its own events; the
 correct configuration is a per-worker `NULLRUN_WAL_PATH`, and with a shared
 one correctness rests on `event_id` dedup rather than on the lock.
 
+**`NULLRUN_WAL_PATH` must be unique per runtime.** Pointing two runtimes at
+one path collides exactly like the old shared default did — the whole-file
+replace in `_persist_to_wal` destroys the other runtime's undelivered events
+— and the SDK cannot detect it. The default is safe because it is scoped per
+API key; an explicit path overrides that and takes the responsibility with
+it.
+
 ## Inspecting and replaying the DLQ
 
 ```bash
-nullrun-wal status                        # files, row counts, reasons, window
+nullrun-wal status                        # every WAL this user owns
+nullrun-wal --wal <path> status           # one WAL
 nullrun-wal replay --dry-run              # what would be sent
 nullrun-wal replay --reason reservation_not_found --limit 100
 nullrun-wal replay --execute              # actually send
 ```
+
+`status` without `--wal` lists every scoped WAL this user owns — there is one
+per API key — and `replay` refuses to guess between them. A guess could
+point the operator at another tenant's file.
 
 `replay` is a dry run unless `--execute` is passed, and it removes a row
 **only** after the backend confirms that exact `event_id`. Anything

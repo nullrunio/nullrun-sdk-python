@@ -38,9 +38,13 @@ import tempfile
 from collections import Counter
 from typing import Any
 
-__all__ = ["main", "read_dlq", "dlq_paths", "default_wal_path"]
+from nullrun.wal_paths import (
+    WAL_PATH_ENV_VAR,
+    legacy_wal_path,
+    scoped_wal_paths,
+)
 
-_DEFAULT_WAL = os.path.join(tempfile.gettempdir(), "nullrun.wal")
+__all__ = ["main", "read_dlq", "dlq_paths", "default_wal_path", "scoped_wal_paths"]
 
 # Refusals that replaying cannot fix, so replay refuses them by default.
 #
@@ -67,15 +71,53 @@ def _is_terminal_without_replay(reason: str) -> bool:
     return reason in _TERMINAL_WITHOUT_REPLAY
 
 
-def default_wal_path() -> str:
-    """The WAL path this host would use, honouring ``NULLRUN_WAL_PATH``.
+def default_wal_path() -> str | None:
+    """The WAL this host would use, or ``None`` when that is not one path.
 
-    Mirrors ``Transport._wal_path``. Duplicated rather than imported so the
-    CLI can answer "where is my WAL" without constructing a Transport, which
-    would create an httpx client and touch the permissions of files it has no
-    business touching yet.
+    The order:
+
+    1. ``NULLRUN_WAL_PATH`` — the operator's explicit choice. It wins
+       outright.
+    2. The single scoped WAL this user owns, when there is exactly one.
+    3. ``None``.
+
+    ``None`` is the honest answer when the user owns several scoped WALs
+    (one per API key). Guessing one of them would point the operator's
+    ``replay`` at a file that may hold another tenant's spend; the CLI
+    lists them instead and asks for ``--wal``.
+
+    Before SDK-4 (security audit 2026-11-06) this returned one fixed path
+    — ``<tempdir>/nullrun.wal`` — shared by every user and every org on
+    the host.
     """
-    return os.environ.get("NULLRUN_WAL_PATH") or _DEFAULT_WAL
+    env_path = os.environ.get(WAL_PATH_ENV_VAR)
+    if env_path:
+        return env_path
+    scoped = scoped_wal_paths()
+    if len(scoped) == 1:
+        return scoped[0]
+    return None
+
+
+def legacy_wal_status() -> str | None:
+    """One line about the unscoped WAL an older SDK left behind, if any.
+
+    It is never read and never migrated: it was shared by every user and
+    every org on the host, so its rows may belong to another tenant.
+    """
+    legacy = legacy_wal_path()
+    try:
+        size = os.path.getsize(legacy)
+    except OSError:
+        return None
+    if size == 0:
+        return None
+    return (
+        f"Legacy unscoped WAL at {legacy} ({size} bytes). It is NOT read and "
+        "NOT migrated: it was shared by every user and org on this host, so "
+        "its events may belong to another tenant. Inspect it with "
+        f"`nullrun-wal --wal {legacy} status`."
+    )
 
 
 def dlq_paths(wal_path: str) -> dict[str, str]:
@@ -144,7 +186,30 @@ def _row_event(row: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
-    wal_path = args.wal
+    if args.wal:
+        return _status_one(args.wal)
+    # No explicit path. The user may own several scoped WALs (one per API
+    # key), so list them all rather than guessing one — a guess could point
+    # the operator at another tenant's file.
+    scoped = scoped_wal_paths()
+    if not scoped:
+        print("No WAL found for this user.")
+        legacy = legacy_wal_status()
+        if legacy:
+            print(f"\n{legacy}")
+        return 0
+    if len(scoped) > 1:
+        print(f"{len(scoped)} WAL(s) for this user:\n")
+    for path in scoped:
+        _status_one(path)
+        print()
+    legacy = legacy_wal_status()
+    if legacy:
+        print(legacy)
+    return 0
+
+
+def _status_one(wal_path: str) -> int:
     paths = dlq_paths(wal_path)
     print(f"WAL: {wal_path}")
     for name, path in paths.items():
@@ -248,6 +313,25 @@ def _unconfirmed_event_ids(transport: Any, wal_path: str) -> set[str]:
 
 def _cmd_replay(args: argparse.Namespace) -> int:
     from nullrun.transport import Transport
+
+    if not args.wal:
+        # `default_wal_path()` is the honest answer to "which one?": the
+        # single WAL this user owns, or None when there are several. A
+        # guess between several would point the replay at a file that may
+        # hold another tenant's spend.
+        one = default_wal_path()
+        if one:
+            hint = f" Pass --wal {one}."
+        else:
+            hint = (
+                f" This host owns {len(scoped_wal_paths())} scoped WAL(s), and "
+                "`status` lists them."
+            )
+        print(
+            f"error: no WAL to replay. Pass --wal <path>.{hint}",
+            file=sys.stderr,
+        )
+        return 1
 
     paths = dlq_paths(args.wal)
     rows, corrupt = read_dlq(paths["dlq"])
@@ -425,8 +509,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--wal",
-        default=default_wal_path(),
-        help="WAL path (default: $NULLRUN_WAL_PATH, else the tempdir).",
+        default=None,
+        help=(
+            "WAL path. Default: $NULLRUN_WAL_PATH, else the one scoped WAL "
+            "this user owns. Without it, `status` lists every WAL this user "
+            "owns (one per API key) and `replay` refuses to guess."
+        ),
     )
     sub = parser.add_subparsers(dest="command")
 
