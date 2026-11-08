@@ -18,7 +18,10 @@ exposes ``list_tools()`` / ``call_tool(name, args)``.
 
 Scope (kept deliberately small):
   * Cache `tools/list` for ``MCP_ADAPTER_CACHE_SECONDS``
-    (default 300s, matches the gate's ``heartbeat`` cadence).
+    (default 30s). The cached annotations are a policy input for
+    the gate's MCP umbrella policies, so the window is short; a
+    failed refresh never presents the stale snapshot to the gate
+    as if it were current.
   * On every ``call_tool(name, args)``, set
     ``call_mcp_class='mcp'`` + ``call_mcp_annotations=...`` via
     the public ``context`` helpers so the runtime's
@@ -69,12 +72,19 @@ from nullrun.context import (
 logger = logging.getLogger(__name__)
 
 
-# Cache TTL for the ``tools/list`` discovery response. Matches
-# the v3.31 gate's ``heartbeat`` cadence so the adapter and the
-# gate see roughly the same version of the server's tool inventory
-# over time. Operators who need a tighter or looser TTL can
-# override it via the constructor.
-DEFAULT_CACHE_SECONDS = 300
+# Cache TTL for the ``tools/list`` discovery response.
+#
+# The cached annotations are a POLICY INPUT: the gate's
+# ``mcp_destructive_policy`` / ``mcp_readonly_policy`` umbrella
+# policies are evaluated against the ``destructive`` / ``read_only``
+# hints this cache hands to ``/check``. A cached ``destructive=False``
+# that the server has since changed to ``True`` is a stale policy
+# input, so the window is kept short.
+#
+# 30 seconds is the floor the constructor already enforces. Operators
+# who cannot accept any staleness pass ``cache_seconds=0`` and pay
+# one ``tools/list`` round trip per tool call.
+DEFAULT_CACHE_SECONDS = 30
 
 
 @dataclass(frozen=True)
@@ -237,12 +247,17 @@ class MCPAdapter:
     ) -> None:
         if not server_name:
             raise ValueError("MCPAdapter: server_name is required")
-        if cache_seconds < 30:
-            # Less than 30s would hammer the upstream and
+        if cache_seconds < 0 or 0 < cache_seconds < 30:
+            # A value between 0 and 30 would hammer the upstream and
             # skew the v3.31 ``mcp_observed_tools`` drift
             # detector's notion of "stable tool inventory".
+            #
+            # 0 is allowed and means "no cache": the annotations are
+            # fetched fresh before every tool call, at the cost of one
+            # ``tools/list`` round trip per call. It is the operator's
+            # only way to remove the staleness window entirely.
             raise ValueError(
-                f"MCPAdapter: cache_seconds must be >= 30 (got {cache_seconds})"
+                f"MCPAdapter: cache_seconds must be 0 or >= 30 (got {cache_seconds})"
             )
         self.server_name = server_name
         self._mcp_client = mcp_client
@@ -257,6 +272,13 @@ class MCPAdapter:
         # call_tool, refreshed every ``cache_seconds``.
         self._cache: dict[str, _CachedTool] = {}
         self._cached_at: float = 0.0
+        # False when the last refresh attempt FAILED. The snapshot in
+        # ``self._cache`` is then older than the TTL and must not be
+        # presented to the gate as if it were the server's current
+        # answer — a stale ``destructive=False`` is a stale policy
+        # input. Diagnostics may still read the snapshot; the gate
+        # gets the unknown shape instead.
+        self._cache_fresh: bool = False
         # every ``call_tool``. When provided, ``call_tool`` blocks on
         # ``runtime.execute(...)`` returning decision="block" so a
         # permissive MCP server cannot bypass the operator's
@@ -324,6 +346,7 @@ class MCPAdapter:
                 fresh[cached.name] = cached
             self._cache = fresh
             self._cached_at = time.monotonic()
+            self._cache_fresh = True
             logger.debug(
                 "MCPAdapter: refreshed tool cache for %s (%d tools)",
                 self.server_name,
@@ -331,9 +354,14 @@ class MCPAdapter:
             )
         except Exception as exc:  # noqa: BLE001
             # Cache refresh is best-effort. If the upstream is
-            # down we'll keep using the previous cache rather
-            # than failing every call. Operators see stale
-            # data in the audit log; the next call will retry.
+            # down we keep the previous snapshot for DIAGNOSTICS
+            # rather than failing every call.
+            #
+            # The snapshot is NOT presented to the gate as current
+            # truth: ``_cache_fresh`` goes False and ``call_tool``
+            # stamps the unknown shape instead, so the gate falls
+            # back to its own classifier. The next call retries.
+            self._cache_fresh = False
             logger.warning(
                 "MCPAdapter: %s tools/list refresh failed: %s (keeping %d cached)",
                 self.server_name,
@@ -342,8 +370,14 @@ class MCPAdapter:
             )
 
     def _maybe_refresh(self) -> None:
+        # ``cache_seconds == 0`` means "no cache": every access
+        # re-lists. The comparison is on the clock, so it is spelled
+        # out here rather than left to ``elapsed > 0`` -- a clock
+        # that does not tick between two calls would silently keep
+        # the cache.
         if (
-            not self._cache
+            self._cache_seconds <= 0
+            or not self._cache
             or (time.monotonic() - self._cached_at) > self._cache_seconds
         ):
             self._refresh_cache()
@@ -460,13 +494,33 @@ class MCPAdapter:
         """
         self._maybe_refresh()
         cached = self._cache.get(tool_name)
-        if cached is None:
+        if not self._cache_fresh:
+            # The last refresh FAILED, so the snapshot in the cache is
+            # older than the TTL and may no longer describe the server.
+            # Hand the gate the unknown shape instead of a stale
+            # answer: the umbrella MCP policies then fall back to the
+            # gate's own classifier rather than to a cached
+            # ``destructive=False`` the server may have retired.
+            annotations: dict[str, Any] | None = {
+                "read_only": None,
+                "destructive": None,
+                "open_world": None,
+            }
+            tool_class = "invalid"
+            logger.debug(
+                "MCPAdapter: tools/list refresh failed for %s; stamping "
+                "class=invalid on /check for tool %r instead of the stale "
+                "cached annotations",
+                self.server_name,
+                tool_name,
+            )
+        elif cached is None:
             # Unknown tool. Be honest with the gate: this is
             # not a recognised MCP server's tool. The gate
             # will fall through to its ``classify_tool``
             # parser (which would have classified this as
             # ``invalid`` anyway given the cached inventory).
-            annotations: dict[str, Any] | None = {
+            annotations = {
                 "read_only": None,
                 "destructive": None,
                 "open_world": None,
