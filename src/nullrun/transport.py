@@ -956,6 +956,11 @@ class DecisionSource:
     """
 
     GATEWAY = "gateway"
+    # NO PRODUCER. Nothing in ``src/`` ever returns this value: the
+    # SDK has no in-process decision cache (ADR-180 / NR-116). The
+    # member is kept so that code importing it keeps working, but it
+    # reads as a live decision cache and it is not one. A pin test
+    # asserts that no producer appears.
     CACHED = "cached"
     FALLBACK = "fallback"
     LOCAL = "local"
@@ -1027,9 +1032,10 @@ class ExecuteConfig:
     timeout: float = 5.0
     # Max retries for execute calls
     max_retries: int = 10
-    # Cache TTL for CACHED mode (seconds)
+    # UNUSED. There is no decision cache in the SDK (NR-116): no
+    # producer reads these two fields. They are kept for import
+    # compatibility and a pin test asserts that nothing reads them.
     cache_ttl: float = 60.0
-    # Cache max size
     cache_max_size: int = 10000
 
 
