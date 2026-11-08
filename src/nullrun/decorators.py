@@ -64,6 +64,7 @@ from nullrun.context import (
     set_trace_id,
 )
 from nullrun.observability import metrics
+from nullrun.observability.redaction import scrub_secret_values
 from nullrun.runtime import NullRunRuntime, get_runtime
 from nullrun.transport import is_fallback_decision_source
 
@@ -150,6 +151,12 @@ def _safe_repr(value: object, max_len: int = 50) -> str:
     # ``details=`` substring is replaced before we potentially
     # truncate it away.
     r = _strip_details_balanced(r)
+    # Redact credential-shaped VALUES. Key-name redaction only knows
+    # the argument names someone listed; a secret that arrives under
+    # a benign name (``{"note": "<key>"}``) survives it. This pass
+    # runs BEFORE the truncation below, so a credential that straddles
+    # the cut is caught whole.
+    r = scrub_secret_values(r)
     # Truncate to ``max_len`` so a giant repr doesn't bloat span
     # events. We append ``...<truncated>`` so consumers can see the
     # cut happened.
