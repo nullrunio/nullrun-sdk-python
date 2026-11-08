@@ -14,11 +14,18 @@ repos:
         args: [--fix]
       - id: ruff-format
 
-  - repo: https://github.com/pre-commit/mypy
-    rev: v1.8.0
-    hooks:
-      - id: mypy
-        additional_dependencies: [types-all]
+  # The mypy hook used to come from ``https://github.com/pre-commit/mypy``.
+  # That mirror no longer exists: GitHub answers 404 and ``git fetch``
+  # answers "Repository not found". The consequence was not a dead hook
+  # but a dead CHAIN — pre-commit installs every repo in the file before
+  # it runs any hook, so the missing mirror aborted the whole run and
+  # NO hook in this file executed, including the supply-chain gate
+  # below. A gate that cannot start is not a gate.
+  #
+  # The check is not lost: CI runs ``mypy src/`` (``.github/workflows/
+  # ci.yml``) and ``make type-check`` runs ``mypy src/nullrun --strict``.
+  # The old ``types-all`` extra is dropped with the hook: CI never
+  # installed it and the strict run is green without it.
 
   # Project rule, not a third-party check. Lives here rather than in
   # .git/hooks so it is versioned, shared, and runs in CI — a hook installed
@@ -30,4 +37,16 @@ repos:
         entry: scripts/reject_coauthor_trailer.sh
         language: script
         stages: [commit-msg]
+        always_run: true
+      # SDK-3 (security audit 2026-11-06). The same script CI runs: a
+      # workflow that pins an action to a mutable ref, or installs a
+      # dependency outside uv.lock, fails here before it reaches a runner.
+      # ``always_run`` because the check reads every workflow, not only
+      # the ones the commit touched.
+      - id: check-supply-chain
+        name: check the supply chain pins
+        entry: python scripts/check_supply_chain.py
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]
         always_run: true
