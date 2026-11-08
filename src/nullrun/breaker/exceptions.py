@@ -561,6 +561,8 @@ class NullRunChainError(NullRunDecision):
 
     Covers backend codes: ``CHAIN_MAX_DURATION_EXCEEDED`` (402),
     ``CHAIN_CROSS_ORG`` (403), ``CHAIN_ORG_MISMATCH`` (403),
+    ``CHAIN_KEY_MISMATCH`` (403 — ADR-180: the chain belongs to the
+    API key that created it),
     ``CHAIN_NOT_FOUND`` / ``CHAIN_EXPIRED`` (404), and the
     Execution Graph v0 (2026-08-06) trio:
     ``PARENT_EXECUTION_NOT_FOUND`` / ``PARENT_EXECUTION_ORG_MISMATCH``

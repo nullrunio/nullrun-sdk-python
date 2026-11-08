@@ -5185,6 +5185,7 @@ def _parse_v3_error_envelope_uncategorised(
         backend_code == "CHAIN_MAX_DURATION_EXCEEDED"
         or backend_code == "CHAIN_CROSS_ORG"
         or backend_code == "CHAIN_ORG_MISMATCH"
+        or backend_code == "CHAIN_KEY_MISMATCH"
     ):
         return NullRunChainError(
             full_message,
@@ -5539,6 +5540,13 @@ def _build_v3_error_code_map() -> dict[str, type[Exception]]:
         # 403 — chain security + workflow state
         "CHAIN_CROSS_ORG": NullRunChainError,
         "CHAIN_ORG_MISMATCH": NullRunChainError,
+        # ADR-180 (2026-11-07): a chain belongs to the API key that
+        # created it. The backend emits this code when another key of
+        # the same organization presents a chain it does not own. It
+        # is a chain refusal, so it carries the chain class — without
+        # this entry the dispatcher falls through to the base class and
+        # a caller branching on NullRunChainError cannot catch it.
+        "CHAIN_KEY_MISMATCH": NullRunChainError,
         "PARENT_EXECUTION_NOT_FOUND": NullRunChainError,
         "PARENT_EXECUTION_ORG_MISMATCH": NullRunChainError,
         "PARENT_EXECUTION_KEY_MISMATCH": NullRunChainError,

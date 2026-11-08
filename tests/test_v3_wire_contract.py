@@ -465,6 +465,27 @@ class TestV3ErrorEnvelopeMapping:
         exc = _parse_v3_error_envelope(resp, "check")
         assert isinstance(exc, NullRunChainError)
 
+    def test_chain_key_mismatch_maps_to_chain_error(self):
+        """ADR-180 — the chain belongs to the API key that created it.
+
+        The backend refuses a chain presented by another key of the
+        same organization with ``CHAIN_KEY_MISMATCH`` (403). Without a
+        map entry the dispatcher falls through to the base class and a
+        caller branching on ``NullRunChainError`` cannot catch it.
+        """
+        resp = self._make_response(
+            403,
+            {
+                "error_code": "CHAIN_KEY_MISMATCH",
+                "error_message": "chain belongs to another api key",
+                "details": {"chain_id": "abc"},
+            },
+        )
+        exc = _parse_v3_error_envelope(resp, "check")
+        assert isinstance(exc, NullRunChainError)
+        assert exc.backend_code == "CHAIN_KEY_MISMATCH"
+        assert exc.chain_id == "abc"
+
     def test_workflow_inactive_maps_to_workflow_inactive_error(self):
         resp = self._make_response(
             403,
@@ -614,6 +635,10 @@ class TestV3ErrorMapCatalog:
             "CHAIN_MAX_DURATION_EXCEEDED",
             "CHAIN_CROSS_ORG",
             "CHAIN_ORG_MISMATCH",
+            # ADR-180 (2026-11-07): a chain belongs to the API key that
+            # created it. The backend emits this code when another key
+            # of the same organization presents a chain it does not own.
+            "CHAIN_KEY_MISMATCH",
             "WORKFLOW_INACTIVE",
             "API_KEY_REVOKED",
             "CONSUME_OVERBUDGET",
