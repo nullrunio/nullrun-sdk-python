@@ -96,9 +96,10 @@ class ErrorContext:
     # tool-call failures.
     tool_name: str | None = None
 
-    # First 10 characters of the api key in use, or ``None`` if
-    # no key was set yet. Used for log triage — the full key
-    # never leaves the SDK.
+    # An 8-character SHA-256 fingerprint of the api key in use, or
+    # ``None`` if no key was set yet. Used for log triage — the full
+    # key never leaves the SDK, and neither does any character of it
+    # (SDK-5; the value used to be the first ten characters).
     api_key_prefix: str | None = None
 
     # Backend correlation id (``X-Correlation-Id`` response

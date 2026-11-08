@@ -206,8 +206,10 @@ def test_preflight_declares_the_calls_own_numbers():
     # The historical value was the literal 1 — one token. The whole
     # point of ADR-101 is that the call's own size is declared.
     assert kwargs["estimated_tokens"] >= 100
-    # A cached "allow" carries the PREVIOUS call's reservation id.
-    assert kwargs["use_gate_cache"] is False
+    # There is no in-process gate cache, so the pre-flight never
+    # passes a "do not cache me" flag — every call is its own /gate
+    # call with its own reservation (SDK-1).
+    assert "use_gate_cache" not in kwargs
 
 
 def test_no_output_cap_means_no_output_cap_is_declared():
@@ -583,7 +585,7 @@ def test_the_requests_path_preflights_and_carries_the_reservation(
     )
     assert runtime.gate_kwargs["model"] == "gpt-4o-mini"
     assert runtime.gate_kwargs["max_output_tokens"] == 128
-    assert runtime.gate_kwargs["use_gate_cache"] is False
+    assert "use_gate_cache" not in runtime.gate_kwargs
     assert len(runtime.tracked) == 1
     assert runtime.tracked[0][1] == "req-1-1"
 

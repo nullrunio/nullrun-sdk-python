@@ -32,6 +32,8 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
+from nullrun.breaker.exceptions import ENFORCEMENT_EXCEPTIONS
+
 logger = logging.getLogger(__name__)
 
 _crewai_patched = False
@@ -72,6 +74,12 @@ def _emit_usage_metrics(runtime: Any, crew: Any) -> None:
                     "raw_usage": dict(m),
                 }
             )
+        except ENFORCEMENT_EXCEPTIONS:
+            # SDK-6 (reliability audit 2026-11-02): the backend REFUSED
+            # to book this call. ADR-008's /track row is CLOSED for
+            # enforcement rejections — the refusal propagates to the
+            # caller, so a refused track cannot look like a success.
+            raise
         except Exception as e:  # pragma: no cover - defensive
             logger.debug("crewai usage_metrics emit failed: %s", e)
 

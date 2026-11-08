@@ -18,7 +18,10 @@ exposes ``list_tools()`` / ``call_tool(name, args)``.
 
 Scope (kept deliberately small):
   * Cache `tools/list` for ``MCP_ADAPTER_CACHE_SECONDS``
-    (default 300s, matches the gate's ``heartbeat`` cadence).
+    (default 30s). The cached annotations are a policy input for
+    the gate's MCP umbrella policies, so the window is short; a
+    failed refresh never presents the stale snapshot to the gate
+    as if it were current.
   * On every ``call_tool(name, args)``, set
     ``call_mcp_class='mcp'`` + ``call_mcp_annotations=...`` via
     the public ``context`` helpers so the runtime's
@@ -54,22 +57,34 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable, Iterable
+from contextvars import Token
 from dataclasses import dataclass
 from typing import Any
 
+from nullrun.business_impact import BusinessImpact, compute_action_digest
 from nullrun.context import (
+    get_call_impact,
+    reset_call_impact,
+    set_call_impact,
     set_mcp_tool_context,
 )
 
 logger = logging.getLogger(__name__)
 
 
-# Cache TTL for the ``tools/list`` discovery response. Matches
-# the v3.31 gate's ``heartbeat`` cadence so the adapter and the
-# gate see roughly the same version of the server's tool inventory
-# over time. Operators who need a tighter or looser TTL can
-# override it via the constructor.
-DEFAULT_CACHE_SECONDS = 300
+# Cache TTL for the ``tools/list`` discovery response.
+#
+# The cached annotations are a POLICY INPUT: the gate's
+# ``mcp_destructive_policy`` / ``mcp_readonly_policy`` umbrella
+# policies are evaluated against the ``destructive`` / ``read_only``
+# hints this cache hands to ``/check``. A cached ``destructive=False``
+# that the server has since changed to ``True`` is a stale policy
+# input, so the window is kept short.
+#
+# 30 seconds is the floor the constructor already enforces. Operators
+# who cannot accept any staleness pass ``cache_seconds=0`` and pay
+# one ``tools/list`` round trip per tool call.
+DEFAULT_CACHE_SECONDS = 30
 
 
 @dataclass(frozen=True)
@@ -129,6 +144,47 @@ def _normalize_annotation(tool: Any) -> _CachedTool:
         destructive=read_ann("destructiveHint"),
         open_world=read_ann("openWorldHint"),
     )
+
+
+def _derive_mcp_impact(
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> tuple[BusinessImpact, dict[str, Any], str] | None:
+    """Derive the ONE envelope that describes one MCP tool call.
+
+    ADR-125. The envelope is a ``tool_call`` impact carrying the tool
+    name and the EXACT argument dict the adapter forwards as the
+    canonical bag (``tool_arguments``). The backend re-derives the
+    digest from the live payload, compares it with the digest stored
+    on the approval row, and then compares the envelope's ``params``
+    with the live bag — so the params MUST be that same dict, not a
+    masked or reshaped copy of it. A reshaped copy would bind the
+    operator's approval to arguments nobody approved.
+
+    Returns ``(impact, wire_dict, digest)``, or ``None`` when the
+    envelope cannot be built: the digest layer cannot round-trip the
+    arguments (an f64, a non-ASCII tool name, an over-long parameter
+    name). The caller then sends the ``no_impact`` digest with NO
+    envelope, which the backend refuses at consume time — the
+    fail-CLOSED arm, not the legacy "no digest at all" arm that binds
+    an approval to nothing.
+    """
+    if not isinstance(arguments, dict):
+        # A non-mapping argument bag is not a tool payload this
+        # envelope can describe.
+        return None
+    try:
+        impact = BusinessImpact.tool_call(tool_name, arguments)
+    except (ValueError, TypeError, AttributeError) as exc:
+        logger.warning(
+            "MCPAdapter: could not derive a tool_call BusinessImpact for %r (%s); "
+            "the call goes on the wire with the no_impact digest and NO envelope, "
+            "so an operator approval for it cannot be consumed.",
+            tool_name,
+            exc,
+        )
+        return None
+    return impact, impact.to_wire_dict(), compute_action_digest(impact)
 
 
 class MCPAdapter:
@@ -191,12 +247,17 @@ class MCPAdapter:
     ) -> None:
         if not server_name:
             raise ValueError("MCPAdapter: server_name is required")
-        if cache_seconds < 30:
-            # Less than 30s would hammer the upstream and
+        if cache_seconds < 0 or 0 < cache_seconds < 30:
+            # A value between 0 and 30 would hammer the upstream and
             # skew the v3.31 ``mcp_observed_tools`` drift
             # detector's notion of "stable tool inventory".
+            #
+            # 0 is allowed and means "no cache": the annotations are
+            # fetched fresh before every tool call, at the cost of one
+            # ``tools/list`` round trip per call. It is the operator's
+            # only way to remove the staleness window entirely.
             raise ValueError(
-                f"MCPAdapter: cache_seconds must be >= 30 (got {cache_seconds})"
+                f"MCPAdapter: cache_seconds must be 0 or >= 30 (got {cache_seconds})"
             )
         self.server_name = server_name
         self._mcp_client = mcp_client
@@ -211,6 +272,13 @@ class MCPAdapter:
         # call_tool, refreshed every ``cache_seconds``.
         self._cache: dict[str, _CachedTool] = {}
         self._cached_at: float = 0.0
+        # False when the last refresh attempt FAILED. The snapshot in
+        # ``self._cache`` is then older than the TTL and must not be
+        # presented to the gate as if it were the server's current
+        # answer — a stale ``destructive=False`` is a stale policy
+        # input. Diagnostics may still read the snapshot; the gate
+        # gets the unknown shape instead.
+        self._cache_fresh: bool = False
         # every ``call_tool``. When provided, ``call_tool`` blocks on
         # ``runtime.execute(...)`` returning decision="block" so a
         # permissive MCP server cannot bypass the operator's
@@ -278,6 +346,7 @@ class MCPAdapter:
                 fresh[cached.name] = cached
             self._cache = fresh
             self._cached_at = time.monotonic()
+            self._cache_fresh = True
             logger.debug(
                 "MCPAdapter: refreshed tool cache for %s (%d tools)",
                 self.server_name,
@@ -285,9 +354,14 @@ class MCPAdapter:
             )
         except Exception as exc:  # noqa: BLE001
             # Cache refresh is best-effort. If the upstream is
-            # down we'll keep using the previous cache rather
-            # than failing every call. Operators see stale
-            # data in the audit log; the next call will retry.
+            # down we keep the previous snapshot for DIAGNOSTICS
+            # rather than failing every call.
+            #
+            # The snapshot is NOT presented to the gate as current
+            # truth: ``_cache_fresh`` goes False and ``call_tool``
+            # stamps the unknown shape instead, so the gate falls
+            # back to its own classifier. The next call retries.
+            self._cache_fresh = False
             logger.warning(
                 "MCPAdapter: %s tools/list refresh failed: %s (keeping %d cached)",
                 self.server_name,
@@ -296,8 +370,14 @@ class MCPAdapter:
             )
 
     def _maybe_refresh(self) -> None:
+        # ``cache_seconds == 0`` means "no cache": every access
+        # re-lists. The comparison is on the clock, so it is spelled
+        # out here rather than left to ``elapsed > 0`` -- a clock
+        # that does not tick between two calls would silently keep
+        # the cache.
         if (
-            not self._cache
+            self._cache_seconds <= 0
+            or not self._cache
             or (time.monotonic() - self._cached_at) > self._cache_seconds
         ):
             self._refresh_cache()
@@ -354,6 +434,17 @@ class MCPAdapter:
           consume time, so a tampered payload is refused (NR-015,
           SDK half).
 
+          **When the caller supplies NEITHER, the adapter derives
+          both from the tool call itself** (ADR-125): a ``tool_call``
+          envelope carrying the tool name and the exact argument bag
+          it forwards, plus that envelope's digest. Without them the
+          approval row carries no digest at all, and the backend's
+          post-approval ``/execute`` re-entry cannot server-derive
+          one — it refuses the consume with ``BUSINESS_IMPACT_INVALID``
+          (NR-010), so an operator approval for an MCP tool could
+          never be spent, and even where it could, the approval would
+          bind the tool NAME but not the ARGUMENTS.
+
         Gate enforcement: ``call_tool`` ALWAYS routes the invocation
         through ``runtime.execute(...)`` (the /api/v1/execute gate
         endpoint) BEFORE the underlying MCP client is called. The
@@ -371,11 +462,23 @@ class MCPAdapter:
         EXECUTION_NOT_FOUND when the ``execution:{id}`` binding is
         missing. The ``@protect`` path gets that ``/gate`` from its own
         pre-flight; a DIRECT ``adapter.call_tool(...)`` has no such
-        wrapper, so the adapter runs the pre-flight ITSELF when no
-        server-minted execution id is in scope. When one IS in scope
-        the pre-flight is SKIPPED: that path reserves money at the
-        gate, and a second ``/gate`` would charge the org twice for
-        one logical tool call.
+        wrapper, so the adapter runs the pre-flight ITSELF.
+
+        The pre-flight runs for EVERY tool call, because every tool
+        call is its own action with its own budget. Two cases skip it,
+        and only those two:
+
+        * the approval re-entry — the caller carries an
+          ``approval_id``, so the ambient server-minted id IS the
+          approval row's execution id, and a second ``/gate`` would
+          mint a different one;
+        * the ``@protect`` scope — the scope already reserved for
+          itself, and a second ``/gate`` would reserve twice and
+          orphan the first (NR-059).
+
+        A second tool call in the same scope is NOT one of those two.
+        It gets its own ``/gate``, its own reservation, its own
+        execution id. The backend settles a reservation once (SDK-1).
 
         B2 (2026-09-30): there is no ungated path. ``runtime=None``
         used to mean "skip the round-trip entirely"; it now means
@@ -391,13 +494,33 @@ class MCPAdapter:
         """
         self._maybe_refresh()
         cached = self._cache.get(tool_name)
-        if cached is None:
+        if not self._cache_fresh:
+            # The last refresh FAILED, so the snapshot in the cache is
+            # older than the TTL and may no longer describe the server.
+            # Hand the gate the unknown shape instead of a stale
+            # answer: the umbrella MCP policies then fall back to the
+            # gate's own classifier rather than to a cached
+            # ``destructive=False`` the server may have retired.
+            annotations: dict[str, Any] | None = {
+                "read_only": None,
+                "destructive": None,
+                "open_world": None,
+            }
+            tool_class = "invalid"
+            logger.debug(
+                "MCPAdapter: tools/list refresh failed for %s; stamping "
+                "class=invalid on /check for tool %r instead of the stale "
+                "cached annotations",
+                self.server_name,
+                tool_name,
+            )
+        elif cached is None:
             # Unknown tool. Be honest with the gate: this is
             # not a recognised MCP server's tool. The gate
             # will fall through to its ``classify_tool``
             # parser (which would have classified this as
             # ``invalid`` anyway given the cached inventory).
-            annotations: dict[str, Any] | None = {
+            annotations = {
                 "read_only": None,
                 "destructive": None,
                 "open_world": None,
@@ -441,6 +564,116 @@ class MCPAdapter:
         runtime = self._resolve_runtime()
         execute_input = arguments if arguments is not None else {}
 
+        # Is a scope-level envelope ALREADY in scope? Read BEFORE the
+        # adapter resolves its own envelope below, because the adapter
+        # installs one of its own and that would make this answer
+        # "yes" for every call.
+        #
+        # The ``@protect`` path is the only thing in the SDK that
+        # installs one, and it installs it for the WHOLE scope — after
+        # its own ``/gate`` reserved for that scope. So "an envelope
+        # was already here" is the marker of a scope that already
+        # gated itself.
+        scope_already_gated = get_call_impact() is not None
+
+        # ── The ONE envelope for this logical action (ADR-125) ─────
+        #
+        # The adapter derives the envelope from the tool call it is
+        # about to make: the tool name and the EXACT argument dict it
+        # forwards as the canonical bag. Without it the approval row
+        # carries NO digest, and the backend's post-approval
+        # /execute re-entry cannot server-derive the digest at all —
+        # it refuses the consume with BUSINESS_IMPACT_INVALID (NR-010),
+        # so an operator approval for an MCP tool could never be
+        # spent. See ADR-125 §1.
+        business_impact, action_digest, impact_token = self._resolve_impact(
+            tool_name=tool_name,
+            arguments=execute_input,
+            business_impact=business_impact,
+            action_digest=action_digest,
+        )
+        try:
+            return self._call_tool_gated(
+                runtime=runtime,
+                tool_name=tool_name,
+                arguments=arguments,
+                execute_input=execute_input,
+                approval_id=approval_id,
+                business_impact=business_impact,
+                action_digest=action_digest,
+                passthrough=passthrough,
+                scope_already_gated=scope_already_gated,
+            )
+        finally:
+            if impact_token is not None:
+                reset_call_impact(impact_token)
+
+    def _resolve_impact(
+        self,
+        *,
+        tool_name: str,
+        arguments: dict[str, Any],
+        business_impact: dict[str, Any] | None,
+        action_digest: str | None,
+    ) -> tuple[dict[str, Any] | None, str | None, Token[BusinessImpact | None] | None]:
+        """Resolve the envelope this call goes on the wire with.
+
+        Returns ``(business_impact, action_digest, impact_token)``.
+
+        * A caller that brought its OWN envelope (or its own digest)
+          keeps it: the SDK cannot reconstruct the caller's envelope,
+          so inventing a digest for it would be a claim the backend
+          cannot verify. Forward it verbatim.
+        * Otherwise the adapter derives the envelope from the call
+          itself and installs it on the call context, so the
+          pre-flight ``/gate`` hashes the SAME bytes this ``/execute``
+          carries (ADR-065: one envelope per logical action).
+        * An envelope already in scope (the ``@protect`` path) is NOT
+          overwritten — that path's own ``/gate`` and ``/execute`` must
+          keep agreeing with each other.
+        * When no envelope can be built at all, the digest still goes
+          on the wire (over the ``no_impact`` sentinel) and the
+          envelope stays ABSENT. The backend then takes its
+          fail-CLOSED arm ("cannot recompute") instead of the legacy
+          "no digest at all" arm, which is a grant bound to nothing.
+        """
+        if business_impact is not None or action_digest is not None:
+            return business_impact, action_digest, None
+
+        derived = _derive_mcp_impact(tool_name, arguments)
+        if derived is None:
+            return (
+                None,
+                compute_action_digest(BusinessImpact.no_impact()),
+                None,
+            )
+
+        impact, wire, digest = derived
+        token: Token[BusinessImpact | None] | None = None
+        if get_call_impact() is None:
+            token = set_call_impact(impact)
+        return wire, digest, token
+
+    def _call_tool_gated(
+        self,
+        *,
+        runtime: Any,
+        tool_name: str,
+        arguments: dict[str, Any] | None,
+        execute_input: dict[str, Any],
+        approval_id: str | None,
+        business_impact: dict[str, Any] | None,
+        action_digest: str | None,
+        passthrough: dict[str, Any],
+        scope_already_gated: bool,
+    ) -> Any:
+        """The gated half of :meth:`call_tool`.
+
+        Split out so the caller can hold ONE envelope for the whole
+        logical action: the envelope is installed on the call context
+        before the pre-flight ``/gate`` runs and released after this
+        method returns, whatever it returns.
+        """
         # ── Pre-flight: /execute needs a prior /gate ───────────────
         #
         # The backend's ``/api/v1/execute`` runs an existence check on
@@ -452,13 +685,30 @@ class MCPAdapter:
         # has no such wrapper, so without this pre-flight the /execute
         # round trip was refused and the MCP server was never called.
         #
-        # The pre-flight is CONDITIONAL, and the condition is the
-        # server-minted execution id: when one is already in scope a
-        # ``/gate`` has already run for this logical action, and
-        # running it again would reserve the budget a second time
-        # (that path charges money at the gate). The contextvar is
-        # exactly what ``runtime.execute`` reads to decide whether to
-        # reuse the id, so the two agree by construction.
+        # The pre-flight runs for EVERY tool call. A tool call is its
+        # own action with its own budget, so it gets its own ``/gate``,
+        # its own reservation and its own execution id.
+        #
+        # The condition used to be "no server-minted execution id in
+        # scope". That id is set by ``/gate`` and by ``/execute`` and is
+        # NEVER reset in ``src/``, so the second and later tool calls
+        # in one scope ran NO ``/gate``: no budget check, no
+        # reservation, no spend reserved for those calls. The id says
+        # "some action was gated", not "THIS action was gated".
+        #
+        # Two cases are genuinely covered by an ambient reservation,
+        # and both are about THIS action:
+        #
+        # * the approval re-entry — the caller carries an
+        #   ``approval_id``, and the backend's require_approval arm
+        #   echoes the approval row's execution id into
+        #   ``reservation_id``. The ambient id IS the approval's
+        #   execution, so a second ``/gate`` would mint a DIFFERENT
+        #   id and the approval's consume (``WHERE execution_id =
+        #   $3``) would miss its row (APPROVAL_REPLAY_REJECTED).
+        # * the ``@protect`` scope — the scope reserved for itself,
+        #   and a second ``/gate`` inside it would reserve twice and
+        #   orphan the first (NR-059).
         #
         # A refusal from the pre-flight propagates: the MCP client is
         # NOT called. Same ordering and same error handling as the
@@ -466,7 +716,27 @@ class MCPAdapter:
         # pre-flight → /execute → body).
         from nullrun.context import get_server_minted_execution_id
 
-        if get_server_minted_execution_id() is None:
+        # Via-edge. The BOX is the enforcement surface there: its
+        # ``/enforce`` call is what prices AND charges the call, and
+        # there is no cloud ``/track`` to book it through afterwards.
+        # So every tool call needs its own ask — one box call, one
+        # charge, per tool call.
+        #
+        # The "a /gate already ran for this action" short-circuit is
+        # correct for the cloud (one /gate reserves, one /execute
+        # reuses that reservation, one /track settles it) and wrong
+        # for the edge (one /enforce per tool call). Skipping the ask
+        # on the second tool call would leave the box unconsulted, and
+        # with the SDK-2 fix the /execute then fails CLOSED because
+        # nobody asked — so the second and later MCP calls in an edge
+        # scope must ask the box themselves.
+        _transport = getattr(runtime, "_transport", None)
+        edge_mode = getattr(_transport, "edge", None) is not None
+
+        ambient_id = get_server_minted_execution_id()
+        covered = (approval_id is not None) or scope_already_gated
+
+        if edge_mode or ambient_id is None or not covered:
             runtime.check_workflow_budget()
 
         # Every MCP tool call routed through the runtime contacts

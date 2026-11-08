@@ -130,6 +130,13 @@ DEFAULT_MESSAGES: dict[str, str] = {
     # call — replay / retry-loop signal. NOT a transient failure; the
     # same approval_id will never succeed twice. Inspect retry logic.
     "NR-A015": "Your request couldn't be completed because the approval has already been used. Please start a new request.",
+    # NR-A017: approval tool mismatch (DEC-5 / DEC-7). The operator
+    # approved an action for one tool; the agent is executing a
+    # DIFFERENT tool under that approval. The approval binds a tool
+    # SET, so the existing grant can never authorise a tool outside it
+    # — the user's next move is a fresh approval for the tool they
+    # actually want to run, not a retry of the same one.
+    "NR-A017": "Your request couldn't be completed because the approval was for a different tool. Please request a new approval and try again.",
     # ---- Workflow lifecycle (server-side state) ------------------------------
     # NR-W004: workflow soft-deleted or killed on the server. Distinct
     # from NR-W002 (BaseException path that bypasses ``nullrun.guard``)
@@ -178,6 +185,14 @@ DEFAULT_MESSAGES: dict[str, str] = {
     # support" — the host code needs an SDK upgrade, which only the
     # operator / developer can perform.
     "NR-P001": "This service needs an update. Please contact support.",
+    # NR-P004: the SDK could not OBTAIN a decision — the gate call
+    # failed for a reason that is NOT a network failure, so the SDK
+    # stopped rather than assume the call was allowed (ADR-129 for
+    # the /gate seam, ADR-131 for the /execute seam). The fault is the
+    # SDK's own and may be transient, so the end-user copy is the
+    # "try again" cluster — the same shape as NR-B001, because the
+    # user's action is identical: retry.
+    "NR-P004": "I'm unable to check this request right now. Please try again in a moment.",
     # ---- Chain (multi-leg conversation state) -------------------------------
     # NR-CH001: chain context invalid — chain_id is unknown, belongs to
     # a different org, or exceeded max_duration. End-user outcome is

@@ -11,7 +11,6 @@ import json
 import logging
 import os
 import random
-import tempfile
 import threading
 import time
 import uuid
@@ -42,10 +41,17 @@ from nullrun.breaker.exceptions import (
     NullRunMcpDestructiveBlockedError,
     NullRunMcpReadonlyBypassBlockedError,
     NullRunTransportError,
+    NullRunUnknownActionError,
     RateLimitError,
     TransportErrorSource,
 )
 from nullrun.observability import metrics
+from nullrun.observability.redaction import api_key_fingerprint
+from nullrun.wal_paths import (
+    WAL_PATH_ENV_VAR,
+    default_wal_path,
+    legacy_wal_path,
+)
 
 if TYPE_CHECKING:
     # Forward-referenced to avoid transport.py ⇄ transport_websocket.py cycle.
@@ -670,6 +676,21 @@ def _wait_on(cancel: threading.Event, seconds: float) -> bool:
     return not cancel.wait(seconds)
 
 
+def _sleep(seconds: float) -> None:
+    """The clock seam for the non-cancel sleep path.
+
+    A module-level function, like ``_wait_on``, for one reason:
+    ``time.sleep`` is ONE attribute on ONE module object, so a test that
+    patches it — anywhere — captures the sleep of EVERY thread in the
+    process. The webhook-delivery singleton idles on ``time.sleep(0.5)``,
+    and that value lands in a retry-delay list that is supposed to hold
+    the transport's own waits, turning a floor assertion into a
+    load-sensitive flake. This seam lets a test observe or stub the
+    transport's wait and only the transport's wait.
+    """
+    time.sleep(seconds)
+
+
 def _interruptible_sleep(seconds: float, cancel: threading.Event | None) -> bool:
     """Sleep, but wake early when the SDK is shutting down.
 
@@ -686,7 +707,7 @@ def _interruptible_sleep(seconds: float, cancel: threading.Event | None) -> bool
     misbehaving, which is when someone is most likely to be killing it.
     """
     if cancel is None:
-        time.sleep(seconds)
+        _sleep(seconds)
         return True
     return _wait_on(cancel, seconds)
 
@@ -935,6 +956,11 @@ class DecisionSource:
     """
 
     GATEWAY = "gateway"
+    # NO PRODUCER. Nothing in ``src/`` ever returns this value: the
+    # SDK has no in-process decision cache (ADR-180 / NR-116). The
+    # member is kept so that code importing it keeps working, but it
+    # reads as a live decision cache and it is not one. A pin test
+    # asserts that no producer appears.
     CACHED = "cached"
     FALLBACK = "fallback"
     LOCAL = "local"
@@ -1006,9 +1032,10 @@ class ExecuteConfig:
     timeout: float = 5.0
     # Max retries for execute calls
     max_retries: int = 10
-    # Cache TTL for CACHED mode (seconds)
+    # UNUSED. There is no decision cache in the SDK (NR-116): no
+    # producer reads these two fields. They are kept for import
+    # compatibility and a pin test asserts that nothing reads them.
     cache_ttl: float = 60.0
-    # Cache max size
     cache_max_size: int = 10000
 
 
@@ -1032,6 +1059,7 @@ class Transport:
         secret_key: str | None = None,
         config: FlushConfig | None = None,
         redis_client: Any = None,
+        organization_id: str | None = None,
     ):
         self.api_url = api_url.rstrip("/")
 
@@ -1060,6 +1088,27 @@ class Transport:
 
         self.api_key = api_key
         self.secret_key = secret_key  # HMAC signing key
+        # Metadata only. The WAL path is scoped by the API KEY, not by
+        # this value — see `_resolve_wal_path` and `nullrun.wal_paths`.
+        self.organization_id = organization_id
+        # SDK-4 (security audit 2026-11-06). The WAL path is resolved
+        # ONCE, here, and NEVER changes for the life of this transport.
+        #
+        # It used to be re-derived on every call, and the default was a
+        # FIXED path in the shared temp directory: every user and every
+        # org on the host resolved to `<tempdir>/nullrun.wal`. Two
+        # runtimes then wrote to the same file and the atomic
+        # whole-file replace in `_persist_to_wal` destroyed the other
+        # runtime's undelivered events — money that had already been
+        # spent was never booked.
+        #
+        # Resolving it once is what makes the scope safe. A path that
+        # changed when the org id arrived (it arrives AFTER
+        # authentication, which happens after construction) would
+        # orphan every file written before that moment, and no test
+        # would catch it: the path is "correct" at every instant and
+        # the spend is lost anyway.
+        self._wal_base_path = self._resolve_wal_path()
         self.config = config or FlushConfig()
         # Allow env-var override of batch size and flush interval.
         if "NULLRUN_BATCH_SIZE" in os.environ:
@@ -1182,8 +1231,13 @@ class Transport:
         )
         self._stopped = False  # Track if stop was called
         # 0.7.0 thin client: no local policy cache. Backend is authoritative.
-        _masked = api_key[:8] + "***" if api_key and len(api_key) >= 8 else "***"
-        logger.debug(f"Transport initialized: api_url={self.api_url}, api_key={_masked}")
+        # SDK-5: a fingerprint, not a prefix. The transport and the
+        # status string used to print different numbers of key
+        # characters; they now print the same fingerprint.
+        _fingerprint = api_key_fingerprint(api_key) or "unknown"
+        logger.debug(
+            f"Transport initialized: api_url={self.api_url}, api_key_fp={_fingerprint}"
+        )
 
         # OpenTelemetry tracer (lazy-loaded: only if opentelemetry is installed)
         self._tracer = None
@@ -1232,12 +1286,57 @@ class Transport:
         except ValueError:
             return self._WAL_MAX_BYTES_DEFAULT
 
-    def _wal_path(self) -> str:
-        """Resolve WAL path. Honours ``NULLRUN_WAL_PATH``; defaults to platform tempdir."""
-        env_path = os.environ.get("NULLRUN_WAL_PATH")
+    def _resolve_wal_path(self) -> str:
+        """Resolve the WAL base path. Called ONCE, from the constructor.
+
+        ``NULLRUN_WAL_PATH`` wins outright — it is the operator's
+        explicit choice. Otherwise the default is scoped per user AND
+        per api key, so two runtimes on one host do not share a file
+        (SDK-4, security audit 2026-11-06).
+        """
+        env_path = os.environ.get(WAL_PATH_ENV_VAR)
         if env_path:
             return env_path
-        return os.path.join(tempfile.gettempdir(), "nullrun.wal")
+        return default_wal_path(api_key=self.api_key, org_id=self.organization_id)
+
+    def _wal_path(self) -> str:
+        """The WAL base path of this transport. Fixed for its lifetime.
+
+        Resolved once in the constructor on purpose: a path that changed
+        mid-life would orphan the files written under the previous one.
+        """
+        return self._wal_base_path
+
+    def _warn_about_legacy_wal(self) -> None:
+        """Report the unscoped WAL an older SDK left in the temp dir.
+
+        The file is NOT read, NOT migrated and NOT deleted. It was
+        shared by every user and every org on the host, so its rows may
+        belong to another tenant — replaying them into this org's WAL
+        would book a stranger's spend against this account. Reporting
+        the path is the only safe thing to do with it; an operator with
+        the right credentials decides what it holds.
+        """
+        if os.environ.get(WAL_PATH_ENV_VAR):
+            # The operator pinned the path. The legacy file is not ours.
+            return
+        legacy = legacy_wal_path()
+        try:
+            size = os.path.getsize(legacy)
+        except OSError:
+            return
+        if size == 0:
+            return
+        logger.warning(
+            "Legacy unscoped WAL found at %s (%d bytes). It is NOT read, NOT "
+            "migrated and NOT deleted: it was shared by every user and org on "
+            "this host, so its events may belong to another tenant. Inspect it "
+            "with `nullrun-wal --wal %s status` and replay it under the org "
+            "that owns it.",
+            legacy,
+            size,
+            legacy,
+        )
 
     def _rotate_wal_if_needed(self) -> None:
         """Rotate ``<path>`` to ``<path>.1`` if it exceeds the size cap."""
@@ -1282,6 +1381,23 @@ class Transport:
     def _wal_lock_path(self) -> str:
         """Path of the advisory lock guarding mutations of the WAL files."""
         return f"{self._wal_path()}.lock"
+
+    def _wal_v3_path(self) -> str:
+        """Path of the v3 single-shot consume WAL.
+
+        SDK-1 (security audit 2026-11-06). A SEPARATE file from the
+        base WAL because the two are replayed through DIFFERENT
+        endpoints.
+
+        The base WAL holds legacy events, and they are replayed through
+        ``/api/v1/track/batch``. A v3 consume payload must go to
+        ``/api/v1/track``: the batch path does not run the CONSUME
+        script, so a reservation replayed through it is never settled
+        and the money is never booked. Replaying a v3 payload through
+        the batch path is the same loss as dropping it, with more
+        machinery.
+        """
+        return f"{self._wal_path()}.v3"
 
     @property
     def _dlq_max_bytes(self) -> int:
@@ -1824,6 +1940,186 @@ class Transport:
             + (" (unflushed remainder re-persisted)" if repersisted else "")
         )
 
+    # ------------------------------------------------------------------
+    # SDK-1 (security audit 2026-11-06): the v3 consume WAL.
+    #
+    # The money path. A v3 `/track` carries a CONSUME: it settles the
+    # reservation the matching `/gate` made. If that call is refused or
+    # never reaches the backend, the tool call has ALREADY run and the
+    # money has ALREADY been spent — but nothing booked it. That gap is
+    # what this file closes.
+    #
+    # The invariant: after the call, the event is either BOOKED or
+    # RECOVERABLE. Never dropped.
+    # ------------------------------------------------------------------
+
+    def persist_v3_track(self, payload: dict[str, Any]) -> bool:
+        """Durably record a v3 /track payload that could not be delivered.
+
+        The payload is written VERBATIM — ``reservation_id`` and
+        ``idempotency_key`` included — because the replay sends it back
+        exactly as it was built.
+
+        The ``idempotency_key`` is not decoration. The backend DELETEs
+        the reservation key after the first successful consume, so a
+        replay that arrives WITHOUT the key is answered with 503
+        ``RESERVATION_NOT_FOUND`` and the row could never leave the
+        file. With the key the backend replays its stored answer (200,
+        ``idempotent_replay: true``) and the row clears.
+
+        APPENDED, never rewritten: the file holds every undelivered
+        payload, and a rewrite would drop the ones an earlier failure
+        left behind.
+
+        Returns True when the payload is durably on disk.
+        """
+        row = _v3_wal_row(payload)
+        path = self._wal_v3_path()
+        if not self._write_events_atomic(path, [row], mode="a"):
+            logger.error(
+                "Could not persist the v3 consume payload for reservation_id=%s "
+                "to %s. The spend is NOT recoverable — it is lost.",
+                payload.get("reservation_id"),
+                path,
+            )
+            return False
+        logger.warning(
+            "v3 consume for reservation_id=%s was not delivered; the payload is "
+            "recoverable in %s and will be replayed to /api/v1/track.",
+            payload.get("reservation_id"),
+            path,
+        )
+        return True
+
+    def _read_wal_rows(self, path: str) -> list[dict[str, Any]]:
+        """Read the JSON lines of a WAL file under the cross-process lock.
+
+        A line that does not parse is skipped: it was never durable (a
+        torn tail) and there is nothing to recover from it.
+        """
+        with self._wal_file_lock() as acquired:
+            if not acquired:
+                logger.warning(
+                    "WAL read skipped: another process holds the WAL lock."
+                )
+                return []
+            try:
+                with open(path) as f:
+                    lines = f.readlines()
+            except FileNotFoundError:
+                return []
+            except OSError as e:
+                logger.warning(f"Failed to read WAL {path}: {e}")
+                return []
+        rows: list[dict[str, Any]] = []
+        for line in lines:
+            try:
+                row = json.loads(line.strip())
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
+        return rows
+
+    def _replay_v3_from_wal(self) -> None:
+        """Replay the v3 consumes that could not be delivered.
+
+        Each payload is re-sent to ``/api/v1/track`` (single) — NOT to
+        the batch endpoint. The batch path does not run the CONSUME
+        script, so a reservation replayed through it is never settled
+        and the money is never booked.
+
+        A row is removed ONLY when the backend accepted it. A payload
+        that is refused again stays in the file: an undelivered spend
+        that nobody retries is a lost spend. The loop stops at the
+        first refusal so the spends keep their order.
+        """
+        path = self._wal_v3_path()
+        rows = self._read_wal_rows(path)
+        if not rows:
+            return
+        delivered: set[str] = set()
+        for row in rows:
+            payload = row.get("payload")
+            if not isinstance(payload, dict):
+                # Not a row this SDK wrote. Leave it alone — it is
+                # evidence, and the SDK cannot know what it means.
+                logger.warning(
+                    "WAL replay: %s holds a row this SDK cannot read; leaving it "
+                    "in place.",
+                    path,
+                )
+                continue
+            try:
+                self.track_single(payload)
+            except (NullRunBackendError, NullRunDecision) as exc:
+                # The backend ANSWERED and refused this row. The refusal
+                # is about this consume, not about the backend, so the
+                # next row still gets its chance — one stuck row must
+                # not block every spend behind it.
+                #
+                # A `NullRunDecision` (a budget verdict, e.g.
+                # CONSUME_OVERBUDGET) is a refusal too, and it used to
+                # fall through to the arm below, which STOPS the replay
+                # — so one overbudget row blocked every spend behind it
+                # from being booked. The rows are independent
+                # reservations; one stuck row must not block the rest.
+                logger.error(
+                    "WAL replay: /track still refuses the consume for "
+                    "reservation_id=%s (%s). The payload stays in %s and is "
+                    "retried on the next start.",
+                    payload.get("reservation_id"),
+                    exc,
+                    path,
+                )
+                continue
+            except Exception as exc:  # noqa: BLE001 — every failure is a keep
+                # The backend did not answer (unreachable, timeout). Every
+                # remaining row would fail the same way, so the replay
+                # stops here and the file keeps every payload.
+                logger.error(
+                    "WAL replay: /track is unreachable (%s). The payloads stay "
+                    "in %s and are retried on the next start.",
+                    exc,
+                    path,
+                )
+                break
+            delivered.add(_v3_row_key(row))
+            metrics.inc_transport("v3_track_replayed")
+        if delivered:
+            self._remove_v3_rows(delivered, path)
+        logger.info(
+            "Replayed %d of %d v3 consume payload(s) from WAL",
+            len(delivered),
+            len(rows),
+        )
+
+    def _remove_v3_rows(self, delivered: set[str], path: str) -> None:
+        """Drop the rows the backend accepted. Everything else stays.
+
+        The file is re-read before the rewrite so a row another process
+        appended in the meantime survives.
+        """
+        rows = self._read_wal_rows(path)
+        kept = [row for row in rows if _v3_row_key(row) not in delivered]
+        if len(kept) == len(rows):
+            return
+        if not kept:
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                return
+            except OSError as e:
+                logger.warning(f"Failed to remove emptied v3 WAL {path}: {e}")
+            return
+        if not self._write_events_atomic(path, kept, mode="w"):
+            logger.warning(
+                "WAL replay: could not rewrite %s. The accepted payloads stay "
+                "in the file; the next replay re-sends them and the backend "
+                "answers them from its idempotency record.",
+                path,
+            )
+
     def track(self, event: dict[str, Any]) -> None:
         """
         Add event to buffer. Non-blocking.
@@ -1849,8 +2145,14 @@ class Transport:
         """Start background flush thread."""
         if self._running:
             return
+        # SDK-4: report the unscoped WAL an older SDK left behind. It is
+        # not read and not migrated — see `_warn_about_legacy_wal`.
+        self._warn_about_legacy_wal()
         # Replay any events from WAL that were persisted due to previous crash
         self._replay_from_wal()
+        # SDK-1: replay the v3 consumes that could not be delivered. They
+        # go to /api/v1/track (single), not to the batch endpoint.
+        self._replay_v3_from_wal()
         # Held refusals are recovered separately and are NOT replayed onto the
         # send path. `_replay_from_wal` recovers undelivered events, which is
         # the right thing for them; these were already refused, so re-sending
@@ -3161,6 +3463,22 @@ class Transport:
                     reason = action.get("reason", "")
                     if action_type:
                         handle_action(action_type, workflow_id, reason)
+                except NullRunUnknownActionError as item_err:
+                    # The control plane sent an action type this SDK
+                    # cannot execute (SDK-12). That is a control-plane
+                    # INTEGRITY event, not a malformed payload: it is
+                    # logged at ERROR so it is not filed under "skipped
+                    # malformed action", and the loop continues so one
+                    # unknown action cannot abort the rest of the batch.
+                    logger.error(
+                        "Control plane sent an action type this SDK cannot "
+                        "execute: %r (workflow=%s). The action was NOT "
+                        "executed — this is a server/SDK version mismatch. "
+                        "(%s)",
+                        action.get("type"),
+                        action.get("workflow_id"),
+                        item_err,
+                    )
                 except Exception as item_err:
                     logger.warning("Skipping malformed action %r: %s", action, item_err)
             for msg in (data or {}).get("messages", []) or []:
@@ -3278,14 +3596,31 @@ class Transport:
         # (defeating the mode) or ask the box a question it has no
         # endpoint for. Re-asking would also double-charge: the charge
         # and the decision are one event, done once.
+        #
+        # So the answer comes from the box's own call — the pre-flight
+        # (`Transport.check` → `edge.enforce`) recorded it under the
+        # event id, and it is read back here. What this branch must
+        # NOT do is DECIDE. It used to return a client-side
+        # `{"decision": "allow"}` without the box ever being asked
+        # (SDK-2): the whole edge decision surface was client-side
+        # only, so an expired, revoked or exhausted lease still
+        # allowed the call, and the caller could not tell the box's
+        # answer from the SDK's own.
+        #
+        # With no recorded answer the box was never asked about THIS
+        # call, and the answer is a refusal. The cloud has the same
+        # rule and the same reason: a direct `/execute` with no prior
+        # `/gate` is answered 404 EXECUTION_NOT_FOUND, because the
+        # backend's `execution:{id}` binding does not exist.
         if self.edge is not None:
-            from nullrun.edge import EDGE_LEASE
-            return {
-                "decision": "allow",
-                "decision_source": self.edge.last_source or EDGE_LEASE,
-                "execution_id": execution_id,
-                "via_edge": True,
-            }
+            from nullrun.context import get_operation_id
+
+            answer = self.edge.take_answer(get_operation_id())
+            if answer is None:
+                return self.edge.not_enforced(execution_id)
+            answer["via_edge"] = True
+            answer.setdefault("execution_id", execution_id)
+            return answer
 
         gate_request = {
             "organization_id": organization_id,
@@ -4984,6 +5319,30 @@ def _safe_json(response: httpx.Response, endpoint: str) -> Any:
         ) from exc
 
 
+def _v3_wal_row(payload: dict[str, Any]) -> dict[str, Any]:
+    """Wrap a v3 consume payload into a WAL row.
+
+    The wrapper marks the row's KIND. The base WAL and the v3 WAL are
+    separate files with separate replay routes, so the kind is
+    belt-and-braces — but it costs nothing and it means a row can
+    never be mistaken for a legacy event.
+    """
+    return {"_nullrun_wal": "v3_track", "_v": 1, "payload": payload}
+
+
+def _v3_row_key(row: dict[str, Any]) -> str:
+    """The identity of a v3 WAL row: the reservation it settles.
+
+    Two rows for the same reservation are the same consume. The
+    idempotency key is part of the identity because two attempts at the
+    same consume can carry different keys.
+    """
+    payload = row.get("payload")
+    if not isinstance(payload, dict):
+        return ""
+    return f"{payload.get('reservation_id')}|{payload.get('idempotency_key')}"
+
+
 def _parse_v3_error_envelope(
     response: httpx.Response,
     endpoint: str,
@@ -5002,6 +5361,26 @@ def _parse_v3_error_envelope(
         body = response.json()
     except Exception:
         body = None
+    # The backend's OWN error code, as the wire spelled it.
+    #
+    # `_extract_error_envelope` is the single normaliser for the three
+    # envelope shapes the backend emits, and the uncategorised parser
+    # dispatched on its result — so this is the same string the class
+    # was chosen from. It is exposed on the exception because the
+    # decision "is this refusal fail-closed?" is made BY CODE, not by
+    # exception class: the class hierarchy puts a backend refusal
+    # (`NullRunBackendError`) under `NullRunInfrastructureError`, which
+    # is a SIBLING of `NullRunDecision`, so no `isinstance` check can
+    # tell them apart.
+    backend_code, _message, _details = _extract_error_envelope(
+        body if isinstance(body, dict) else {}, response.text
+    )
+    exc.backend_error_code = backend_code or None  # type: ignore[attr-defined]
+    # The HTTP status of the ANSWER. This attribute is the marker that
+    # separates "the backend refused" from "the backend never answered":
+    # the network path raises `NullRunTransportError` without it.
+    # ADR-008's fail-OPEN covers the second case only.
+    exc.wire_status_code = response.status_code  # type: ignore[attr-defined]
     if isinstance(body, dict):
         # ADR-062 §2.2. A refusal whose category is ABSENT is left
         # absent, not defaulted: the runtime's strict rule reads the
@@ -5011,10 +5390,17 @@ def _parse_v3_error_envelope(
         category = body.get("category")
         if category is not None:
             exc.wire_category = category  # type: ignore[attr-defined]
+        # The TOP LEVEL first. The `/track` envelope carries the code
+        # there and NOT inside `details`
+        # (``handlers.rs::track_handler``), so the old details-first
+        # order reported `None` for every /track refusal — the one
+        # place the SDK most needs to read the code. The gate's own
+        # envelope carries it in BOTH places, so the order does not
+        # change what that path reports.
+        details_block = body.get("details")
+        details_block = details_block if isinstance(details_block, dict) else {}
         exc.wire_error_code = (  # type: ignore[attr-defined]
-            (body.get("details") or {}).get("error_code")
-            if isinstance(body.get("details"), dict)
-            else body.get("error_code")
+            body.get("error_code") or details_block.get("error_code")
         )
         # Server-authored text, carried the same way ``check()``
         # carries it on the dict it returns. ADR-063 §1.3(e):
@@ -5049,12 +5435,11 @@ def _parse_v3_error_envelope_uncategorised(
     Mapping table lives at ``_V3_ERROR_CODE_MAP`` below — keep the
     helper as a thin dispatcher.
 
-    DEF-NR-TOOLBLOCKED-PARSER: the ``catalog is
-    NullRunToolBlockedError or catalog is NullRunBlockedException``
-    arm further down is the dedicated branch for the typed v3
-    envelope. It used to be documented by a comment inside
-    ``Transport.check``, which never had such a branch — the tag was
-    filed against the wrong function for as long as it existed.
+    DEF-NR-TOOLBLOCKED-PARSER: the subclass test on
+    NullRunBlockedException further down is the dedicated branch for
+    the typed v3 envelope. It used to be documented by a comment
+    inside ``Transport.check``, which never had such a branch — the tag
+    was filed against the wrong function for as long as it existed.
     Re-filed here, on the function that actually holds the code.
     """
     # Lazy imports: the exception classes import the transport
@@ -5071,7 +5456,6 @@ def _parse_v3_error_envelope_uncategorised(
         NullRunConsumeOverbudgetError,
         NullRunProtocolError,
         NullRunRateLimitRedisError,
-        NullRunToolBlockedError,
         NullRunWorkflowInactiveError,
         RateLimitError,
     )
@@ -5138,6 +5522,7 @@ def _parse_v3_error_envelope_uncategorised(
         backend_code == "CHAIN_MAX_DURATION_EXCEEDED"
         or backend_code == "CHAIN_CROSS_ORG"
         or backend_code == "CHAIN_ORG_MISMATCH"
+        or backend_code == "CHAIN_KEY_MISMATCH"
     ):
         return NullRunChainError(
             full_message,
@@ -5173,6 +5558,7 @@ def _parse_v3_error_envelope_uncategorised(
         "APPROVAL_EXPIRED",
         "APPROVAL_DIGEST_MISMATCH",
         "APPROVAL_TOOL_DIGEST_MISMATCH",
+        "APPROVAL_TOOL_MISMATCH",
         "APPROVAL_REPLAY_REJECTED",
     ):
         # dispatch so callers can branch on the precise grant-consume
@@ -5190,11 +5576,16 @@ def _parse_v3_error_envelope_uncategorised(
         # NullRunApprovalNotYetApprovedError:`` for wait/poll,
         # ``except NullRunApprovalReplayRejectedError:`` for
         # retry-loop detection, etc.
+        #
+        # DEC-5 / DEC-7 added the seventh: ``APPROVAL_TOOL_MISMATCH``
+        # (NR-A017, HTTP 409 — a conflict, not a permission denial).
+        # The ``status_code`` passed through is the one the backend
+        # actually sent, so the 409 reaches the caller verbatim.
         catalog = _V3_ERROR_CODE_MAP[backend_code]
         return catalog(  # type: ignore[call-arg]
             workflow_id=str(details.get("workflow_id") or "unknown"),
             reason=full_message,
-            status_code=status,  # 403 per backend mapping
+            status_code=status,  # 403 per backend mapping (409 for APPROVAL_TOOL_MISMATCH)
             approval_id=details.get("approval_id"),
         )
 
@@ -5263,6 +5654,44 @@ def _parse_v3_error_envelope_uncategorised(
             return catalog(full_message)
         if catalog is NullRunProtocolError:
             return catalog(full_message)
+        if catalog is RateLimitError:
+            # RateLimitError has NO message-only form: it requires
+            # ``source`` + ``endpoint``. The generic
+            # ``catalog(full_message, **forwarded)`` fallback below
+            # would raise TypeError, and the TypeError escapes the
+            # parser into the catch-all in Transport.execute — the
+            # refusal would be swallowed into a synthetic
+            # ``{"decision": "block"}`` dict and the caller would see
+            # a block where the backend said "you are rate limited".
+            #
+            # The 429 codes that reach this arm are RATE_LIMIT_PLAN_TIER
+            # (the PLAN's aggregate per-org cap — ADR-029 §13) and
+            # WAITLIST_RATE_LIMITED. ``upgrade_url`` is the plan-change
+            # link the backend sends for the plan tier; the caller
+            # surfaces it instead of guessing the pricing page.
+            retry_after = retry_after_ms / 1000.0 if retry_after_ms else None
+            return RateLimitError(
+                full_message,
+                source=TransportErrorSource.GATEWAY_ERROR,
+                endpoint=endpoint,
+                retry_after=retry_after,
+                upgrade_url=body.get("upgrade_url") if isinstance(body, dict) else None,
+                body=body,
+            )
+        if catalog is NullRunChainError:
+            # The chain family carries its own attributes (chain_id,
+            # backend_code). The generic fallback drops them: the base
+            # constructor only accepts error_code / user_action /
+            # retryable / docs_url / cause, and everything else in the
+            # wire ``details`` is filtered out before the call.
+            # ``backend_code`` keeps the wire string, which is what
+            # tells CHAIN_NOT_FOUND (404) from CHAIN_ENDED (409).
+            return NullRunChainError(
+                full_message,
+                chain_id=details.get("chain_id"),
+                backend_code=backend_code,
+                status_code=status,
+            )
         # NullRunAuthError — surface the wire error_code (one of
         # v3.38's API_KEY_REVOKED / API_KEY_EXPIRED / API_KEY_DISABLED
         # / API_KEY_INVALID / API_KEY_MISSING / API_KEY_MALFORMED) on
@@ -5304,27 +5733,38 @@ def _parse_v3_error_envelope_uncategorised(
         # as BaseException (the helper declares -> Exception).
         allowed = {"error_code", "user_action", "retryable", "docs_url", "cause"}
         forwarded = {k: v for k, v in details.items() if k in allowed}
-        if (
-            catalog is NullRunToolBlockedError
-            or catalog is NullRunBlockedException
-        ):
-            # subclasses require positional ``workflow_id`` + ``reason``
-            # (no defaults), so the generic ``catalog(full_message, ...)``
-            # fallback below raises TypeError when given a string for
-            # ``workflow_id``. Affects 7 catalog entries: TOOL_BLOCKED,
-            # LOOP_DETECTED, MODEL_REQUIRED, POLICY_UNCONFIGURED,
-            # TOO_MANY_PENDING_APPROVALS, BUSINESS_IMPACT_INVALID,
-            # VALIDATION_FAILED. Pre-fix the TypeError escaped the parser
-            # and got swallowed by the catch-all ``except Exception: pass``
-            # in Transport.execute, surfacing the synthetic-block dict
+        if issubclass(catalog, NullRunBlockedException):
+            # Every NullRunBlockedException subclass requires
+            # ``workflow_id`` + ``reason`` (no defaults), so the generic
+            # ``catalog(full_message, ...)`` fallback below raises
+            # TypeError when given a string for ``workflow_id``.
+            #
+            # The test is ``issubclass``, not identity, and that is the
+            # whole point of this arm. An identity test
+            # (``catalog is NullRunBlockedException``) matched only the
+            # two exact classes — NullRunToolBlockedError and the base —
+            # so EVERY typed subclass of the blocked family fell through
+            # to the generic fallback and raised TypeError:
+            # NullRunApprovalDbUnavailableError (8 catalog entries),
+            # NullRunApprovalReplayRejectedError (via
+            # APPROVAL_ALREADY_DECIDED), and the three NullRunMcp*Error
+            # classes. The TypeError escaped the parser and got swallowed
+            # by the catch-all ``except Exception: pass`` in
+            # Transport.execute, surfacing the synthetic-block dict
             # ``{"decision": "block", "explanation": "Gateway returned
-            # 403"}`` instead of the typed NR-T001 / NR-Lxxx catalog line.
-            # ``tool_name`` is forwarded for NullRunToolBlockedError
-            # (the only BlockedException subclass that surfaces it on the
-            # wire envelope); the parent constructor drops it for plain
-            # NullRunBlockedException so it's a no-op there. ``forwarded``
-            # (error_code / user_action / retryable / docs_url / cause) is
-            # passed through so the catalog value's defaults win.
+            # 403"}`` instead of the typed NR-Axxx / NR-MCPxx catalog
+            # line. The caller could not branch on the refusal at all.
+            #
+            # ``tool_name`` is forwarded for the subclasses that surface
+            # it on the wire envelope; the parent constructor drops it
+            # for plain NullRunBlockedException so it's a no-op there.
+            # ``forwarded`` (error_code / user_action / retryable /
+            # docs_url / cause) is passed through so the catalog value's
+            # defaults win.
+            #
+            # Order matters: NullRunBudgetError is a subclass of
+            # NullRunBlockedException and has its OWN arm above, so the
+            # budget family keeps its dedicated constructor.
             instance = catalog(  # type: ignore[call-arg]
                 workflow_id=str(details.get("workflow_id") or "unknown"),
                 reason=full_message,
@@ -5384,6 +5824,7 @@ def _build_v3_error_code_map() -> dict[str, type[Exception]]:
         NullRunApprovalNotYetApprovedError,
         NullRunApprovalReplayRejectedError,
         NullRunApprovalToolDigestMismatchError,
+        NullRunApprovalToolMismatchError,
         NullRunAuthError,
         NullRunBackendError,
         NullRunBlockedException,
@@ -5436,6 +5877,13 @@ def _build_v3_error_code_map() -> dict[str, type[Exception]]:
         # 403 — chain security + workflow state
         "CHAIN_CROSS_ORG": NullRunChainError,
         "CHAIN_ORG_MISMATCH": NullRunChainError,
+        # ADR-180 (2026-11-07): a chain belongs to the API key that
+        # created it. The backend emits this code when another key of
+        # the same organization presents a chain it does not own. It
+        # is a chain refusal, so it carries the chain class — without
+        # this entry the dispatcher falls through to the base class and
+        # a caller branching on NullRunChainError cannot catch it.
+        "CHAIN_KEY_MISMATCH": NullRunChainError,
         "PARENT_EXECUTION_NOT_FOUND": NullRunChainError,
         "PARENT_EXECUTION_ORG_MISMATCH": NullRunChainError,
         "PARENT_EXECUTION_KEY_MISMATCH": NullRunChainError,
@@ -5489,6 +5937,12 @@ def _build_v3_error_code_map() -> dict[str, type[Exception]]:
         "APPROVAL_EXPIRED": NullRunApprovalExpiredError,
         "APPROVAL_DIGEST_MISMATCH": NullRunApprovalDigestMismatchError,
         "APPROVAL_TOOL_DIGEST_MISMATCH": NullRunApprovalToolDigestMismatchError,
+        # DEC-5 / DEC-7 (audit 2026-11-02): the approval binds a TOOL
+        # SET, and the executing tool must be a member. The operator
+        # approved an action for one tool and the agent is running a
+        # different one — a money approval used to bind only the
+        # AMOUNT, so an approval for tool A authorised tool B.
+        "APPROVAL_TOOL_MISMATCH": NullRunApprovalToolMismatchError,
         "APPROVAL_REPLAY_REJECTED": NullRunApprovalReplayRejectedError,
         # Distinct from BUDGET_HARD_BLOCKED: the operator explicitly
         # approved the grant at /gate, but the period-bound counter
@@ -5716,10 +6170,260 @@ def _build_v3_error_code_map() -> dict[str, type[Exception]]:
         # catch-all hiding drift: previously every one of the eleven
         # codes above landed here untyped.
         "INTERNAL_ERROR": NullRunBackendError,
+        # -----------------------------------------------------------------
+        # 2026-11-07 (SDK-15) — thirty-four codes the backend registers and
+        # this catalog never learned about.
+        #
+        # The parity guard in
+        # ``backend/tests/nr007_sdk_error_code_parity.rs`` could not see
+        # them: it was not wired into any workflow, so the drift grew from
+        # the twelve the audit named to thirty-four by the time the guard
+        # was finally run against a live backend enum. Every one of them
+        # fell through to the status-based fallback, so the refusal
+        # arrived as a generic ``NullRunBackendError`` (or, on a 4xx, as
+        # an authentication error) with no diagnostic class at all.
+        #
+        # The mapping is by WIRE BUCKET, and the bucket comes from the
+        # backend's own registry — ``GateErrorCode::http_status`` — so the
+        # SDK's class and the backend's status cannot disagree:
+        #
+        #   - 402/429 money       → NullRunBudgetError ("stop spending")
+        #   - 403 refusal         → the refusal's own class
+        #   - 429 rate limit      → RateLimitError (retry_after and
+        #                           upgrade_url ride along)
+        #   - 4xx client contract → NullRunProtocolError / the typed
+        #                           binding class
+        #   - 5xx "the store did
+        #     not answer"        → NullRunBackendError (retryable), or
+        #                           the subsystem's own typed infra class
+        # -----------------------------------------------------------------
+        # 402 — the anti-DoS reserve scan could not enumerate the org's
+        # reservations, so the reservation was refused. The wire puts it
+        # in the money bucket: the call did not get its money. It is NOT
+        # an outage, so it belongs to the budget family and not to the
+        # infra family.
+        "RESERVED_SCANNED_PARTIAL": NullRunBudgetError,
+        # 429 — the period budget was exhausted between reserve and
+        # consume. The caller must stop and wait for the period, exactly
+        # like every other exhausted-boundary code — a money outcome, so a
+        # budget error and not a rate limit.
+        "BUDGET_EXCEEDED": NullRunBudgetError,
+        # 429 — the PLAN's aggregate per-org cap refused the call
+        # (ADR-029 §13). Same 429 bucket as RATE_LIMIT_EXCEEDED and the
+        # same client behaviour (back off and retry), with a distinct wire
+        # string so the OPERATOR can tell the two caps apart. The
+        # caller's own remedy is a plan change, which is what the
+        # exception's ``upgrade_url`` is for.
+        "RATE_LIMIT_PLAN_TIER": RateLimitError,
+        # 429 — the address waitlist refused the call. Same 429 bucket.
+        "WAITLIST_RATE_LIMITED": RateLimitError,
+        # 503 — the rate limiter's store could not be reached, so the gate
+        # could not decide. Fail-CLOSED, and the rate-limit subsystem's
+        # own typed infra class — NOT the generic backend error, so a
+        # caller can tell "the limiter is down" from "the backend is
+        # down".
+        "RATE_LIMITER_UNAVAILABLE": NullRunRateLimitRedisError,
+        # 503 — the AUTH store could not be reached. The registry says
+        # 503, not 401: the store did not answer, so this is an outage
+        # and not a rejection. NullRunAuthError means "the key was
+        # REJECTED", which is a different fact with a different remedy,
+        # so the generic infra class is the honest one here.
+        "AUTH_BACKEND_UNAVAILABLE": NullRunBackendError,
+        # 503 — the org context could not be resolved (the key's org
+        # binding could not be read). Same shape as the code above: the
+        # store did not answer.
+        "ORG_CONTEXT_UNRESOLVED": NullRunBackendError,
+        # 403 — the key authenticates but lacks the scope this endpoint
+        # needs (ADR-143 / P2-08). The auth family, and the granular wire
+        # code is preserved on ``exc.wire_code``, so a caller can tell
+        # "wrong scope" from "bad key".
+        "INSUFFICIENT_SCOPE": NullRunAuthError,
+        # 404 — the chain_id names no live chain. The same "no binding
+        # exists" class as EXECUTION_NOT_FOUND: the client mints a new id
+        # and carries on.
+        "CHAIN_NOT_FOUND": NullRunChainError,
+        # 409 — the chain ENDED (duration cap, or an explicit end). A new
+        # chain_id is the remedy. Same class as the chain family: the
+        # lineage context is what is wrong.
+        "CHAIN_ENDED": NullRunChainError,
+        # 422 — the execution has no binding. Only the server can mint an
+        # execution_id, so the remedy is "re-issue /gate" — the same
+        # remedy NullRunExecutionNotFoundError already names. The class
+        # carries the status, so the 422 reaches the caller verbatim.
+        "EXECUTION_NOT_BOUND": NullRunExecutionNotFoundError,
+        # 500 — the binding VANISHED (the state is gone). A server-side
+        # fault: the class that says "the backend could not produce a
+        # determinate answer", and it is retryable.
+        "EXECUTION_BINDING_MISSING": NullRunBackendError,
+        # 503 — Redis could not be READ for the binding.
+        "EXECUTION_BINDING_READ_FAILED": NullRunBackendError,
+        # 503 — Redis could not be WRITTEN for the binding.
+        "EXECUTION_BINDING_WRITE_FAILED": NullRunBackendError,
+        # 503 — Redis errored while resolving the binding.
+        "EXECUTION_RESOLVE_REDIS_ERROR": NullRunBackendError,
+        # 409 — a prior request with this idempotency_key is still being
+        # processed. The remedy is "retry after the in-flight call
+        # settles" — a transient race, so the retryable infra class. The
+        # wire's ``retry_after_ms`` rides along in the details.
+        "IDEMPOTENCY_IN_FLIGHT": NullRunBackendError,
+        # 409 — the same key replayed with a different payload. A
+        # client-side contract violation, the same class as
+        # IDEMPOTENCY_KEY_MISMATCH: mint a fresh key.
+        "IDEMPOTENCY_CONFLICT": NullRunProtocolError,
+        # 503 — the ingestion queue is applying backpressure.
+        "INGESTION_BACKPRESSURE": NullRunBackendError,
+        # 503 — the ingestion queue is closed.
+        "INGESTION_CLOSED": NullRunBackendError,
+        # 413 — the batch is too large. The transport halves and resends
+        # on this status before the failure ever reaches the exception
+        # path; the entry exists so the catalog is complete.
+        "BATCH_TOO_LARGE": NullRunBackendError,
+        # 422 — a /track field carries control characters. A payload-shape
+        # defect on the client's side, the same family as
+        # WORKFLOW_ID_BODY_MISMATCH.
+        "CONTROL_CHARS_IN_FIELD": NullRunBackendError,
+        # 503 — the /track reservation envelope is gone. The /track path
+        # surfaces this per event as a deterministic refusal; the entry
+        # keeps the catalog complete.
+        "RESERVATION_NOT_FOUND": NullRunBackendError,
+        # 403 — the executed tool arguments DRIFTED from the
+        # operator-approved ToolCall.params. The same family as the
+        # business-impact digest mismatch: the operator approved a
+        # different action than the one now bound, and the remedy is a
+        # fresh approval.
+        "APPROVAL_TOOL_ARGUMENT_MISMATCH": NullRunApprovalDigestMismatchError,
+        # 403 — the server could not obtain the executed payload to
+        # compare against the approval, so the approval boundary could
+        # not be verified at all. The closest typed home is the
+        # approval-infra class: the refusal stays in the approval family
+        # instead of collapsing into the generic infra class.
+        "APPROVAL_TOOL_ARGUMENT_UNAVAILABLE": NullRunApprovalDbUnavailableError,
+        # 403 — the org's MCP registry says this tool does not run. The
+        # generic tool-block class: "this tool is blocked" is exactly what
+        # the caller has to act on.
+        "MCP_TOOL_BLOCKED": NullRunToolBlockedError,
+        # 403 — the registry's decision is "ask", so the tool needs an
+        # operator approval that is not there yet. Retryable: the operator
+        # can still decide.
+        "MCP_TOOL_APPROVAL_REQUIRED": NullRunMcpApprovalRequiredError,
+        # 403 — nobody has decided about this tool yet. The same remedy
+        # as the code above (wait for a decision), so the same class; the
+        # wire string is what tells the two apart for an operator.
+        "MCP_TOOL_DECISION_REQUIRED": NullRunMcpApprovalRequiredError,
+        # 403 — the tool's definition moved under the approval. The same
+        # family as APPROVAL_TOOL_DIGEST_MISMATCH: the operator approved a
+        # different capability surface.
+        "MCP_DEFINITION_DRIFTED": NullRunApprovalToolDigestMismatchError,
+        # 403 — the tool is gone from the registry. The tool does not run:
+        # the generic tool-block class.
+        "MCP_TOOL_REMOVED": NullRunToolBlockedError,
+        # 503 — the per-org MCP registry could not be read, so the gate
+        # could not determine whether the operator allows this tool.
+        # Fail-CLOSED and retryable: ask again.
+        "MCP_REGISTRY_UNAVAILABLE": NullRunBackendError,
+        # 503 — the call could not be RESERVED, so the budget was never
+        # enforced for it. Deliberately NOT a budget error: 402 means
+        # "your budget is exhausted", this says "this server could not
+        # check the budget", and the remedy (fix the config) and the SDK
+        # behaviour (retry, do not stop) are both different.
+        "RESERVE_DISABLED": NullRunBackendError,
+        # 503 — the budget projection (the estimate) could not be read.
+        # The same shape as RESERVE_DISABLED.
+        "BUDGET_PROJECTION_UNAVAILABLE": NullRunBackendError,
+        # 500 — the workflow's budget configuration is invalid. A
+        # server-side defect: the call cannot be priced.
+        "WORKFLOW_BUDGET_CONFIG_INVALID": NullRunBackendError,
+        # 503 — the ToolBlock backstop's policy cache could not be read,
+        # so the gate could not determine whether to block. Fail-CLOSED
+        # and retryable.
+        "TOOL_BLOCKED_BACKSTOP_UNAVAILABLE": NullRunBackendError,
     }
 
 
 _V3_ERROR_CODE_MAP: dict[str, type[Exception]] = _build_v3_error_code_map()
+
+
+# SDK-1 (security audit 2026-11-06). The refusal rule for the /track
+# path.
+#
+# WHERE THE VOCABULARY COMES FROM. The backend owns the error
+# vocabulary: every refusal it can emit is a variant of `GateErrorCode`
+# (`backend/src/proxy/http/gate/error_codes.rs`), and that registry
+# classifies each one as Denied / Budget / Halt / Infra. The SDK's own
+# catalog (`_V3_ERROR_CODE_MAP`) is the projection of that registry, and
+# the backend keeps the two in sync with a parity test that reads
+# `GateErrorCode::all()` — `backend/tests/nr007_sdk_error_code_parity.rs`
+# (green). So the codes in the catalog are not a hand-kept list in the
+# SDK: they are the classes the registry maps its `Infra` family onto.
+#
+# The catalog still decides the CLASS a refusal raises as — a
+# `NullRunBackendError` for RESERVATION_NOT_FOUND, a
+# `NullRunRateLimitRedisError` for a limiter Redis that did not answer,
+# a `NullRunAuthenticationError` for a request refused before it could
+# be judged, a `NullRunDecision` for a budget or approval verdict. The
+# catalog does NOT decide whether the SDK may report the consume as
+# booked. That question is answered by the wire, one function below.
+#
+# A refusal means the CONSUME DID NOT LAND. The spend is real and
+# unbooked, so the SDK must not report it as a successful track.
+#
+# NOT a refusal: `NullRunDecision` is a verdict — but it is one, and it
+# raises in its own branch. NOT a refusal: a request that never reached
+# the backend. That is a transport failure, and the ADR-008 fail-open
+# row for the network case applies.
+#
+# ---------------------------------------------------------------------------
+# SDK-1 (security audit 2026-11-06) — the class list above was WRONG.
+#
+# It named three classes and left nine backend codes OUTSIDE them, so
+# those nine were dropped exactly like a network error: the
+# `PROTOCOL_*` family, `IDEMPOTENCY_CONFLICT`, `IDEMPOTENCY_KEY_MISMATCH`
+# and the three `RATE_LIMIT_*` codes. The backend rate-limits `/track`,
+# so a 429 there is LIVE, and a 429 was a dropped spend.
+#
+# The list was also the wrong SHAPE. A refusal is not a class — it is
+# the fact that the backend ANSWERED. The taxonomy of the answer (a
+# budget verdict, a rate limit, a protocol error) does not change what
+# the SDK owes the caller: the consume did not land, so the spend is
+# unbooked, and reporting that as a successful track is a lost spend
+# with a success label on it.
+#
+# So the rule is now ONE question — "did the backend answer?" — asked of
+# the WIRE, not of the exception class. ADR-008's fail-OPEN covers
+# exactly one thing: the gate could not be REACHED. There is then no
+# answer to honour and a dead backend must not freeze the agent loop.
+# Every other case is a refusal.
+# ---------------------------------------------------------------------------
+
+
+def is_backend_refusal(exc: BaseException) -> bool:
+    """True when the backend ANSWERED the consume and refused it.
+
+    ADR-008's fail-OPEN covers exactly ONE thing: the gate could not be
+    REACHED. There is then no answer to honour, and a dead backend must
+    not freeze the agent loop. Every other case is a refusal, and a
+    refusal the SDK reports as a successful track is a lost spend with a
+    success label on it.
+
+    The marker is the WIRE, never the exception class. The class
+    hierarchy puts a backend refusal (`NullRunBackendError`) under
+    `NullRunInfrastructureError`, a SIBLING of `NullRunDecision`, so no
+    `isinstance` check can tell a 503 ``RESERVATION_NOT_FOUND`` from a
+    budget verdict. The wire status is stamped on the exception by
+    `_parse_v3_error_envelope`; the network path raises
+    `NullRunTransportError` without it.
+
+    A named error code counts as an answer even when no status was
+    stamped: the backend named a refusal, so there IS an answer.
+
+    The function answers ONE question. `NullRunDecision` is a refusal
+    too, so the caller must test that class FIRST.
+    """
+    status = getattr(exc, "wire_status_code", None)
+    if isinstance(status, int):
+        return True
+    code = getattr(exc, "backend_error_code", None) or getattr(exc, "wire_error_code", None)
+    return bool(code) and isinstance(code, str)
 
 
 def _parse_error_envelope(
@@ -5727,7 +6431,9 @@ def _parse_error_envelope(
     endpoint: str,
 ) -> Exception:
     """Translate a non-2xx ``httpx.Response`` into the right exception
-    subclass per the canonical ``contracts/errors.ts`` envelope.
+    subclass per the control-plane ``ApiErrorResponse`` envelope
+    (``backend/src/proxy/http/errors.rs`` — the ``ErrorSlug`` values
+    the backend actually emits).
 
     4xx/5xx/429 are mapped to distinct ``RateLimitError`` /
     ``NullRunAuthenticationError`` / ``NullRunTransportError(GATEWAY_ERROR)``

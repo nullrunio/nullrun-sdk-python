@@ -13,26 +13,36 @@ jobs:
     permissions:
       contents: read
     # 2026-07-08: parallel matrix kept (PyPI publish is a one-shot
-    # event and the runner is already paid for) but pip cache
+    # event and the runner is already paid for) but the uv cache
     # brought in for parity with ci.yml.
     strategy:
       matrix:
         python-version: ["3.10", "3.11", "3.12"]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python ${{ matrix.python-version }}
+        id: setup-python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ matrix.python-version }}
-          cache: "pip"
-          cache-dependency-path: pyproject.toml
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.11.28"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Point uv at the interpreter setup-python installed
+        run: echo "UV_PYTHON=${{ steps.setup-python.outputs.python-path }}" >> "$GITHUB_ENV"
 
       - name: Install dependencies
-        run: pip install -e ".[dev]" "pytest-xdist>=3.6"
+        run: uv sync --frozen --extra dev
 
       - name: Run tests
-        run: pytest tests/ -v -n auto
+        run: uv run --frozen --extra dev pytest tests/ -v -n auto
 
   publish:
     name: Build and publish
@@ -50,24 +60,46 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        id: setup-python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.11"
 
+      - name: Set up uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.11.28"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Point uv at the interpreter setup-python installed
+        run: echo "UV_PYTHON=${{ steps.setup-python.outputs.python-path }}" >> "$GITHUB_ENV"
+
+      # This is the job that holds the PyPI Trusted Publishing token
+      # (``id-token: write`` above), so the supply-chain check belongs
+      # HERE and not only in ci.yml. A tag push that carries a mutable
+      # action ref or a lockless install must not reach the upload step.
+      - name: Check the action pins and the lock-based installs
+        run: python scripts/check_supply_chain.py
+
+      - name: Check that uv.lock matches pyproject.toml
+        run: uv lock --check
+
       - name: Build
-        run: |
-          pip install --upgrade build
-          python -m build
+        # ``build`` and ``twine`` come from the ``publish`` dependency
+        # group in uv.lock. They used to be installed with
+        # ``pip install --upgrade build`` and ``pip install twine``,
+        # which resolved inside the trusted-publishing job.
+        run: uv run --frozen --only-group publish python -m build
 
       - name: Check dist
-        run: |
-          pip install twine
-          twine check dist/*
+        run: uv run --frozen --only-group publish twine check dist/*
 
       - name: Publish to PyPI (Trusted Publishing)
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # release/v1
 
       # GitHub Release creation — gated on tag pushes so the manual
       # workflow_dispatch path (used for hotfix re-runs) doesn't create
@@ -80,7 +112,7 @@ jobs:
       # for environments where pip isn't available.
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ github.ref_name }}
           generate_release_notes: true

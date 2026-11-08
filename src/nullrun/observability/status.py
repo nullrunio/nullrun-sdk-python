@@ -139,7 +139,11 @@ class NullRunStatus:
 
     # Auth
     api_key_valid: bool | None  # None = never tested
-    api_key_prefix: str | None  # first 10 chars, never the full key
+    # An 8-character SHA-256 fingerprint of the API key (SDK-5).
+    # The field name is the legacy one: the value used to be the
+    # first TEN CHARACTERS of the key. It now carries NO character of
+    # the key.
+    api_key_prefix: str | None
     organization_id: str | None
     workflow_id: str | None
     api_url: str
@@ -169,13 +173,13 @@ class NullRunStatus:
         console.
 
         Example outputs:
-            "NullRunStatus(ok, api_key=nr_live_S, org=…, wf=…)"
+            "NullRunStatus(ok, api_key_fp=3f2a1b9c, org=…, wf=…)"
             "NullRunStatus(degraded, wf_state=Killed, backend=unreachable)"
             "NullRunStatus(offline, ws=False, errors=2)"
         """
         bits = [f"NullRunStatus({self.state}"]
         if self.api_key_prefix:
-            bits.append(f"api_key={self.api_key_prefix}")
+            bits.append(f"api_key_fp={self.api_key_prefix}")
         if self.organization_id:
             bits.append(f"org={self.organization_id[:8]}")
         if self.workflow_id:

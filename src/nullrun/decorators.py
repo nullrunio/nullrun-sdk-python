@@ -63,6 +63,8 @@ from nullrun.context import (
     set_span_id,
     set_trace_id,
 )
+from nullrun.observability import metrics
+from nullrun.observability.redaction import scrub_secret_values
 from nullrun.runtime import NullRunRuntime, get_runtime
 from nullrun.transport import is_fallback_decision_source
 
@@ -149,6 +151,12 @@ def _safe_repr(value: object, max_len: int = 50) -> str:
     # ``details=`` substring is replaced before we potentially
     # truncate it away.
     r = _strip_details_balanced(r)
+    # Redact credential-shaped VALUES. Key-name redaction only knows
+    # the argument names someone listed; a secret that arrives under
+    # a benign name (``{"note": "<key>"}``) survives it. This pass
+    # runs BEFORE the truncation below, so a credential that straddles
+    # the cut is caught whole.
+    r = scrub_secret_values(r)
     # Truncate to ``max_len`` so a giant repr doesn't bloat span
     # events. We append ``...<truncated>`` so consumers can see the
     # cut happened.
@@ -890,15 +898,16 @@ def protect(fn: F | None = None) -> F | Callable[[F], F]:
 def _raise_deferred_enforcement(tool_name: str) -> None:
     """Raise a gate decision a framework callback could not enforce.
 
-    LangChain discards exceptions raised from a callback handler — it
-    logs ``Error in <handler> callback`` and continues. So when
-    ``NullRunCallback.on_llm_start`` calls ``check_workflow_budget``
-    and gets a real block (budget exhausted, workflow KILL/PAUSE), it
-    cannot abort the LLM call from inside the callback.
+    A langchain-core handler's exception is swallowed BY DEFAULT — the
+    framework logs ``Error in <handler> callback`` and continues. The
+    NullRun handler opts out of that default by setting
+    ``raise_error = True`` (SDK-4), so a real refusal now reaches the
+    caller and aborts the LLM call.
 
-    The callback stashes the decision instead; this runs at the
-    ``@protect`` boundary, which can abort, and re-raises the oldest
-    unraised one.
+    This boundary is the SECOND channel: it drains a decision that was
+    recorded per-thread by a callback and re-raises it here, where the
+    SDK can abort on the boundary's own thread. It is the only channel
+    that survives a host framework which ignores ``raise_error``.
 
     The import is deliberately LAZY and failure-tolerant. The stashing
     side lives in ``instrumentation.langgraph``, which is only imported
@@ -953,9 +962,13 @@ def _run_tool_policy_gate(
     the outage.
 
     Opt-out: set ``NULLRUN_SENSITIVE_FAIL_OPEN=1`` to restore fail-
-    OPEN behavior on transport error (dev / test only). Real
-    ``decision=block`` from the gateway is still honored and still
-    raises ``NullRunBlockedException``.
+    OPEN behavior on transport error (dev / test only) — but only for
+    a tool the operator classified as fail-open-allowed
+    (``runtime.register_fail_open_tools([...])``). The switch alone
+    opens nothing: a tool that is not classified stays fail-CLOSED
+    even with the variable set. Real ``decision=block`` from the
+    gateway is still honored and still raises
+    ``NullRunBlockedException``.
 
     ## Wire contract
 
@@ -998,13 +1011,16 @@ def _run_tool_policy_gate(
         NullRunBlockedException,
         NullRunDecision,
         NullRunExecutionNotFoundError,
+        NullRunGateIndeterminateError,
         NullRunInfrastructureError,
         NullRunTransportError,
         RateLimitError,
         TransportErrorSource,
     )
 
-    fail_open = runtime.sensitive_fail_open_enabled()
+    fail_open = runtime.sensitive_fail_open_enabled() and runtime.is_fail_open_allowed(
+        fn.__name__
+    )
     # *display* workflow_id via the runtime's precedence chain
     # (contextvar → self.workflow_id → None). Sentinel stays as the
     # last resort for never-bound keys (no workflow context).
@@ -1037,7 +1053,8 @@ def _run_tool_policy_gate(
             logger.warning(
                 f"tool policy gate unavailable for {fn.__name__!r}: "
                 f"{exc.source} on /{exc.endpoint}. "
-                f"NULLRUN_SENSITIVE_FAIL_OPEN=1 — body will run."
+                f"NULLRUN_SENSITIVE_FAIL_OPEN=1 and {fn.__name__!r} is "
+                f"classified as fail-open-allowed — body will run."
             )
             return
         _code = {
@@ -1055,8 +1072,12 @@ def _run_tool_policy_gate(
                 f"The NullRun policy engine is unreachable "
                 f"({exc.source.value}). The body of "
                 f"'{fn.__name__}' did NOT run (fail-CLOSED). "
-                f"Set NULLRUN_SENSITIVE_FAIL_OPEN=1 to opt out for "
-                f"tests / staging — production should leave it off."
+                f"To opt out for tests / staging: set "
+                f"NULLRUN_SENSITIVE_FAIL_OPEN=1 AND register the tool "
+                f"as fail-open-allowed "
+                f"(runtime.register_fail_open_tools(['{fn.__name__}'])) "
+                f"— the switch alone opens nothing. Production should "
+                f"leave both off."
             ),
         )
         runtime._emit_sdk_error(
@@ -1080,24 +1101,51 @@ def _run_tool_policy_gate(
         # first-class attributes.
         raise
     except Exception as exc:  # noqa: BLE001
-        if fail_open:
-            logger.warning(
-                f"tool policy gate unavailable for {fn.__name__!r}: "
-                f"{exc}. NULLRUN_SENSITIVE_FAIL_OPEN=1 — body will run."
-            )
-            return
-        err = NullRunBlockedException(
-            workflow_id=workflow_id,
-            reason=f"policy engine unavailable: {exc}",
-            tool_name=fn.__name__,
-            error_code="NR-B001",
-            user_action=(
-                f"The NullRun policy engine raised an unexpected "
-                f"exception during the @protect pre-check of "
-                f"'{fn.__name__}'. The body did NOT run. Check the "
-                f"chained exception (raise ... from exc) for the "
-                f"root cause."
-            ),
+        # NOT a transport failure, and NOT a decision the gateway
+        # named. Every class the arms above recognise is already
+        # classified, so what lands here is a fault in the SDK's OWN
+        # code — a request body that cannot be serialised, a bug in
+        # the signer, a TypeError in the transport's request builder.
+        #
+        # The decision is INDETERMINATE, and an indeterminate decision
+        # is not permission. ADR-063 §2.4's governing rule: a
+        # fail-OPEN is acceptable only when the check is genuinely
+        # un-decidable (no network) AND something downstream can
+        # correct it. Neither holds here: the policy engine WAS
+        # reachable, and the only thing downstream is `/track` — which
+        # does not gate on the policy answer, so a lost decision stays
+        # lost.
+        #
+        # Pre-fix this arm did three wrong things at once (SDK-13):
+        #   (a) it reported the fault as NR-B001 — a NETWORK code —
+        #       even though every network failure is classified by
+        #       the arm above and never reaches here;
+        #   (b) it typed the refusal as a policy BLOCK
+        #       (``NullRunBlockedException`` ⊂ ``NullRunDecision``),
+        #       so the FastAPI integration rendered it HTTP 429 /
+        #       category "decision" — the operator was told the policy
+        #       refused (or rate-limited) when the truth is that the
+        #       SDK has a bug;
+        #   (c) under the two-step opt-out it RETURNED, so the body
+        #       ran. That is what the audit's "proceeds" line
+        #       describes, and it is reachable ONLY for SDK-internal
+        #       faults: the /execute path converts every transport
+        #       failure into ``NullRunTransportError``, which the arm
+        #       above owns. The opt-out is documented as covering
+        #       "the policy engine is UNREACHABLE"; an SDK bug is a
+        #       different fact, and nothing downstream corrects it.
+        #
+        # This is the /execute twin of ADR-129's row 29: same fact,
+        # same class, same counter discipline.
+        metrics.inc_runtime("policy_gate_indeterminate_total")
+        logger.error(
+            f"tool policy gate for {fn.__name__!r} failed with a "
+            f"non-transport error, refusing the call: {exc!r}"
+        )
+        err = NullRunGateIndeterminateError(
+            "the /execute call failed with a non-transport error, so the "
+            f"SDK could not determine a decision for {fn.__name__!r}: {exc!r}",
+            cause=exc,
         )
         runtime._emit_sdk_error(
             err,
@@ -1128,7 +1176,9 @@ def _run_tool_policy_gate(
             if fail_open:
                 logger.warning(
                     f"tool policy gate for {fn.__name__!r} returned "
-                    f"{decision_source}; NULLRUN_SENSITIVE_FAIL_OPEN=1 — body will run."
+                    f"{decision_source}; NULLRUN_SENSITIVE_FAIL_OPEN=1 "
+                    f"and {fn.__name__!r} is classified as "
+                    f"fail-open-allowed — body will run."
                 )
                 return
             _code = {
@@ -1146,8 +1196,11 @@ def _run_tool_policy_gate(
                     f"The NullRun policy engine returned a fallback "
                     f"({decision_source}) for '{fn.__name__}'. The "
                     f"body did NOT run. Retry once the policy engine "
-                    f"is back — or set NULLRUN_SENSITIVE_FAIL_OPEN=1 "
-                    f"for tests / staging."
+                    f"is back — or, for tests / staging, set "
+                    f"NULLRUN_SENSITIVE_FAIL_OPEN=1 AND register the "
+                    f"tool as fail-open-allowed "
+                    f"(runtime.register_fail_open_tools(['{fn.__name__}'])) "
+                    f"— the switch alone opens nothing."
                 ),
             )
             runtime._emit_sdk_error(

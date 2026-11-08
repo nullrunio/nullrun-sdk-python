@@ -18,8 +18,14 @@ unchanged**, down to the code path and the decision source.
 a disguise: the operator reads "the box said yes" while what happened
 is that the cloud said yes and the box was never asked. So in edge mode
 the cloud is not a fallback for the gate — it is not a fallback at all.
-A box that cannot be reached produces a *refusal*, and under STRICT (the
-default, as everywhere else) that refusal is final.
+A box that cannot be reached produces a *refusal*, and that refusal is
+final: no fallback mode, no environment variable and no operator
+setting turns an unanswered box question into permission. ADR-067 §3
+("an unavailable lease store must degrade to deny, never to allow"),
+and the reason it differs from the cloud's fail-OPEN on a transport
+error is that the cloud's is recoverable — the spend is still booked
+by `/track` — while the edge's is not: there is no cloud to book it
+through.
 
 **2. Let the caller write the money.** The wire carries a model and
 token counts, not an amount. The box prices the call from the rates the
@@ -65,14 +71,13 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 import uuid
 from collections.abc import Mapping
 from typing import Any
 
 import httpx
-
-from nullrun.transport import DecisionSource
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +90,64 @@ logger = logging.getLogger(__name__)
 # it and the runtime honours it as a real decision — which is the whole
 # point of E2.
 EDGE_LEASE = "edge_lease"
+
+# `last_source` marker for "the box answered, and the answer was NO".
+#
+# NOT a wire `decision_source`. The refusal path still puts
+# `EDGE_LEASE` in the returned body's `decision_source`, and that is
+# deliberate: `decision_source` says WHO decided, and on a refusal the
+# lease was the authority that spoke — the box answered, with "no".
+# The direction is carried by `decision`, which is `block`. Changing
+# the wire value would need a new name in the runtime's known-source
+# set, and until the runtime knows it, a body carrying it is a
+# MALFORMED response: a clean refusal would become a crash.
+#
+# What this constant is for is `last_source`, which answers a
+# different question — "which way did the box go on the last call?".
+# Before it existed, the allow path and the refusal path both wrote
+# `EDGE_LEASE` there, so the two collapsed into one string and a
+# caller reading the attribute could not tell a box ALLOW from a box
+# REFUSAL.
+#
+# Deliberately not a fallback source (`is_fallback_decision_source` is
+# False for it): a box that said no is a VERDICT, not a degraded
+# transport. Reading it as synthetic would discard the refusal before
+# the caller saw it — the same hole SDK-3 closed for the other edge
+# sources.
+EDGE_LEASE_REFUSED = "edge_lease_refused"
+
+# Decision source for "the box did not answer".
+#
+# Deliberately NOT `DecisionSource.FALLBACK`, and that is the whole
+# fix for the SDK-3 hole.
+#
+# `is_fallback_decision_source` is the runtime's fail-OPEN predicate:
+# a body whose source is a fallback source means "the engine never
+# answered", and ADR-008 lets the budget pre-flight proceed on it (the
+# cloud's `/track` can still bill the call later, so a dead backend
+# must not freeze the agent's loop).
+#
+# The edge is the opposite case and the difference is not stylistic:
+# in edge mode the BOX is the enforcement surface, the cloud is not
+# consulted at all, and there is no `/track` recovery — the cloud the
+# spend would have been recovered through is the same one that is down.
+# An unanswered box question therefore has to stay a refusal.
+#
+# Reusing FALLBACK for it made the two surfaces indistinguishable, and
+# the runtime — which can only see the source — discarded the edge's
+# refusal and reported "no decision". A source the runtime cannot
+# mistake for a transport error is what makes the refusal final.
+# (ADR-067 §3: "an unavailable lease store must degrade to deny, never
+# to allow".)
+EDGE_UNREACHABLE = "edge_unreachable"
+
+# Decision source for "the box was never asked about this call".
+#
+# The difference from EDGE_UNREACHABLE is who is at fault: there the
+# box was asked and could not answer; here nobody asked. Both refuse,
+# and neither is a fallback source, because in edge mode there is no
+# other surface that could have said yes.
+EDGE_NOT_ENFORCED = "edge_not_enforced"
 
 # Default timeout for one enforcement call.
 #
@@ -134,7 +197,48 @@ class EdgeTransport:
         # Named source instead of a bool, because a bare flag here
         # would be indistinguishable from "the box said no" at every
         # call site, and those two must not collapse.
+        #
+        # It answers "which way did the box go on the last call?":
+        # `EDGE_LEASE` for an allow, `EDGE_LEASE_REFUSED` for a
+        # refusal, `EDGE_UNREACHABLE` for no answer, and
+        # `EDGE_NOT_ENFORCED` for a box that was never asked.
         self.last_source: str | None = None
+        # The box's answers, keyed by the event id they were asked for.
+        #
+        # This is a CACHE of the box's answer, not a decision source.
+        # The enforcement point in edge mode is the box's `/enforce`
+        # call; `/execute` has no box equivalent and must not invent
+        # one, so it reads back what the box said for this event.
+        #
+        # Read with `take_answer`, which POPS. A pop is what makes a
+        # stale answer impossible: an answer that was never consumed
+        # (a pre-flight with no matching /execute) cannot be handed to
+        # a later action, and a later action that never asked the box
+        # gets "no answer" and is refused rather than allowed on the
+        # strength of somebody else's decision.
+        self._answers: dict[str, dict[str, Any]] = {}
+        # The lock that guards `_answers`.
+        #
+        # There is one EdgeTransport per runtime and one runtime per
+        # agent, but an agent's tool calls share the runtime — so this
+        # dict is genuinely multi-threaded. Without the lock a thread
+        # that evicts from it can be resized by another thread between
+        # the `iter()` and the `next()`, and CPython raises
+        # `RuntimeError: dictionary changed size during iteration`
+        # (or the eviction's `pop` raises `KeyError` when the other
+        # thread took the key first).
+        #
+        # Why that is more than a crash: the exception escapes
+        # `enforce`, and the gate's fail-OPEN arm catches it and
+        # returns "no decision" — so the tool body runs with no policy
+        # decision at all, while the box has already charged the
+        # lease. SDK-9.
+        self._answers_lock = threading.Lock()
+        # Bound on the cache. Entries are popped on use; the cap only
+        # matters for a pre-flight that is never followed by an
+        # /execute, and it exists so a long-lived transport cannot grow
+        # this dict without limit.
+        self._answer_cap = 64
 
     # -- the call -------------------------------------------------------
 
@@ -155,12 +259,31 @@ class EdgeTransport:
 
         Never raises for a business answer, and does not raise for a
         missing one either: an unreachable box comes back as a `block`
-        carrying `decision_source = FALLBACK`, which the runtime's
-        existing STRICT/PERMISSIVE handling turns into the right thing
-        without a second policy living here. PERMISSIVE therefore still
-        means what it means everywhere else — the caller has explicitly
-        accepted running unenforced — and it is the only way this
-        returns a non-block for an unanswered question.
+        carrying `decision_source = EDGE_UNREACHABLE`.
+
+        That source is the load-bearing part. It is NOT a fallback
+        source, so the runtime honours the block instead of reading it
+        as "the engine never answered" and proceeding (SDK-3). The
+        cloud's own fail-OPEN on a transport error (ADR-008) is
+        *recoverable* — the spend is still booked by `/track` — while
+        the edge's is not: in edge mode there is no cloud to book it
+        through, and ADR-067 §3 requires an unavailable lease store to
+        degrade to deny. A refusal that a caller can switch off with
+        PERMISSIVE would not be a refusal.
+
+        `EDGE_LEASE` is the source for every answer the box actually
+        gave; `EDGE_UNREACHABLE` is the source for the absence of one.
+        The `decision` field says which way the box went.
+
+        The transport's own `last_source` says the same thing at a
+        finer grain: `EDGE_LEASE` for an allow, `EDGE_LEASE_REFUSED`
+        for a refusal. The two paths used to write the same string
+        there, so a caller reading `last_source` could not tell a box
+        ALLOW from a box REFUSAL.
+
+        The answer is recorded under the event id, so the `/execute`
+        half of the same logical action can read back exactly what the
+        box said about it (see `take_answer`).
         """
         body: dict[str, Any] = {
             "lease_id": self.lease_id,
@@ -174,6 +297,64 @@ class EdgeTransport:
         # is the expensive bug the whole mechanism exists to prevent.
         body["event_id"] = event_id or str(uuid.uuid4())
 
+        answer = self._ask(body, on_transport_error)
+        self._record(body["event_id"], answer)
+        return answer
+
+    def take_answer(self, event_id: str | None) -> dict[str, Any] | None:
+        """The box's answer for this event, consumed.
+
+        ``None`` means the box was never asked about this event, which
+        is a refusal case and not a "no opinion" case: the caller must
+        not proceed on an event nobody priced.
+        """
+        if not event_id:
+            return None
+        with self._answers_lock:
+            return self._answers.pop(event_id, None)
+
+    def not_enforced(self, execution_id: str | None = None) -> dict[str, Any]:
+        """No answer from the box for this call. Fail CLOSED.
+
+        The box was never asked — not "it could not answer", but
+        "nobody asked". The cloud has the same rule and the same
+        reason: a direct `/execute` with no prior `/gate` is answered
+        with 404 EXECUTION_NOT_FOUND, because the backend's
+        `execution:{id}` binding does not exist. Answering "allow"
+        here would be the same hole with a different spelling.
+        """
+        self.last_source = EDGE_NOT_ENFORCED
+        return {
+            "decision": "block",
+            "decision_source": EDGE_NOT_ENFORCED,
+            "error_code": "EDGE_NOT_ENFORCED",
+            "explanation": (
+                "The edge box was never asked about this call. NullRun "
+                "refuses rather than allowing a call no lease was "
+                "consulted about — the same rule the cloud applies when "
+                "/execute arrives with no prior /gate."
+            ),
+            "suggestions": [
+                "Run the pre-flight check for this call before executing it.",
+            ],
+            "edge_error_code": None,
+            "execution_id": execution_id,
+        }
+
+    def _record(self, event_id: str, answer: dict[str, Any]) -> None:
+        with self._answers_lock:
+            self._answers[event_id] = answer
+            while len(self._answers) > self._answer_cap:
+                # Copy the key list before evicting. The oldest entry is
+                # chosen from the snapshot, never from a live iteration
+                # of a dict another thread may be resizing.
+                keys = list(self._answers)
+                if not keys:
+                    break
+                self._answers.pop(keys[0], None)
+
+    def _ask(self, body: dict[str, Any], on_transport_error: Any) -> dict[str, Any]:
+        """One round trip to the box. Returns a gate-shaped dict."""
         try:
             response = self._post(body)
         except Exception as exc:  # noqa: BLE001 — any failure is one fact
@@ -225,7 +406,13 @@ class EdgeTransport:
             }
 
         code = payload.get("error_code") or "EDGE_DENIED"
-        self.last_source = EDGE_LEASE
+        # The refusal path reports its OWN source. It used to write
+        # `EDGE_LEASE` here — the same string the allow path writes —
+        # so `last_source` could not tell a box ALLOW from a box
+        # REFUSAL. The wire `decision_source` below stays `EDGE_LEASE`
+        # on purpose: the lease was the authority that spoke either
+        # way, and `decision` says which way it went.
+        self.last_source = EDGE_LEASE_REFUSED
         logger.info("Edge refused the call: %s", code)
         return {
             "decision": "block",
@@ -281,12 +468,18 @@ class EdgeTransport:
     # -- failure --------------------------------------------------------
 
     def _unreachable(self, exc: Exception, on_transport_error: Any) -> dict[str, Any]:
-        """No answer from the box. Fail CLOSED unless explicitly told not to.
+        """No answer from the box. Fail CLOSED, and stay failed.
 
         There is no cloud fallback here, and that is the point. See the
         module docstring: falling back would report the cloud's answer
         under the box's name, and in the outage this exists for there is
         no cloud to ask.
+
+        The source is `EDGE_UNREACHABLE`, not `FALLBACK`, and the
+        runtime treats the two differently on purpose — see the
+        constant's comment. A `FALLBACK` here would be read as "the
+        engine never answered, carry on" (ADR-008's cloud rule) and the
+        refusal would be discarded before the caller ever saw it.
         """
         message = f"{type(exc).__name__}: {exc}"
         logger.warning(
@@ -302,9 +495,10 @@ class EdgeTransport:
                 # change the decision. It is a reporter, not a gate.
                 logger.debug("on_transport_error raised; ignoring", exc_info=True)
 
+        self.last_source = EDGE_UNREACHABLE
         return {
             "decision": "block",
-            "decision_source": DecisionSource.FALLBACK,
+            "decision_source": EDGE_UNREACHABLE,
             "error_code": "EDGE_UNREACHABLE",
             "explanation": (
                 f"The edge box at {self.base_url} did not answer ({message}). "
@@ -438,6 +632,9 @@ def _int_env(source: Mapping[str, str], name: str, default: int) -> int:
 
 __all__ = [
     "EDGE_LEASE",
+    "EDGE_LEASE_REFUSED",
+    "EDGE_UNREACHABLE",
+    "EDGE_NOT_ENFORCED",
     "DEFAULT_EDGE_TIMEOUT_SECONDS",
     "EdgeConfigurationError",
     "EdgeTransport",

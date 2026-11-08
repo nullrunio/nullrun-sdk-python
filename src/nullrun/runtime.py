@@ -8,7 +8,7 @@ This is the main entry point for the SDK. It handles:
 - Local policy enforcement (instant, no network latency)
 - Pre-execution enforcement via /execute endpoint
 
-## Pre-execution gate fail-OPEN/CLOSED contract (ADR-008)
+## Pre-execution gate fail-OPEN/CLOSED contract (ADR-063 §2.4)
 
 The SDK enforces workflow safety through a set of *pre-execution gates*
 that run before a protected function body executes and may raise to halt
@@ -17,13 +17,24 @@ the authoritative table; deviations require an ADR amendment (Rule 5).
 
 | Gate | Transport-error behavior | Recovery behavior | Opt-out |
 |---|---|---|---|
-| `check_workflow_budget` | OPEN (skip check, log warning) for TRANSPORT errors; **CLOSED for authentication errors** (401 raises `NullRunAuthError` — see below) | silent post-hoc correction in `/track` events via `cost_correction_applied=true` | `NULLRUN_SKIP_BUDGET_CHECK=1` -- **full billing bypass**, not just check bypass (see docstring WARNING) |
+| `check_workflow_budget` | OPEN (skip check, log warning) for TRANSPORT errors ONLY; **CLOSED for everything else** — a 401 raises `NullRunAuthError`, a malformed answer raises `NullRunMalformedGateResponseError`, and a non-transport fault raises `NullRunGateIndeterminateError` (ADR-129) | silent post-hoc correction in `/track` events via `cost_correction_applied=true` | `NULLRUN_SKIP_BUDGET_CHECK=1` -- **full billing bypass**, not just check bypass (see docstring WARNING) |
 | `check_control_plane` | OPEN (treat state as `Normal`) | deferred enforcement -- next WS-push or `/status` poll sees the true state | none |
-| `_enforce_sensitive_tool` (default `_fallback_mode=strict` since v3.53) | CLOSED -- transport returns `decision=block, decision_source=FALLBACK_*` | n/a | none for the strict path; `NULLRUN_SENSITIVE_FAIL_OPEN=1` opts into the legacy permissive override |
-| `_enforce_sensitive_tool` (`_fallback_mode=permissive`, opt-in) | CLOSED -- body MUST NOT run when `decision_source` is any `FALLBACK_*` | n/a (body did not run) | `NULLRUN_SENSITIVE_FAIL_OPEN=1` -- explicitly documented as "OPEN-when-engine-unavailable" |
+| `_run_tool_policy_gate` (the `@protect` path) | CLOSED -- the body MUST NOT run when the policy engine is unreachable | n/a | `NULLRUN_SENSITIVE_FAIL_OPEN=1` **plus** a per-tool classification (`runtime.register_fail_open_tools([...])`) -- the switch alone opens NOTHING (ADR-126) |
+| `_run_tool_policy_gate` with the switch ON and the tool classified fail-open-allowed | OPEN for THAT tool only -- the body runs while the engine is unreachable | n/a | the two-step opt-out above; every tool that is not classified stays CLOSED (ADR-126) |
+| `_run_tool_policy_gate` -- a NON-transport fault inside the /execute call (the SDK's own code) | CLOSED -- the refusal is `NullRunGateIndeterminateError` (NR-P004) and the body MUST NOT run (ADR-131) | n/a | none -- the two-step opt-out opens TRANSPORT failures only. An SDK-internal fault is not "the engine is unreachable", and nothing downstream corrects it |
+| `runtime.execute` -> `Transport.execute` (the MCP path; `fallback_mode=strict` by default) | CLOSED -- transport returns `decision=block, decision_source=FALLBACK` and the MCP client is NOT called | n/a | none -- `NULLRUN_SENSITIVE_FAIL_OPEN` is NOT consulted on this path |
+| `runtime.execute` -> `Transport.execute` (`fallback_mode=permissive`, opt-in) | OPEN -- transport synthesises `decision=allow, decision_source=FALLBACK` | n/a (the body runs) | the constructor knob `NullRunRuntime(fallback_mode="permissive")` -- a code-level opt-in, not an env var |
 | `_emit_span_start` / `_emit_span_end` | n/a -- never blocks | n/a | n/a |
 | `/track` batch path (legacy) | OPEN-on-network-error (event dropped, no retry) | n/a -- circuit breaker backoff applies | none |
-| `/track` v3 single path (`track_single`) | OPEN-on-network-error and OPEN-on-5xx (event dropped, no retry); **CLOSED for enforcement rejections** — a typed `NullRunDecision` (`CONSUME_OVERBUDGET` 422, budget block 402) propagates to the caller | caller reconciles the delta from the exception's `reserved_millicents` / `max_allowed_millicents` / `actual_cost_cents` / `recorded` (the reservation is on the wire in millicents and the actual in cents; the backend does not send its configured epsilon, so `actual - reserved` is the only honest way to recover it); ADR-005 forbids implicit re-reserve, so there is nothing for the SDK to retry | none |
+| `/track` v3 single path (`track_single`) | OPEN-on-network-error ONLY — the payload is written to the v3 WAL (`<wal>.v3`) BEFORE the caller's view drops it, and it is replayed on the next start; **CLOSED for every ANSWER that refused the consume** — any non-2xx, whether or not the body names an enforcement failure (SDK-1, ADR-183). A typed `NullRunDecision` (`CONSUME_OVERBUDGET` 422, budget block 402) propagates to the caller | the durable v3 WAL, replayed to `/api/v1/track` (SINGLE — the batch path does not run the CONSUME script, so a reservation replayed through it is never settled). The caller also reconciles the delta from the exception's `reserved_millicents` / `max_allowed_millicents` / `actual_cost_cents` / `recorded` (the reservation is on the wire in millicents and the actual in cents; the backend does not send its configured epsilon, so `actual - reserved` is the only honest way to recover it); ADR-005 forbids implicit re-reserve, so there is nothing for the SDK to retry | none |
+
+**The LangChain/LangGraph callback obeys the `check_workflow_budget` row.**
+`NullRunCallback` calls the same gate. It fails OPEN for a transport error and
+CLOSED for every other fault. It raises the same class the runtime raises, so
+one refusal produces one outcome on every path (SDK-16).
+
+**The `@protect` boundary is a different gate.** It fails CLOSED for every
+fault. The two-step opt-out in its own row is the only way it fails OPEN.
 
 **Fail-OPEN policy** — SDK-side transport failure (network timeout,
 5xx, breaker open) is fail-OPEN on the *check* path so a dead
@@ -43,6 +54,15 @@ fall-OPEN on a wire 4xx/5xx that names an enforcement failure.
 * **SDK-side transport failure** (network timeout, 5xx, breaker open)
   → fail-OPEN on the *check* path so a dead backend doesn't freeze
   the user's agent loop (this is what the README describes).
+* **A backend ANSWER that refused a consume** (`/track`, the money path)
+  → fail-CLOSED, even when the body names no enforcement failure.
+  SDK-1 (ADR-183): the question is not "what did the body say?" but
+  "did the backend ANSWER?". The consume did not land, the tool call
+  has already run and the money has already been spent, so reporting
+  the refusal as a successful track is a lost spend with a success
+  label on it. A request that never REACHED the backend keeps the
+  fail-OPEN row above — and its payload is durable in the v3 WAL, so
+  it is not dropped either.
 * **Authentication failure (401)** → fail-CLOSED.
   ``NullRunAuthError`` propagates. A 401 is a CREDENTIAL/CONFIG
   failure, not a transient transport condition: no retry can fix a
@@ -51,6 +71,14 @@ fall-OPEN on a wire 4xx/5xx that names an enforcement failure.
   OPEN here means the agent proceeds on a request the backend never
   approved. Added 2026-09-29 (DEF-MP-TS12-ENF-01) — this NARROWS the
   fail-OPEN set, it does not widen enforcement.
+* **Indeterminate decision (SDK-11, ADR-129)** → fail-CLOSED.
+  ``NullRunGateIndeterminateError`` propagates. The gate call failed
+  for a reason that is NOT a transport failure, so the SDK cannot
+  tell "the backend said no" from "the SDK never found out". The
+  fail-OPEN above covers a gate that could not be REACHED; this is
+  the case where the SDK itself faulted while asking. Failing OPEN
+  here turned an SDK bug into "allowed" — the call ran with no
+  reservation and its cost event was dropped.
 * **Backend-side budget-enforcement failure** (the /gate or /track
   handler actually returned a wire response, just one indicating a
   Redis outage or aggregate rate-limit Redis unavailable) → the
@@ -69,9 +97,18 @@ README claim must be updated in lockstep.
 The "Opt-out" column makes it explicit that `NULLRUN_SKIP_BUDGET_CHECK=1`
 is a **different category** of action than
 `NULLRUN_SENSITIVE_FAIL_OPEN=1` (bypass vs. change semantics), despite
-the similar naming. See `docs/adr/008-sdk-preflight-fail-policy.md`
-for the full rules, including transport error classification
-(`FALLBACK_NETWORK_ERROR` / `FALLBACK_GATEWAY_ERROR` / `FALLBACK_BREAKER_OPEN`).
+the similar naming. See ADR-063 §2.4 (in the NULLRUN repository,
+`docs/adr/ADR-063-pause-on-the-gate-and-the-fail-open-ledger.md`) for
+the full ledger of every fail-OPEN site in both repos, including the
+transport error classification (`FALLBACK_NETWORK_ERROR` /
+`FALLBACK_GATEWAY_ERROR` / `FALLBACK_BREAKER_OPEN`).
+
+The `NULLRUN_SENSITIVE_FAIL_OPEN` switch is a **whole-system switch**,
+and what it is allowed to open is decided **per tool** by the
+operator's classification (`runtime.register_fail_open_tools([...])`).
+The two are combined at the one call site (`decorators.py`), and the
+set is empty by default -- so the switch alone opens nothing and every
+tool stays fail-CLOSED. ADR-126.
 """
 
 from __future__ import annotations
@@ -103,6 +140,7 @@ from nullrun.breaker.categories import (
     NullRunUnclassifiedRefusalError,
 )
 from nullrun.breaker.exceptions import (
+    ENFORCEMENT_EXCEPTIONS,
     NullRunApprovalDeniedError,
     NullRunApprovalExpiredError,
     NullRunApprovalReplayRejectedError,
@@ -113,7 +151,7 @@ from nullrun.breaker.exceptions import (
     NullRunBudgetError,
     NullRunDecision,
     NullRunDeniedError,
-    NullRunError,
+    NullRunGateIndeterminateError,
     NullRunInfrastructureError,
     NullRunTransportError,
     NullRunWorkflowKilledError,
@@ -129,7 +167,10 @@ from nullrun.context import (
     get_workflow_id,
 )
 from nullrun.edge import EDGE_LEASE as EDGE_LEASE_DECISION_SOURCE
+from nullrun.edge import EDGE_NOT_ENFORCED as EDGE_NOT_ENFORCED_DECISION_SOURCE
+from nullrun.edge import EDGE_UNREACHABLE as EDGE_UNREACHABLE_DECISION_SOURCE
 from nullrun.observability import metrics
+from nullrun.observability.redaction import api_key_fingerprint
 from nullrun.transport import (
     HEADER_PROTOCOL,
     DecisionSource,
@@ -141,6 +182,7 @@ from nullrun.transport import (
     _emit_for_transport_error,
     _protocol_header_value,
     _safe_json,
+    is_backend_refusal,
     is_fallback_decision_source,
 )
 from nullrun.uuid7 import uuid7_str
@@ -150,66 +192,38 @@ logger = logging.getLogger(__name__)
 # Sentinel used when a gate fires outside a ``with workflow(...)``
 UNKNOWN_WORKFLOW_ID: str = "__nullrun_unknown__"
 
-# In-process gate cache for chain-mode. The cache key includes
-# ``estimated_tokens`` (currently hardcoded to 1 in
-# ``check_workflow_budget``) so two chain-mode calls with the same
-# (workflow_id, chain_id, call_model) but different cost_estimate
-# do not collide and silently serve a cheaper cached allow for
-# a more expensive call. The cache is also invalidated when
-# /track signals budget exhaustion (HTTP 422 from
-# CONSUME_OVERBUDGET) and when ``chain_end`` is called — without
-# this, a chain that exhausts its budget mid-loop could continue
-# serving cached "allow" decisions for up to the TTL after the
-# backend has actually blocked subsequent calls. Invalidations
-# use the active chain_id from the contextvar so unrelated
-# chains sharing the runtime instance are not affected.
-_GATE_CACHE: dict[tuple[str, str | None, str | None, int], tuple[float, dict[str, Any]]] = {}
-_GATE_CACHE_TTL_SECONDS: float = 5.0
-
-
-def _invalidate_gate_cache_for_chain(workflow_id: str | None, chain_id: str | None) -> int:
-    """Drop ``_GATE_CACHE`` entries whose ``(workflow_id, chain_id)``
-    match the supplied pair, regardless of ``call_model`` or
-    ``estimated_tokens``. Returns the number of entries removed.
-
-    Called from two sites:
-      1. ``_route_track`` after ``track_single`` raises HTTP 422
-         (CONSUME_OVERBUDGET) or HTTP 402 (REDIS_UNAVAILABLE for
-         consume-side authoritative check). The backend's
-         authoritative budget check has now said "no further
-         spend", so any cached "allow" for the same chain is stale
-         and must not be served until the chain ends or the
-         budget rolls over.
-      2. ``chain_end`` after the /gate body returns. The chain is
-         closed on the server; the SDK's in-process cache for that
-         chain is no longer reachable from subsequent calls, so
-         dropping it frees memory and prevents a hypothetical
-         re-use of the same (workflow_id, chain_id) UUID from
-         hitting the cached entry (UUID v4 collision risk is
-         negligible but the cleanup costs nothing).
-
-    Args:
-        workflow_id: The workflow whose entries should be dropped.
-            ``None`` matches every workflow with the same chain_id
-            (rare but defensive).
-        chain_id: The chain whose entries should be dropped.
-            ``None`` matches every chain with the same workflow_id.
-
-    Returns:
-        The number of cache entries removed. Useful for tests /
-        metric counters; not currently surfaced.
-    """
-    if not _GATE_CACHE:
-        return 0
-    keys_to_drop = [
-        k
-        for k in _GATE_CACHE
-        if (workflow_id is None or k[0] == workflow_id)
-        and (chain_id is None or k[1] == chain_id)
-    ]
-    for k in keys_to_drop:
-        _GATE_CACHE.pop(k, None)
-    return len(keys_to_drop)
+# There is deliberately NO in-process gate cache.
+#
+# There was one: a chain-mode short-circuit keyed on
+# ``(workflow_id, chain_id, call_model, estimated_tokens)`` that served
+# a previous ``/gate`` answer for up to five seconds. It is gone
+# because it was not a cache, it was a second authorisation path with
+# no gate behind it (SDK-1):
+#
+#   * The key carried no org id, no api key id and no tool set, so one
+#     chain's allow could be served to another chain — or to a
+#     different tool inside the same chain — whose call was never
+#     checked.
+#   * The cached body carried call #1's ``reservation_id``, and the
+#     runtime re-captured it for every later step of the chain. Every
+#     step of the chain therefore ran under ONE server-minted
+#     execution id. The backend settles an execution id at most once
+#     (``consume_v3.lua`` answers IDEMPOTENT_REPLAY for an execution
+#     that is already ``consumed``, and books nothing), so a three-step
+#     chain performed three tool executions and produced ONE
+#     accounting event: the money for steps 2 and 3 was never billed.
+#   * The tool-block check never ran for a cached step either — the key
+#     has no tool set in it.
+#
+# The chain feature it was written for does not need it. The backend
+# owns the chain: ``chain_op`` (start / continue / end) and the chain's
+# TTL are enforced there, and every ``/gate`` inside a chain reserves
+# and settles its own envelope. The backend's own idempotency store
+# (``idempotency_key`` = the SDK's ``operation_id``) is the safe
+# version of what the cache was reaching for: it dedupes a genuine
+# RETRY of one logical action and nothing else. A client-side cache
+# that cannot tell a retry from a new step is the wrong place to put
+# that decision.
 
 
 # Production-environment detection for security opt-out
@@ -218,20 +232,49 @@ def _invalidate_gate_cache_for_chain(workflow_id: str | None, chain_id: str | No
 # NULLRUN_SKIP_BUDGET_CHECK в production env"); the SDK refuses
 # it outside dev / test environments.
 #
-# Two signals combine to flag a production environment:
+# Two signals flag a production environment:
 # 1. The configured ``api_url`` hostname matches the prod host
 #    (``api.nullrun.io``) — the SDK's hard-coded default per the
 #    constructor docstring.
 # 2. The operator set ``NULLRUN_ENV`` to ``production`` / ``prod``
-#    (explicit override for non-standard deployments that point at
+#    (explicit declaration for non-standard deployments that point at
 #    a custom URL but still serve prod traffic).
 #
+# A host is dev ONLY when it says so in a way that cannot be an
+# accident: an exact loopback, a ``.localhost`` suffix, or an explicit
+# dev-environment LABEL (``staging.`` / ``test.``). NEVER by substring.
+# SDK-2 (2026-11-06): the old check asked "is any marker a SUBSTRING of
+# the hostname?". ``"test"`` is a substring of ``latest``, ``contest``,
+# ``attest``; ``"localhost"`` is a substring of ``notlocalhost.example.com``.
+# So a host that merely CONTAINED a dev marker was classified non-prod
+# and the operator's ``NULLRUN_ENV=production`` was suppressed — the
+# billing bypass ran against production with a WARNING instead of a
+# refusal.
+#
 # Test / dev harnesses that override ``api_url`` to a local /
-# staging host are NOT flagged as production regardless of
-# ``NULLRUN_ENV`` — operators who DO want the bypass in prod can
-# set ``NULLRUN_ALLOW_SKIP_BUDGET_CHECK=1`` to acknowledge the
-# risk explicitly (analogous to ``NULLRUN_SENSITIVE_FAIL_OPEN``).
+# staging host are NOT flagged as production — operators who DO want
+# the bypass in prod can set ``NULLRUN_ALLOW_SKIP_BUDGET_CHECK=1`` to
+# acknowledge the risk explicitly (analogous to
+# ``NULLRUN_SENSITIVE_FAIL_OPEN``).
 _PROD_API_HOST: str = "api.nullrun.io"
+
+# Hosts that are local by construction. ``0.0.0.0`` is the
+# "unspecified" address a dev harness binds to; it is a marker string
+# here, never a bind address (S104).
+_LOOPBACK_HOSTS: frozenset[str] = frozenset(
+    # "0.0.0.0" is a marker string compared against a hostname, never a
+    # bind address (S104).
+    {"localhost", "127.0.0.1", "0.0.0.0", "::1"}  # noqa: S104
+)
+
+# A leading label that declares a dev environment. Compared as a
+# LABEL, so ``api.test.nullrun.io`` keeps its own meaning and
+# ``staging.internal`` is a dev host while ``latest.nullrun.io`` is
+# not.
+_DEV_HOST_LABELS: frozenset[str] = frozenset({"staging", "test"})
+
+# Values of ``NULLRUN_ENV`` that declare production.
+_PROD_ENV_VALUES: frozenset[str] = frozenset({"production", "prod"})
 
 
 def _is_production_environment(api_url: str | None = None) -> bool:
@@ -239,21 +282,28 @@ def _is_production_environment(api_url: str | None = None) -> bool:
     NullRun backend.
 
     Used by ``check_workflow_budget`` to refuse
-    ``NULLRUN_SKIP_BUDGET_CHECK=1`` outside dev / test environments.
-    Detection rules (in order):
+    ``NULLRUN_SKIP_BUDGET_CHECK=1`` outside dev / test environments,
+    and by ``sensitive_fail_open_enabled`` to refuse the second
+    fail-open switch.
 
-    1. ``api_url`` is None or matches the prod host
-       (``api.nullrun.io``) — the default constructor value.
-    2. ``NULLRUN_ENV`` is set to ``production`` / ``prod`` (case
-       insensitive) AND the api_url is not explicitly pointed at a
-       known non-prod host (``localhost``, ``127.0.0.1``,
-       ``staging``, ``test``).
+    Detection rules, in order:
 
-    Local / staging / test deployments are NOT flagged so the dev
-    bypass keeps working. Operators who insist on the bypass in
-    prod can set ``NULLRUN_ALLOW_SKIP_BUDGET_CHECK=1`` — but the
-    env var is then surfaced in audit / telemetry so it's not a
-    silent fail-OPEN.
+    1. The host EXACTLY a loopback (``localhost``, ``127.0.0.1``,
+       ``0.0.0.0``, ``::1``) or ending in ``.localhost`` → NOT
+       production. A local machine does not serve prod traffic, and
+       no env var may arm the guard for it.
+    2. The host's FIRST label is a dev label (``staging.``,
+       ``test.``) → NOT production. This is an explicit environment
+       marker, not a name accident.
+    3. The host is exactly ``api.nullrun.io`` → production.
+    4. ``NULLRUN_ENV`` is ``production`` / ``prod`` (case insensitive)
+       → production for every other host. The operator's declaration
+       wins over the host heuristic; the substring test that used to
+       suppress it is gone.
+
+    A host the SDK does not recognise, with no ``NULLRUN_ENV``, stays
+    non-production: that is the pre-existing behaviour for a custom
+    deployment and it keeps the documented dev escape hatch working.
     """
     from urllib.parse import urlparse
 
@@ -268,20 +318,30 @@ def _is_production_environment(api_url: str | None = None) -> bool:
     host = parsed.hostname if parsed is not None else None
     host_lc = (host or "").lower()
 
-    # Signal 1: explicit prod host. ``api.nullrun.io`` is the
+    # Rule 1: exact loopback / ``.localhost`` suffix. Never production,
+    # whatever NULLRUN_ENV says — a loopback is a local machine.
+    if host_lc in _LOOPBACK_HOSTS or host_lc.endswith(".localhost"):
+        return False
+
+    # Rule 2: an explicit dev-environment LABEL. Compared label by
+    # label, never as a substring: ``staging.internal`` is dev,
+    # ``latest.nullrun.io`` and ``notlocalhost.example.com`` are not.
+    first_label = host_lc.split(".")[0]
+    if first_label in _DEV_HOST_LABELS:
+        return False
+
+    # Rule 3: explicit prod host. ``api.nullrun.io`` is the
     # canonical production endpoint; the constructor's default
     # value is exactly this URL so any caller that did not
     # override ``api_url`` lands here.
     if host_lc == _PROD_API_HOST:
         return True
 
-    # Signal 2: explicit NULLRUN_ENV=production (or "prod") AND
-    # the api_url does not point at a known dev/staging host.
+    # Rule 4: the operator declared production. This wins over every
+    # remaining host heuristic — SDK-2: the old substring match used
+    # to suppress it.
     explicit_env = os.getenv("NULLRUN_ENV", "").strip().lower()
-    non_prod_hosts = ("localhost", "127.0.0.1", "0.0.0.0", "staging", "test")  # noqa: S104  -- string marker, not a bind address
-    if explicit_env in {"production", "prod"} and not any(
-        marker in host_lc for marker in non_prod_hosts
-    ):
+    if explicit_env in _PROD_ENV_VALUES:
         return True
 
     return False
@@ -934,6 +994,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # every value is lowercased at insertion time.
         self._sensitive_tools_lower: frozenset[str] = frozenset()
         self._strict_mode_tools_lower: frozenset[str] = frozenset()
+        self._fail_open_tools_lower: frozenset[str] = frozenset()
         self._sensitive_tools: set[str] = {
             # Financial operations
             "stripe.charge",
@@ -964,6 +1025,24 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             "admin.disable_user",
         }
         self._strict_mode_tools: set[str] = set()
+        # Tools the operator has classified as FAIL-OPEN-ALLOWED.
+        #
+        # This is the per-tool classification that bounds the
+        # NULLRUN_SENSITIVE_FAIL_OPEN switch: the switch may let a
+        # tool's body run while the policy engine is unreachable ONLY
+        # for a tool in this set. It is EMPTY by default, so the switch
+        # on its own opens nothing.
+        #
+        # It is deliberately NOT the sensitivity registry above. That
+        # registry answers "is this tool destructive?" (the SDK's
+        # built-in list of financial / messaging / admin operations);
+        # a destructive tool is the last thing that should be allowed
+        # to run unchecked. This set answers the opposite question:
+        # "which tools may this agent run unchecked during an
+        # outage?". The two questions must not be merged -- merging
+        # them would make the SDK's own list of destructive operations
+        # an allowlist for running without a policy decision.
+        self._fail_open_tools: set[str] = set()
         # Snapshot the lowercase view of the built-in list so the
         # hot path is a single frozenset membership check (no set
         # comprehension per call). Subsequent add/remove/
@@ -1060,7 +1139,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
 
         # --- Auth state ---
         api_key_valid: bool | None = None
-        api_key_prefix: str | None = self.api_key[:10] if self.api_key else None
+        api_key_prefix: str | None = api_key_fingerprint(self.api_key)
         if self.organization_id is not None:
             # If we have an org, auth at least started — it
             # may have failed (we'd be in misconfigured), but
@@ -1337,7 +1416,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 stage=stage,
                 workflow_id=resolved_workflow_id,
                 tool_name=tool_name,
-                api_key_prefix=(self.api_key[:10] if self.api_key else None),
+                api_key_prefix=api_key_fingerprint(self.api_key),
                 correlation_id=correlation_id,
                 extra=extra or {},
             ),
@@ -1401,11 +1480,7 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 self.workflow_id = data.get("workflow_id")
 
                 if self.workflow_id is None:
-                    masked_key = (
-                        (self.api_key[:8] + "***")
-                        if self.api_key and len(self.api_key) >= 8
-                        else "***"
-                    )
+                    masked_key = api_key_fingerprint(self.api_key) or "unknown"
                     logger.warning(
                         f"API key {masked_key!s} is a legacy key with no "
                         f"workflow binding; remote kill/pause will not be "
@@ -2046,8 +2121,25 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
     # producer cannot drift into two different spellings of one value —
     # which is exactly how `is_fallback_decision_source` ended up with
     # two hand-maintained copies.
+    #
+    # `edge_unreachable` and `edge_not_enforced` are the two edge
+    # REFUSALS (the box did not answer / the box was never asked). They
+    # are here for the same reason `edge_lease` is, and with the same
+    # consequence: the runtime must recognise them as real verdicts and
+    # honour the block. They are deliberately NOT fallback sources —
+    # `fallback` means "the engine never answered, and the cloud's
+    # `/track` can still book the call later" (ADR-008), which is not
+    # true in edge mode. See `nullrun.edge.EDGE_UNREACHABLE`.
     _KNOWN_DECISION_SOURCES = frozenset(
-        {"gateway", "cached", "fallback", "local", EDGE_LEASE_DECISION_SOURCE}
+        {
+            "gateway",
+            "cached",
+            "fallback",
+            "local",
+            EDGE_LEASE_DECISION_SOURCE,
+            EDGE_UNREACHABLE_DECISION_SOURCE,
+            EDGE_NOT_ENFORCED_DECISION_SOURCE,
+        }
     )
 
     def _require_gate_decision(self, response: Any) -> str:
@@ -2185,6 +2277,14 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         ``NULLRUN_ALLOW_SENSITIVE_FAIL_OPEN=1``, mirroring
         ``NULLRUN_ALLOW_SKIP_BUDGET_CHECK``.
 
+        **This method answers "is the switch on?", not "may this tool
+        fail open?"** The switch is a whole-system switch; what it is
+        allowed to open is decided per tool by the operator's
+        classification (``register_fail_open_tools`` /
+        ``is_fail_open_allowed``). The two are combined at the one
+        call site -- ``decorators.py`` -- and the tool's name is
+        needed for the second half, which is why it is not asked here.
+
         Lives here rather than in ``decorators`` so the environment
         policy stays in one module with
         :func:`_is_production_environment`, and so the two opt-outs
@@ -2216,11 +2316,13 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                     pass
                 return False
             logger.warning(
-                "sensitive tool gate: failing OPEN via "
-                "NULLRUN_SENSITIVE_FAIL_OPEN=1 in production "
-                "(NULLRUN_ALLOW_SENSITIVE_FAIL_OPEN=1 also set). This is an "
-                "explicit operator ack — ensure the incident-response runbook "
-                "drove it, and unset both vars when the incident closes."
+                "the sensitive fail-open switch is ON in production "
+                "(NULLRUN_SENSITIVE_FAIL_OPEN=1 + "
+                "NULLRUN_ALLOW_SENSITIVE_FAIL_OPEN=1). Only tools the "
+                "operator classified as fail-open-allowed may run "
+                "unchecked. This is an explicit operator ack — ensure the "
+                "incident-response runbook drove it, and unset both vars "
+                "when the incident closes."
             )
             try:
                 metrics.inc_runtime("sensitive_fail_open_allowed_in_prod")
@@ -2229,8 +2331,9 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             return True
 
         logger.debug(
-            "sensitive tool gate: failing OPEN via NULLRUN_SENSITIVE_FAIL_OPEN=1 "
-            "(non-production api_url=%r).",
+            "the sensitive fail-open switch is ON (non-production "
+            "api_url=%r). Only tools the operator classified as "
+            "fail-open-allowed may run unchecked.",
             self.api_url,
         )
         return True
@@ -2241,7 +2344,6 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         model: str | None = None,
         estimated_tokens: int | None = None,
         max_output_tokens: int | None = None,
-        use_gate_cache: bool = True,
     ) -> str | None:
         """
         Pre-flight budget check via /api/v1/gate. Called from @protect
@@ -2265,11 +2367,12 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                 zero-code path needs in order to reserve the call's own
                 cost instead of one token's worth of it.
             max_output_tokens: overrides the call-context output cap.
-            use_gate_cache: set False by a path that needs its OWN
-                reservation per call. The chain-mode cache replays a
-                previous response — including its reservation id — so a
-                cached "allow" would hand a second LLM call the FIRST
-                call's reservation.
+
+        Every call is a separate ``/gate`` call and mints its own
+        reservation. There is no in-process cache and no
+        ``use_gate_cache`` switch: a cached answer would hand a later
+        call an earlier call's reservation, and the backend settles a
+        reservation once (SDK-1).
 
         Decision → exception mapping:
             "allow" → return
@@ -2307,17 +2410,34 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             - Credential failure (``NullRunAuthenticationError``),
               malformed body, and ``NullRunUnclassifiedRefusalError``
               all `raise` rather than fail open. Ordering matters:
-              each precedes the bare ``except Exception`` arm, which is
-              a superset of all three.
+              each precedes the transport arm below.
+            - A refusal the gate NAMED (``ENFORCEMENT_EXCEPTIONS``)
+              `raise`s, and the family arm comes FIRST — a
+              ``RateLimitError`` is a ``NullRunTransportError``, so a
+              later transport arm would swallow the 429 and fail OPEN
+              on it.
             - A non-fallback synthetic source is likewise treated as a
               transport error and fails open.
 
-        The rationale for the fail-open arms is that a transient backend
+        The transport arm is the ONLY fail-OPEN class (ADR-129). Anything
+        else that faults inside the gate call — the SDK's own code
+        raising while it asks the gate a question — leaves the decision
+        INDETERMINATE, and that raises ``NullRunGateIndeterminateError``
+        instead of proceeding. The distinction is the whole point:
+
+            - UNREACHABLE (transport failure): there is no answer to
+              honour, and nothing downstream can produce one.
+            - INDETERMINATE (any other fault): the backend may have
+              answered and the SDK cannot read it. An unanswered
+              question is not a yes.
+
+        The rationale for the fail-open arm is that a transient backend
         outage must never freeze the user's agent, and `/track` does not
         gate on budget, so the worst case while `/gate` is unreachable is
         that enforcement is advisory until the gateway recovers. That
         rationale covers UNREACHABLE, not REFUSING — which is why the
-        ADR-062 arms were split out above.
+        ADR-062 arms were split out above — and not INDETERMINATE, which
+        is why the residual arm refuses (SDK-11).
 
         Uses `estimated_tokens=1` (the minimum the API accepts). Goal
         is the binary question "is there any budget left?", not cost
@@ -2615,106 +2735,105 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # action by the backend's binding key.
         check_req["idempotency_key"] = check_req["operation_id"]
 
-        # In-process gate cache for chain-mode invocations. See
-        # module-top comment on _GATE_CACHE for full rationale.
+        # One /gate call per logical action. There is no in-process
+        # cache and no short-circuit for chain mode: a cached answer
+        # would carry an earlier call's reservation id, and the backend
+        # settles a reservation once — so the later steps of a chain
+        # would run tool calls that are never billed (SDK-1). See the
+        # module-top comment for the full mechanism.
         response: dict[str, Any]
-        cache_key: tuple[str, str | None, str | None, int] | None = None
-        cache_enabled = (
-            chain_id is not None
-            and use_gate_cache
-            and not os.environ.get("NULLRUN_GATE_CACHE_DISABLE", "").strip() == "1"
-        )
-        if cache_enabled:
-            cache_key = (str(workflow_id), chain_id, call_model, check_req.get("estimated_tokens", 1))
-            cached = _GATE_CACHE.get(cache_key)
-            if cached is not None and (time.monotonic() - cached[0]) < _GATE_CACHE_TTL_SECONDS:
-                # Cache hit within TTL — reuse the response without a
-                response = cached[1]
-            else:
-                # Cache miss or expired — go to the server, then store.
-                try:
-                    response = self._transport.check(check_req)
-                    # The backend ANSWERED. A refusal (402/403/429) is
-                    # still an answer and must not be read as
-                    # unreachable.
-                    self._note_backend_attempt(True)
-                except NullRunAuthenticationError:
-                    # DEF-MP-TS12-ENF-01 (RUN_ID 20260929T1338, 2026-09-29):
-                    # a 401 is a CREDENTIAL failure, not a transport
-                    # failure, and must NOT be read as "allowed".
-                    #
-                    # `_retry_with_backoff` raises `NullRunAuthError` (a
-                    # `NullRunAuthenticationError`) on any 401 and
-                    # re-raises it WITHOUT retrying. Pre-fix the
-                    # `except` clauses below swallowed it and returned
-                    # None, which the caller reads as "no block" — the
-                    # agent proceeded on a request the backend had
-                    # refused. Classification is by TYPE here, never by
-                    # inspecting the message.
-                    raise
-                except NullRunUnclassifiedRefusalError:
-                    # ADR-062 §2.2. The gate DID answer — it refused —
-                    # and the SDK cannot tell a policy decision from a
-                    # backend fault. That is not "gate unavailable":
-                    # failing OPEN here would read an unclassifiable
-                    # refusal as "allowed", which is the exact hole the
-                    # category work closes. Must precede the arm below
-                    # (a `NullRunError` superset).
-                    raise
-                except (httpx.HTTPError, NullRunError) as exc:
-                    # Narrow catch: fail-OPEN only on transport +
-                    # classified SDK errors. Internal bugs
-                    # (KeyError, AttributeError) surface rather
-                    # than silently allowing an unbounded call.
-                    self._note_backend_attempt(False)
-                    logger.warning(f"check_workflow_budget: /gate unavailable, failing open: {exc}")
-                    metrics.inc_runtime("gate_fail_open_total")
-                    return None
-                except ValueError as exc:
-                    # `Transport.check` ends in `response.json()`. A
-                    # body that is not JSON — proxy error page,
-                    # captive portal, TLS interception box — raises
-                    # JSONDecodeError, a ValueError. Pre-fix this
-                    # matched neither arm above and escaped as an
-                    # untyped crash; and had it matched the
-                    # fail-OPEN arm, a non-NULLRUN responder would
-                    # have been read as "gate unavailable, carry on",
-                    # which is precisely the authorisation-without-
-                    # policy hole the missing `decision` default
-                    # shares. It is a malformed ANSWER, not an
-                    # unreachable gate, so it raises.
-                    self._raise_malformed_gate_response(exc)
-                assert cache_key is not None  # narrowed by cache_enabled above
-                _GATE_CACHE[cache_key] = (time.monotonic(), response)
-        else:
-            try:
-                response = self._transport.check(check_req)
-                # Same rationale as the cached branch: a refusal is an
-                # answer, not an outage.
-                self._note_backend_attempt(True)
-            except NullRunAuthenticationError:
-                # Same rationale as the cached branch above. Ordering
-                # matters: this arm precedes the broad `except
-                # Exception`, which is a superset.
-                raise
-            except ValueError as exc:
-                # Same rationale as the cached branch: a body that is
-                # not JSON is a malformed answer, and must precede the
-                # broad `except Exception` below, which is a superset
-                # of this arm.
-                self._raise_malformed_gate_response(exc)
-            except NullRunUnclassifiedRefusalError:
-                # ADR-062 §2.2 — same rationale as the cached branch.
-                # This is a refusal the SDK cannot classify, not an
-                # unreachable gate, so it must not fail open. It is
-                # listed explicitly because the arm below is a bare
-                # ``except Exception``.
-                raise
-            except Exception as exc:  # noqa: BLE001
-                self._note_backend_attempt(False)
-                logger.warning(f"check_workflow_budget: /gate unavailable, failing open: {exc}")
-                metrics.inc_runtime("gate_fail_open_total")
-                return None
+        try:
+            response = self._transport.check(check_req)
+            # The backend ANSWERED. A refusal (402/403/429) is still an
+            # answer and must not be read as unreachable.
+            self._note_backend_attempt(True)
+        except ENFORCEMENT_EXCEPTIONS:
+            # ADR-063 §2.4 row 2, as amended by ADR-129. A refusal the
+            # gate NAMED is never downgraded to "the gate was
+            # unreachable, carry on".
+            #
+            # The family arm comes FIRST because the ordering is
+            # load-bearing: `RateLimitError` is a
+            # `NullRunTransportError`, so the transport arm below would
+            # swallow the 429 and fail OPEN on it.
+            raise
+        except NullRunAuthenticationError:
+            # DEF-MP-TS12-ENF-01 (RUN_ID 20260929T1338, 2026-09-29):
+            # a 401 is a CREDENTIAL failure, not a transport failure,
+            # and must NOT be read as "allowed".
+            #
+            # `_retry_with_backoff` raises `NullRunAuthError` (a
+            # `NullRunAuthenticationError`) on any 401 and re-raises it
+            # WITHOUT retrying. Pre-fix the `except` clauses below
+            # swallowed it and returned None, which the caller reads as
+            # "no block" — the agent proceeded on a request the backend
+            # had refused. Classification is by TYPE here, never by
+            # inspecting the message.
+            raise
+        except ValueError as exc:
+            # `Transport.check` ends in `response.json()`. A body that
+            # is not JSON — proxy error page, captive portal, TLS
+            # interception box — raises JSONDecodeError, a ValueError.
+            # Pre-fix this matched neither arm above and escaped as an
+            # untyped crash; and had it matched the fail-OPEN arm, a
+            # non-NULLRUN responder would have been read as "gate
+            # unavailable, carry on", which is precisely the
+            # authorisation-without-policy hole the missing `decision`
+            # default shares. It is a malformed ANSWER, not an
+            # unreachable gate, so it raises.
+            self._raise_malformed_gate_response(exc)
+        except NullRunUnclassifiedRefusalError:
+            # ADR-062 §2.2. The gate DID answer — it refused — and the
+            # SDK cannot tell a policy decision from a backend fault.
+            # That is not "gate unavailable": failing OPEN here would
+            # read an unclassifiable refusal as "allowed", which is the
+            # exact hole the category work closes. Listed explicitly
+            # because the arm below catches transport errors by TYPE.
+            raise
+        except (httpx.HTTPError, NullRunTransportError) as exc:
+            # ADR-008's fail-OPEN — and the ONLY class it covers. The
+            # gate could not be REACHED, so there is no answer to
+            # honour: the enforcement path is un-decidable, not
+            # undecided. A dead backend must not freeze the agent.
+            #
+            # Everything that is NOT a transport failure falls through
+            # to the arm below, which refuses. That is the whole point
+            # of the split (ADR-129): pre-fix this arm was a bare
+            # ``except Exception``, so an SDK-internal fault was
+            # laundered into "allowed" and the call ran with no
+            # reservation.
+            self._note_backend_attempt(False)
+            logger.warning(f"check_workflow_budget: /gate unavailable, failing open: {exc}")
+            metrics.inc_runtime("gate_fail_open_total")
+            return None
+        except Exception as exc:  # noqa: BLE001
+            # NOT a transport failure. The backend may have answered;
+            # the SDK's own code faulted while asking it a question
+            # (a request body that cannot be serialised, a decode
+            # error, a fault in the edge path's token split). The
+            # decision is INDETERMINATE, and an indeterminate decision
+            # is not permission.
+            #
+            # ADR-063 §2.4's governing rule: a fail-OPEN is acceptable
+            # only when the check is genuinely un-decidable AND
+            # something downstream can correct it. This is neither:
+            # the check is decidable in principle, and the only thing
+            # downstream is `/track` — which does not gate on budget.
+            #
+            # The refusal is typed and counted, not logged and
+            # forgotten: a log line is not a control, and the operator
+            # needs to see that the fleet is refusing calls.
+            self._note_backend_attempt(False)
+            metrics.inc_runtime("gate_indeterminate_total")
+            logger.error(
+                "check_workflow_budget: /gate failed with a non-transport "
+                f"error, refusing the call: {exc!r}"
+            )
+            raise NullRunGateIndeterminateError(
+                "the /gate call failed with a non-transport error, so the "
+                f"SDK could not determine a decision: {exc!r}",
+                cause=exc,
+            ) from exc
 
         # The reservation id the backend minted for THIS call. It is
         # captured into the server-minted contextvar (the legacy
@@ -3317,11 +3436,10 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             organization_id=self.organization_id,
             trace_id=get_trace_id(),
         )
-        # Drop the in-process gate cache for this chain AFTER the wire
-        # call so a transient transport failure does not free the
-        # cache before the server confirms closure.
-        workflow_id_str = str(self.workflow_id) if self.workflow_id else None
-        _invalidate_gate_cache_for_chain(workflow_id_str, chain_id)
+        # There is no in-process gate cache to drop: every step of a
+        # chain is admitted by its own /gate call and holds its own
+        # reservation, so closing the chain frees nothing locally
+        # (SDK-1).
         return result
 
     def approximate_budget(self) -> dict[str, Any]:
@@ -3650,6 +3768,99 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         """
         return self._sensitive_tools | self._strict_mode_tools
 
+    # =============================================================================
+    # Fail-open classification — the per-tool bound on
+    # NULLRUN_SENSITIVE_FAIL_OPEN
+    # =============================================================================
+
+    def register_fail_open_tools(self, tool_names: list[str]) -> None:
+        """Classify tools as ones the fail-open switch may open.
+
+        ``NULLRUN_SENSITIVE_FAIL_OPEN=1`` lets a protected tool's body
+        run while the policy engine is unreachable. Before this
+        classification existed the switch applied to EVERY protected
+        tool, so one operator decision (set the variable) removed
+        enforcement from the whole agent.
+
+        The switch is now bounded by this classification: it opens a
+        tool ONLY if that tool was registered here. The set is empty
+        by default, so the switch alone opens nothing and every tool
+        stays fail-CLOSED.
+
+        This is a code-level classification on purpose. It is not an
+        environment variable, so it cannot be inherited by a deploy
+        pipeline or a CI job that did not choose it — it is a
+        deliberate act by whoever writes the agent.
+
+        This is NOT the sensitivity registry (``add_sensitive_tool``
+        and friends). That registry answers "is this tool
+        destructive?"; this one answers "may this tool run unchecked
+        during an outage?". A tool may be in both, and the two
+        answers are independent.
+
+        Args:
+            tool_names: Names of the tools to classify. Match is
+                case-insensitive, like the sensitivity registry.
+
+        Example:
+            runtime = NullRunRuntime.get_instance()
+            runtime.register_fail_open_tools(["charge_card"])
+        """
+        with self._tools_lock:
+            for tool_name in tool_names:
+                self._fail_open_tools.add(tool_name)
+            # Rebuild the lowercase snapshot once after the batch
+            # insert (a single set comprehension beats N rebuilds
+            # in the loop).
+            self._fail_open_tools_lower = frozenset(
+                t.lower() for t in self._fail_open_tools
+            )
+
+    def remove_fail_open_tool(self, tool_name: str) -> None:
+        """Un-classify a tool: the fail-open switch stops applying to it.
+
+        Args:
+            tool_name: Name of the tool to remove from the fail-open
+                classification.
+
+        Example:
+            runtime = NullRunRuntime.get_instance()
+            runtime.remove_fail_open_tool("charge_card")
+        """
+        with self._tools_lock:
+            self._fail_open_tools.discard(tool_name)
+            self._fail_open_tools_lower = frozenset(
+                t.lower() for t in self._fail_open_tools
+            )
+
+    def get_fail_open_tools(self) -> set[str]:
+        """The tools currently classified as fail-open-allowed.
+
+        Returns:
+            A copy of the classified tool names, so a caller cannot
+            mutate the runtime's state through the returned set.
+        """
+        with self._tools_lock:
+            return set(self._fail_open_tools)
+
+    def is_fail_open_allowed(self, tool_name: str) -> bool:
+        """Whether the fail-open switch may open this tool.
+
+        This is the per-tool bound on ``NULLRUN_SENSITIVE_FAIL_OPEN``.
+        It is a pure classification lookup: it does not read the
+        environment and does not decide whether the switch is on.
+
+        Args:
+            tool_name: Name of the tool.
+
+        Returns:
+            True when the operator classified this tool as one that
+            may run unchecked while the policy engine is unreachable.
+        """
+        needle = tool_name.lower()
+        with self._tools_lock:
+            return needle in self._fail_open_tools_lower
+
     def execute(
         self,
         tool_name: str,
@@ -3970,9 +4181,13 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
         # then echoes the new id back via ``reservation_id``
         # (mirrored by the backend's GateResponse::require_approval
         # constructor — see backend/src/enforcement/gate_wire_adapter.rs).
-        # Capture here is fail-OPEN (drops malformed values
-        # silently via the helper's UUID parse), matching
-        # ``check_workflow_budget``'s behaviour.
+        #
+        # The capture REFUSES a present-but-unusable id (SDK-10) —
+        # it is not fail-OPEN. The old comment here said "fail-OPEN
+        # (drops malformed values silently via the helper's UUID
+        # parse)", which described the defect: a dropped reservation id
+        # meant the tool ran with no reservation, so its spend was
+        # never booked.
         _capture_server_minted_execution_id(result)
 
         # Sync the kwargs dict to the captured id so the post-approval
@@ -4235,6 +4450,11 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             "NullRunApprovalReplayRejectedError": frozenset({"approval_id"}),
             "NullRunApprovalDigestMismatchError": frozenset({"approval_id"}),
             "NullRunApprovalToolDigestMismatchError": frozenset({"approval_id"}),
+            # DEC-5 / DEC-7: the approval binds a TOOL SET; the
+            # executing tool must be a member. Same promotion as the
+            # two digest siblings — ``approval_id`` lands as a
+            # first-class attr, not only inside ``details``.
+            "NullRunApprovalToolMismatchError": frozenset({"approval_id"}),
         }
 
         def _build_payload(
@@ -4551,10 +4771,25 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
                Failure mode
                ------------
                ``track_single`` raises on 422 / 503 / 5xx (see
-               ``nullrun.breaker.exceptions``). We catch and log at
-               WARNING level; the event is dropped (NOT retried via
-               the batch path — that would risk double-billing the
-               idempotency contract).
+               ``nullrun.breaker.exceptions``).
+
+               A backend ANSWER raises. The consume did not land, so
+               the caller must not be told the track succeeded. The
+               payload goes to the v3 WAL first, so the refusal is
+               raised AND recoverable (ADR-183).
+
+               An enforcement verdict also raises, and it is NOT
+               written to the WAL. The backend will answer the same
+               way next time.
+
+               A request that never reached the backend keeps the
+               ADR-008 fail-OPEN row. The payload still goes to the
+               v3 WAL, the failure is logged at WARNING, and the
+               caller is not blocked.
+
+               The event is never retried via the batch path. That
+               endpoint does not run the CONSUME script, so a
+               reservation replayed through it is never settled.
         """
         from nullrun.context import get_server_minted_execution_id
 
@@ -4613,36 +4848,44 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             # DEF-CACHE-STALE-ALLOW-AFTER-OVERBUDGET: when the backend
             # refuses the consume with HTTP 422 (CONSUME_OVERBUDGET)
             # or HTTP 402 (REDIS_UNAVAILABLE on the consume path)
-            # the chain has hit its budget ceiling. Any cached
-            # "allow" for the same (workflow_id, chain_id) must NOT
-            # be served for the next 0–5 s — otherwise a chain firing
-            # faster than the cache TTL over-reserves against a
-            # budget the server has just rejected. Invalidate before
-            # logging so the order in logs matches the order in code.
+            # the chain has hit its budget ceiling.
             #
-            # chain_id lives in the contextvar (set by the
-            # ``with chain(...)`` contextmanager or
-            # ``set_chain_id(...)`` manual setter), NOT on the
-            # wire_event — wire_event is the per-call track dict
-            # and the chain_id is implicit (the backend re-derives
-            # it from the reservation binding on /track). Reading
-            # from ``get_chain_id()`` ensures we invalidate ONLY
-            # the failing chain's cache entries, not every chain
-            # for the same workflow.
-            from nullrun.context import get_chain_id
-
+            # Pre-fix the SDK also dropped an in-process gate cache
+            # here, so the next step of the chain could not be served
+            # a stale "allow". There is no such cache any more: every
+            # step is admitted by its own /gate call, and a refused
+            # consume is refused by the server, which is the only
+            # place the budget lives (SDK-1).
             status_code = getattr(exc, "status_code", None)
-            if status_code in (402, 422):
-                _invalidate_gate_cache_for_chain(
-                    wire_event.get("workflow_id"),
-                    get_chain_id(),
-                )
             _emit_for_transport_error(
                 exc,
                 stage="track_v3_single",
                 correlation_id=smid,
                 status_code=status_code,
             )
+            # SDK-1 (security audit 2026-11-06). The tool call has
+            # ALREADY run and the money has ALREADY been spent. The
+            # only thing that keeps that spend from being lost is a
+            # durable copy of the consume payload, so it is written
+            # BEFORE anything decides whether to raise.
+            #
+            # The payload is written VERBATIM — `reservation_id` and
+            # `idempotency_key` included — and the WAL replay sends it
+            # back to `/api/v1/track` (single). The batch endpoint is
+            # NOT a recovery route: it does not run the CONSUME
+            # script, so a reservation replayed through it is never
+            # settled and the money is never booked.
+            #
+            # A determinate verdict is NOT persisted. A
+            # `NullRunDecision` (budget, approval, chain,
+            # consume-overbudget) is the backend's ANSWER: re-sending
+            # it produces the same answer and a row that could never
+            # leave the WAL.
+            if not isinstance(exc, NullRunDecision):
+                if self._transport.persist_v3_track(single_payload):
+                    metrics.inc_runtime("v3_track_persisted_to_wal")
+                else:
+                    metrics.inc_runtime("v3_track_wal_persist_failed")
             # DEF-TC6-006 (2026-10-02, QA RUN_ID 20261002T0826):
             # a bare `except Exception` here laundered an ADR-005
             # enforcement rejection into a transport warning. The
@@ -4671,15 +4914,58 @@ class NullRunRuntime(metaclass=_NullRunRuntimeMeta):
             # plain 5xx stay in the transport class and keep
             # dropping, because they name no enforcement failure
             # and raising on them would be the over-correction.
+            # (PRE-SDK-1 RULE. Superseded by SDK-1 below — a
+            # protocol error and a plain 5xx on /track are refusals
+            # of the CONSUME, not of the check.)
             # The invalidation above runs first either way — the
             # cached-allow blast radius (DEF-CACHE-STALE-ALLOW-
             # AFTER-OVERBUDGET) is closed before the raise, not
             # traded away for it.
+            #
+            # SDK-1 (security audit 2026-11-06) changes this. The
+            # scope above was WRONG on the money path, and the
+            # exception hierarchy is why it was wrong: a backend
+            # refusal (`NullRunBackendError`) sits under
+            # `NullRunInfrastructureError`, a SIBLING of
+            # `NullRunDecision`, so `isinstance(exc, NullRunDecision)`
+            # never caught a 503 `RESERVATION_NOT_FOUND` or a 500
+            # `INTERNAL_ERROR`. Those are refusals of the CONSUME:
+            # the tool call has already run, the money has already been
+            # spent, and the backend refused to book it. Reporting
+            # `{"allowed": True}` for that is a lost spend with a
+            # success label on it.
+            #
+            # The refusal is now decided BY THE WIRE (see
+            # `transport.is_backend_refusal`), not by the exception
+            # class: the question is "did the backend ANSWER?", and the
+            # answer is on the exception as the HTTP status of the
+            # response. A request that never reached the backend stays
+            # a transport failure and keeps dropping — that is the
+            # ADR-008 fail-open row, and it is unchanged.
+            #
+            # The class list this replaced named three classes and left
+            # nine backend codes outside them: the `PROTOCOL_*` family,
+            # `IDEMPOTENCY_CONFLICT`, `IDEMPOTENCY_KEY_MISMATCH` and
+            # the three `RATE_LIMIT_*` codes. The backend rate-limits
+            # `/track`, so a 429 there is LIVE — and it was a dropped
+            # spend. The taxonomy of an answer does not change what the
+            # SDK owes the caller: the consume did not land.
             if isinstance(exc, NullRunDecision):
                 logger.warning(
                     "_route_track: /track refused the consume for "
                     "execution_id=%s (%s) — propagating (ADR-008: an "
                     "enforcement rejection is not a transport error)",
+                    smid,
+                    exc,
+                )
+                raise
+            if is_backend_refusal(exc):
+                logger.warning(
+                    "_route_track: /track refused the consume for "
+                    "execution_id=%s (%s) — propagating (SDK-1: the "
+                    "backend answered and refused, so the consume did "
+                    "not land and the refusal must not be reported as "
+                    "a successful track)",
                     smid,
                     exc,
                 )
@@ -4929,15 +5215,66 @@ def __getattr__(name):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+def _refuse_malformed_reservation(reason: str) -> None:
+    """Refuse an answer whose ``reservation_id`` cannot be bound.
+
+    SDK-10 (reliability audit 2026-11-02). The capture used to log a
+    warning and return ``None`` for a ``reservation_id`` that is not a
+    UUID — reading "the server handed back an id I cannot use" as
+    "the server reserved nothing". Those are two different facts, and
+    the difference is money:
+
+    * the backend's ``/gate`` Allow arm threads the Step-9 Lua
+      reserve's server-minted ``uuidv7`` into ``GateResponse``
+      ``reservation_id`` (the dispatcher's third tuple position), and
+      the ``/execute`` arm reuses the same id (ADR-073), so a REAL
+      answer always carries a UUID there;
+    * an id that is present and NOT a UUID therefore did not come from
+      the reserve path — a non-NULLRUN responder (captive portal,
+      TLS-interception box), a corrupted proxy hop, or a backend that
+      minted something else.
+
+    Dropping it silently let the call run with NO reservation: the
+    ``/track`` event had no ``execution_id`` to carry, so the spend
+    was never booked, and the backend's reserve sat on the period
+    counter until its TTL ran out. The agent got the call for free.
+
+    So the answer is REFUSED, not downgraded. The class is the one the
+    SDK already uses for "something answered, and what it said was not
+    a verdict" (``_require_gate_decision``): the reservation id is part
+    of the verdict, because it is what binds the money.
+
+    Always raises; the ``-> None`` return type lets the call sites use
+    it as the tail of an arm.
+    """
+    from nullrun.breaker.exceptions import NullRunMalformedGateResponseError
+
+    logger.error(
+        "_capture_server_minted_execution_id: response.reservation_id "
+        "cannot be bound (%s) — refusing the call",
+        reason,
+    )
+    metrics.inc_runtime("gate_malformed_reservation_total")
+    raise NullRunMalformedGateResponseError(
+        f"/gate returned a reservation_id that cannot be bound: {reason}. "
+        f"That id is what ties this call's spend to the reservation the "
+        f"server minted, so the SDK refuses the call instead of running it "
+        f"unbilled."
+    )
+
+
 # The module-level slot is a proxy over the registry. The
 def _capture_server_minted_execution_id(response: dict[str, Any]) -> str | None:
     """Capture ``response["reservation_id"]`` into the server-minted
     execution_id contextvar.
 
-    Returns the captured id (or ``None`` on miss / malformed) so the
-    caller can log it on debug paths. The contextvar itself is the
-    authoritative side-effect — readers consult
-    ``get_server_minted_execution_id`` from ``nullrun.context``.
+    Returns the captured id, or ``None`` when the answer carries NO
+    reservation (a block reserves nothing). A reservation id that is
+    PRESENT but unusable is a different case — it is an answer the SDK
+    cannot act on, and it REFUSES (SDK-10, ``_refuse_malformed_reservation``).
+
+    The contextvar itself is the authoritative side-effect — readers
+    consult ``get_server_minted_execution_id`` from ``nullrun.context``.
 
     Import is lazy (inside the function) to keep
     ``nullrun.runtime`` import order stable: ``context`` itself
@@ -4954,37 +5291,33 @@ def _capture_server_minted_execution_id(response: dict[str, Any]) -> str | None:
     )
 
     raw = response.get("reservation_id") if isinstance(response, dict) else None
-    if not raw:
+    if raw is None:
         # Block response with no reservation_id; clear so the
-        # previous scope's value can't leak.
+        # previous scope's value can't leak. An ABSENT id means the
+        # server reserved nothing — that is a fact, not a fault.
         clear_server_minted_execution_id()
         return None
 
     if not isinstance(raw, str):
-        clear_server_minted_execution_id()
-        logger.warning(
-            "_capture_server_minted_execution_id: response.reservation_id "
-            "is %s, expected str — dropping",
-            type(raw).__name__,
+        _refuse_malformed_reservation(
+            f"it is {type(raw).__name__}, expected a string"
         )
-        return None
 
-    # Defence-in-depth UUID parse — backend's mint_execution_id
-    # emits RFC-4122 uuidv7 but a buggy proxy could echo garbage.
-    # Drop without raising (fail-OPEN on capture; the backend will
-    # still reject malformed ids with 400 on /track).
+    if not raw:
+        _refuse_malformed_reservation("it is an empty string")
+
+    # The backend's ``/gate`` Allow arm threads the Step-9 reserve's
+    # server-minted ``uuidv7`` into ``reservation_id``, and the
+    # ``/execute`` arm reuses that same id (ADR-073) — so a real
+    # answer always carries a UUID here. A present-but-unparseable id
+    # did not come from the reserve path, and the spend it would have
+    # paid for cannot be bound to it. Refuse (SDK-10).
     import uuid as _uuid
 
     try:
         _uuid.UUID(raw)
     except (ValueError, AttributeError):
-        clear_server_minted_execution_id()
-        logger.warning(
-            "_capture_server_minted_execution_id: response.reservation_id=%r "
-            "is not a valid UUID — dropping",
-            raw,
-        )
-        return None
+        _refuse_malformed_reservation(f"{raw!r} is not a valid UUID")
 
     set_server_minted_execution_id(raw)
     set_server_minted_reservation_at(_time.monotonic())

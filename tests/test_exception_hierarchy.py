@@ -38,10 +38,13 @@ from nullrun.breaker.exceptions import (
     NullRunBudgetError,
     # Config / auth
     NullRunConfigError,
+    NullRunDecision,
     NullRunError,
+    NullRunGateIndeterminateError,
     NullRunToolBlockedError,
     # Transport
     NullRunTransportError,
+    NullRunUnknownActionError,
     RateLimitError,
     TransportErrorSource,
     WorkflowKilledInterrupt,
@@ -236,6 +239,69 @@ class TestErrorCodeCatalog:
             )
         assert info.value.error_code == "NR-R001"
         assert info.value.retryable is True
+
+    def test_indeterminate_gate_is_NR_P004(self):
+        """SDK-11 — the refusal for a decision the SDK could not obtain.
+
+        The code is the operator's only handle on this class, so it is
+        pinned like every other one. ``retryable`` is True: the fault
+        is the SDK's own and may be transient.
+        """
+        with pytest.raises(NullRunGateIndeterminateError) as info:
+            raise NullRunGateIndeterminateError("no decision")
+        assert info.value.error_code == "NR-P004"
+        assert info.value.retryable is True
+
+    def test_indeterminate_gate_is_not_a_transport_error(self):
+        """ADR-126's two-step opt-in opens TRANSPORT errors.
+
+        An indeterminate decision must not be convertible into "the
+        body runs" by flipping a switch, so it must not be a
+        transport error.
+        """
+        assert not issubclass(
+            NullRunGateIndeterminateError, NullRunTransportError
+        ), (
+            "the indeterminate refusal must not be a transport error — "
+            "that is the one class ADR-126's opt-in can open"
+        )
+
+    def test_unknown_action_is_NR_P005(self):
+        """SDK-12 — the refusal for an action the SDK cannot execute.
+
+        ``retryable`` is False: the same unknown action on the same SDK
+        version fails identically. The fix is a version alignment, not
+        a retry.
+        """
+        with pytest.raises(NullRunUnknownActionError) as info:
+            raise NullRunUnknownActionError("unknown action type")
+        assert info.value.error_code == "NR-P005"
+        assert info.value.retryable is False
+
+    def test_unknown_action_is_not_a_transport_error(self):
+        """The same rule as the indeterminate refusal (ADR-126).
+
+        "The body runs" is not an acceptable answer to "the control
+        plane sent an instruction this SDK cannot execute".
+        """
+        assert not issubclass(
+            NullRunUnknownActionError, NullRunTransportError
+        ), (
+            "the unknown-action refusal must not be a transport error — "
+            "that is the one class ADR-126's opt-in can open"
+        )
+
+    def test_unknown_action_is_not_a_decision(self):
+        """It is an infrastructure error, NOT a policy decision.
+
+        A decision would mean "the policy engine refused this"; an
+        unknown action type means "the control plane sent something
+        this SDK cannot execute". The workflow is NOT blocked.
+        """
+        assert not issubclass(NullRunUnknownActionError, NullRunDecision), (
+            "an unknown action type must not be a decision — a decision "
+            "reads as a policy verdict and as a block"
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -22,11 +22,30 @@ except ImportError:
 
 from nullrun.breaker.exceptions import (
     NullRunBlockedException,
+    NullRunUnknownActionError,
     NullRunWorkflowKilledError,
+    WorkflowKilledInterrupt,
     WorkflowPausedException,
 )
+from nullrun.observability import metrics
 
 logger = logging.getLogger(__name__)
+
+# The refusals the DEFAULT handlers raise ON PURPOSE: kill, pause,
+# block. A handler that refuses this way HAS EXECUTED — the refusal is
+# the action's outcome, not a fault in the handler, so it belongs on
+# the INFO channel. Anything else a handler raises is a fault in the
+# handler and belongs on the ERROR channel.
+#
+# Deliberately NOT the whole ``ENFORCEMENT_EXCEPTIONS`` family: that
+# family also holds classes that mean "the SDK could not determine the
+# answer" (``NullRunGateIndeterminateError``), and downgrading those
+# to INFO here would hide a refusal behind a log level.
+_ACTION_REFUSALS: tuple[type[BaseException], ...] = (
+    WorkflowKilledInterrupt,
+    WorkflowPausedException,
+    NullRunBlockedException,
+)
 
 
 @dataclass
@@ -69,8 +88,13 @@ class ActionHandler:
     Handler for NullRun circuit breaker actions.
 
     This executes protective actions when triggered:
-    - KILL: Immediately stops the workflow (raises NullRunWorkflowKilledError, NR-W002)
-    - PAUSE: Temporarily halts the workflow (raises WorkflowPausedException)
+    - KILL: signals the kill (the default handler raises
+      NullRunWorkflowKilledError, NR-W002). The raise is SWALLOWED by
+      ``handle`` — see its docstring — so what actually stops the
+      workflow is the GATE refusing the next /check (ADR-063 §3), not
+      this handler.
+    - PAUSE: signals the pause (raises WorkflowPausedException) —
+      swallowed the same way, and the gate refuses the next /check.
     - ALERT: Sends notification (can be customized)
     - SNAPSHOT: Captures workflow state for debugging
     - WEBHOOK: Sends HTTP webhook notification
@@ -179,15 +203,23 @@ class ActionHandler:
             **details: Additional details about the action
 
         Raises:
-            NullRunWorkflowKilledError: If action is "kill"
-                (subclass of WorkflowKilledInterrupt, which is
-                the canonical catch name.)
-            WorkflowPausedException: If action is "pause"
-            NullRunBlockedException: If action is "block"
+            NullRunUnknownActionError: If ``action`` is not a known
+                action type. The action was NOT executed and the
+                caller is told so. It is deliberately NOT a block, so
+                the workflow keeps running — an unrecognised value
+                must not become a DoS amplifier.
+
+        Note:
+            The handler's own refusal (kill / pause / block) does NOT
+            escape this method. It is recorded in the action history
+            and logged at INFO. The authoritative enforcement of a kill
+            or a pause is the GATE (ADR-063 §3): the gate refuses the
+            next /check. A handler that raises anything else is a
+            fault and is logged at ERROR.
         """
         try:
             action_type = ActionType(action.lower())
-        except ValueError:
+        except ValueError as exc:
             # Pre-fix this degraded silently to ``ActionType.BLOCK``
             # (B14) and triggered ``_default_block`` which raises
             # ``NullRunBlockedException``. That made the SDK into a
@@ -196,19 +228,22 @@ class ActionHandler:
             # would block every subsequent tool call in the workflow
             # with no actionable error.
             #
+            # B14's fix (log at ERROR, record the event, RETURN) kept
+            # the DoS property but left the action neither executed
+            # nor refused: the caller could not tell "it ran" from
+            # "it could not run" (SDK-12).
+            #
             # Post-fix: log at ERROR, record the event for forensic
-            # visibility, and DO NOT invoke any handler. The
-            # workflow keeps running under fail-open. The operator
-            # gets a clear signal that the control plane sent an
-            # action type the SDK doesn't understand — likely a
-            # version mismatch (server upgraded, SDK not yet) or a
-            # schema regression worth investigating.
+            # visibility, DO NOT invoke any handler, and RAISE a typed
+            # error so the caller learns the action did not run. The
+            # error is an infrastructure error, NOT a block — the
+            # workflow keeps running.
             logger.error(
                 f"Unknown action type received from control plane: {action!r} "
                 f"for workflow {workflow_id!r} (reason={reason!r}). "
                 "This is a server/SDK version mismatch or a control plane "
-                "schema regression. Failing open — the workflow will continue "
-                "running. Investigate ASAP."
+                "schema regression. The action was NOT executed — the "
+                "workflow keeps running. Investigate ASAP."
             )
             self._record_action(
                 ActionType.BLOCK,
@@ -216,7 +251,15 @@ class ActionHandler:
                 f"unknown_action_type:{action}",
                 details,
             )
-            return
+            metrics.inc_runtime("unknown_action_total")
+            raise NullRunUnknownActionError(
+                f"the control plane sent an unknown action type {action!r} "
+                f"for workflow {workflow_id!r}; the action was not executed",
+                action=action,
+                workflow_id=workflow_id,
+                reason=reason,
+                cause=exc,
+            ) from exc
 
         handler = self._handlers.get(action_type, self._default_block)
 
@@ -229,13 +272,28 @@ class ActionHandler:
 
         try:
             handler(workflow_id, reason or "Unknown", **details)  # type: ignore[no-untyped-call]
-        except BaseException as e:
-            # Don't let handler exceptions propagate. We catch
-            # `BaseException` (not just `Exception`) because
-            # kill signals (NullRunWorkflowKilledError, the
-            # third-party kill-shaped signals must be recorded
-            # in history (already done above) and swallowed,
-            # NOT re-raised into the caller's frame.
+        except _ACTION_REFUSALS as e:
+            # The handler REFUSED ON PURPOSE — kill, pause, block. That
+            # is the action's outcome, not a fault in the handler, so it
+            # goes to INFO and the ERROR channel keeps meaning
+            # "something is broken". Pre-SDK-12 this arm logged at
+            # ERROR, so every server-side kill raised a false alarm.
+            #
+            # The refusal is deliberately NOT re-raised: the history
+            # entry above is already the audit trail, and the
+            # authoritative enforcement of a kill/pause is the GATE
+            # (ADR-063 §3 — the gate refuses the next /check).
+            # Re-raising here would abort the caller's action loop over
+            # an action that was delivered correctly.
+            logger.info(
+                f"Action {action_type.value} refused for workflow "
+                f"{workflow_id}: {e}"
+            )
+        except Exception as e:
+            # A real fault in the handler (a buggy custom handler, a
+            # broken call). ``KeyboardInterrupt`` / ``SystemExit`` /
+            # ``GeneratorExit`` are NOT caught: they are BaseException,
+            # not Exception, and a Ctrl-C must reach the caller.
             logger.error(f"Action handler error: {e}")
 
     def _default_kill(

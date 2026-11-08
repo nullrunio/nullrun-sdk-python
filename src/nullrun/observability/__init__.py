@@ -76,6 +76,19 @@ class TransportMetrics:
     # We split it from hmac_verify_failures_total so the two
     # alert paths can have different runbooks.
     hmac_verify_expired_total: int = 0
+    # Approval frames on the control-plane WebSocket that the SDK
+    # could NOT authenticate. Such a frame is REFUSED — it never
+    # releases a parked gate (SDK-5). A non-zero value means
+    # somebody pushed an approval the SDK cannot verify: either a
+    # client that never got its HMAC secret, or a forged frame.
+    ws_unverified_approval_total: int = 0
+    # Control-plane frames the SDK REFUSED because it could verify
+    # signatures (it holds the API key and the HMAC secret) and the
+    # frame was not verifiably signed. The server signs every frame it
+    # sends for such a key, so an unsigned frame did not come from the
+    # server. A non-zero value means somebody injected frames into the
+    # socket, or the client and the server disagree about the secret.
+    ws_unverified_frame_total: int = 0
     # --- WAL durability state (set by Transport, not incremented) ----------
     # These answer "what can this deployment actually promise?", which the
     # code cannot answer on your behalf across OSes and filesystems. A field
@@ -166,6 +179,32 @@ class RuntimeMetrics:
     # counter, the failure mode was invisible at INFO log level on
     # the FALLBACK path.
     gate_fail_open_total: int = 0
+    # The gate's decision was INDETERMINATE and the SDK REFUSED
+    # (SDK-11). A separate counter from ``gate_fail_open_total``
+    # because this one does NOT fail open: the call is stopped. It is
+    # the signal that the SDK itself is broken (a request body that
+    # cannot be serialised, a decode error, a fault in the edge
+    # path) — an SDK-side incident, not a backend outage, so it must
+    # not be alerted on as one.
+    gate_indeterminate_total: int = 0
+    # A control-plane action arrived whose type this SDK does not know
+    # (SDK-12). The action was NOT executed; the SDK raised
+    # ``NullRunUnknownActionError`` and the caller was told. This
+    # counter is the operator's signal that the server and the SDK are
+    # out of step (the server grew its action vocabulary, the SDK did
+    # not follow). Expected rate: zero — a non-zero rate means the
+    # control plane is sending instructions this SDK cannot run.
+    unknown_action_total: int = 0
+    # The /execute policy decision was INDETERMINATE and the SDK
+    # REFUSED (SDK-13). The twin of ``gate_indeterminate_total`` on
+    # the /execute side: the SDK's own code faulted while asking the
+    # policy engine, so the SDK could not tell "the engine refused
+    # this" from "the SDK never found out" — and the decorated body
+    # did NOT run. A SEPARATE counter from ``gate_indeterminate_total``
+    # because the two are different seams: this one is the /execute
+    # request path, that one is the /gate path, and an operator
+    # chasing an SDK bug needs to know which one moved.
+    policy_gate_indeterminate_total: int = 0
     # `/track/batch` with `llm_call` events missing `reservation_id`
     # is now fail-CLOSED at the backend (whole-batch 503 BUDGET_RECHECK_FAILED).
     # Pre-0.16.0 the SDK fell back to that path for calls without a
@@ -256,8 +295,11 @@ class MetricsRegistry:
                     "circuit_half_open_count": self.transport.circuit_half_open_count,
                     "circuit_closed_count": self.transport.circuit_closed_count,
                     "fallback_mode_activations": self.transport.fallback_mode_activations,
+                    "events_recorded_overage": self.transport.events_recorded_overage,
                     "hmac_verify_failures_total": self.transport.hmac_verify_failures_total,
                     "hmac_verify_expired_total": self.transport.hmac_verify_expired_total,
+                    "ws_unverified_approval_total": self.transport.ws_unverified_approval_total,
+                    "ws_unverified_frame_total": self.transport.ws_unverified_frame_total,
                     "wal_dir_fsync": self.transport.wal_dir_fsync,
                     "wal_lock": self.transport.wal_lock,
                     "wal_lock_timeouts_total": self.transport.wal_lock_timeouts_total,
@@ -282,6 +324,14 @@ class MetricsRegistry:
                     "timeouts": self.runtime.timeouts,
                     "loop_detections": self.runtime.loop_detections,
                     "gate_fail_open_total": self.runtime.gate_fail_open_total,
+                    "gate_indeterminate_total": self.runtime.gate_indeterminate_total,
+                    "unknown_action_total": self.runtime.unknown_action_total,
+                    "policy_gate_indeterminate_total": (
+                        self.runtime.policy_gate_indeterminate_total
+                    ),
+                    "dropped_llm_call_no_reservation": (
+                        self.runtime.dropped_llm_call_no_reservation
+                    ),
                 },
             }
 

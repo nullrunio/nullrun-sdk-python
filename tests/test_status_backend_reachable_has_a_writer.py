@@ -46,6 +46,8 @@ from __future__ import annotations
 
 import threading
 
+import pytest
+
 from nullrun.observability.status import _RecentErrorRing
 from nullrun.runtime import NullRunRuntime
 
@@ -160,8 +162,21 @@ class TestWriterIsActuallyWired:
 
     A helper with no call sites is exactly how the field became
     permanently ``None`` in the first place: the reader and the writer
-    were written together and the writer was then never invoked. These
-    pin the call sites in production source.
+    were written together and the writer was then never invoked.
+
+    These drive the real code paths and read the field the writer
+    writes. They used to count occurrences of the call in the source,
+    and that count could not tell "the guard was removed" from "a
+    duplicated arm was removed": the /gate check had two branches (a
+    chain-mode cache branch and the direct branch) with the SAME
+    fail-open arm, so the count of ``_note_backend_attempt(False)`` was
+    3 for a property that only ever had 2 distinct sites. When the
+    cache branch went (SDK-1) the count fell to 2 and the pin went red
+    on correct code.
+
+    The property is what is pinned here: every path that learns the
+    backend answered records True, every path that learns it did not
+    record False.
     """
 
     @staticmethod
@@ -174,16 +189,111 @@ class TestWriterIsActuallyWired:
             encoding="utf-8"
         )
 
-    def test_gate_paths_call_the_writer(self):
-        source = self._runtime_source()
-        assert source.count("_note_backend_attempt(True)") >= 3, (
-            "both /gate paths in check_workflow_budget and the /auth/verify "
-            "success path must record that the backend answered"
+    @staticmethod
+    def _live_runtime() -> NullRunRuntime:
+        """A runtime with a transport but no network."""
+        return NullRunRuntime(
+            api_key="nr_live_testkey",
+            api_url="https://api.example.invalid",
+            _test_mode=True,
+            polling=False,
         )
-        assert source.count("_note_backend_attempt(False)") >= 3, (
-            "both /gate fail-open paths and the /auth/verify transport-error "
-            "path must record a transport failure"
-        )
+
+    def test_the_gate_answer_path_records_reachability(self):
+        """The /gate success path: the backend answered."""
+        from nullrun.context import workflow
+
+        rt = self._live_runtime()
+        try:
+            rt._transport.check = lambda req: {  # type: ignore[method-assign]
+                "decision": "allow",
+                "decision_source": "gateway",
+            }
+            with workflow("wf-writer"):
+                rt.check_workflow_budget()
+            assert rt.status().backend_reachable is True
+        finally:
+            rt.shutdown()
+
+    def test_the_gate_fail_open_path_records_a_transport_failure(self):
+        """The /gate fail-open path: the backend did not answer.
+
+        This is the path that used to be duplicated — once per branch of
+        the (now removed) chain-mode cache. It is one path now and it
+        still records the failure.
+        """
+        import httpx
+
+        from nullrun.context import workflow
+
+        rt = self._live_runtime()
+
+        def boom(req):
+            raise httpx.ConnectError("connection refused")
+
+        try:
+            rt._transport.check = boom  # type: ignore[method-assign]
+            with workflow("wf-writer"):
+                assert rt.check_workflow_budget() is None
+            assert rt.status().backend_reachable is False
+        finally:
+            rt.shutdown()
+
+    def test_the_auth_success_path_records_reachability(self):
+        """The /auth/verify 200 path: the strongest liveness signal."""
+        import httpx
+
+        rt = self._live_runtime()
+        try:
+            rt._post_auth_with_retry = lambda *a, **kw: httpx.Response(  # type: ignore[method-assign]
+                200,
+                json={"organization_id": "org-test", "workflow_id": "wf-1"},
+            )
+            rt._authenticate()
+            assert rt.status().backend_reachable is True
+        finally:
+            rt.shutdown()
+
+    def test_a_refusal_from_auth_still_counts_as_the_backend_answering(self):
+        """A 401 is a reachable backend with a bad key."""
+        import httpx
+
+        from nullrun.breaker.exceptions import NullRunAuthenticationError
+
+        rt = self._live_runtime()
+        try:
+            rt._post_auth_with_retry = lambda *a, **kw: httpx.Response(  # type: ignore[method-assign]
+                401, json={}
+            )
+            with pytest.raises(NullRunAuthenticationError):
+                rt._authenticate()
+            assert rt.status().backend_reachable is True
+        finally:
+            rt.shutdown()
+
+    def test_the_auth_transport_error_path_records_a_transport_failure(self):
+        """The /auth/verify transport error: the backend did not answer.
+
+        This is the FIRST backend attempt in a normal run, so it is
+        what makes `backend_reachable` observable at all when the
+        backend is down from the start.
+        """
+        import httpx
+
+        from nullrun.breaker.exceptions import NullRunTransportError
+
+        rt = self._live_runtime()
+
+        def boom(*a, **kw):
+            raise httpx.ConnectError("connection refused")
+
+        try:
+            rt._post_auth_with_retry = boom  # type: ignore[method-assign]
+            with pytest.raises(NullRunTransportError):
+                rt._authenticate()
+            assert rt.status().backend_reachable is False
+        finally:
+            rt.shutdown()
 
     def test_writer_has_no_none_assignment(self):
         """The invariant that keeps the field truthful."""

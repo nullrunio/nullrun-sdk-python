@@ -29,6 +29,8 @@ import logging
 import threading
 from typing import Any
 
+import httpx
+
 from nullrun.runtime import get_runtime
 from nullrun.tracing import (
     SpanContext,
@@ -38,42 +40,112 @@ from nullrun.tracing import (
 )
 
 # Exceptions that represent a REAL enforcement decision from the gate,
-# as opposed to a failure to reach the gate. `NullRunBudgetError` is
-# the budget-exhausted block, `WorkflowKilledInterrupt` /
-# `WorkflowPausedException` are the dashboard KILL/PAUSE switches. All
-# three derive from `Exception`, so an ordering-sensitive `except`
-# clause is required: this tuple must be caught BEFORE the broad
-# transport arm, or the block is silently downgraded to a fail-OPEN
-# transport error.
+# as opposed to a failure to reach the gate. All of them derive from
+# `Exception`, so an ordering-sensitive `except` clause is required:
+# this tuple must be caught BEFORE the broad transport arm, or the
+# block is silently downgraded to a fail-OPEN transport error.
 #
 # ADR-008's fail-OPEN policy covers "the policy engine could not be
 # reached". It explicitly does NOT cover "the policy engine returned
 # `block`" — conflating the two is what let a real budget block
 # through as a debug log line.
+#
+# SDK-4 (reliability audit 2026-11-02) widened this family. The old
+# tuple named THREE concrete classes, and every other refusal the gate
+# can issue fell into the broad transport arm and was dropped at DEBUG:
+#
+#   * `TOOL_BLOCKED`  -> `NullRunToolBlockedError` -> `NullRunBlockedException`
+#                         -> `NullRunDecision`. NOT in the old tuple, so a
+#                         policy refusal was logged at debug and the agent
+#                         continued.
+#   * `RATE_LIMIT_EXCEEDED` -> `RateLimitError` -> `NullRunTransportError`
+#                         -> `NullRunInfrastructureError`. It is NOT a
+#                         `NullRunDecision` — the gate refused, but the
+#                         refusal wears a transport-shaped class because
+#                         the wire code is a 429. Naming `NullRunDecision`
+#                         alone would still have swallowed it.
+#
+# The family is therefore named by BASE class, so a refusal subclass
+# added later cannot silently fall back into the fail-OPEN arm:
+#   * `NullRunDecision` — every "the gate said no" refusal: tool-block,
+#     budget, the approval family, chain, workflow-inactive, PAUSE.
+#   * `RateLimitError` — the 429 refusal, which is transport-shaped.
+#   * `WorkflowKilledInterrupt` — the dashboard KILL switch. It derives
+#     from `NullRunError` directly, NOT from `NullRunDecision`.
+#
+# The family itself now lives in ONE place —
+# `nullrun.breaker.exceptions.ENFORCEMENT_EXCEPTIONS`. The /track path
+# needs the SAME rule (SDK-6), and two hand-written copies of the
+# family are two places to forget a refusal subclass.
+#
+# SDK-16 (reliability audit 2026-11-02, SDK-16 row of the handoff
+# ledger) adds the SECOND half of the classification the callback
+# needs. The family alone was not enough: `check_workflow_budget`
+# RAISES four classes the family does not name — a 401
+# (`NullRunAuthError`), an unreadable answer
+# (`NullRunMalformedGateResponseError`, already in the family), an
+# unclassifiable refusal (`NullRunUnclassifiedRefusalError`) and a
+# rate-limit backend that is down (`NullRunRateLimitRedisError`) —
+# and the callback swallowed all of them in a broad arm while the
+# `@protect` boundary re-raised them. The same refusal then killed
+# the call or not depending on which path it arrived through.
+#
+# The callback's classification is now the SAME four arms the
+# `@protect` boundary uses (`decorators.py::_run_tool_policy_gate`),
+# in the same order:
+#
+#   1. the family        -> a REFUSAL: it reaches the caller
+#   2. a transport error -> the gate could not be REACHED:
+#                           ADR-008's fail-OPEN (a dead backend must
+#                           not freeze the agent)
+#   3. any other infra   -> the gate ANSWERED, or the SDK could not
+#                           read the answer: fail-CLOSED
+#   4. anything else     -> a cosmetic fault in the SDK's own code:
+#                           swallowed, because a callback must never
+#                           break the host framework
+#
+# The order is load-bearing in BOTH directions:
+# `RateLimitError` is a `NullRunTransportError` (so arm 2 would
+# swallow the 429), and `NullRunTransportError` is a
+# `NullRunInfrastructureError` (so arm 3 would turn a dead backend
+# into a refusal and freeze the agent).
 try:  # pragma: no cover - import shape, not behaviour
     from nullrun.breaker.exceptions import (
-        NullRunBudgetError,
-        WorkflowKilledInterrupt,
-        WorkflowPausedException,
+        ENFORCEMENT_EXCEPTIONS,
+        NullRunInfrastructureError,
+        NullRunTransportError,
     )
 
-    _ENFORCEMENT_EXCEPTIONS: tuple[type[BaseException], ...] = (
-        NullRunBudgetError,
-        WorkflowKilledInterrupt,
-        WorkflowPausedException,
+    _ENFORCEMENT_EXCEPTIONS: tuple[type[BaseException], ...] = ENFORCEMENT_EXCEPTIONS
+    _TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (
+        httpx.HTTPError,
+        NullRunTransportError,
     )
+    _INFRASTRUCTURE_ERRORS: tuple[type[BaseException], ...] = (NullRunInfrastructureError,)
 except ImportError:  # pragma: no cover
     # The SDK is unusable without its own exception types, but never
     # let their absence break `import nullrun` for a consumer who
     # does not use LangChain. Empty tuple => every raise is treated
     # as a transport error, i.e. the pre-a626bbd behaviour.
     _ENFORCEMENT_EXCEPTIONS = ()  # type: ignore[assignment]
+    _TRANSPORT_ERRORS = ()  # type: ignore[assignment]
+    _INFRASTRUCTURE_ERRORS = ()  # type: ignore[assignment]
 
 
-# Deferred-enforcement handoff. LangChain swallows exceptions raised
-# from a callback, so a block discovered in `on_llm_start` cannot abort
-# the LLM call from here. The decision is stashed per-thread; the
-# `@protect` boundary (which CAN abort) drains it and raises.
+# Deferred-enforcement handoff — the SECONDARY channel.
+#
+# The PRIMARY channel is the raise: `on_llm_start` re-raises the gate
+# refusal, and `NullRunCallback.raise_error = True` makes
+# langchain-core propagate it to the caller instead of swallowing it
+# (SDK-4). That channel works across the thread hop the async
+# executor path forces, which a thread-local CANNOT: the stash is
+# written on the callback's thread and read on the `@protect`
+# boundary's thread, and those are different threads whenever the
+# graph is async.
+#
+# The stash is kept as the fallback for a host framework that ignores
+# `raise_error`: the refusal is recorded per-thread and the `@protect`
+# boundary (which CAN abort on its own thread) drains and raises it.
 #
 # Thread-local, not global: LangGraph runs concurrent chains in a
 # thread pool, and one chain's budget block must not abort another's.
@@ -115,6 +187,90 @@ def drain_deferred_enforcement() -> BaseException | None:
         return first
     except Exception:  # noqa: BLE001 — best-effort by construction
         return None
+
+
+def _swallow_callback_failure(fn: Any, exc: BaseException) -> None:
+    """Log a callback failure that must not break the host framework."""
+    logger.debug(
+        "NullRunCallback.%s failed: %s — swallowed so the host "
+        "framework keeps running",
+        getattr(fn, "__name__", "callback"),
+        exc,
+    )
+
+
+def _only_a_gate_refusal_escapes(fn: Any) -> Any:
+    """A callback must never break the host framework — except for a refusal.
+
+    SDK-4 (reliability audit 2026-11-02) turns ``NullRunCallback`` into
+    a handler that opts INTO propagation: langchain-core re-raises a
+    handler's exception when ``handler.raise_error`` is True
+    (``callbacks/manager.py::handle_event`` and
+    ``_ahandle_event_for_handler`` — both paths, sync and async).
+
+    That opt-in is only safe if exactly ONE thing can escape a
+    NullRun callback: a real gate refusal. Without this guard a
+    cosmetic failure — a span bookkeeping bug, a malformed response
+    object — would abort the user's agent, which is a far worse
+    failure than the one being fixed.
+
+    So every callback method is wrapped: a gate refusal is re-raised
+    (it must reach the caller), anything else is logged at debug and
+    swallowed (the pre-existing "best-effort" contract of these
+    callbacks, unchanged).
+
+    SDK-16 (the handoff ledger's SDK-16 row) makes "a real gate
+    refusal" mean what the SDK's own fail-OPEN/CLOSED table says it
+    means. The guard used to re-raise the enforcement FAMILY and
+    swallow everything else, and three classes the runtime raises on
+    purpose — a 401, an unclassifiable refusal, a rate-limit backend
+    that is down — are not in that family. They are not transport
+    failures either: the gate answered, or the SDK could not read the
+    answer. The ``@protect`` boundary already re-raised them, so the
+    same refusal killed the call through one path and vanished
+    through the other.
+
+    The arms are therefore the four of the ``@protect`` boundary, in
+    the same order: the family re-raised, a transport failure
+    swallowed (ADR-008's fail-OPEN), any other infrastructure error
+    re-raised (fail-CLOSED), and everything else swallowed (a
+    cosmetic failure must never break the host framework).
+
+    ``functools.wraps`` keeps ``__wrapped__``, so
+    ``inspect.getsource`` still returns the METHOD's own source — the
+    AST pin in ``tests/test_langchain_enforcement.py`` keeps reading
+    the real ``except`` arms of ``on_llm_start`` and not this
+    wrapper's.
+    """
+    import functools
+
+    @functools.wraps(fn)
+    def _wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return fn(self, *args, **kwargs)
+        except _ENFORCEMENT_EXCEPTIONS:
+            # A real refusal. It MUST reach the caller.
+            raise
+        except _TRANSPORT_ERRORS as exc:  # noqa: BLE001
+            # The gate could not be REACHED. ADR-008's fail-OPEN: a
+            # dead backend must not freeze the agent. Swallowed, as it
+            # always was.
+            _swallow_callback_failure(fn, exc)
+            return None
+        except _INFRASTRUCTURE_ERRORS:
+            # The gate ANSWERED, or the SDK could not read the answer:
+            # a 401, an unreadable body, a refusal the SDK cannot
+            # classify, a rate-limit backend that is down. The SDK's
+            # own table says fail-CLOSED for everything that is not a
+            # transport failure, and the ``@protect`` boundary obeys
+            # it. The callback must not be the one path where the same
+            # refusal is allowed through.
+            raise
+        except Exception as exc:  # noqa: BLE001 — a callback never breaks the chain
+            _swallow_callback_failure(fn, exc)
+            return None
+
+    return _wrapper
 
 # DEF-MP-TS12-SDK-05 (2026-09-29): `langchain-core` is a `dev` extra,
 # NOT a core dependency (`pyproject.toml` core deps are httpx only).
@@ -511,6 +667,32 @@ class NullRunCallback(BaseCallbackHandler):
     inside an `@protect`-wrapped function is properly nested.
     """
 
+    # SDK-4 (reliability audit 2026-11-02): opt INTO propagation.
+    #
+    # langchain-core SWALLOWS an exception raised by a callback handler
+    # unless the handler sets `raise_error = True`:
+    #
+    #   * sync  — `callbacks/manager.py::handle_event` catches the
+    #     handler's exception, logs "Error in <handler> callback", and
+    #     re-raises iff `handler.raise_error`.
+    #   * async — `callbacks/manager.py::_ahandle_event_for_handler`
+    #     does the same for a SYNC handler run through the executor.
+    #
+    # (Verified against langchain-core 1.5.6. The async ASYNC-handler
+    # path, `_run_coros`, swallows unconditionally — but this handler
+    # is synchronous, so it never goes through that path.)
+    #
+    # Without this flag a real gate refusal raised in `on_llm_start`
+    # was logged and dropped, and the agent carried on — the run
+    # COMPLETED after the gate had refused it.
+    #
+    # The flag is only safe because `_only_a_gate_refusal_escapes`
+    # guarantees that a gate refusal is the ONLY thing that can leave
+    # a NullRun callback. Every other failure is still swallowed, so
+    # the "never break the host chain" contract of these callbacks is
+    # unchanged.
+    raise_error = True
+
     def __init__(self, runtime: Any | None = None) -> None:
         self.runtime = runtime or get_runtime()
         # run_id -> SpanContext for in-flight chain / tool / agent
@@ -581,6 +763,7 @@ class NullRunCallback(BaseCallbackHandler):
     # LLM hooks (existing — token extraction only, no span bookkeeping)
     # ------------------------------------------------------------------
 
+    @_only_a_gate_refusal_escapes
     def on_llm_start(self, serialized: Any, prompts: Any, **kwargs: Any) -> None:
         """
         Called when LLM call starts.
@@ -663,40 +846,94 @@ class NullRunCallback(BaseCallbackHandler):
         try:
             self.runtime.check_workflow_budget()
         except _ENFORCEMENT_EXCEPTIONS as exc:
-            # A REAL gate decision — budget exhausted, workflow killed,
-            # workflow paused. NOT a transport failure, so the ADR-008
-            # fail-OPEN policy does not apply: that policy covers
-            # "the gate could not be reached", never "the gate said no".
+            # A REAL gate decision — tool-blocked, rate-limited, budget
+            # exhausted, workflow killed, workflow paused. NOT a
+            # transport failure, so the ADR-008 fail-OPEN policy does
+            # not apply: that policy covers "the gate could not be
+            # reached", never "the gate said no".
             #
             # The pre-fix `except BaseException` lumped these together
             # with transport errors and dropped them to `logger.debug`,
             # so a genuine budget block became an invisible debug line
             # and the LLM call proceeded anyway.
             #
-            # Re-raising here would NOT work: LangChain swallows
-            # exceptions raised from a callback handler (verified
-            # against langchain-core 1.5.6 — `on_llm_start` logs
-            # "Error in <handler> callback" and continues). So the
-            # honest options are (a) record the decision so the
-            # enforcement surface can act on it, and (b) make it
-            # loud. We do both: the decision is stashed on the
-            # runtime for `@protect` to raise at a point that CAN
-            # abort, and it is logged at ERROR rather than debug.
+            # SDK-4 (reliability audit 2026-11-02): the refusal is
+            # RE-RAISED. The old comment here said re-raising "would
+            # NOT work" because langchain swallows callback
+            # exceptions — true for a default handler, but this class
+            # now sets `raise_error = True`, which is exactly the
+            # opt-in langchain-core honours in BOTH the sync and the
+            # async dispatch path. So the refusal leaves the callback
+            # and reaches the caller, and the LLM call is aborted
+            # instead of running with no reservation.
+            #
+            # Before SDK-4 the tuple named only the budget / KILL /
+            # PAUSE classes, so a `TOOL_BLOCKED` or a `RATE_LIMIT`
+            # refusal fell into the broad arm below and was DROPPED —
+            # the run completed after the gate had refused it.
+            #
+            # The decision is ALSO recorded for the `@protect`
+            # boundary: that is the fallback for a host framework
+            # that ignores `raise_error`, and it is the only channel
+            # that can abort on the boundary's own thread.
             logger.error(
                 "NullRunCallback.on_llm_start: gate returned a real "
                 "decision (%s: %s). This LLM call has no reservation; "
                 "its cost event will be dropped by runtime._route_track. "
-                "Enforcement of this decision happens at the @protect "
-                "boundary, which CAN abort.",
+                "The refusal is re-raised so it reaches the caller and "
+                "aborts the LLM call; it is also recorded for the "
+                "@protect boundary.",
                 type(exc).__name__,
                 exc,
             )
             record_deferred_enforcement(exc)
-        except Exception as exc:  # noqa: BLE001 — never raise out of callback
+            raise
+        except _TRANSPORT_ERRORS as exc:  # noqa: BLE001 — never raise out of callback
             # Genuine transport failure (backend unreachable, timeout,
             # 5xx). Fail-OPEN is the DOCUMENTED ADR-008 policy for
             # this class: a dead backend must not freeze the agent,
             # and `/track` reconciles the cost afterwards. Unchanged.
+            logger.debug(
+                "NullRunCallback.on_llm_start: check_workflow_budget "
+                "raised %s — proceeding without reservation (llm_call "
+                "cost event will be dropped by runtime._route_track)",
+                type(exc).__name__,
+            )
+        except _INFRASTRUCTURE_ERRORS as exc:
+            # SDK-16: the gate ANSWERED, or the SDK could not read the
+            # answer, and the refusal is not a transport failure — a
+            # 401, an unclassifiable refusal, a rate-limit backend that
+            # is down. `check_workflow_budget` raises these on
+            # purpose, and the SDK's own fail-OPEN/CLOSED table says
+            # CLOSED for everything that is not a transport failure.
+            # The `@protect` boundary already obeyed that; this arm
+            # used to be the broad one below, so the same refusal
+            # killed the call through one path and vanished through
+            # the other.
+            #
+            # The LLM call must not run: it has no reservation, so its
+            # cost event would be dropped and the agent would get the
+            # call for free.
+            logger.error(
+                "NullRunCallback.on_llm_start: the gate could not be "
+                "used (%s: %s). This LLM call has no reservation; its "
+                "cost event will be dropped by runtime._route_track. "
+                "The refusal is re-raised so it reaches the caller and "
+                "aborts the LLM call; it is also recorded for the "
+                "@protect boundary.",
+                type(exc).__name__,
+                exc,
+            )
+            record_deferred_enforcement(exc)
+            raise
+        except Exception as exc:  # noqa: BLE001 — never raise out of callback
+            # A fault in the SDK's OWN code that is not a NullRun
+            # error — a broken runtime double, a callback bug. The
+            # runtime converts its own faults into a typed refusal
+            # (`NullRunGateIndeterminateError`, ADR-129) before they
+            # can reach here, so this arm is not a decision path: it
+            # is the callback's own "never break the host framework"
+            # contract.
             logger.debug(
                 "NullRunCallback.on_llm_start: check_workflow_budget "
                 "raised %s — proceeding without reservation (llm_call "
@@ -716,6 +953,7 @@ class NullRunCallback(BaseCallbackHandler):
         except Exception as exc:  # noqa: BLE001
             logger.debug(f"llm span_start emission failed: {exc}")
 
+    @_only_a_gate_refusal_escapes
     def on_llm_end(self, response: Any, **kwargs: Any) -> None:
         """
         Called when LLM call ends.
@@ -907,6 +1145,29 @@ class NullRunCallback(BaseCallbackHandler):
             else:
                 logger.debug(f"LLM tracked: model={model}, NO usage data available")
 
+        except _ENFORCEMENT_EXCEPTIONS as e:
+            # SDK-6 (reliability audit 2026-11-02): the backend REFUSED
+            # to book this call's money (CONSUME_OVERBUDGET, a budget
+            # block, a 429). ADR-008's /track row is CLOSED for
+            # enforcement rejections — the refusal propagates to the
+            # caller. The broad arm below used to swallow it here, so
+            # the refusal never even reached
+            # ``@_only_a_gate_refusal_escapes`` and the run finished
+            # as if the money had been booked.
+            #
+            # It is ALSO recorded for the ``@protect`` boundary: that
+            # is the channel that can abort on the boundary's own
+            # thread when the host framework ignores ``raise_error``.
+            logger.error(
+                "NullRunCallback.on_llm_end: the backend refused to book "
+                "this LLM call (%s: %s). The refusal is re-raised so it "
+                "reaches the caller; it is also recorded for the "
+                "@protect boundary.",
+                type(e).__name__,
+                e,
+            )
+            record_deferred_enforcement(e)
+            raise
         except Exception as e:
             logger.warning(f"Failed to track LLM event: {e}")
         finally:
@@ -929,6 +1190,7 @@ class NullRunCallback(BaseCallbackHandler):
     # Chain / tool / agent hooks — emit span events
     # ------------------------------------------------------------------
 
+    @_only_a_gate_refusal_escapes
     def on_chain_start(
         self,
         serialized: Any,
@@ -949,12 +1211,15 @@ class NullRunCallback(BaseCallbackHandler):
             str(run_id), str(parent_run_id) if parent_run_id else None, name, kind="chain"
         )
 
+    @_only_a_gate_refusal_escapes
     def on_chain_end(self, outputs: Any, *, run_id: Any = None, **kwargs: Any) -> None:
         self._end_run(run_id)
 
+    @_only_a_gate_refusal_escapes
     def on_chain_error(self, error: Any, *, run_id: Any = None, **kwargs: Any) -> None:
         self._end_run(run_id, error=str(error))
 
+    @_only_a_gate_refusal_escapes
     def on_tool_start(
         self,
         serialized: Any,
@@ -973,12 +1238,15 @@ class NullRunCallback(BaseCallbackHandler):
             str(run_id), str(parent_run_id) if parent_run_id else None, name, kind="tool"
         )
 
+    @_only_a_gate_refusal_escapes
     def on_tool_end(self, output: Any, *, run_id: Any = None, **kwargs: Any) -> None:
         self._end_run(run_id)
 
+    @_only_a_gate_refusal_escapes
     def on_tool_error(self, error: Any, *, run_id: Any = None, **kwargs: Any) -> None:
         self._end_run(run_id, error=str(error))
 
+    @_only_a_gate_refusal_escapes
     def on_agent_action(
         self,
         action: Any,
@@ -998,6 +1266,7 @@ class NullRunCallback(BaseCallbackHandler):
             kind="agent",
         )
 
+    @_only_a_gate_refusal_escapes
     def on_agent_finish(self, finish: Any, *, run_id: Any = None, **kwargs: Any) -> None:
         self._end_run(run_id)
 

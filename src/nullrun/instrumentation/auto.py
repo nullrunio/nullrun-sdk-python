@@ -48,7 +48,9 @@ from typing import Any, NamedTuple
 
 import httpx
 
+from nullrun.breaker.exceptions import ENFORCEMENT_EXCEPTIONS
 from nullrun.instrumentation.langgraph import NullRunCallback
+from nullrun.transport import is_backend_refusal
 
 logger = logging.getLogger(__name__)
 
@@ -953,11 +955,9 @@ def _preflight_llm_call(
         # one-token reserve is the smallest honest number then.
         estimated_tokens=profile.estimated_input_tokens or None,
         max_output_tokens=profile.declared_max_output_tokens,
-        # Each provider call needs its OWN reservation. The chain-mode
-        # cache replays a previous response — including its reservation
-        # id — so a cached "allow" would hand this call the previous
-        # call's reservation.
-        use_gate_cache=False,
+        # Each provider call gets its OWN reservation: there is no
+        # in-process gate cache, so every call here is a separate
+        # /gate call that mints its own reservation id (SDK-1).
     )
     if not isinstance(reservation_id, str) or not reservation_id:
         return (None, profile.model)
@@ -975,8 +975,10 @@ def _track_with_reservation(
     The call shape is unchanged for the no-reservation case, so a
     duck-typed runtime (a test double, an older SDK) that implements
     ``track(event)`` keeps working. Passing a keyword it does not
-    accept would raise, and the transport swallows track failures —
-    which would silently drop the cost event.
+    accept would raise, and the transport swallows a track failure
+    that is NOT an enforcement refusal — which would silently drop
+    the cost event. An enforcement refusal is re-raised by the caller
+    (SDK-6): the backend said no, and the application must see it.
     """
     if reservation_id:
         runtime.track(event, reservation_id=reservation_id)
@@ -1269,7 +1271,26 @@ class NullRunSyncTransport(httpx.BaseTransport):
                 _build_llm_call_event(host, usage, model_for_event),
                 reservation_id,
             )
+        except ENFORCEMENT_EXCEPTIONS:
+            # SDK-6 (reliability audit 2026-11-02): the backend REFUSED
+            # to book this call (CONSUME_OVERBUDGET, a budget block, a
+            # 429). ADR-008's /track row is CLOSED for enforcement
+            # rejections — the refusal propagates to the caller. The
+            # broad arm below used to swallow it, so a refused track
+            # looked like a success to the application.
+            raise
         except Exception as e:
+            # SDK-1 (security audit 2026-11-06). The family above is a
+            # list of CLASSES, and a backend refusal that is not a
+            # verdict — a 503 `RESERVATION_NOT_FOUND`, a 500
+            # `INTERNAL_ERROR` — is not in it. The backend ANSWERED and
+            # refused to book the money, so the refusal has to reach
+            # the caller exactly like a verdict does.
+            #
+            # The test is the WIRE, not the class: the exception
+            # carries the HTTP status of the answer.
+            if is_backend_refusal(e):
+                raise
             logger.debug("NullRun transport: track failed: %s", e)
 
     def close(self) -> None:
@@ -1400,7 +1421,17 @@ class NullRunAsyncTransport(httpx.AsyncBaseTransport):
                 _build_llm_call_event(host, usage, model_for_event),
                 reservation_id,
             )
+        except ENFORCEMENT_EXCEPTIONS:
+            # SDK-6 — see the sync transport above. An enforcement
+            # refusal is not a transport failure: it must reach the
+            # caller.
+            raise
         except Exception as e:
+            # SDK-1 (security audit 2026-11-06) — see the sync
+            # transport above. A backend answer that refused the
+            # consume is not a transport failure either.
+            if is_backend_refusal(e):
+                raise
             logger.debug("NullRun transport: async track failed: %s", e)
 
     async def aclose(self) -> None:
@@ -2058,7 +2089,17 @@ def _emit_from_agents_result(runtime: Any, result: Any) -> None:
             if span_model:
                 agents_event["model"] = span_model
             runtime.track(agents_event)
+        except ENFORCEMENT_EXCEPTIONS:
+            # SDK-6 — the backend refused to book the money. It must
+            # reach the caller; a refused track must not look like a
+            # successful one.
+            raise
         except Exception as e:  # pragma: no cover — defensive
+            # SDK-1 (security audit 2026-11-06) — see the sync
+            # transport above. A backend answer that refused the
+            # consume is not a transport failure either.
+            if is_backend_refusal(e):
+                raise
             logger.debug("NullRun: agents track failed: %s", e)
 
 

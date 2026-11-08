@@ -170,9 +170,14 @@ def test_cache_seconds_minimum():
 
 def test_default_cache_seconds_matches_documented_value():
     """Public constant — if we ever change the default, callers
-    that rely on it (operator docs) break. Pin it."""
+    that rely on it (operator docs) break. Pin it.
 
-    assert DEFAULT_CACHE_SECONDS == 300
+    The value was 300 until the hygiene round of 2026-11-08: the
+    cached annotations are a POLICY INPUT for the gate's MCP
+    umbrella policies, so the window was cut to the 30 s floor the
+    constructor already enforces."""
+
+    assert DEFAULT_CACHE_SECONDS == 30
 
 
 # -----------------------------------------------------------------------

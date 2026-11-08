@@ -38,6 +38,7 @@ _EXPECTED_CODES = {
     "NR-A014",
     "NR-A015",
     "NR-A016",  # B.1 (2026-09-10): APPROVAL_DB_* sibling family
+    "NR-A017",  # DEC-5 / DEC-7 (2026-11-02): approval tool mismatch
     "NR-B001",
     "NR-B002",
     "NR-B004",
@@ -57,6 +58,12 @@ _EXPECTED_CODES = {
     "NR-MCP03",  # B.1 (2026-09-10): MCP umbrella approval required
     "NR-O001",
     "NR-P001",
+    # NR-P004: the SDK could not obtain a decision (ADR-129 on the
+    # /gate seam, ADR-131 on the /execute seam). It had NO entry here
+    # and none in DEFAULT_MESSAGES, so the refusal rendered as the
+    # generic fallback — the operator saw "Something went wrong" for
+    # the one failure that stops the call.
+    "NR-P004",
     "NR-R001",
     "NR-R002",
     "NR-T001",

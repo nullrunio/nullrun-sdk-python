@@ -1,12 +1,24 @@
 [build-system]
-requires = ["hatchling"]
+# The build backend is pinned to an EXACT version on purpose.
+#
+# SDK-3 (security audit 2026-11-06) found ``requires = ["hatchling"]``
+# with no constraint. The publish job resolves this list fresh, inside
+# the job that holds the PyPI Trusted Publishing token
+# (``permissions: id-token: write``). An unpinned backend means the
+# version that builds and uploads the wheel is chosen at publish time,
+# not at commit time, so a new upstream release lands inside the
+# trusted-publishing job without a review.
+#
+# An exact pin makes that resolution deterministic. Bump it explicitly
+# (with a test run) rather than letting the range float.
+requires = ["hatchling==1.32.4"]
 build-backend = "hatchling.build"
 
 [project]
 name = "nullrun"
 # Full release history lives in CHANGELOG.md; only the current version
 # is pinned here.
-version = "0.23.0"
+version = "0.24.0"
 # Kept under the 200-char preview threshold so the full line is visible
 # without an "expand" click. The headline is the canonical §1 statement
 # from positioning.md — "runtime decision layer for tool-using AI agents"
@@ -168,6 +180,34 @@ dev = [
     # is declared. Conditional on `<3.11` so the upper-bound
     # environments do not pull a redundant package.
     "tomli>=2.0; python_version < '3.11'",
+]
+
+# PEP 735 dependency groups. A group is a developer-side install set: it
+# never lands in the wheel metadata and it never reaches an end user.
+#
+# SDK-3 (security audit 2026-11-06) found the publish workflow running
+# ``pip install --upgrade build`` and ``pip install twine`` inside the job
+# that holds the PyPI Trusted Publishing token. Both resolved at run time,
+# inside the trusted-publishing job. The group below puts them in
+# ``uv.lock`` with exact pins, so the publish job installs the same bytes
+# every run.
+#
+# The versions are exact on purpose: the lock is the contract, and an
+# exact pin says which bytes the lock carries.
+#
+# These are NOT project extras. ``tests/test_websocket_extra_is_declared.py``
+# pins the set of ``[project.optional-dependencies]`` extras to exactly
+# {opentelemetry, websocket, dev}, and a build tool has no business in an
+# end user's extra.
+[dependency-groups]
+publish = [
+    "build==1.6.1",
+    # twine 7.0.0 is the version that understands ``Metadata-Version: 2.5``,
+    # which is what hatchling >= 1.30 writes and what nullrun 0.23.0 on
+    # PyPI already ships. twine 6.2.0 rejects it ("2.5 is not a valid
+    # metadata version"), so ``twine check`` would fail on the project's
+    # own artifact.
+    "twine==7.0.0",
 ]
 
 [project.scripts]

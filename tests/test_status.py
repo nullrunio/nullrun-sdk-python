@@ -70,7 +70,8 @@ class TestSnapshotFields:
         rt = _make_runtime()
         s = rt.status()
         assert s.state == "ok"
-        assert s.api_key_prefix == "nr_live_te"
+        # SDK-5: the value is a fingerprint, not a prefix of the key.
+        assert s.api_key_prefix == "653ad4a8"
         assert s.is_healthy() is True
 
     def test_snapshot_is_frozen(self):
@@ -85,13 +86,23 @@ class TestSnapshotFields:
         s2 = rt.status()
         assert s1 == s2
 
-    def test_api_key_prefix_truncated_to_10_chars(self):
-        _make_runtime(api_key="nr_live_SsBF9OMYcVCgRCNcCVcJ4khTOPKx79JG")
+    def test_api_key_prefix_is_a_fingerprint_not_a_prefix(self):
+        """SDK-5: the snapshot carries NO character of the key.
+
+        Before the fix this field was ``api_key[:10]`` — ten
+        characters of a credential in a user-visible string. The
+        assertion below must FAIL if the raw slice comes back: the
+        fake key starts with ``nr_live_`` and the fingerprint does not
+        contain it.
+        """
         s = _make_runtime(
             api_key="nr_live_SsBF9OMYcVCgRCNcCVcJ4khTOPKx79JG"
         ).status()
-        assert s.api_key_prefix == "nr_live_Ss"
-        assert len(s.api_key_prefix) == 10
+        assert s.api_key_prefix == "c9ef9e82"
+        assert len(s.api_key_prefix) == 8
+        # No character of the key, not even its prefix.
+        assert "nr_live_" not in str(s)
+        assert "SsBF9OMY" not in str(s)
         # Full key MUST NOT leak into the snapshot.
         assert "TOPKx79JG" not in str(s)
 
@@ -215,7 +226,9 @@ class TestSummary:
     def test_ok_summary(self):
         out = _make_runtime().status().summary()
         assert "ok" in out
-        assert "nr_live_te" in out
+        # SDK-5: the summary carries a fingerprint, not a key prefix.
+        assert "api_key_fp=653ad4a8" in out
+        assert "nr_live_te" not in out
 
     def test_summary_with_organization_and_workflow(self):
         # Covers the ``if self.organization_id`` and

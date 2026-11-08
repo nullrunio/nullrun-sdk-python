@@ -1,4 +1,4 @@
-.PHONY: install test lint type-check coverage clean build publish-test publish smoke-test
+.PHONY: install test lint type-check coverage clean build publish-test publish smoke-test lint-supply-chain
 
 # ── Setup ─────────────────────────────────────────────────────
 install:
@@ -45,23 +45,34 @@ lint-fix:
 type-check:
 	mypy src/nullrun --strict
 
-check: lint type-check test
+check: lint lint-supply-chain type-check test
+
+# ── Supply chain ──────────────────────────────────────────────
+# SDK-3 (security audit 2026-11-06). Fails on a workflow that pins an
+# action to a mutable ref, and on a dependency install that ignores
+# uv.lock. CI runs the same script (.github/workflows/ci.yml, job
+# ``supply-chain``) and the publish workflows run it inside the job that
+# holds the PyPI Trusted Publishing token.
+lint-supply-chain:
+	python scripts/check_supply_chain.py
 
 # ── Build & Publish ───────────────────────────────────────────
 clean:
 	rm -rf dist/ build/ *.egg-info htmlcov/ .coverage coverage.xml
 
+# ``build`` and ``twine`` come from the ``publish`` dependency group in
+# uv.lock, so the local publish path resolves the same versions as CI.
+# ``--inexact`` keeps the dev packages that are already in the venv.
 build: clean
-	pip install build
-	python -m build
-	pip install twine
-	twine check dist/*
+	uv sync --frozen --only-group publish --inexact
+	uv run --frozen --no-sync python -m build
+	uv run --frozen --no-sync twine check dist/*
 
 publish-test: build
-	twine upload --repository testpypi dist/*
+	uv run --frozen --no-sync twine upload --repository testpypi dist/*
 
 publish: build
-	twine upload dist/*
+	uv run --frozen --no-sync twine upload dist/*
 
 # ── Dev helpers ───────────────────────────────────────────────
 smoke-test: build

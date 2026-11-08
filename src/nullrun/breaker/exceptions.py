@@ -423,11 +423,146 @@ class NullRunMalformedGateResponseError(NullRunProtocolError):
     retryable = True
 
 
+class NullRunGateIndeterminateError(NullRunInfrastructureError):
+    """The gate's decision could not be determined — and the SDK will not guess.
+
+    Raised when the ``/gate`` call fails with something that is NOT a
+    transport failure: the SDK's OWN code faulted while asking the gate
+    a question (a request body that cannot be serialised, a decoding
+    error, a programming error in the request builder, a fault in the
+    edge path's token split).
+
+    Why this is not a transport error
+    ---------------------------------
+    ADR-008's fail-OPEN covers ONE thing: the gate could not be
+    REACHED, so there is no answer to honour and the agent must not
+    freeze. That is a fact about the world — the backend is down.
+
+    This class is the opposite. The backend may well have answered; the
+    SDK simply cannot read what it got, or never got as far as asking.
+    The question "may this call proceed?" therefore has no answer, and
+    an unanswered question is not a yes. ADR-063 §2.4's governing rule
+    says it exactly: *"a fail-OPEN where the answer is known and merely
+    inconvenient to obtain is a bug"* — and the sharper form: an
+    enforcement failure must never become implicit permission.
+
+    Before this class existed, the runtime's gate handler ended in a
+    bare ``except Exception`` that failed OPEN for every fault, so an
+    SDK-internal ``KeyError`` was logged and the call proceeded with no
+    reservation (SDK-11). That is the same shape as the SDK-10 hole one
+    class away: the call ran, and its cost event was dropped.
+
+    It is deliberately NOT a :class:`NullRunTransportError` subclass.
+    The ``@protect`` boundary treats a transport error as the one class
+    ADR-126's two-step opt-in can open; an indeterminate decision must
+    not be convertible into "the body runs". Deriving from
+    :class:`NullRunInfrastructureError` puts it in the boundary's
+    ``except NullRunInfrastructureError: raise`` arm instead.
+    """
+
+    error_code = "NR-P004"
+    user_action = (
+        "The SDK could not obtain a decision from the NullRun gate: the "
+        "call failed for a reason that is not a network failure, so the "
+        "SDK stopped rather than assume the call was allowed. This is "
+        "usually an SDK-side fault — retry, and if it persists, report "
+        "the exception's cause with the SDK version."
+    )
+    retryable = True
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_code: str | None = None,
+        user_action: str | None = None,
+        retryable: bool | None = None,
+        docs_url: str | None = None,
+        cause: BaseException | None = None,
+    ) -> None:
+        # ``cause`` is the original fault. It is what makes this class
+        # actionable: the message says the decision was indeterminate,
+        # and the cause says WHY (a bad request body, a decode error).
+        #
+        # The other keywords mirror the base class: a caller may
+        # override the class-level values per instance, and the base
+        # never mutates the class attribute.
+        super().__init__(
+            message,
+            error_code=error_code,
+            user_action=user_action,
+            retryable=retryable,
+            docs_url=docs_url,
+            cause=cause,
+        )
+
+
+class NullRunUnknownActionError(NullRunInfrastructureError):
+    """The control plane sent an action type this SDK does not know.
+
+    Raised when a control-plane action arrives whose ``type`` is not
+    in the SDK's ``ActionType`` enum — a wire value the SDK cannot
+    interpret, and therefore cannot execute.
+
+    Why this raises instead of returning quietly (SDK-12)
+    -----------------------------------------------------
+    The action dispatcher used to log the unknown type at ERROR, record
+    a forensic history event, and RETURN. The caller then had no way
+    to tell "the action ran" from "the action could not be run": the
+    action was neither executed nor refused, while the caller's own
+    bookkeeping said it had been handled. A control-plane instruction
+    that is silently dropped is a control-plane instruction that does
+    not exist.
+
+    The refusal is deliberately NOT a :class:`NullRunBlockedException`.
+    An unknown action type must not degrade into "the workflow is
+    blocked": that is what made the SDK a DoS amplifier in the first
+    place (B14) — one unrecognised value from the control plane would
+    stop every subsequent tool call in the workflow. This class is an
+    INFRASTRUCTURE error: the control plane sent something the SDK
+    cannot execute, and the fix is a version alignment, not a policy
+    verdict.
+
+    It is deliberately NOT a :class:`NullRunTransportError` subclass,
+    for the same reason as :class:`NullRunGateIndeterminateError`:
+    ADR-126's two-step opt-in opens transport errors, and "the body
+    runs" is not an acceptable answer to "the control plane sent an
+    instruction this SDK cannot execute".
+    """
+
+    error_code = "NR-P005"
+    user_action = (
+        "The NullRun control plane sent an action type this SDK version "
+        "does not know, so the action was NOT executed. This is a "
+        "server/SDK version mismatch — upgrade the SDK to a version that "
+        "understands the control plane's action vocabulary. The "
+        "workflow itself is not blocked."
+    )
+    retryable = False
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        action: str | None = None,
+        workflow_id: str | None = None,
+        reason: str | None = None,
+        cause: BaseException | None = None,
+        **kwargs: Any,
+    ) -> None:
+        self.action = action
+        self.workflow_id = workflow_id
+        self.reason = reason
+        super().__init__(message, cause=cause, **kwargs)
+
+
 class NullRunChainError(NullRunDecision):
     """Chain-related failure.
 
     Covers backend codes: ``CHAIN_MAX_DURATION_EXCEEDED`` (402),
     ``CHAIN_CROSS_ORG`` (403), ``CHAIN_ORG_MISMATCH`` (403),
+    ``CHAIN_KEY_MISMATCH`` (403 — ADR-180: the chain belongs to the
+    API key that created it),
     ``CHAIN_NOT_FOUND`` / ``CHAIN_EXPIRED`` (404), and the
     Execution Graph v0 (2026-08-06) trio:
     ``PARENT_EXECUTION_NOT_FOUND`` / ``PARENT_EXECUTION_ORG_MISMATCH``
@@ -1333,6 +1468,37 @@ class NullRunApprovalToolDigestMismatchError(NullRunBlockedException):
     retryable = False
 
 
+class NullRunApprovalToolMismatchError(NullRunBlockedException):
+    """The executing tool is not covered by the operator's approval (DEC-5 / DEC-7).
+
+    Wire code ``APPROVAL_TOOL_MISMATCH`` (HTTP 409). The operator
+    approved an action for one tool; the agent is executing a DIFFERENT
+    tool under that approval. Before this code existed a money approval
+    bound only the AMOUNT (``BusinessImpact::Money`` carries no tool
+    name), so an approval for tool A authorised tool B.
+
+    The backend binds the approval to the tool set the matched approval
+    RULE covers (intersected with the tools the ``/gate`` request
+    declared), so the refusal is structural, not advisory.
+    Cookbook pattern: request a FRESH approval for the tool you
+    actually intend to run — the existing grant can never authorise a
+    tool outside its set.
+
+    Distinct from NR-A013 / NR-A014: those mean the PAYLOAD drifted
+    (business impact / capability digest). This means the TOOL is
+    different, and a fresh approval — not a re-derived digest — is the
+    remediation.
+    """
+
+    error_code = "NR-A017"
+    user_action = (
+        "Approval tool mismatch — the operator's approval covers a "
+        "different tool than the one currently executing. Request a "
+        "fresh approval for the tool you intend to run and retry."
+    )
+    retryable = False
+
+
 # ────────────────────────────────────────────────────────────────────────
 #
 # Pre-B.1 these three wire codes (``MCP_DESTRUCTIVE_BLOCKED``,
@@ -1604,3 +1770,64 @@ class NullRunWorkflowKilledError(WorkflowKilledInterrupt):
         "or inspect the reason before retrying."
     )
     retryable = False
+
+
+# ---------------------------------------------------------------------------
+# The enforcement-refusal family
+# ---------------------------------------------------------------------------
+# ONE tuple that means "the enforcement path said NO" — as opposed to
+# "the enforcement path could not be reached".
+#
+# The distinction is the whole point. ADR-008's fail-OPEN policy
+# covers the SECOND: a dead backend must not freeze the agent. It
+# explicitly does NOT cover the FIRST: conflating "the gate refused"
+# with "the gate was unreachable" is what let a real budget block
+# through as a debug log line (SDK-4, and the same defect on the
+# /track path — SDK-6).
+#
+# All of these derive from ``Exception``, so an ordering-sensitive
+# ``except`` clause is required: this tuple must be caught BEFORE the
+# broad transport arm, or the block is silently downgraded to a
+# fail-OPEN transport error.
+#
+# The family is named by BASE class, so a refusal subclass added later
+# cannot silently fall back into the fail-OPEN arm:
+#   * ``NullRunDecision`` — every "the gate said no" refusal:
+#     tool-block, budget, the approval family, chain,
+#     workflow-inactive, PAUSE.
+#   * ``RateLimitError`` — the 429 refusal. It is NOT a
+#     ``NullRunDecision``: the gate refused, but the refusal wears a
+#     transport-shaped class because the wire code is a 429. Naming
+#     ``NullRunDecision`` alone would still have swallowed it.
+#   * ``WorkflowKilledInterrupt`` — the dashboard KILL switch. It
+#     derives from ``NullRunError`` directly, NOT from
+#     ``NullRunDecision``.
+#   * ``NullRunMalformedGateResponseError`` — the gate ANSWERED, and
+#     what it said was not a verdict (SDK-10). It is a protocol error
+#     by class, but the SDK's only safe answer to it is to REFUSE:
+#     the runtime already decided that a body without a usable
+#     decision fails CLOSED (``_require_gate_decision``), and the
+#     reservation id is part of that decision — it is what binds the
+#     spend to the reservation the server minted. Before this member
+#     existed, the instrumentation's blanket arms downgraded it to a
+#     fail-OPEN transport error, so an unusable answer let the call
+#     run with no reservation and its cost event was DROPPED — the
+#     agent got the call for free. It is in the family because the
+#     operational rule the family encodes is the one that matters
+#     here: none of these may be downgraded to "the gate was
+#     unreachable, carry on".
+#   * ``NullRunGateIndeterminateError`` — the decision is
+#     INDETERMINATE (SDK-11): the gate call produced no decision the
+#     SDK can act on, and the failure was NOT a transport failure, so
+#     the SDK cannot tell "the backend said no" from "the SDK never
+#     found out". Same operational rule: it must not be downgraded to
+#     a fail-OPEN transport error, because an SDK-internal fault was
+#     being laundered into "allowed" — the call ran with no
+#     reservation and its cost event was dropped.
+ENFORCEMENT_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    NullRunDecision,
+    RateLimitError,
+    WorkflowKilledInterrupt,
+    NullRunMalformedGateResponseError,
+    NullRunGateIndeterminateError,
+)

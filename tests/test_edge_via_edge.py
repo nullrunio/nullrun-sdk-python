@@ -14,6 +14,8 @@ import pytest
 
 from nullrun.edge import (
     EDGE_LEASE,
+    EDGE_NOT_ENFORCED,
+    EDGE_UNREACHABLE,
     EdgeConfigurationError,
     EdgeTransport,
     edge_transport_from_env,
@@ -123,14 +125,29 @@ def test_a_lease_decision_is_not_a_fallback_decision():
     assert is_fallback_decision_source(EDGE_LEASE) is False
 
 
-def test_an_unreachable_box_is_a_fallback_so_strict_still_closes():
-    """E3. The unreachable answer is NOT a lease answer.
+def test_an_unreachable_box_is_not_a_fallback_source():
+    """E3 / SDK-3. The unreachable answer is NOT a lease answer AND NOT
+    a fallback answer.
 
-    Same shape, opposite direction: this one must read as synthetic, or
-    the runtime would treat "the box did not answer" as the lease having
-    spoken.
+    Same shape, opposite direction: it must not read as synthetic
+    either. `is_fallback_decision_source` is the runtime's fail-OPEN
+    predicate — a body whose source is a fallback source means "the
+    engine never answered", and ADR-008 lets the budget pre-flight
+    proceed on it (the cloud's `/track` can still bill the call
+    later).
+
+    The edge is the opposite case, and the difference is not stylistic:
+    in edge mode the BOX is the enforcement surface, the cloud is not
+    consulted at all, and there is no `/track` recovery — the cloud the
+    spend would have been recovered through is the same one that is
+    down. Reusing FALLBACK made the two surfaces indistinguishable,
+    and the runtime — which can only see the source — discarded the
+    edge's refusal and reported "no decision" (SDK-3).
     """
     assert is_fallback_decision_source(DecisionSource.FALLBACK) is True
+    assert is_fallback_decision_source(EDGE_UNREACHABLE) is False
+    assert is_fallback_decision_source(EDGE_NOT_ENFORCED) is False
+    assert is_fallback_decision_source(EDGE_LEASE) is False
 
 
 # ── what the SDK is allowed to say ─────────────────────────────────────
@@ -279,8 +296,8 @@ def test_an_unreachable_box_blocks_and_does_not_reach_the_cloud():
 
     The cloud is not configured anywhere in this object, so there is
     nothing to fall back to even in principle. What is asserted is the
-    shape the runtime needs: a synthetic block, not an exception and
-    definitely not an allow.
+    shape the runtime needs: a block the runtime cannot mistake for a
+    transport error — not an exception and definitely not an allow.
     """
     def boom(body):
         raise OSError("connection refused")
@@ -288,21 +305,22 @@ def test_an_unreachable_box_blocks_and_does_not_reach_the_cloud():
     t = _transport(boom)
     result = t.enforce("gpt-4o", 0, 10)
     assert result["decision"] == "block"
-    assert result["decision_source"] == DecisionSource.FALLBACK
+    assert result["decision_source"] == EDGE_UNREACHABLE
     assert result["error_code"] == "EDGE_UNREACHABLE"
-    assert is_fallback_decision_source(result["decision_source"]) is True
+    assert is_fallback_decision_source(result["decision_source"]) is False
 
 
 def test_a_broken_box_is_not_laundered_into_a_budget_answer():
     """5xx means the box is broken, which is not the same as 'no money'.
 
-    It takes the transport-error path so STRICT closes. A 5xx presented
-    as a lease refusal would be a decision the lease never made.
+    It takes the transport-error path so the refusal stays a refusal. A
+    5xx presented as a lease refusal would be a decision the lease
+    never made.
     """
     t = _transport(lambda body: _FakeResponse({"allowed": False}, status_code=503))
     result = t.enforce("gpt-4o", 0, 10)
     assert result["decision"] == "block"
-    assert result["decision_source"] == DecisionSource.FALLBACK
+    assert result["decision_source"] == EDGE_UNREACHABLE
     assert result["error_code"] == "EDGE_UNREACHABLE"
 
 
@@ -314,7 +332,8 @@ def test_a_non_json_answer_from_the_box_is_a_transport_failure():
 
     t = _transport(responder)
     result = t.enforce("gpt-4o", 0, 10)
-    assert result["decision_source"] == DecisionSource.FALLBACK
+    assert result["decision"] == "block"
+    assert result["decision_source"] == EDGE_UNREACHABLE
 
 
 def test_a_broken_observer_cannot_change_the_decision():
@@ -360,10 +379,17 @@ def test_check_goes_to_the_box_and_never_builds_a_gate_body(monkeypatch):
 
 
 def test_execute_does_not_reach_the_cloud_in_via_edge_mode(monkeypatch):
-    """E4. `/execute` has no box equivalent — and must not look for one.
+    """E4 / SDK-2. `/execute` has no box equivalent — and must not look
+    for one.
 
     The box's `/enforce` already decided and charged, so a second call
     would either hit the cloud or double-charge.
+
+    What `/execute` MAY do is read back what the box said about THIS
+    event. What it must not do is DECIDE — pre-fix it returned a
+    client-side `{"decision": "allow"}` without the box ever being
+    asked, so an expired, revoked or exhausted lease still allowed the
+    call.
     """
     monkeypatch.setenv("NULLRUN_EDGE_URL", "http://127.0.0.1:18090")
     monkeypatch.setenv("NULLRUN_EDGE_LEASE_ID", "lease-1")
@@ -376,7 +402,58 @@ def test_execute_does_not_reach_the_cloud_in_via_edge_mode(monkeypatch):
         raise AssertionError("the cloud was called in via-edge mode")
 
     t._client.post = must_not_be_called  # type: ignore[method-assign]
-    t.edge.last_source = EDGE_LEASE
+
+    # The box is asked once, about one event.
+    t.edge._post = lambda body: _FakeResponse(  # type: ignore[method-assign]
+        {"allowed": True, "spent_millicents": 10, "remaining_millicents": 90}
+    )
+    t.edge.enforce("gpt-4o", 0, 10, event_id="evt-1")
+
+    from nullrun.context import set_operation_id
+
+    token = set_operation_id("evt-1")
+    try:
+        result = t.execute(
+            organization_id="org-1",
+            execution_id="exec-1",
+            trace_id="trace-1",
+            tool="read_file",
+            input_data={},
+        )
+    finally:
+        from nullrun.context import _operation_id_var
+
+        _operation_id_var.reset(token)
+
+    assert result["decision"] == "allow"
+    assert result["decision_source"] == EDGE_LEASE
+    assert result["via_edge"] is True
+
+
+def test_execute_with_no_box_answer_is_refused(monkeypatch):
+    """SDK-2. The box was never asked about this call, so it is refused.
+
+    This is the shape of the hole the fix closes. Pre-fix `/execute`
+    answered "allow" with no box answer at all, so the whole edge
+    decision surface was client-side only — a box that said no, or was
+    never asked, was indistinguishable from a grant in force.
+
+    The cloud applies the same rule for the same reason: a direct
+    `/execute` with no prior `/gate` is answered 404
+    EXECUTION_NOT_FOUND, because the backend's `execution:{id}`
+    binding does not exist.
+    """
+    monkeypatch.setenv("NULLRUN_EDGE_URL", "http://127.0.0.1:18090")
+    monkeypatch.setenv("NULLRUN_EDGE_LEASE_ID", "lease-1")
+    monkeypatch.setenv("NULLRUN_EDGE_TOKEN", "box-token")
+    monkeypatch.setenv("NULLRUN_API_KEY", "nr_org_key")
+
+    t = Transport(api_url="https://api.nullrun.io")
+
+    def must_not_be_called(*a, **kw):
+        raise AssertionError("the cloud was called in via-edge mode")
+
+    t._client.post = must_not_be_called  # type: ignore[method-assign]
 
     result = t.execute(
         organization_id="org-1",
@@ -385,8 +462,45 @@ def test_execute_does_not_reach_the_cloud_in_via_edge_mode(monkeypatch):
         tool="read_file",
         input_data={},
     )
-    assert result["decision"] == "allow"
-    assert result["via_edge"] is True
+    assert result["decision"] == "block"
+    assert result["decision_source"] == EDGE_NOT_ENFORCED
+    assert result["error_code"] == "EDGE_NOT_ENFORCED"
+    assert is_fallback_decision_source(result["decision_source"]) is False
+
+
+def test_a_box_answer_is_consumed_once_and_never_reused():
+    """SDK-2. A recorded answer authorises ONE action.
+
+    `take_answer` pops. That is what makes a stale answer impossible:
+    an answer that was never consumed cannot be handed to a later
+    action, and a later action that never asked the box gets "no
+    answer" and is refused.
+    """
+    t = _transport(
+        lambda body: _FakeResponse({"allowed": True, "spent_millicents": 10})
+    )
+    t.enforce("gpt-4o", 0, 10, event_id="evt-1")
+
+    first = t.take_answer("evt-1")
+    assert first is not None
+    assert first["decision"] == "allow"
+
+    # Second take: nothing left. The box's answer was for that one
+    # action.
+    assert t.take_answer("evt-1") is None
+
+
+def test_an_answer_for_another_event_does_not_authorise_this_one():
+    """The answer is keyed by event, not by "the last thing that
+    happened". A different event is a different call and a different
+    charge."""
+    t = _transport(
+        lambda body: _FakeResponse({"allowed": True, "spent_millicents": 10})
+    )
+    t.enforce("gpt-4o", 0, 10, event_id="evt-1")
+
+    assert t.take_answer("evt-2") is None
+    assert t.take_answer("evt-1") is not None
 
 
 def test_a_direct_transport_has_no_edge_and_says_nothing_about_one(monkeypatch):
@@ -462,3 +576,97 @@ def test_a_source_is_not_enough_if_the_decision_is_nonsense():
     rt = NullRunRuntime.__new__(NullRunRuntime)
     with pytest.raises(NullRunMalformedGateResponseError):
         rt._require_gate_decision({"decision": "probably", "decision_source": EDGE_LEASE})
+
+
+def test_the_runtime_accepts_the_edge_refusal_sources():
+    """SDK-3. A refusal the runtime cannot parse is a refusal the
+    runtime discards.
+
+    `_require_gate_decision` rejects any body whose `decision_source`
+    it does not know, and it runs BEFORE the decision is read. So the
+    two edge refusal sources must be on the list — otherwise the
+    runtime raises "malformed response" on a perfectly well-formed
+    refusal, and the agent sees a crash instead of a block.
+    """
+    from nullrun.runtime import NullRunRuntime
+
+    rt = NullRunRuntime.__new__(NullRunRuntime)  # no I/O, no client
+    for source in (EDGE_LEASE, EDGE_UNREACHABLE, EDGE_NOT_ENFORCED):
+        assert rt._require_gate_decision(
+            {"decision": "block", "decision_source": source}
+        ) == "block"
+
+
+# ── the refusal reaches the caller ────────────────────────────────────
+
+
+def _edge_runtime(monkeypatch):
+    """A runtime whose enforcement path is a box that cannot answer."""
+    monkeypatch.setenv("NULLRUN_EDGE_URL", "http://127.0.0.1:18090")
+    monkeypatch.setenv("NULLRUN_EDGE_LEASE_ID", "lease-1")
+    monkeypatch.setenv("NULLRUN_EDGE_TOKEN", "box-token")
+    monkeypatch.setenv("NULLRUN_API_KEY", "nr_org_key")
+
+    from nullrun.runtime import NullRunRuntime
+
+    return NullRunRuntime(
+        api_key="nr_org_key",
+        api_url="https://api.nullrun.io",
+        _test_mode=True,
+        polling=False,
+    )
+
+
+def test_an_unreachable_box_blocks_the_budget_preflight(monkeypatch):
+    """SDK-3. The refusal must reach the caller.
+
+    Pre-fix the runtime's fail-OPEN predicate read the edge's
+    unreachable answer as a fallback source, so the pre-flight returned
+    "no decision" — and the caller reads that as "no block". The agent
+    carried on with the tool call unenforced.
+
+    Here the block must surface as a raised exception. `None` is the
+    shape that means "nothing was decided", and the whole point is that
+    something WAS decided: by nobody, which is a refusal.
+    """
+    from nullrun.breaker.exceptions import NullRunBlockedException
+    from nullrun.context import workflow
+
+    rt = _edge_runtime(monkeypatch)
+
+    def boom(body):
+        raise OSError("connection refused")
+
+    rt._transport.edge._post = boom  # type: ignore[method-assign]
+
+    with workflow("wf-edge"):
+        with pytest.raises(NullRunBlockedException) as excinfo:
+            rt.check_workflow_budget()
+
+    assert excinfo.value.error_code == "EDGE_UNREACHABLE", (
+        "the refusal must name the edge, not the budget"
+    )
+
+
+def test_an_unreachable_box_is_not_reported_as_a_budget_error(monkeypatch):
+    """The refusal must not be laundered into "your budget ran out".
+
+    An operator reading a budget error goes and raises a cap. The box
+    being unreachable is an infrastructure fact, and the error code
+    says so.
+    """
+    from nullrun.breaker.exceptions import NullRunBudgetError
+    from nullrun.context import workflow
+
+    rt = _edge_runtime(monkeypatch)
+
+    def boom(body):
+        raise OSError("connection refused")
+
+    rt._transport.edge._post = boom  # type: ignore[method-assign]
+
+    with workflow("wf-edge"):
+        with pytest.raises(Exception) as excinfo:
+            rt.check_workflow_budget()
+
+    assert not isinstance(excinfo.value, NullRunBudgetError)

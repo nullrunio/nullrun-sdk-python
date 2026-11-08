@@ -127,12 +127,18 @@ def test_the_scan_actually_found_something():
     "declared ok, nothing ran" failure class. Pin a floor at the
     known size and assert a few names that must be in the set.
     """
-    # 39 = every exception class in exceptions.py + the one in
+    # 40 = every exception class in exceptions.py + the one in
     # categories.py. Enums are deliberately not counted (see
     # `_is_exception_base`), so this number must not be inflated by
     # them and must not drift upward by accident either.
-    assert len(RAISABLE) == 39, (
-        f"expected the exception scan to find exactly 39 classes, found "
+    # 40 = 39 + NullRunApprovalToolMismatchError (DEC-5 / DEC-7,
+    # 2026-11-02 — the approval tool-binding refusal).
+    # 41 = 40 + NullRunGateIndeterminateError (SDK-11, 2026-11-05 —
+    # the refusal for a gate decision the SDK could not determine).
+    # 42 = 41 + NullRunUnknownActionError (SDK-12, 2026-11-05 — the
+    # refusal for a control-plane action the SDK cannot execute).
+    assert len(RAISABLE) == 42, (
+        f"expected the exception scan to find exactly 42 classes, found "
         f"{len(RAISABLE)}. The scan is the premise of every test in "
         f"this module — if it silently stopped matching, they would "
         f"all pass vacuously."
@@ -141,6 +147,8 @@ def test_the_scan_actually_found_something():
         "NullRunError",
         "NullRunApprovalDeniedError",
         "NullRunUnclassifiedRefusalError",
+        "NullRunGateIndeterminateError",
+        "NullRunUnknownActionError",
         "WorkflowKilledInterrupt",
     ):
         assert must_exist in RAISABLE, (

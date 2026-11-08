@@ -519,6 +519,17 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
         "nullrun.breaker.exceptions",
         "NullRunMalformedGateResponseError",
     ),
+    "NullRunGateIndeterminateError": (
+        "nullrun.breaker.exceptions",
+        "NullRunGateIndeterminateError",
+    ),
+    # The control plane sent an action type this SDK cannot execute
+    # (SDK-12). Infrastructure, not a decision: the workflow is NOT
+    # blocked, but the action did NOT run and the caller is told.
+    "NullRunUnknownActionError": (
+        "nullrun.breaker.exceptions",
+        "NullRunUnknownActionError",
+    ),
     "NullRunRateLimitRedisError": ("nullrun.breaker.exceptions", "NullRunRateLimitRedisError"),
     "NullRunBudgetRecheckFailedError": ("nullrun.breaker.exceptions", "NullRunBudgetRecheckFailedError"),
     "NullRunExecutionNotFoundError": ("nullrun.breaker.exceptions", "NullRunExecutionNotFoundError"),
@@ -564,6 +575,10 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "NullRunApprovalToolDigestMismatchError": (
         "nullrun.breaker.exceptions",
         "NullRunApprovalToolDigestMismatchError",
+    ),
+    "NullRunApprovalToolMismatchError": (
+        "nullrun.breaker.exceptions",
+        "NullRunApprovalToolMismatchError",
     ),
     # Layer 2: on_error context type
     "ErrorContext": ("nullrun.observability.error_hooks", "ErrorContext"),
@@ -743,6 +758,8 @@ __all__ = [
     "InsecureTransportError",
     "NullRunProtocolError",
     "NullRunMalformedGateResponseError",
+    "NullRunGateIndeterminateError",
+    "NullRunUnknownActionError",
     "NullRunRateLimitRedisError",
     "NullRunBudgetRecheckFailedError",
     "NullRunExecutionNotFoundError",
@@ -759,6 +776,7 @@ __all__ = [
     "NullRunApprovalReplayRejectedError",
     "NullRunApprovalDigestMismatchError",
     "NullRunApprovalToolDigestMismatchError",
+    "NullRunApprovalToolMismatchError",
     # User-facing message catalog — the single entry point for
     # turning an SDK exception into a string safe to display to
     # end users. ``set_user_message`` lets a deployment brand its

@@ -10,7 +10,11 @@ adapter could not complete an approval round trip at all:
   saw the grant.
 * The adapter sent neither ``business_impact`` nor ``action_digest``,
   so the approval row was never digest-bound and the backend could not
-  detect a tampered payload when the grant was consumed.
+  detect a tampered payload when the grant was consumed. **ADR-125
+  closed this one**: the adapter now DERIVES both from the tool call
+  it is about to make — the deep properties live in
+  ``tests/test_mcp_action_binding.py``, and the "absent impact" test
+  below now asserts the derived envelope instead of its absence.
 * The tool arguments reached the wire only as the legacy ``input``
   field. The backend's canonical argument bag (ADR-060 §4) is
   ``tool_arguments`` → ``tool_params`` → Null, so with
@@ -251,10 +255,22 @@ class TestImpactReachesTheGate:
 
         assert runtime.execute_calls[0]["action_digest"] == "cd" * 32
 
-    def test_absent_impact_is_not_invented_on_the_wire(self):
-        """The adapter must not fabricate a digest the caller did not
-        supply — a made-up one would be a claim the backend cannot
-        verify."""
+    def test_the_absent_impact_is_derived_from_the_call_itself(self):
+        """ADR-125 supersedes the old "do not invent a digest" rule.
+
+        The adapter now derives the envelope from the call it is about
+        to make, so the digest on the wire is the digest OF that
+        envelope — not a made-up hex. The backend re-derives it from
+        the live payload and compares it with the digest stored on the
+        approval row, so a tampered payload is still refused; and
+        without an envelope the post-approval re-entry was refused
+        outright (BUSINESS_IMPACT_INVALID), so an operator approval
+        for an MCP tool could never be spent.
+
+        The deep properties live in ``tests/test_mcp_action_binding.py``.
+        """
+
+        from nullrun.business_impact import BusinessImpact, compute_action_digest
 
         runtime = _RecordingRuntime()
         adapter, _ = _adapter(runtime)
@@ -262,8 +278,9 @@ class TestImpactReachesTheGate:
         adapter.call_tool("create_issue", {"repo": "acme/api"})
 
         body = runtime.execute_calls[0]
-        assert "business_impact" not in body
-        assert "action_digest" not in body
+        envelope = BusinessImpact.tool_call("create_issue", {"repo": "acme/api"})
+        assert body["business_impact"] == envelope.to_wire_dict()
+        assert body["action_digest"] == compute_action_digest(envelope)
 
 
 # ---------------------------------------------------------------------------
@@ -323,9 +340,21 @@ class TestGatePreflight:
         assert runtime.gate_calls == 1, "no /gate ran"
         assert order == ["gate", "execute"]
 
-    def test_the_preflight_is_skipped_when_a_gate_already_ran(self):
-        """The pre-flight RESERVES money at the gate. Running it twice
-        for one logical call would charge the org twice."""
+    def test_an_ambient_execution_id_alone_does_not_cover_this_tool_call(self):
+        """An execution id in scope says "some action was gated", not
+        "THIS action was gated".
+
+        The id is set by ``/gate`` and by ``/execute`` and is never
+        reset in ``src/``, so after the first tool call in a scope it
+        is still set. Skipping the pre-flight on that basis ran NO
+        ``/gate`` for the second tool call: no budget check, no
+        reservation, no spend reserved for it (P2-18).
+
+        The pre-flight RESERVES money at the gate, so running it twice
+        for ONE logical call would charge the org twice — which is
+        what the two cells below pin, for the two cases where the
+        ambient reservation really does cover THIS action.
+        """
 
         set_server_minted_execution_id("0192f0c1-1111-7000-8000-000000000001")
 
@@ -335,9 +364,69 @@ class TestGatePreflight:
 
         adapter.call_tool("create_issue", {"repo": "acme/api"})
 
-        assert runtime.gate_calls == 0, "a second /gate would charge twice"
+        assert runtime.gate_calls == 1, (
+            "the tool call ran no /gate — its budget was never checked "
+            "and its spend was never reserved"
+        )
+        assert len(runtime.execute_calls) == 1
+        assert order == ["gate", "execute"]
+
+    def test_the_approval_re_entry_skips_the_preflight(self):
+        """The approval's own execution id must survive the re-fire.
+
+        The backend's require_approval arm echoes the approval row's
+        execution id into ``reservation_id``, so the ambient id IS the
+        approval's execution. A second ``/gate`` would mint a DIFFERENT
+        id and the approval's consume (``WHERE execution_id = $3``)
+        would miss its row (APPROVAL_REPLAY_REJECTED).
+        """
+
+        set_server_minted_execution_id("0192f0c1-1111-7000-8000-000000000001")
+
+        order: list[str] = []
+        runtime = _RecordingRuntime(order=order)
+        adapter, _ = _adapter(runtime)
+
+        adapter.call_tool(
+            "create_issue",
+            {"repo": "acme/api"},
+            approval_id="appr-1",
+        )
+
+        assert runtime.gate_calls == 0, (
+            "the approval re-entry ran a second /gate — a second reserve "
+            "for one logical call charges the org twice"
+        )
         assert len(runtime.execute_calls) == 1
         assert order == ["execute"]
+
+    def test_the_protect_scope_skips_the_preflight(self):
+        """The scope reserved for itself, and only for itself.
+
+        The ``@protect`` path runs its own ``/gate`` for the whole
+        scope. A second ``/gate`` inside the scope reserves twice and
+        orphans the first (NR-059).
+        """
+        from nullrun.business_impact import BusinessImpact
+        from nullrun.context import reset_call_impact, set_call_impact
+
+        set_server_minted_execution_id("0192f0c1-1111-7000-8000-000000000001")
+        token = set_call_impact(BusinessImpact.no_impact())
+        try:
+            order: list[str] = []
+            runtime = _RecordingRuntime(order=order)
+            adapter, _ = _adapter(runtime)
+
+            adapter.call_tool("create_issue", {"repo": "acme/api"})
+
+            assert runtime.gate_calls == 0, (
+                "the protected scope ran a second /gate — the second "
+                "reserve orphans the first"
+            )
+            assert len(runtime.execute_calls) == 1
+            assert order == ["execute"]
+        finally:
+            reset_call_impact(token)
 
     def test_a_blocked_preflight_never_reaches_the_mcp_client(self):
         """The pre-flight is a gate, not a formality: a block there

@@ -37,11 +37,26 @@ Pre-fix (audit 2026-09-10):
 
 Post-fix:
   - Added a dedicated dispatch branch BEFORE the final catalog
-    fallback. Detects ``catalog is NullRunToolBlockedError`` or
-    ``catalog is NullRunBlockedException`` and calls the
-    constructor with the right (workflow_id, reason, status_code,
-    tool_name) signature. ``forwarded`` is passed through so
-    catalog value's defaults win.
+    fallback. Detects the blocked family and calls the constructor
+    with the right (workflow_id, reason, status_code, tool_name)
+    signature. ``forwarded`` is passed through so catalog value's
+    defaults win.
+
+SDK-15 (2026-11-07) widened the branch. It used to test the class
+by IDENTITY — ``catalog is NullRunToolBlockedError or catalog is
+NullRunBlockedException`` — so every typed SUBCLASS of the blocked
+family (the approval family, the MCP family) fell through to the
+generic fallback and raised the same TypeError this file was written
+to kill: nineteen codes, all of them flattened into the synthetic
+block by the transport's catch-all. The branch now matches by
+SUBCLASS (``issubclass(catalog, NullRunBlockedException)``), which
+covers the two exact classes and every subclass of them.
+
+The source pins below were re-pointed at that contract. They used to
+assert the branch's exact bytes (an identity test on two class
+names); a byte-window that has been widened by a deliberate fix must
+be re-pointed at the STRUCTURAL boundary, not satisfied by keeping
+dead code alive to match the old window.
 
 These tests pin BOTH the source shape AND the runtime behavior
 so a future refactor that reverts to the broken generic fallback
@@ -69,7 +84,16 @@ TRANSPORT_PY = SDK_ROOT / "src" / "nullrun" / "transport.py"
 # The dedicated dispatch branch DEF-NR-TOOLBLOCKED-PARSER added. Used as
 # the content needle for locating the dispatching parser — see
 # ``_parser_fn_containing``.
-_BRANCH_NEEDLE = "catalog is NullRunToolBlockedError"
+#
+# The needle is the branch's SUBCLASS TEST, which is the one line that
+# exists only in that branch. Two needles were tried and rejected:
+# a class NAME is self-satisfying (the function-local import block
+# names it even after the branch is deleted, so the pin would go green
+# against a parser with no branch at all), and the branch's
+# constructor call is not unique to it (the NullRunBudgetError arm
+# above builds the same ``workflow_id=`` argument, so the pin stayed
+# green when the blocked branch was gutted).
+_BRANCH_NEEDLE = "issubclass(catalog, NullRunBlockedException)"
 
 
 def _read(path: Path) -> str:
@@ -161,23 +185,27 @@ class TestDefNrToolblockedParserSourcePin:
 
     def test_dedicated_branch_present(self):
         src = _read(TRANSPORT_PY)
-        # The fix added an ``if catalog is NullRunToolBlockedError
-        # or catalog is NullRunBlockedException:`` branch BEFORE
-        # the generic ``catalog(full_message, **forwarded)``
-        # fallback.
+        # The fix added a dispatch branch BEFORE the generic
+        # ``catalog(full_message, **forwarded)`` fallback. It
+        # matches the blocked family BY SUBCLASS (SDK-15): an
+        # identity test on two class names left every typed
+        # subclass of the family — the approval family, the MCP
+        # family, nineteen codes — falling through to the generic
+        # fallback and raising the TypeError this branch exists to
+        # prevent.
         assert re.search(
-            r"catalog\s+is\s+NullRunToolBlockedError\s*\n\s+or\s+catalog\s+is\s+NullRunBlockedException",
+            r"issubclass\(\s*catalog,\s*NullRunBlockedException\s*\)",
             src,
         ), (
             "DEF-NR-TOOLBLOCKED-PARSER: the dedicated "
-            "NullRunToolBlockedError / NullRunBlockedException "
-            "dispatch branch must be present in "
-            "_parse_v3_error_envelope. Pre-fix the generic "
-            "catalog-fallback called "
-            "``catalog(full_message, **forwarded)`` which "
-            "raised TypeError because "
-            "NullRunBlockedException.__init__ requires positional "
-            "(workflow_id, reason)."
+            "NullRunBlockedException dispatch branch must be present "
+            "in _parse_v3_error_envelope, and it must match the "
+            "family BY SUBCLASS. Pre-fix the generic catalog-fallback "
+            "called ``catalog(full_message, **forwarded)`` which "
+            "raised TypeError because NullRunBlockedException."
+            "__init__ requires positional (workflow_id, reason); and "
+            "an identity test on two class names left every subclass "
+            "of the family with the same TypeError."
         )
 
     def test_branch_in_parser(self):
@@ -188,24 +216,30 @@ class TestDefNrToolblockedParserSourcePin:
         src = _read(TRANSPORT_PY)
         # Locate the parser function body that holds the dedicated
         # branch. Resolved by the BRANCH, not by the exception name:
-        # resolving on ``NullRunToolBlockedError`` is self-satisfying,
-        # because the function-local import block names it even after
-        # the branch is deleted. Verified — deleting the branch left
+        # resolving on a class name is self-satisfying, because the
+        # function-local import block names it even after the branch
+        # is deleted. Verified — deleting the branch left
         # this pin green that way. The branch text is the only needle
         # that is actually absent when the branch is gone.
         fn_body = _parser_fn_containing(src, _BRANCH_NEEDLE)
         assert _BRANCH_NEEDLE in fn_body, (
-            "DEF-NR-TOOLBLOCKED-PARSER: NullRunToolBlockedError "
-            "must be referenced inside the v3-envelope parser that "
-            "performs the dispatch (the dedicated dispatch branch "
-            "lives there)."
+            "DEF-NR-TOOLBLOCKED-PARSER: the blocked-family "
+            "constructor call must be inside the v3-envelope parser "
+            "that performs the dispatch (the dedicated dispatch "
+            "branch lives there)."
         )
 
     def test_import_includes_blocked_exception_classes(self):
         """The function-local import block in the dispatching parser
-        must include both ``NullRunToolBlockedError`` and
-        ``NullRunBlockedException`` — otherwise NameError at
-        runtime even though the branch is present."""
+        must include ``NullRunBlockedException`` — otherwise NameError
+        at runtime even though the branch is present.
+
+        The branch names the BASE class of the family (it matches by
+        subclass), so the base is what it must import. The concrete
+        subclasses are named by the CATALOG, which is built in
+        ``_build_v3_error_code_map`` with its own import block — a
+        class the parser never names must not be pinned here.
+        """
         src = _read(TRANSPORT_PY)
         # Locate the function-local import block (the one inside the
         # function that holds the branch, NOT the module-level one).
@@ -223,11 +257,6 @@ class TestDefNrToolblockedParserSourcePin:
             "v3-envelope parser"
         )
         imported = import_block.group(1)
-        assert "NullRunToolBlockedError" in imported, (
-            "DEF-NR-TOOLBLOCKED-PARSER: NullRunToolBlockedError "
-            "must be imported in the function-local block — the "
-            "dedicated dispatch branch references it."
-        )
         assert "NullRunBlockedException" in imported, (
             "DEF-NR-TOOLBLOCKED-PARSER: NullRunBlockedException "
             "must be imported in the function-local block — the "
@@ -271,11 +300,10 @@ class TestDefNrToolblockedParserSourcePin:
         ``catalog(full_message, **forwarded)`` form for these
         classes."""
         src = _read(TRANSPORT_PY)
-        # Extract the body of the new branch (between
-        # ``catalog is NullRunToolBlockedError`` and the next
-        # ``return cast(Exception, instance)``).
+        # Extract the body of the new branch (between the subclass
+        # test and the next ``return cast(Exception, instance)``).
         m = re.search(
-            r"if \(\s*\n\s*catalog is NullRunToolBlockedError.*?"
+            r"if issubclass\(catalog,\s*NullRunBlockedException\).*?"
             r"return cast\(Exception, instance\)",
             src,
             re.DOTALL,
